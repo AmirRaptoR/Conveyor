@@ -432,7 +432,10 @@ func (s *Server) handleOrder(w http.ResponseWriter, r *http.Request) {
 // RunMeta is one run directory, as the board needs it.
 type RunMeta struct {
 	model.Run
-	Log string `json:"log,omitempty"`
+	// Lines, not a blob: a log carries structure the writer already knew —
+	// which stream a line came from — and handing back one string throws it
+	// away, so a finished run could not be rendered the way a live one is.
+	Lines []runner.LogLine `json:"lines,omitempty"`
 }
 
 // handleRuns lists recent runs, newest first, optionally for one item.
@@ -456,7 +459,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	for _, run := range runs {
 		if run.ID == id {
 			b, _ := os.ReadFile(filepath.Join(run.Dir, "log.txt"))
-			run.Log = string(b)
+			run.Lines = parseLog(string(b))
 			writeJSON(w, run)
 			return
 		}
@@ -510,6 +513,29 @@ func (s *Server) listRuns(itemID string, limit int) ([]RunMeta, error) {
 		}
 	}
 	return out, nil
+}
+
+// parseLog turns a written log back into the lines it was made of. The format
+// is the runner's: a timestamp, the stream, then the text, which may itself
+// contain anything at all — so it is split exactly twice and no further.
+func parseLog(s string) []runner.LogLine {
+	out := []runner.LogLine{}
+	for _, ln := range strings.Split(strings.TrimRight(s, "\n"), "\n") {
+		if ln == "" {
+			out = append(out, runner.LogLine{Stream: "stdout"})
+			continue
+		}
+		parts := strings.SplitN(ln, " ", 3)
+		if len(parts) < 3 {
+			out = append(out, runner.LogLine{Stream: "stdout", Text: ln})
+			continue
+		}
+		// Verbatim: the writer pads the stream to a fixed width, and every
+		// stream name is already that width, so anything after the second
+		// space is the script's own text — indentation included.
+		out = append(out, runner.LogLine{Stream: strings.TrimSpace(parts[1]), Text: parts[2]})
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

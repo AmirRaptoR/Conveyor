@@ -252,10 +252,30 @@
 
   .log {
     margin:0; flex:1 1 auto; min-height:0; overflow:auto; padding:14px 18px;
-    font-size:11.5px; line-height:1.75; white-space:pre-wrap; word-break:break-word;
-    color:var(--dim);
+    font-size:11.5px; line-height:1.7; color:var(--dim);
   }
   .log:empty::after { content:"No output."; color:var(--faint); }
+  .ln { white-space:pre-wrap; word-break:break-word; }
+  .ln.blank { height:.55em; }
+  /* stderr is where a script says something went wrong, and where the blocked
+     convention is reported. It should not look like prose. */
+  .ln.stderr { color:var(--stop); }
+  .ln.engine { color:var(--run); font-style:italic; }
+  /* A tool call is an event, not a sentence: the agent did something. */
+  .ln.tool {
+    color:var(--ink); margin:3px 0 3px -8px; padding-left:8px;
+    border-left:2px solid var(--run);
+  }
+  .ln.tool .tname { color:var(--run); letter-spacing:.06em; }
+  .ln.tool .targ { color:var(--dim); }
+  .ln.head { color:var(--ink); font-weight:600; margin-top:9px; }
+  .ln.rule { border-top:1px solid var(--rule-soft); margin:8px 0; height:0; }
+  .ln .bullet { color:var(--faint); }
+  .log code {
+    background:color-mix(in srgb, var(--ink) 8%, transparent);
+    color:var(--ink); padding:0 3px; border-radius:2px;
+  }
+  .log strong { color:var(--ink); font-weight:600; }
 
   @media (prefers-reduced-motion: reduce) {
     *, *::before { animation:none !important; transition:none !important; }
@@ -293,7 +313,7 @@
     <button class="ctl" id="close">Close</button>
   </div>
   <div class="history" id="history"></div>
-  <pre class="log" id="log"></pre>
+  <div class="log" id="log"></div>
 </aside>
 
 <script>
@@ -453,7 +473,7 @@ async function inspect(id, title, stage) {
   $("#psub").textContent = `${id} · ${stage}`;
   $("#panel").classList.add("open"); $("#panel").setAttribute("aria-hidden", "false");
   $("#scrim").classList.add("open");
-  $("#log").textContent = "";
+  $("#log").innerHTML = "";
   await loadHistory(id);
 }
 
@@ -490,8 +510,51 @@ async function showRun(id) {
   followRun = id;
   document.querySelectorAll("[data-run]").forEach(b => b.classList.toggle("sel", b.dataset.run === id));
   const r = await (await fetch(`/api/runs/${id}`)).json();
-  $("#log").textContent = r.log || "";
-  $("#log").scrollTop = $("#log").scrollHeight;
+  const log = $("#log");
+  log.innerHTML = "";
+  for (const line of r.lines || []) log.appendChild(renderLine(line));
+  log.scrollTop = log.scrollHeight;
+}
+
+// An agent writes markdown and calls tools; showing that as one monospace blob
+// throws away everything it told you about shape. Presentation only — the
+// engine still reads no data out of a log, it comes back in $CONVEYOR_RESULT.
+function renderLine(line) {
+  const el = document.createElement("div");
+  const text = line.text ?? "";
+  el.className = "ln " + (line.stream === "stderr" ? "stderr"
+                        : line.stream === "engine" ? "engine" : "");
+
+  if (!text.trim()) { el.classList.add("blank"); return el; }
+
+  // "  · Bash: git status" — the shape agents/claude/_stream emits.
+  const tool = text.match(/^\s*·\s*([A-Za-z_]+):\s?([\s\S]*)$/);
+  if (tool) {
+    el.classList.add("tool");
+    el.innerHTML = `<span class="tname">${esc(tool[1])}</span> <span class="targ">${esc(tool[2])}</span>`;
+    return el;
+  }
+  if (/^\s*(-{3,}|={3,})\s*$/.test(text)) { el.className = "ln rule"; return el; }
+  if (/^#{1,6}\s/.test(text)) {
+    el.classList.add("head");
+    el.innerHTML = inline(text.replace(/^#{1,6}\s/, ""));
+    return el;
+  }
+  const bullet = text.match(/^(\s*)([-*·])\s+([\s\S]*)$/);
+  if (bullet) {
+    el.innerHTML = `${bullet[1]}<span class="bullet">${esc(bullet[2])}</span> ${inline(bullet[3])}`;
+    return el;
+  }
+  el.innerHTML = inline(text);
+  return el;
+}
+
+// The little markdown that actually appears in agent output. Escaped first, so
+// nothing a repository contains can inject markup into the board.
+function inline(s) {
+  return esc(s)
+    .replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`)
+    .replace(/\*\*([^*]+)\*\*/g, (_, b) => `<strong>${b}</strong>`);
 }
 
 function closePanel() {
@@ -580,10 +643,10 @@ es.onmessage = ev => {
   const e = JSON.parse(ev.data);
   if (e.kind === "log") {
     if (e.runId === followRun && e.line) {
-      const pre = $("#log");
-      const pinned = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 48;
-      pre.textContent += e.line.text + "\n";
-      if (pinned) pre.scrollTop = pre.scrollHeight;
+      const log = $("#log");
+      const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
+      log.appendChild(renderLine(e.line));
+      if (pinned) log.scrollTop = log.scrollHeight;
     }
     return;
   }
