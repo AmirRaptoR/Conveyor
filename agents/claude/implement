@@ -16,6 +16,7 @@ payload=$(cat)
 ref=$(jq -r '.item.ref' <<<"$payload")
 title=$(jq -r '.item.title' <<<"$payload")
 body=$(jq -r '.item.description // ""' <<<"$payload")
+url=$(jq -r '.item.url // ""' <<<"$payload")
 
 # A dirty tree means the previous run died mid-edit. Building on top of that is
 # how one failure becomes a corrupted branch, so stop and ask for a human.

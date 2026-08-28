@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Review an item's pull request with Claude Code, headless, and merge it if the
+# review comes back clean.
+#
+# The skill it invokes owns the loop — ask Codex, judge findings, fix, re-review,
+# up to three rounds, then merge when everything is green. So this stage runs
+# once and its verdict is final: success means merged, failure means the review
+# did not converge and a person is needed.
+#
+# Config (source env: + this script's params:):
+#   PROMPT           what to do. Required. Usually the slash command "/review $REF".
+#   ALLOWED_TOOLS    --allowedTools. Needs write tools: a review that finds a
+#                    real bug fixes it, and merging is a gh call.
+#   MODEL, MAX_TURNS, PERMISSION_MODE
+#   REPO             owner/name, for the pull-request check below
+set -euo pipefail
+
+: "${PROMPT:?PROMPT is required (set it in this script params: block)}"
+
+payload=$(cat)
+ref=$(jq -r '.item.ref' <<<"$payload")
+title=$(jq -r '.item.title' <<<"$payload")
+
+# Nothing to review means the previous stage did not deliver, whatever it
+# reported. Checked here rather than trusted from the skill, because the skill
+# stopping politely would otherwise read as success and advance the item.
+if [[ -n "${REPO:-}" ]]; then
+	pr=$(gh pr list --repo "$REPO" --state open --search "$ref" --json number --jq '.[0].number' 2>/dev/null)
+	if [[ -z "$pr" ]]; then
+		echo "no open PR references #$ref; nothing to review" >&2
+		exit 20
+	fi
+	echo "reviewing PR #$pr for $CONVEYOR_SOURCE #$ref — $title"
+else
+	echo "reviewing $CONVEYOR_SOURCE #$ref — $title"
+fi
+
+# A slash command must lead the message; the item context follows it. $REF is
+# the one substitution made, because a command needs the issue number.
+task=${PROMPT//\$REF/$ref}
+
+if [[ "$task" == /* ]]; then
+	full="${task}
+
+--- the item, as the pipeline sees it ---
+Item #${ref}${REPO:+ in $REPO}: ${title}${pr:+
+Pull request #${pr}}
+--- end item ---"
+else
+	full="Item #${ref}${REPO:+ in $REPO}: ${title}${pr:+
+Pull request #${pr}}
+
+${task}"
+fi
+
+full="${full}
+
+If the review cannot reach a verdict because it needs a decision only a human
+can make, change nothing and write {\"blocked\": true, \"reason\": \"<the
+decision needed>\"} to the file at ${CONVEYOR_RESULT}."
+
+set +e
+claude -p "$full" \
+	--max-turns "${MAX_TURNS:-200}" \
+	--permission-mode "${PERMISSION_MODE:-acceptEdits}" \
+	--allowedTools "${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep,Agent,Skill}" \
+	${MODEL:+--model "$MODEL"}
+rc=$?
+set -e
+
+if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
+	[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
+	echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
+	exit 20
+fi
+
+# GitHub is the record, never the transcript. A clean review ends in a merge, so
+# the PR must be gone; if it is still open the review did not converge, whatever
+# the session said.
+if [[ $rc -eq 0 && -n "${REPO:-}" ]]; then
+	still=$(gh pr list --repo "$REPO" --state open --search "$ref" --json number --jq '.[0].number' 2>/dev/null)
+	if [[ -n "$still" ]]; then
+		echo "PR #$still is still open; the review did not converge" >&2
+		exit 1
+	fi
+	echo "PR merged"
+fi
+exit $rc
