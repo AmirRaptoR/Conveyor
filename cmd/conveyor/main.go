@@ -112,7 +112,7 @@ func cmdValidate(args []string) error {
 	for _, s := range cfg.Stages {
 		n := s.Name
 		switch {
-		case s.OnEnter != "":
+		case s.Work:
 			n += "*"
 		case s.Terminal:
 			n += "."
@@ -125,6 +125,24 @@ func cmdValidate(args []string) error {
 	fmt.Printf("    poll %s, default timeout %s, log retention %s\n",
 		cfg.Poll.D(), cfg.Timeout.D(), cfg.Logs.Retention.D())
 	fmt.Println("    (* runs a script on enter, . terminal)")
+
+	// A repo that has not been onboarded is reported, not fatal: it must not
+	// take the healthy repos down with it.
+	bad := 0
+	for _, s := range cfg.Sources {
+		if s.OK() {
+			continue
+		}
+		bad++
+		fmt.Printf("\n    source %q cannot run:\n", s.Name)
+		for _, p := range s.Problems {
+			fmt.Printf("      - %s\n", p)
+		}
+	}
+	if bad > 0 {
+		fmt.Printf("\n%d of %d source(s) unusable; the rest will still be worked\n",
+			bad, len(cfg.Sources))
+	}
 	return nil
 }
 
@@ -142,6 +160,10 @@ func cmdList(args []string) error {
 	total := 0
 	for _, s := range cfg.Sources {
 		if *only != "" && s.Name != *only {
+			continue
+		}
+		if !s.OK() {
+			fmt.Fprintf(os.Stderr, "skip: %s: %s\n", s.Name, strings.Join(s.Problems, "; "))
 			continue
 		}
 		res, err := source.New(cfg, s, r).List(ctx)
@@ -219,6 +241,10 @@ func cmdTick(args []string) error {
 	advanced := 0
 	for _, s := range cfg.Sources {
 		if *only != "" && s.Name != *only {
+			continue
+		}
+		if !s.OK() {
+			fmt.Fprintf(os.Stderr, "skip: %s: %s\n", s.Name, strings.Join(s.Problems, "; "))
 			continue
 		}
 		for advanced < *max {

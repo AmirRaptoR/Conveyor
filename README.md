@@ -46,12 +46,15 @@ Nothing to install but Go — the mocks need no GitHub and no AI.
 
 ```bash
 go build -o conveyor ./cmd/conveyor
-cp conveyor.example.yaml conveyor.yaml
 
-./conveyor validate         # check the config and print the stage graph
-./conveyor list             # run every source's list script
-./conveyor tick -n 8 -v     # drain the pipeline, streaming logs
+# -c keeps your own conveyor.yaml, if you have one, out of the way
+./conveyor validate -c conveyor.example.yaml   # check config, print the graph
+./conveyor list     -c conveyor.example.yaml   # run every source's list script
+./conveyor tick     -c conveyor.example.yaml -n 8 -v
 ```
+
+`conveyor.yaml` is the working config and is deliberately untracked;
+`conveyor.example.yaml` is the template that ships.
 
 You should see items advance in priority order, one blocked item routed out of
 the pipeline, and then `nothing to do`.
@@ -66,20 +69,109 @@ concurrency:
 stages:
   - name: backlog                        # no script: a queue
   - name: refining
-    onEnter: ./stages/mock/refine.sh
+    work: true        # the script lives in each source's repo
     onSuccess: ready
     onFailure: backlog
   - name: done
     terminal: true
 sources:
   - name: mock
+    provider: mock    # a folder under providers/
     workdir: .
-    list: ./sources/mock/list.sh
-    move: ./sources/mock/move.sh
 ```
 
 Only sources listed in the config are ever touched. There is no directory
 auto-discovery: enrolling a repository is adding an entry.
+
+`provider:` is the one thing a source says about *how* to talk to its backend.
+It cannot name `list` and `move` separately, deliberately — that would let one
+source pair GitHub's list with Azure's move, a mismatch nothing downstream could
+detect, because by then they are just two executable paths.
+
+## Onboarding a repo
+
+`stages:` is the state machine and nothing more. A stage marked `work: true`
+runs something, but *what* it runs belongs to the repository, at
+`.conveyor/<stage>` in the source's workdir:
+
+```
+~/codes/midgame/.conveyor/
+  refining        claude -p "/refine" — picks up the repo's own .claude/skills
+  in-progress     claude -p "/deliver-issue $CONVEYOR_ITEM_REF"
+
+~/codes/caravan/.conveyor/
+  refining        codex exec "$(cat .conveyor/prompts/refine.md)"
+  in-progress     ...
+```
+
+Same pipeline, different work. One repo refines with a Claude skill, another
+with a long Codex prompt, and the engine knows about neither — it execs a file
+in a directory. Scripts resolve by name with or without an extension, exactly
+like providers.
+
+**A repo missing a script for a `work:` stage is reported, not tolerated:**
+
+```
+    source "caravan" cannot run:
+      - stage "in-progress": no in-progress script in ~/codes/caravan/.conveyor
+
+3 of 4 source(s) unusable; the rest will still be worked
+```
+
+Onboarding a repository is configuration work, and an incomplete one is a
+configuration error. But it is *that source's* error: conveyor reports it,
+skips it, and keeps working every healthy repo. There is no shared fallback to
+inherit by accident — a repo you meant to customise cannot silently do
+something generic instead.
+
+The starting template is in [`examples/`](examples/) — copy it into the repo
+you are enrolling, then edit it there:
+
+```bash
+cp -r examples/.conveyor ~/codes/midgame/
+```
+
+## Writing a provider
+
+A provider is a folder under `providers/` holding one script per verb:
+
+```
+providers/github/
+  list.sh      open issues -> items
+  move.sh      item stage -> a status:* label
+```
+
+The engine finds them by name, with or without an extension — `list.sh`,
+`list.py` and a compiled `list` are equivalent, because the runner execs the
+file directly and never consults an interpreter. Exactly one match per verb is
+required; two would make the choice depend on glob order.
+
+Writing a provider is creating a folder. Nothing registers it.
+
+Per-repository detail lives in the source's `env:`, which is how one adapter
+serves many repositories:
+
+```yaml
+sources:
+  - name: midgame
+    provider: github
+    workdir: ~/codes/midgame
+    env:
+      REPO: RaptoR-Soft/midgame
+      # The source owns the provider<->stage mapping; the engine never sees a
+      # label. Stages with no entry simply have nothing written.
+      STAGE_LABELS: |
+        refining=status:refining
+        ready=status:ready
+        in-progress=status:in-progress
+        blocked=status:blocked
+```
+
+Credentials are not part of this: the script inherits the ambient environment,
+so `gh`'s existing auth works and no token belongs in a committed config.
+
+`providers/github/selfcheck.sh` exercises both scripts against a stubbed `gh`
+and in dry-run, touching no network and no repository.
 
 ## Writing a source or a stage
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -40,8 +41,15 @@ type Logs struct {
 }
 
 type Stage struct {
-	Name        string   `yaml:"name"`
-	OnEnter     string   `yaml:"onEnter"`
+	Name string `yaml:"name"`
+	// Work declares that this stage runs something; the script itself lives in
+	// each source's repo at .conveyor/<stage>. The config owns the state
+	// machine, the repo owns what the work actually is.
+	//
+	// It stays in config because the scheduler needs it: a stage with no work
+	// is a queue, while a work stage found mid-flight is an interrupted job to
+	// re-run. A per-repo file cannot answer that for a repo not yet onboarded.
+	Work        bool     `yaml:"work"`
 	Timeout     Duration `yaml:"timeout"`
 	OnSuccess   string   `yaml:"onSuccess"`
 	OnFailure   string   `yaml:"onFailure"`
@@ -56,11 +64,24 @@ type Stage struct {
 }
 
 type Source struct {
-	Name    string            `yaml:"name"`
-	Workdir string            `yaml:"workdir"`
-	List    string            `yaml:"list"`
-	Move    string            `yaml:"move"`
-	Env     map[string]string `yaml:"env"`
+	Name     string            `yaml:"name"`
+	Provider string            `yaml:"provider"`
+	Workdir  string            `yaml:"workdir"`
+	Env      map[string]string `yaml:"env"`
+
+	// List and Move are resolved from Provider at load time and are never set
+	// in YAML. Naming the two scripts independently would let a source pair
+	// GitHub's list with Azure's move — a mismatch nothing downstream could
+	// detect, because by then they are just two executable paths.
+	List string `yaml:"-"`
+	Move string `yaml:"-"`
+
+	// Scripts maps stage name -> the absolute script in this source's repo.
+	// Problems is why this source cannot run: an un-onboarded repo, a missing
+	// provider script. Both are resolved at load and never fatal — one
+	// misconfigured repo must not stop every other repo from being worked.
+	Scripts  map[string]string `yaml:"-"`
+	Problems []string          `yaml:"-"`
 }
 
 // Duration accepts "30d", "90m", "5m" — Go's ParseDuration has no day unit, and
@@ -111,6 +132,7 @@ func Load(path string) (*Config, error) {
 	}
 	c.Dir = filepath.Dir(abs)
 	c.applyDefaults()
+	c.resolveSources()
 	if errs := c.Validate(); len(errs) > 0 {
 		return nil, fmt.Errorf("%s is invalid:\n  - %s", path, strings.Join(errs, "\n  - "))
 	}
@@ -155,7 +177,7 @@ func (c *Config) applyDefaults() {
 		// A blocked item must always leave the stage it blocked in. Staying
 		// would mean the scheduler re-runs the same script on the next poll,
 		// which is the exact infinite loop this design exists to avoid.
-		if s.OnBlocked == "" && s.OnEnter != "" && hasBlocked {
+		if s.OnBlocked == "" && s.Work && hasBlocked {
 			s.OnBlocked = "blocked"
 		}
 	}
@@ -189,6 +211,127 @@ func (c *Config) ResolveScript(p string) string {
 	return filepath.Join(c.Dir, p)
 }
 
+// ProvidersDir holds one directory per provider, named exactly as a source's
+// `provider:` names it. Adding a provider is creating a folder.
+func (c *Config) ProvidersDir() string { return filepath.Join(c.Dir, "providers") }
+
+// providerScript finds providers/<provider>/<verb>.
+func (c *Config) providerScript(provider, verb string) (string, error) {
+	dir := filepath.Join(c.ProvidersDir(), provider)
+	if fi, err := os.Stat(dir); err != nil {
+		return "", fmt.Errorf("provider %q: %v", provider, err)
+	} else if !fi.IsDir() {
+		return "", fmt.Errorf("provider %q: %s is not a directory", provider, dir)
+	}
+	path, err := findScript(dir, verb)
+	if err != nil {
+		return "", fmt.Errorf("provider %q: %v", provider, err)
+	}
+	return path, nil
+}
+
+// StageDir is where a source's repo keeps its stage scripts. Onboarding a repo
+// is creating this directory and filling it in.
+const StageDir = ".conveyor"
+
+// findScript finds dir/<name>, with or without an extension: name.sh, name.py
+// and a compiled `name` are equivalent, because the runner execs the file
+// directly and never consults an interpreter. Exactly one match is required —
+// two would make the choice depend on glob order.
+func findScript(dir, name string) (string, error) {
+	cand, _ := filepath.Glob(filepath.Join(dir, name+".*"))
+	cand = append(cand, filepath.Join(dir, name))
+
+	var found []string
+	for _, m := range cand {
+		if fi, err := os.Stat(m); err == nil && !fi.IsDir() {
+			found = append(found, m)
+		}
+	}
+	sort.Strings(found)
+
+	switch len(found) {
+	case 0:
+		return "", fmt.Errorf("no %s script in %s", name, dir)
+	case 1:
+		return found[0], nil
+	default:
+		names := make([]string, len(found))
+		for i, f := range found {
+			names[i] = filepath.Base(f)
+		}
+		return "", fmt.Errorf("ambiguous %s script (%s)", name, strings.Join(names, ", "))
+	}
+}
+
+// resolveSources fills in each source's script paths and records why it cannot
+// run. Nothing here is fatal: onboarding a repo is configuration work, and a
+// repo half-way through it must be reported as broken, not crash the engine and
+// take every healthy repo down with it.
+func (c *Config) resolveSources() {
+	for i := range c.Sources {
+		s := &c.Sources[i]
+		s.Scripts = map[string]string{}
+		s.Problems = nil
+		note := func(f string, a ...any) { s.Problems = append(s.Problems, fmt.Sprintf(f, a...)) }
+
+		if s.Provider != "" {
+			// The directory is checked once, not once per verb: a missing
+			// provider folder is one problem, and saying it twice buries the
+			// real list under noise.
+			dir := filepath.Join(c.ProvidersDir(), s.Provider)
+			if fi, err := os.Stat(dir); err != nil {
+				note("provider %q: %v", s.Provider, err)
+			} else if !fi.IsDir() {
+				note("provider %q: %s is not a directory", s.Provider, dir)
+			} else {
+				// Fixed order, not a map: problem lists are read by humans and
+				// compared by tests.
+				for _, v := range []struct {
+					verb string
+					dst  *string
+				}{{"list", &s.List}, {"move", &s.Move}} {
+					path, err := c.providerScript(s.Provider, v.verb)
+					if err != nil {
+						note("%v", err)
+						continue
+					}
+					if errs := checkScript(path, v.verb+" script"); len(errs) > 0 {
+						note("%s", strings.Join(errs, "; "))
+						continue
+					}
+					*v.dst = path
+				}
+			}
+		}
+
+		wd := c.Workdir(*s)
+		if _, err := os.Stat(wd); err != nil {
+			note("workdir %s: %v", s.Workdir, err)
+			continue // every stage script lives under it; one message is enough
+		}
+
+		for _, st := range c.Stages {
+			if !st.Work {
+				continue
+			}
+			path, err := findScript(filepath.Join(wd, StageDir), st.Name)
+			if err != nil {
+				note("stage %q: %v", st.Name, err)
+				continue
+			}
+			if errs := checkScript(path, fmt.Sprintf("stage %q", st.Name)); len(errs) > 0 {
+				note("%s", strings.Join(errs, "; "))
+				continue
+			}
+			s.Scripts[st.Name] = path
+		}
+	}
+}
+
+// OK reports whether this source can be worked.
+func (s Source) OK() bool { return len(s.Problems) == 0 }
+
 func (c *Config) Validate() []string {
 	var errs []string
 	add := func(f string, a ...any) { errs = append(errs, fmt.Sprintf(f, a...)) }
@@ -220,23 +363,20 @@ func (c *Config) Validate() []string {
 		}
 		seen[s.Name] = true
 
-		if s.Terminal && s.OnEnter != "" {
-			add("stage %q: terminal stages cannot have onEnter", s.Name)
-		}
-		if s.OnEnter != "" {
-			errs = append(errs, checkScript(c.ResolveScript(s.OnEnter), fmt.Sprintf("stage %q onEnter", s.Name))...)
+		if s.Terminal && s.Work {
+			add("stage %q: terminal stages cannot do work", s.Name)
 		}
 		if s.MaxAttempts < 0 {
 			add("stage %q: maxAttempts cannot be negative", s.Name)
 		}
 		// A non-terminal stage that runs a script must be able to leave.
-		if !s.Terminal && s.OnEnter != "" && s.OnSuccess == "" {
-			add("stage %q: has onEnter but no onSuccess and is not terminal — items would have nowhere to go", s.Name)
+		if !s.Terminal && s.Work && s.OnSuccess == "" {
+			add("stage %q: does work but has no onSuccess and is not terminal — items would have nowhere to go", s.Name)
 		}
 		// Without a blocked target the item stays put and the scheduler runs
 		// the same script again on the next poll.
-		if s.OnEnter != "" && s.OnBlocked == "" {
-			add("stage %q: has onEnter but no onBlocked, and there is no stage named \"blocked\" to default to — a blocked item would be re-run forever", s.Name)
+		if s.Work && s.OnBlocked == "" {
+			add("stage %q: does work but has no onBlocked, and there is no stage named \"blocked\" to default to — a blocked item would be re-run forever", s.Name)
 		}
 	}
 	// Targets must exist. Checked after the name set is complete so ordering
@@ -265,20 +405,8 @@ func (c *Config) Validate() []string {
 			continue
 		}
 		srcSeen[s.Name] = true
-		if s.List == "" {
-			add("source %q: list script is required", s.Name)
-		} else {
-			errs = append(errs, checkScript(c.ResolveScript(s.List), fmt.Sprintf("source %q list", s.Name))...)
-		}
-		if s.Move == "" {
-			add("source %q: move script is required", s.Name)
-		} else {
-			errs = append(errs, checkScript(c.ResolveScript(s.Move), fmt.Sprintf("source %q move", s.Name))...)
-		}
-		if s.Workdir != "" {
-			if _, err := os.Stat(expandHome(s.Workdir)); err != nil {
-				add("source %q: workdir %s: %v", s.Name, s.Workdir, err)
-			}
+		if s.Provider == "" {
+			add("source %q: provider is required", s.Name)
 		}
 	}
 	return errs

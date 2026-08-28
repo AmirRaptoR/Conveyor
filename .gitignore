@@ -14,3 +14,8 @@ node_modules/
 # The working config; conveyor.example.yaml is the tracked template.
 /conveyor.yaml
 /conveyor
+
+# Migration material from the old machine: personal skills, a systemd unit, and
+# repos.conf naming private repositories. Local to this machine, not the project.
+/conveyor-handoff/
+/conveyor-handoff.tar.gz

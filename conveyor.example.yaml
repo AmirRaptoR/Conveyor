@@ -23,14 +23,19 @@ logs:
 # ---------------------------------------------------------------------------
 # Stages. Minimum two. Order defines the board's columns, left to right, and the
 # default "next stage" on success.
+#
+# This is the state machine and nothing else. `work: true` says a stage runs
+# something; WHAT it runs is the repo's business, at .conveyor/<stage> in each
+# source's workdir. That is what lets one repo refine with a Claude skill and
+# another with a long Codex prompt, on the same pipeline.
 # ---------------------------------------------------------------------------
 stages:
   - name: backlog
-    # No onEnter: nothing runs. Items land here and wait.
+    # No work: nothing runs. Items land here and wait.
 
   - name: refining
-    onEnter: ./stages/mock/refine.sh
-    timeout: 30m
+    work: true                # the script lives in each source's repo at
+    timeout: 30m              # .conveyor/refining — see "Onboarding a repo"
     onSuccess: ready          # explicit; would default to the next stage anyway
     onFailure: backlog        # a failed refine returns it to the pile
 
@@ -43,7 +48,7 @@ stages:
                               # Some stages must never be entered by hand.
 
   - name: in-progress
-    onEnter: ./stages/mock/implement.sh
+    work: true                # .conveyor/in-progress in each source's repo
     onSuccess: done
     onFailure: blocked
     maxAttempts: 2            # after this many failures, force to onBlocked
@@ -57,20 +62,26 @@ stages:
 # ---------------------------------------------------------------------------
 # Sources. Only what is listed here is ever scanned — there is no directory
 # auto-discovery. Adding a repo is adding an entry.
+#
+# `provider:` names a folder under providers/. The engine finds list and move
+# inside it by name, with or without an extension: list.sh, list.py and a
+# compiled `list` are equivalent. Writing a new provider is creating a folder.
+#
+# A source cannot name its two scripts separately, on purpose — that would let
+# one pair GitHub's list with Azure's move, and nothing downstream could tell.
 # ---------------------------------------------------------------------------
 sources:
   - name: mock
+    provider: mock
     workdir: .
-    list: ./sources/mock/list.sh
-    move: ./sources/mock/move.sh
 
   # - name: midgame
+  #   provider: github
   #   workdir: ~/codes/midgame
-  #   list: ./sources/github/list.sh
-  #   move: ./sources/github/move.sh
   #   env:
   #     REPO: RaptoR-Soft/midgame
   #     # The source owns the provider<->stage mapping. The engine never sees it.
+  #     # Stages with no entry (backlog, done) simply have no label written.
   #     STAGE_LABELS: |
   #       refining=status:refining
   #       ready=status:ready

@@ -168,13 +168,23 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 
 	// A stage with no script is a queue, not an error: the item rests here
 	// until something else moves it.
-	if stage.OnEnter == "" {
+	if !stage.Work {
 		tr.Outcome = model.OutcomeNoop
 		return tr, nil
 	}
 
+	src := mustSource(e.cfg, srcName)
+	script, ok := src.Scripts[to]
+	if !ok {
+		// resolveSources already recorded why, and Engine skips unhealthy
+		// sources — reaching here means one went bad after load.
+		tr.Outcome = model.OutcomeFailure
+		tr.Err = fmt.Errorf("source %q has no script for stage %q", srcName, to)
+		return tr, tr.Err
+	}
+
 	res, err := e.runner.Run(ctx, runner.Spec{
-		Script:  e.cfg.ResolveScript(stage.OnEnter),
+		Script:  script,
 		Kind:    "stage",
 		Workdir: e.cfg.Workdir(mustSource(e.cfg, srcName)),
 		Env:     mustSource(e.cfg, srcName).Env,
@@ -246,7 +256,7 @@ func Target(cfg *config.Config, it *model.Item) (string, bool) {
 	if !ok || stage.Terminal {
 		return "", false
 	}
-	if stage.OnEnter != "" {
+	if stage.Work {
 		return stage.Name, true // re-run: recover an interrupted stage
 	}
 	if stage.OnSuccess == "" {
