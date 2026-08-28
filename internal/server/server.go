@@ -35,6 +35,16 @@ type State struct {
 	Warnings  []string     `json:"warnings,omitempty"`
 	UpdatedAt time.Time    `json:"updatedAt"`
 	Polling   bool         `json:"polling"`
+	// Active is the stage running right now, if any. The board lights that
+	// station; without it the page cannot tell work from stillness.
+	Active *Active `json:"active,omitempty"`
+}
+
+type Active struct {
+	Source string `json:"source"`
+	Stage  string `json:"stage"`
+	ItemID string `json:"itemId"`
+	Title  string `json:"title"`
 }
 
 type StageView struct {
@@ -199,10 +209,21 @@ func (s *Server) advance(ctx context.Context) {
 	if item == nil {
 		return
 	}
+
+	s.setActive(&Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title})
+	defer s.setActive(nil)
+
 	tr, _ := s.eng.Advance(ctx, item.Source, item, target)
 	if tr != nil {
 		s.hub.publish(event{Kind: "transition", Transition: tr})
 	}
+}
+
+func (s *Server) setActive(a *Active) {
+	s.mu.Lock()
+	s.state.Active = a
+	s.mu.Unlock()
+	s.hub.publish(event{Kind: "state"})
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
