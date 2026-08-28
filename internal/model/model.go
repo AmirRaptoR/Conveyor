@@ -26,6 +26,16 @@ type Item struct {
 	CreatedAt string `json:"createdAt,omitempty"`
 	UpdatedAt string `json:"updatedAt,omitempty"`
 
+	// Blocked is a mark on the item, not a place it goes. An item that needs a
+	// human stays in the stage it stopped in and wears this; the source reports
+	// it in whatever vocabulary the provider has — a label, a field, a column.
+	//
+	// The scheduler never picks a marked item, and that is what stops a stage
+	// being re-run on every poll. It is also what makes unblocking cheap: a
+	// person deletes the mark, the next listing shows an unfinished job in the
+	// stage it stopped in, and the work resumes there instead of restarting.
+	Blocked bool `json:"blocked,omitempty"`
+
 	// Raw is provider passthrough: opaque to the engine, handed back to
 	// scripts untouched.
 	Raw map[string]any `json:"raw,omitempty"`
@@ -37,7 +47,7 @@ type Outcome string
 const (
 	OutcomeSuccess Outcome = "success" // 0
 	OutcomeNoop    Outcome = "noop"    // 10
-	OutcomeBlocked Outcome = "blocked" // 20
+	OutcomeBlocked Outcome = "blocked" // 20 — marks the item where it stands
 	OutcomeFailure Outcome = "failure" // anything else
 	OutcomeTimeout Outcome = "timeout" // killed at the deadline
 	// OutcomeRunning is stamped before the script starts and replaced when it
@@ -109,10 +119,19 @@ type Run struct {
 
 // StageInput is the JSON piped to a stage or move script's stdin.
 type StageInput struct {
-	Item   *Item          `json:"item"`
-	Stage  string         `json:"stage"`
-	From   string         `json:"from,omitempty"`
-	Config map[string]any `json:"config,omitempty"`
+	Item  *Item  `json:"item"`
+	Stage string `json:"stage"`
+	From  string `json:"from,omitempty"`
+	// Blocked is the mark a move script should leave the item wearing. Always
+	// present, and always the whole truth: a move writes both the stage and the
+	// mark, so there is no second verb to forget to call. Setting and clearing
+	// are the same call with a different value.
+	Blocked bool `json:"blocked"`
+	// BlockedReason is why, when the script said so — the agents' convention is
+	// a "reason" in $CONVEYOR_RESULT. A provider that can record it should; one
+	// that cannot may ignore it.
+	BlockedReason string         `json:"blockedReason,omitempty"`
+	Config        map[string]any `json:"config,omitempty"`
 }
 
 // ListInput is the JSON piped to a list script's stdin.

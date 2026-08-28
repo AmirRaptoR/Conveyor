@@ -5,12 +5,16 @@
 #   REPO           owner/name — required
 #   STAGE_LABELS   "stage=label" per line. The source owns the provider<->stage
 #                  mapping; the engine never sees a label.
+#   BLOCKED_LABEL  the label that means "a human must decide" (default: blocked).
+#                  It is a mark, not a stage: an issue wearing it keeps whatever
+#                  status:* it stopped on, and the scheduler leaves it alone.
 #   DEFAULT_STAGE  where an issue carrying no mapped label lands (default: backlog)
 #   LIMIT          max issues to fetch (default: 200)
 set -euo pipefail
 
 : "${REPO:?REPO is required (set it in the source env: block)}"
 DEFAULT_STAGE="${DEFAULT_STAGE:-backlog}"
+BLOCKED_LABEL="${BLOCKED_LABEL:-blocked}"
 
 # STAGE_LABELS is written stage=label because that is the direction move.sh
 # needs. Listing needs the reverse, so invert it here into {label: stage}.
@@ -30,6 +34,7 @@ gh issue list --repo "$REPO" --state open --limit "${LIMIT:-200}" \
 	--json number,title,body,labels,url,assignees |
 	jq --arg source "$CONVEYOR_SOURCE" \
 		--arg default "$DEFAULT_STAGE" \
+		--arg blocked "$BLOCKED_LABEL" \
 		--argjson map "$label_to_stage" '
 		map(
 			(.labels | map(.name)) as $names
@@ -42,6 +47,9 @@ gh issue list --repo "$REPO" --state open --limit "${LIMIT:-200}" \
 				# the next move.sh clears the loser.
 				stage:       ([$names[] | $map[.] // empty] | .[0] // $default),
 				title:       .title,
+				# The mark rides beside the stage, never instead of it: this is
+				# what keeps an unblocked issue resuming where it stopped.
+				blocked:     ($names | index($blocked) != null),
 				description: (.body // ""),
 				url:         .url,
 				labels:      $names,

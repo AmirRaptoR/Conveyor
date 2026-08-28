@@ -118,10 +118,25 @@ func (c *Client) validate(in []model.Item) ([]model.Item, []Warning) {
 	return ok, warns
 }
 
-// Move writes a stage change back to the provider. CONTRACTS.md §4: the engine
-// calls this, never a stage script, so a crashed stage cannot leave provider
-// state inconsistent with what the engine believes.
-func (c *Client) Move(ctx context.Context, item *model.Item, to string) (*model.Run, error) {
+// Mark is the blocked flag as the provider should end up writing it. Setting
+// and clearing are the same call with a different value, which is why it rides
+// on move rather than being a verb of its own: a mark is provider state, and
+// move is already how provider state gets written.
+type Mark struct {
+	Blocked bool
+	// Reason is what the script said when it blocked. Best effort: a provider
+	// that has somewhere to put it should, one that does not may ignore it.
+	Reason string
+}
+
+// Move writes a stage and a mark back to the provider. CONTRACTS.md §4: the
+// engine calls this, never a stage script, so a crashed stage cannot leave
+// provider state inconsistent with what the engine believes.
+//
+// Both facts go every time. A move that wrote only the stage would need a
+// second call to clear a mark, and the gap between them is a window in which
+// the item is in one state and marked for another.
+func (c *Client) Move(ctx context.Context, item *model.Item, to string, mark Mark) (*model.Run, error) {
 	from := item.Stage
 	res, err := c.run.Run(ctx, runner.Spec{
 		Script:  c.cfg.ResolveScript(c.src.Move),
@@ -133,7 +148,10 @@ func (c *Client) Move(ctx context.Context, item *model.Item, to string) (*model.
 		From:    from,
 		To:      to,
 		Timeout: c.cfg.Timeout.D(),
-		Stdin:   model.StageInput{Item: item, Stage: to, From: from},
+		Stdin: model.StageInput{
+			Item: item, Stage: to, From: from,
+			Blocked: mark.Blocked, BlockedReason: mark.Reason,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("source %q: move %s %s->%s: %w", c.src.Name, item.ID, from, to, err)
@@ -143,5 +161,6 @@ func (c *Client) Move(ctx context.Context, item *model.Item, to string) (*model.
 			c.src.Name, item.ID, from, to, res.Run.ExitCode, res.Run.Dir)
 	}
 	item.Stage = to
+	item.Blocked = mark.Blocked
 	return &res.Run, nil
 }

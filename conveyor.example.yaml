@@ -41,6 +41,12 @@ logs:
 # and a source missing one is reported and skipped. A stage with no `script:`
 # runs nothing and is simply a queue.
 #
+# `onSuccess:` is the only route. There is no onFailure and no onBlocked: any
+# non-zero exit leaves the item in the stage it stopped in, wearing a blocked
+# mark that the provider writes in its own vocabulary, and the scheduler never
+# picks a marked item. Clearing the mark is one label, and the work resumes
+# where it stopped rather than restarting from the top.
+#
 # How the work is actually done — which agent, which model, which tools — lives
 # in each source's script, because it differs per repository and the engine must
 # never know. Onboarding a repository is writing its scripts.
@@ -54,7 +60,9 @@ stages:
                               # script need not share a name
     timeout: 30m
     onSuccess: ready          # explicit; would default to the next stage anyway
-    onFailure: backlog        # a failed refine returns it to the pile
+                              # There is no onFailure. A refine that fails stops
+                              # where it is, wearing a blocked mark, and resumes
+                              # there when a human clears it.
 
   - name: ready
     # --- reserved for v2, inert in v1 ---
@@ -67,8 +75,10 @@ stages:
   - name: in-progress
     script: implement         # conveyor.d/<source>/implement
     onSuccess: announcing
-    onFailure: blocked
-    maxAttempts: 2            # after this many failures, force to onBlocked
+    maxAttempts: 2            # two goes before the item is marked blocked where
+                              # it stands. Unset means one: the first failure
+                              # marks it, because a failure that neither routed
+                              # nor marked would be re-run on every poll forever.
 
   - name: announcing
     # The other form: a body written here instead of a name resolved per source.
@@ -83,13 +93,9 @@ stages:
       cat >/dev/null    # the item arrives as JSON on stdin; ignore it here
       echo "$CONVEYOR_SOURCE #$CONVEYOR_ITEM_REF is done"
     onSuccess: done
-    onFailure: blocked
 
   - name: done
     terminal: true            # no further transitions
-
-  - name: blocked
-    terminal: true            # needs a human; the board is how they see it
 
 # ---------------------------------------------------------------------------
 # Sources. Only what is listed here is ever scanned — there is no directory
@@ -113,6 +119,7 @@ sources:
     #     params:
     #       STAGE_LABELS: |
     #         refining=status:refining
+    #       BLOCKED_LABEL: blocked
     provider: mock
     workdir: .
 
@@ -147,7 +154,9 @@ sources:
   #         refining=status:refining
   #         ready=status:ready
   #         in-progress=status:in-progress
-  #         blocked=status:blocked
+  #       # The mark, in GitHub's vocabulary. Not a stage: an issue wearing it
+  #       # keeps whatever status:* it stopped on.
+  #       BLOCKED_LABEL: blocked
   #   env:
   #     REPO: RaptoR-Soft/midgame
   #   scripts:

@@ -13,7 +13,9 @@ done
 # Empty description is the mock's stand-in for "not enough to work with".
 if [[ -z "$(jq -r '.item.description // ""' <<<"$payload")" ]]; then
   echo "no description: cannot derive acceptance criteria" >&2
-  jq -n '{blocked:"needs a description before it can be refined"}' >"$CONVEYOR_RESULT"
+  # The convention every agent adapter shares, so the engine can hand the reason
+  # to `move` and the provider can record it beside the mark.
+  jq -n '{blocked:true,reason:"needs a description before it can be refined"}' >"$CONVEYOR_RESULT"
   exit 20
 fi
 

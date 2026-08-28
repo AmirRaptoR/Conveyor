@@ -169,9 +169,25 @@
   }
   .open:hover { color:var(--ink); border-color:var(--faint); }
 
-  /* Terminal stations sit after a gap, joined by a short spur. They were once
-     offset vertically to draw the divert literally; it read as misalignment
-     rather than as meaning, so the colour carries it instead. */
+  /* An item that needs a human. It has not gone anywhere — it is standing in
+     the stage it stopped in — so the mark is on the card and the column keeps
+     it in place. Red, because CONTRACTS §6 makes "what needs me?" the first
+     question the board answers. */
+  .item.blocked {
+    border-color:color-mix(in srgb, var(--stop) 55%, var(--rule));
+    background:color-mix(in srgb, var(--stop) 6%, var(--raised));
+  }
+  .item.blocked .title { color:var(--ink); }
+  .blocked-tag {
+    color:var(--stop); letter-spacing:.14em; text-transform:uppercase; font-size:9.5px;
+  }
+  .blocked-tag::before {
+    content:""; display:inline-block; width:5px; height:5px;
+    background:var(--stop); margin-right:5px; vertical-align:middle;
+  }
+  .count .held { color:var(--stop); }
+
+  /* Terminal stations sit after a gap, joined by a short spur. */
   .terminus { flex:0 0 auto; padding-left:30px; position:relative; z-index:1; }
   .terminus .plate { min-width:158px; }
   .terminus .queue { margin-right:0; padding-right:0; border-top-color:var(--rule-soft); }
@@ -179,11 +195,8 @@
     content:""; position:absolute; left:0; top:calc(14px + 52px); width:30px; height:1px;
     background:var(--rule);
   }
-  .terminus.done .plate { border-color:color-mix(in srgb, var(--ok) 45%, var(--rule)); }
-  .terminus.done .name { color:var(--ok); }
-  .terminus.divert .plate { border-color:color-mix(in srgb, var(--stop) 55%, var(--rule)); }
-  .terminus.divert .name { color:var(--stop); }
-  .terminus.divert::before { background:color-mix(in srgb, var(--stop) 55%, var(--rule)); }
+  .terminus .plate { border-color:color-mix(in srgb, var(--ok) 45%, var(--rule)); }
+  .terminus .name { color:var(--ok); }
 
   /* ---- sources ---------------------------------------------------------- */
   .sources {
@@ -337,7 +350,9 @@ function draw() {
   if (!state) return;
   const stages = state.stages || [], items = state.items || [];
   indexSources(state.sources);
-  const active = state.active;
+  // A list, because stages run in parallel: one entry per transition in flight.
+  const active = state.active || [];
+  const workingOn = id => active.find(a => a.itemId === id);
 
   // The saved order decides what the board shows first, because it decides what
   // the scheduler picks first. A card's position is the claim it makes.
@@ -352,8 +367,8 @@ function draw() {
     // worked has already been moved, so show it in the stage it is being worked
     // in — otherwise it sits in its old column flagged as working, which is
     // true of two different moments and reads as a bug.
-    const stage = active && active.itemId === it.id ? active.stage : it.stage;
-    (bucket[stage] ||= []).push(it);
+    const a = workingOn(it.id);
+    (bucket[a ? a.stage : it.stage] ||= []).push(it);
   }
   for (const k of Object.keys(bucket)) {
     bucket[k].sort((a, b) => seq(a) - seq(b) || prio(a) - prio(b) || a.id.localeCompare(b.id));
@@ -390,11 +405,15 @@ function draw() {
       ${bad.map(s => `<div><b>${esc(s.name)}</b> — ${s.problems.map(esc).join("<br>")}</div>`).join("")}
     </div>` : "";
 
-  $("#lamp").className = "lamp " + (active ? "busy" : state.polling ? "busy" : "idle");
+  $("#lamp").className = "lamp " + (active.length || state.polling ? "busy" : "idle");
   const when = state.updatedAt ? new Date(state.updatedAt).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"}) : "—";
-  $("#line1").innerHTML = active
-    ? `<b>${esc(active.stage)}</b> running &middot; ${esc(active.itemId)}`
-    : `<b>${items.length}</b> items &middot; ${(state.sources||[]).length} sources &middot; ${when}`;
+  const held = items.filter(it => it.blocked).length;
+  $("#line1").innerHTML = active.length === 1
+    ? `<b>${esc(active[0].stage)}</b> running &middot; ${esc(active[0].itemId)}`
+    : active.length
+      ? `<b>${active.length}</b> running &middot; ${active.map(a => esc(a.stage)).join(", ")}`
+      : `<b>${items.length}</b> items &middot; ${(state.sources||[]).length} sources${
+          held ? ` &middot; <b>${held}</b> blocked` : ""} &middot; ${when}`;
 
   document.querySelectorAll(".item").forEach(el => {
     const open = () => { if (!justDragged) inspect(el.dataset.id, el.dataset.title, el.dataset.stage); };
@@ -407,10 +426,10 @@ function draw() {
 }
 
 function station(st, items, active) {
-  const live = active && active.stage === st.name;
+  const live = active.some(a => a.stage === st.name);
   return `<section class="station${live ? " live" : ""}">
     <div class="plate">
-      <div class="name">${esc(st.name)}<span class="count">${items.length}</span></div>
+      <div class="name">${esc(st.name)}${tally(items)}</div>
       <div class="runs-label">${st.script ? `runs <b>${esc(st.script)}</b>` : st.runs ? "runs inline" : "queue"}</div>
     </div>
     <div class="queue" data-stage="${esc(st.name)}">${
@@ -420,14 +439,22 @@ function station(st, items, active) {
 }
 
 function terminus(st, items) {
-  const kind = st.name === "blocked" ? "divert" : "done";
-  return `<section class="terminus ${kind}">
+  return `<section class="terminus">
     <div class="plate">
-      <div class="name">${esc(st.name)}<span class="count">${items.length}</span></div>
-      <div class="runs-label">${kind === "divert" ? "needs a human" : "end of line"}</div>
+      <div class="name">${esc(st.name)}${tally(items)}</div>
+      <div class="runs-label">end of line</div>
     </div>
-    <div class="queue">${items.map(it => card(it, null, null)).join("")}</div>
+    <div class="queue">${items.map(it => card(it, [], null)).join("")}</div>
   </section>`;
+}
+
+// How many are here, and how many of those are not moving. Blocked is no longer
+// a column to look at, so the count is where a stage says it is holding
+// something a person has to deal with.
+function tally(items) {
+  const held = items.filter(it => it.blocked).length;
+  return `<span class="count">${items.length}${
+    held ? ` &middot; <span class="held">${held} blocked</span>` : ""}</span>`;
 }
 
 function card(it, active, place) {
@@ -435,16 +462,17 @@ function card(it, active, place) {
   // used to render "NaN" in the rank badge rather than omitting it.
   const ranked = Number.isInteger(place);
   const hasPrio = it.priority !== null && it.priority !== undefined;
-  const working = active && active.itemId === it.id;
+  const working = active.some(a => a.itemId === it.id);
   const cls = ["item", hasPrio ? "p" + it.priority : "", working ? "working" : "",
-               ranked ? "ranked" : ""].filter(Boolean).join(" ");
+               it.blocked ? "blocked" : "", ranked ? "ranked" : ""].filter(Boolean).join(" ");
   return `<article class="${cls}" draggable="true" tabindex="0" role="button"
       style="--src:${sourceColour(it.source)}"
       data-id="${esc(it.id)}" data-title="${esc(it.title)}" data-stage="${esc(it.stage)}">
     <span class="title">${esc(it.title)}</span>
     <span class="foot">
       ${working ? `<span class="working-tag">working</span>` : ""}
-      ${ranked && !working ? `<span class="rank">${place + 1}</span>` : ""}
+      ${it.blocked ? `<span class="blocked-tag">blocked</span>` : ""}
+      ${ranked && !working && !it.blocked ? `<span class="rank">${place + 1}</span>` : ""}
       <span class="prio">${hasPrio ? "p" + it.priority : "—"}</span>
       <span class="src">${esc(it.id)}</span>
       ${it.url ? `<a class="open" href="${esc(it.url)}" target="_blank" rel="noopener"

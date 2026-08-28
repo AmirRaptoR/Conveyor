@@ -33,10 +33,7 @@ stages:
   - name: refining
     script: refine
     onSuccess: done
-    onFailure: backlog
   - name: done
-    terminal: true
-  - name: blocked
     terminal: true
 sources:
 `
@@ -285,10 +282,7 @@ stages:
       #!/bin/sh
       echo hello
     onSuccess: done
-    onFailure: done
   - name: done
-    terminal: true
-  - name: blocked
     terminal: true
 sources:
   - name: s1
@@ -321,8 +315,7 @@ func TestStageRunRules(t *testing.T) {
 			workdir(t, filepath.Join(dir, "repo"))
 			path := filepath.Join(dir, "conveyor.yaml")
 			body := "version: 1\nstages:\n  - name: backlog\n  - name: doing\n" + tc.stage +
-				"    onSuccess: done\n    onFailure: done\n  - name: done\n    terminal: true\n" +
-				"  - name: blocked\n    terminal: true\nsources:\n  - name: s1\n" +
+				"    onSuccess: done\n  - name: done\n    terminal: true\nsources:\n  - name: s1\n" +
 				"    provider: github\n    workdir: ./repo\n"
 			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 				t.Fatal(err)
@@ -455,5 +448,36 @@ func TestProviderScalarShorthand(t *testing.T) {
 	}
 	if cfg.Sources[0].Provider.Name != "github" {
 		t.Errorf("provider = %+v, want name github", cfg.Sources[0].Provider)
+	}
+}
+
+// Blocked stopped being a stage, so a config still routing to one is describing
+// a pipeline that does not exist. Naming the key beats ignoring it: KnownFields
+// would have called it a typo, and obeying half the routing silently is worse
+// than refusing to start.
+func TestRemovedRoutesAreNamed(t *testing.T) {
+	for _, key := range []string{"onFailure", "onBlocked"} {
+		t.Run(key, func(t *testing.T) {
+			dir := t.TempDir()
+			provider(t, dir)
+			script(t, filepath.Join(dir, "agents", "claude", "refine"))
+			workdir(t, filepath.Join(dir, "repo"))
+			path := filepath.Join(dir, "conveyor.yaml")
+			body := "version: 1\nstages:\n  - name: backlog\n  - name: refining\n" +
+				"    script: refine\n    onSuccess: done\n    " + key + ": backlog\n" +
+				"  - name: done\n    terminal: true\nsources:\n" + declared
+			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("a removed route loaded without complaint")
+			}
+			for _, want := range []string{key, "has been removed", "marks the item blocked"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %v, want it to mention %q", err, want)
+				}
+			}
+		})
 	}
 }

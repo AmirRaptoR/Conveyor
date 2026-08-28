@@ -28,6 +28,9 @@ arrive in this shape.
   "description": "Full body text, markdown ok",
   "url": "https://github.com/RaptoR-Soft/midgame/issues/47",
   "labels": ["bug"],            // display only; the engine attaches no meaning
+  "blocked": false,             // a MARK, not a stage. true means a human must
+                                // decide, and the item stays exactly where it
+                                // is. The scheduler never picks a marked item.
   "priority": 2,                // 0 = most urgent. null = unranked.
   "assignee": null,
   "createdAt": "2026-08-20T10:00:00Z",
@@ -43,6 +46,9 @@ Rules the engine enforces:
 - Duplicate `id` within one poll → first wins, the collision is logged.
 - An item that disappears from a source is marked gone, not deleted, so its run
   history survives.
+- A marked item is never picked. That is the whole mechanism by which a stage
+  that asked for a human stops being re-run: nothing carries the item out of the
+  line, so nothing has to decide where to put it back.
 
 ## 2. The script contract
 
@@ -53,7 +59,7 @@ author learns it once.
 
 | | |
 | --- | --- |
-| `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "config": {...}}`. For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "config": {...}}` |
+| `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "blocked": false, "config": {...}}`. For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "config": {...}}` |
 | env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, plus everything in the source's `env:` block |
 
 **Output** is split deliberately:
@@ -72,20 +78,35 @@ writes nothing to the result file, it simply produced no data.
 | Code | Meaning | Engine does |
 | --- | --- | --- |
 | `0` | Success | Advance to `onSuccess` (default: next stage) |
-| `20` | Blocked — needs a human | Move to `onBlocked` (default: `blocked` stage), no retry |
+| `20` | Blocked — needs a human | **Mark the item where it stands.** No retry, no move |
 | `10` | No-op — nothing to do | Leave the item where it is, not an error |
-| any other | Failure | Move to `onFailure` (default: stay), count an attempt |
+| any other | Failure | Count an attempt; re-run until `maxAttempts`, then mark |
 | timeout | Killed after `timeout:` | Treated as failure, logged as `timeout` |
+
+`onSuccess:` is the only route in the schema. There is no `onFailure:` and no
+`onBlocked:`, because there is nowhere else to send an item: work that stopped
+stopped *somewhere*, and that is the one fact worth keeping. `maxAttempts:`
+defaults to 1, so a failure that is not retried marks immediately — a failure
+that neither routed nor marked would be re-run on every poll forever.
+
+A blocked script may say why: `{"blocked": true, "reason": "…"}` in
+`$CONVEYOR_RESULT`. The engine passes the reason to `move`, and a provider that
+has somewhere to put it — a comment, a field — should.
 
 ## 3. The three script kinds
 
 **`list`** — read items from a provider. Writes a JSON array of items to
 `$CONVEYOR_RESULT`. Exit 0 with `[]` means an empty backlog, which is normal.
 
-**`move`** — write a stage change back to the provider (set a label, move a card,
-update a field). Called by the **engine**, never by a stage script: the engine
-owns provider state so a crashed stage script cannot leave it inconsistent.
-Receives `{"item":…, "stage": "<target>", "from": "<current>"}`.
+**`move`** — write a stage change *and the blocked mark* back to the provider
+(set a label, move a card, update a field). Called by the **engine**, never by a
+stage script: the engine owns provider state so a crashed stage script cannot
+leave it inconsistent. Receives
+`{"item":…, "stage": "<target>", "from": "<current>", "blocked": <bool>, "blockedReason": "…"}`.
+
+Both facts go every time, and `blocked` is always present. There is no separate
+verb for the mark: a mark is provider state, and this is how provider state gets
+written. Setting and clearing it are the same call with a different value.
 
 **stage script** (whatever the source declares for that name) — do the actual work
 of a stage. Run an AI agent, run
@@ -98,14 +119,22 @@ Moving an item from stage A to stage B is always, in this order:
 
 ```
 1. acquire the source's lock        (one item in flight per source)
-2. move(item, B)                    provider now says B — before any work starts,
-                                    so a crash leaves a truthful record
-3. run B's named script          logs stream to the UI
-4. on exit 0   → move(item, next)   and release
-   on exit 20  → move(item, blocked)
-   on failure  → move(item, onFailure) or leave, count attempt
+2. move(item, B, blocked=false)     provider now says B and says the item is not
+                                    blocked — before any work starts, so a crash
+                                    leaves a truthful record
+3. run B's named script             logs stream to the UI
+4. on exit 0   → move(item, next, blocked=false) and release
+   on exit 20  → move(item, B, blocked=true)     marked where it stands
+   on failure  → count an attempt; leave it in B to be re-run, or once
+                 maxAttempts is spent, move(item, B, blocked=true)
 5. release the lock                 always, including on crash and timeout
 ```
+
+Nothing in step 4 moves an item backwards. An item that stopped is left in the
+stage it stopped in, and the mark is what keeps the scheduler off it — so when a
+person clears the mark, the next listing shows an item sitting inside a stage
+that runs a script, which is exactly what an interrupted job looks like, and it
+is re-run from there. Unblocking costs one label and loses no context.
 
 Step 2 before step 3 is deliberate: it is the same guarantee as marking an issue
 `in-progress` before implementing it. If the process dies mid-stage, the provider
@@ -169,3 +198,7 @@ the primary question the UI answers — more important than showing progress.
 `20` (blocked) and other non-zero exits are both red, but they mean different
 things and the UI says which: blocked is *"a human must decide"*, failure is
 *"this broke, and it may just need retrying"*.
+
+There is no blocked column. A marked item is drawn in the stage it stopped in,
+and that stage's header counts how many it is holding — because blocked is
+something an item *is*, not somewhere it went.

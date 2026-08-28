@@ -27,8 +27,7 @@ check() { # check <label> <expected> <actual>
 export REPO="owner/repo"
 export STAGE_LABELS='refining=status:refining
 ready=status:ready
-in-progress=status:in-progress
-blocked=status:blocked'
+in-progress=status:in-progress'
 
 # --- list.sh: provider shape -> item shape ---------------------------------
 mkdir -p "$tmp/stub"
@@ -40,7 +39,10 @@ cat <<'JSON'
   "labels":[{"name":"bug"},{"name":"priority:p0"},{"name":"status:refining"}],
   "url":"https://example.test/7","assignees":[{"login":"amir"}]},
  {"number":9,"title":"Unranked","body":"","labels":[],
-  "url":"https://example.test/9","assignees":[]}
+  "url":"https://example.test/9","assignees":[]},
+ {"number":11,"title":"Needs a decision","body":"",
+  "labels":[{"name":"status:in-progress"},{"name":"blocked"}],
+  "url":"https://example.test/11","assignees":[]}
 ]
 JSON
 STUB
@@ -61,6 +63,14 @@ check "no priority label stays null" \
 	"null" "$(jq -r '.[1].priority' "$tmp/out.json")"
 check "id is source-qualified" \
 	"midgame:7" "$(jq -r '.[0].id' "$tmp/out.json")"
+# The mark is beside the stage, never instead of it: an unblocked issue must
+# resume where it stopped, which it cannot do if the stage was overwritten.
+check "the blocked label becomes a mark" \
+	"true" "$(jq -r '.[2].blocked' "$tmp/out.json")"
+check "a marked issue keeps the stage it stopped in" \
+	"in-progress" "$(jq -r '.[2].stage' "$tmp/out.json")"
+check "an unmarked issue is not blocked" \
+	"false" "$(jq -r '.[0].blocked' "$tmp/out.json")"
 
 # --- move.sh: stage -> label writes ----------------------------------------
 # move.sh asks GitHub for the issue's current labels, so the stub answers that.
@@ -91,6 +101,25 @@ export LABELS=""
 check "fresh issue only adds" \
 	"gh issue edit 9 --repo owner/repo --add-label status:in-progress" \
 	"$(echo '{"item":{"ref":"9"},"stage":"in-progress"}' | dry)"
+
+# The mark: set and cleared by the same call, and never at the cost of the
+# status label — that is what makes unblocking resume rather than restart.
+export LABELS="status:in-progress"
+check "blocking marks in place and keeps the stage" \
+	"gh issue edit 9 --repo owner/repo --add-label blocked" \
+	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true}' | dry | head -1)"
+export LABELS="status:in-progress blocked"
+check "a set mark is not set twice" \
+	"" \
+	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true}' | dry)"
+export LABELS="status:in-progress blocked"
+check "entering a stage clears the mark" \
+	"gh issue edit 9 --repo owner/repo --remove-label blocked" \
+	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":false}' | dry)"
+export LABELS="status:in-progress"
+check "a reason is commented when the mark goes on" \
+	"gh issue comment 9 --repo owner/repo --body <reason>" \
+	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedReason":"needs a product call"}' | dry | tail -1)"
 
 [[ $fail -eq 0 ]] && echo "all checks passed" || echo "FAILURES"
 exit $fail

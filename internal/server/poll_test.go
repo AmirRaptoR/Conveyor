@@ -55,10 +55,7 @@ stages:
   - name: working
     script: work
     onSuccess: done
-    onBlocked: blocked
   - name: done
-    terminal: true
-  - name: blocked
     terminal: true
 sources:
   - name: s1

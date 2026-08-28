@@ -17,12 +17,14 @@ let the model decide the flow.
 
 Working: `internal/{model,config,runner,source,pipeline}` and the CLI
 (`validate | list | run | tick`). `./conveyor tick -n 8 -c conveyor.example.yaml`
-drains the mock pipeline in priority order and routes a blocked item out.
+drains the mock pipeline in priority order and marks a blocked item in place.
 `providers/github/` runs against real repositories.
 
 `conveyor serve` runs the pipeline and renders it: the board, live logs over
 SSE, run history, and drag-to-reorder. It advances items on its own — `-watch`
-is what makes it observe without touching anything.
+is what makes it observe without touching anything. Discovery, scheduling and
+the tick button are three goroutines, deliberately: a 90-minute stage must not
+be able to stop every source being listed.
 
 Not built yet, in build order (see `docs/DESIGN.md`):
 
@@ -47,9 +49,13 @@ Not built yet, in build order (see `docs/DESIGN.md`):
 - **The scheduler claims a slot before it launches.** Checking whether a slot is
   free and then starting a goroutine leaves a gap in which the next pass decides
   the same thing again. `Engine.Advance` does not lock; its caller must.
-- **Every item must be able to leave a scripted stage.** Config validation
-  rejects a stage that runs a script but has no route out — a blocked item that stays
-  put gets re-run on every poll forever.
+- **Blocked is a mark on the item, not a stage it moves to.** An item that
+  stopped stays in the stage it stopped in and wears a mark the provider writes
+  in its own vocabulary (a `blocked` label on GitHub). The scheduler never picks
+  a marked item, and *that* is what stops the stage being re-run on every poll —
+  it used to be a terminal `blocked` column, which cost the context of where the
+  work stopped. `onSuccess:` is the only route; `onFailure:` and `onBlocked:` are
+  rejected by name. `maxAttempts:` unset means one, so the first failure marks.
 - **A source names a `provider:`, never two script paths.** Naming `list` and
   `move` separately allowed pairing GitHub's list with Azure's move, which
   nothing downstream could detect.
@@ -73,7 +79,9 @@ Not built yet, in build order (see `docs/DESIGN.md`):
 as `provider:` resolves under `providers/`. The prompt, tools, model and turn
 limit are that script's `params:`. The adapter prepends the item to the prompt
 and appends the blocked convention, so prompts stay portable and every agent
-signals "needs a human" identically.
+signals "needs a human" identically: exit 20, with `{"blocked": true, "reason":
+"…"}` in `$CONVEYOR_RESULT`. The engine hands that reason to `move`, and the
+GitHub provider comments it on the issue beside the label.
 
 ## The extension seam
 

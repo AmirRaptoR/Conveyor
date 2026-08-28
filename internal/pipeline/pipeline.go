@@ -7,6 +7,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -135,15 +136,18 @@ func (a *Attempts) Get(id string) int {
 
 // Transition is the record of one item moving through one stage.
 type Transition struct {
-	Item     model.Item    `json:"item"`
-	Stage    string        `json:"stage"`
-	From     string        `json:"from"`
-	Next     string        `json:"next,omitempty"`
-	Outcome  model.Outcome `json:"outcome"`
-	RunID    string        `json:"runId,omitempty"`
-	RunDir   string        `json:"runDir,omitempty"`
-	Attempts int           `json:"attempts,omitempty"`
-	Err      error         `json:"-"`
+	Item    model.Item    `json:"item"`
+	Stage   string        `json:"stage"`
+	From    string        `json:"from"`
+	Next    string        `json:"next,omitempty"`
+	Outcome model.Outcome `json:"outcome"`
+	// Blocked is whether this transition left the item marked. It stays where
+	// it is when it does, so Next is empty and the mark is the whole story.
+	Blocked  bool   `json:"blocked,omitempty"`
+	RunID    string `json:"runId,omitempty"`
+	RunDir   string `json:"runDir,omitempty"`
+	Attempts int    `json:"attempts,omitempty"`
+	Err      error  `json:"-"`
 }
 
 // Engine advances items. It owns no state beyond locks and attempt counts:
@@ -206,7 +210,11 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	from := item.Stage
 	tr := &Transition{Item: *item, Stage: to, From: from}
 
-	if _, err := client.Move(ctx, item, to); err != nil {
+	// Entering a stage writes the mark as well as the stage, and it writes it
+	// off. The scheduler never hands over a marked item, so reaching here means
+	// a person cleared it — saying so out loud keeps the provider honest even
+	// if they cleared only half of it.
+	if _, err := client.Move(ctx, item, to, source.Mark{}); err != nil {
 		tr.Err = err
 		return tr, err
 	}
@@ -259,12 +267,26 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	tr.RunID = res.Run.ID
 	tr.RunDir = res.Run.Dir
 
-	next := e.route(stage, res.Run.Outcome, item.ID, tr)
+	next, mark := e.route(stage, res, item.ID, tr)
 	tr.Next = next
+	tr.Blocked = mark.Blocked
+
+	// Marked where it stands. The item does not move, so whoever clears the
+	// mark gets the job back in the stage it stopped in — which, because the
+	// engine writes provider state before it runs anything, is an interrupted
+	// job the next pass simply re-runs.
+	if mark.Blocked {
+		if _, err := client.Move(ctx, item, to, mark); err != nil {
+			tr.Err = err
+			return tr, err
+		}
+		tr.Item = *item
+		return tr, nil
+	}
 	if next == "" || next == to {
 		return tr, nil
 	}
-	if _, err := client.Move(ctx, item, next); err != nil {
+	if _, err := client.Move(ctx, item, next, source.Mark{}); err != nil {
 		tr.Err = err
 		return tr, err
 	}
@@ -272,32 +294,77 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	return tr, nil
 }
 
-// route applies the transition table, including the attempt ceiling. A stage
-// that keeps failing must eventually stop being retried, or the scheduler will
-// hand it the same item on every poll forever.
-func (e *Engine) route(s *config.Stage, o model.Outcome, itemID string, tr *Transition) string {
+// route decides what happens after a stage script exits: where the item goes,
+// and whether it is marked.
+//
+// Success is the only route. Everything else leaves the item where it is —
+// marked, and therefore out of the scheduler's reach, or unmarked and due
+// another attempt. A stage that keeps failing must eventually stop being
+// retried, or the scheduler hands it the same item on every poll forever, so
+// the mark is what ends the loop and maxAttempts is how many tries it gets
+// first: unset means one, and one failure marks.
+func (e *Engine) route(s *config.Stage, res *runner.Result, itemID string, tr *Transition) (string, source.Mark) {
 	key := itemID + "\x00" + s.Name
-	switch o {
+	switch res.Run.Outcome {
 	case model.OutcomeSuccess:
 		e.attempts.Clear(key)
-		return s.OnSuccess
+		return s.OnSuccess, source.Mark{}
 	case model.OutcomeNoop:
 		e.attempts.Clear(key)
-		return ""
+		return "", source.Mark{}
 	case model.OutcomeBlocked:
+		// A decision, not a fault: no retry could change the answer.
 		e.attempts.Clear(key)
-		return s.OnBlocked
+		reason := blockedReason(res.Data)
+		if reason == "" {
+			reason = fmt.Sprintf("%s asked for a human", s.Name)
+		}
+		return "", source.Mark{Blocked: true, Reason: reason}
 	default: // failure, timeout
 		n := e.attempts.Bump(key)
 		tr.Attempts = n
-		if s.MaxAttempts > 0 && n >= s.MaxAttempts {
-			e.attempts.Clear(key)
-			if s.OnBlocked != "" {
-				return s.OnBlocked
-			}
+		max := s.MaxAttempts
+		if max < 1 {
+			max = 1
 		}
-		return s.OnFailure
+		if n < max {
+			// Left unmarked in the stage it failed in, which is what an
+			// unfinished job looks like: the next pass re-runs it.
+			return "", source.Mark{}
+		}
+		e.attempts.Clear(key)
+		return "", source.Mark{Blocked: true, Reason: failureReason(s, res, n)}
 	}
+}
+
+// blockedReason reads the agents' convention out of the result file: a script
+// that needs a human writes {"blocked": true, "reason": "..."} there. It is a
+// convention and not a requirement — a script that just exits 20 has no reason
+// to give, and anything else in the file is simply not one.
+func blockedReason(data json.RawMessage) string {
+	if len(data) == 0 {
+		return ""
+	}
+	var v struct {
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal(data, &v) != nil {
+		return ""
+	}
+	return v.Reason
+}
+
+// failureReason says what broke in the words the run record already has, so the
+// mark carries the same story as the log it came from.
+func failureReason(s *config.Stage, res *runner.Result, attempts int) string {
+	what := fmt.Sprintf("%s failed (exit %d)", s.Name, res.Run.ExitCode)
+	if res.Run.Outcome == model.OutcomeTimeout {
+		what = fmt.Sprintf("%s timed out after %s", s.Name, s.Timeout.D())
+	}
+	if attempts > 1 {
+		what += fmt.Sprintf(" on attempt %d", attempts)
+	}
+	return what
 }
 
 // Target returns the stage an item should be moved into next, if any.
@@ -308,6 +375,13 @@ func (e *Engine) route(s *config.Stage, o model.Outcome, itemID string, tr *Tran
 // provider state before running, so this is what a crash looks like — and the
 // right answer is to run that stage again rather than skip past it.
 func Target(cfg *config.Config, it *model.Item) (string, bool) {
+	// A marked item is waiting for a person, and not picking it is the whole
+	// mechanism: it is what stops the stage it stopped in from being re-run on
+	// every poll, which is the job the old terminal `blocked` stage did by
+	// carrying the item out of the line.
+	if it.Blocked {
+		return "", false
+	}
 	stage, ok := cfg.Stage(it.Stage)
 	if !ok || stage.Terminal {
 		return "", false

@@ -76,13 +76,24 @@ type Stage struct {
 	// what `script:` is for — so keep it small: anything with real logic in it
 	// wants to be a file, where a shell can check it and a person can run it.
 	// It must start with a shebang; the engine writes it out and execs it.
-	Run         string   `yaml:"run"`
-	Timeout     Duration `yaml:"timeout"`
-	OnSuccess   string   `yaml:"onSuccess"`
-	OnFailure   string   `yaml:"onFailure"`
-	OnBlocked   string   `yaml:"onBlocked"`
-	MaxAttempts int      `yaml:"maxAttempts"`
-	Terminal    bool     `yaml:"terminal"`
+	Run     string   `yaml:"run"`
+	Timeout Duration `yaml:"timeout"`
+	// OnSuccess is the only route out. Everything else leaves the item where it
+	// is: a non-zero exit marks it blocked in place, and a mark is not a
+	// destination.
+	OnSuccess string `yaml:"onSuccess"`
+	// MaxAttempts is how many times a failing stage is re-run before the item is
+	// marked. Unset means one — the first failure marks it — because a failure
+	// that neither routes nor marks would be re-run on every poll forever.
+	MaxAttempts int  `yaml:"maxAttempts"`
+	Terminal    bool `yaml:"terminal"`
+
+	// Removed, and still parsed so the error can say so. Blocked used to be a
+	// stage an item was carried to; it is a mark it wears where it stopped, and
+	// a config still routing to a dead-end column would be silently obeyed if
+	// these were simply unknown keys.
+	OnFailure string `yaml:"onFailure"`
+	OnBlocked string `yaml:"onBlocked"`
 
 	// Reserved for v2 and inert in v1: parsed and validated now so adding
 	// human-driven moves later is not a schema migration. See DESIGN.md.
@@ -249,12 +260,6 @@ func (c *Config) applyDefaults() {
 	}
 	// A stage with no explicit success target advances to the next stage in
 	// order; the last stage has nowhere to go and must be terminal.
-	hasBlocked := false
-	for _, s := range c.Stages {
-		if s.Name == "blocked" {
-			hasBlocked = true
-		}
-	}
 	for i := range c.Stages {
 		s := &c.Stages[i]
 		if s.Timeout == 0 {
@@ -262,12 +267,6 @@ func (c *Config) applyDefaults() {
 		}
 		if s.OnSuccess == "" && !s.Terminal && i+1 < len(c.Stages) {
 			s.OnSuccess = c.Stages[i+1].Name
-		}
-		// A blocked item must always leave the stage it blocked in. Staying
-		// would mean the scheduler re-runs the same script on the next poll,
-		// which is the exact infinite loop this design exists to avoid.
-		if s.OnBlocked == "" && s.runs() && hasBlocked {
-			s.OnBlocked = "blocked"
 		}
 	}
 }
@@ -560,21 +559,23 @@ func (c *Config) Validate() []string {
 		if !s.Terminal && s.runs() && s.OnSuccess == "" {
 			add("stage %q: runs a script but has no onSuccess and is not terminal — items would have nowhere to go", s.Name)
 		}
-		// Without a blocked target the item stays put and the scheduler runs
-		// the same script again on the next poll.
-		if s.runs() && s.OnBlocked == "" {
-			add("stage %q: runs a script but has no onBlocked, and there is no stage named \"blocked\" to default to — a blocked item would be re-run forever", s.Name)
+		// Named rather than ignored: a config still routing failures to a
+		// dead-end column is describing a pipeline that no longer exists, and
+		// obeying half of it silently is worse than refusing to start.
+		for _, gone := range []struct{ key, was string }{
+			{"onFailure", s.OnFailure}, {"onBlocked", s.OnBlocked},
+		} {
+			if gone.was != "" {
+				add("stage %q: %s: has been removed — a non-zero exit now marks the item blocked in the stage it stopped in, and onSuccess is the only route. Delete the key (%s: %s)",
+					s.Name, gone.key, gone.key, gone.was)
+			}
 		}
 	}
 	// Targets must exist. Checked after the name set is complete so ordering
 	// in the file does not matter.
 	for _, s := range c.Stages {
-		for label, target := range map[string]string{
-			"onSuccess": s.OnSuccess, "onFailure": s.OnFailure, "onBlocked": s.OnBlocked,
-		} {
-			if target != "" && !seen[target] {
-				add("stage %q: %s points at unknown stage %q", s.Name, label, target)
-			}
+		if s.OnSuccess != "" && !seen[s.OnSuccess] {
+			add("stage %q: onSuccess points at unknown stage %q", s.Name, s.OnSuccess)
 		}
 	}
 
