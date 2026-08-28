@@ -54,6 +54,21 @@ Not built yet, in build order (see `docs/DESIGN.md`):
   disable that source and leave every other repo running. There is no shared
   fallback to inherit by accident.
 
+## The extension seam
+
+`env:` is the only key whose values the engine never reads; every other key is
+structure it needs to run the state machine. Adding a capability should almost
+always be a string in `env:` and a line in a script, never a new key.
+
+Three scopes, narrowest wins: stage env (this stage, every source), source env
+(this source, every stage), and the script itself at
+`conveyor.d/<source>/<stage>` — already one file per pair, so per-repo-per-stage
+behaviour needs no configuration.
+
+Deliberately not built: `args:` for scripts (env carries it, and `${FOO}` reads
+better than `$3`), and per-source stage overrides (a three-way merge in Go to
+express what the file layout expresses for free).
+
 ## Gotchas
 
 - Go 1.27 lives at `~/.local/go/bin`, added to PATH in `.zshrc`.

@@ -46,6 +46,17 @@ stages:
 
   - name: refining
     work: true                # conveyor.d/<source>/refining
+    # Opaque to the engine: it copies these into the script's environment and
+    # attaches no meaning to any of them. This is the whole extension seam —
+    # "call claude with these tools" is a string here and a decision there.
+    #
+    # Three scopes, narrowest wins:
+    #   stage env    this stage, every source
+    #   source env   this source, every stage
+    #   the script   this source, this stage — it is already one file per pair,
+    #                so per-repo-per-stage needs no configuration at all
+    env:
+      MAX_TURNS: "40"
     timeout: 30m
     onSuccess: ready          # explicit; would default to the next stage anyway
     onFailure: backlog        # a failed refine returns it to the pile

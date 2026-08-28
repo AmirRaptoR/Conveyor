@@ -37,13 +37,27 @@ If refining needs a decision only a human can make, change nothing and write
 \$CONVEYOR_RESULT instead.
 PROMPT_END
 
+# Everything tunable comes from the stage's env: block in conveyor.yaml. The
+# engine passes those through without knowing what any of them mean — they are
+# claude's vocabulary, not conveyor's. Defaults keep the script runnable alone.
 set +e
 claude -p "$PROMPT" \
 	--max-turns "${MAX_TURNS:-40}" \
-	--permission-mode acceptEdits \
-	--allowedTools "Bash,Read,Glob,Grep,Skill"
+	--permission-mode "${PERMISSION_MODE:-acceptEdits}" \
+	--allowedTools "${ALLOWED_TOOLS:-Bash,Read,Glob,Grep,Skill}" \
+	${MODEL:+--model "$MODEL"}
 rc=$?
 set -e
+
+# An optional second opinion, also config-driven. Unset means it never runs.
+if [[ -n "${REVIEW_WITH:-}" ]]; then
+	echo "second opinion from $REVIEW_WITH"
+	body=$(gh issue view "$ref" --repo "$REPO" --json body --jq .body)
+	"$REVIEW_WITH" exec "Review this refined issue for $REPO. Are the acceptance
+criteria actually verifiable, and do the file and line references exist?
+
+$body" --skip-git-repo-check || echo "review unavailable; continuing" >&2
+fi
 
 # "Needs a human" cannot travel in the exit code: a CLI agent exits 0 whenever
 # the process ran, whatever it concluded. It comes back through the result file.

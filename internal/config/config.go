@@ -65,6 +65,13 @@ type Stage struct {
 
 	// Reserved for v2 and inert in v1: parsed and validated now so adding
 	// human-driven moves later is not a schema migration. See DESIGN.md.
+	// Env is handed to this stage's script on top of the source's. The engine
+	// never reads a key or attaches meaning to a value — it is opaque
+	// configuration for whatever the script happens to run. That is the whole
+	// point: "call claude with these tools" is a string here and a decision
+	// there.
+	Env map[string]string `yaml:"env"`
+
 	Manual      bool `yaml:"manual"`
 	AllowManual bool `yaml:"allowManual"`
 }
