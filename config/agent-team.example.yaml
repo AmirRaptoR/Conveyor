@@ -12,6 +12,14 @@ concurrency:
 poll: 5m              # how often to re-list every source
 timeout: 90m          # default per-script timeout; stages may override
 
+logs:
+  retention: 30d      # runs older than this are swept
+  sweepAt: "04:00"    # daily, and once on startup
+                      # A run is PINNED and never swept while it is the most
+                      # recent failed/blocked run of an item still in that state:
+                      # retention must not delete the evidence for the thing
+                      # currently asking for attention.
+
 # ---------------------------------------------------------------------------
 # Stages. Minimum two. Order defines the board's columns, left to right, and the
 # default "next stage" on success.
@@ -27,8 +35,12 @@ stages:
     onFailure: backlog        # a failed refine returns it to the pile
 
   - name: ready
-    manual: true              # the engine never auto-advances OUT of a manual
-                              # stage; a human (or the board) moves it on.
+    # --- reserved for v2, inert in v1 ---
+    # v1 is a pipeline: items advance automatically and there is no dragging.
+    # These keys are read and validated now so the schema does not change later.
+    manual: false             # v2: engine never auto-advances OUT of this stage
+    allowManual: true         # v2: may a human move a card INTO this stage?
+                              # Some stages must never be entered by hand.
 
   - name: in-progress
     onEnter: ./stages/mock/implement.sh

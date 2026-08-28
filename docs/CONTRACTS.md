@@ -122,3 +122,49 @@ concurrency:
 
 `perSource: 1` is a real constraint, not a default. A stage script may spawn as
 many subagents as it likes internally — that is invisible to the engine.
+
+## 6. Runs and logs
+
+Every script invocation is a **run**, and every run is a self-contained directory.
+Nothing about a run lives only in memory or only in a database row.
+
+```
+data/runs/<yyyy-mm-dd>/<run-id>/
+  meta.json      item snapshot, source, from -> to, script path, exit code,
+                 started/finished, duration, the env the script was given
+  stdin.json     exactly what was piped in
+  log.txt        stdout and stderr interleaved in real order, each line stamped
+  result.json    whatever the script wrote to $AGENT_TEAM_RESULT (may be absent)
+```
+
+Self-contained is the point: a failed run can be `tar`'d and handed to someone
+else — or to another agent — with everything needed to understand it and nothing
+else needed from the machine it ran on.
+
+Logs go to disk, not into the database. An AI stage script produces megabytes;
+that is a file, not a row. The store indexes run metadata and points at the
+directory.
+
+### Retention
+
+```yaml
+logs:
+  retention: 30d       # runs older than this are deleted
+  sweepAt: 04:00       # daily; also runs once on startup
+```
+
+One exception, and it matters: **a run is pinned if it is the most recent failed
+or blocked run of an item that is still in a failed or blocked state.** Retention
+must never delete the evidence for the thing currently asking for attention.
+Pinned runs are reported in the sweep log so they cannot pile up unnoticed.
+
+### Failure is a first-class state
+
+An item whose last run exited non-zero is **needs-attention**, shown red, and
+surfaced above everything else in the UI. That state carries the run id, so one
+click reaches the log that produced it. In v1 the answer to "what needs me?" is
+the primary question the UI answers — more important than showing progress.
+
+`20` (blocked) and other non-zero exits are both red, but they mean different
+things and the UI says which: blocked is *"a human must decide"*, failure is
+*"this broke, and it may just need retrying"*.

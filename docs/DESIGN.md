@@ -48,6 +48,37 @@ and two agents in one checkout corrupt each other. `global` starts at 1 and is
 what you raise to run several sources at once. A stage script may spawn as many
 subagents as it likes — invisible to the engine.
 
+## v1 scope
+
+**v1 is a pipeline, not a kanban board.** Items flow automatically; the only
+human control surface is the **order of the inputs**. Everything else is
+observation.
+
+In:
+
+- one agent (`global: 1`, `perSource: 1`)
+- automatic transitions driven entirely by exit codes
+- optional `onEnter` — a stage with no script is a queue, not an error
+- persisted runs, live log streaming, 30-day retention with pinning
+- failure as a first-class state: red, surfaced first, one click to the log
+- reordering the input queue
+
+Out, deliberately:
+
+- dragging cards; a board at all — v1 renders a pipeline
+- manual stage transitions
+- multiple agents
+
+Deferred but **reserved in the schema now**, so adding them is not a migration:
+`manual` (engine never auto-advances out of this stage) and `allowManual` (may a
+human move an item *into* it — some stages must never be entered by hand). Both
+are parsed and validated in v1 and simply have nothing to act on.
+
+When dragging does arrive, the rule is already settled by CONTRACTS.md §4: a drag
+is just a transition, so it calls `move` and then `onEnter` immediately, through
+exactly the same path the scheduler uses. There is no second code path for
+human-initiated moves — that is what keeps the feature cheap to add.
+
 ## Go package layout
 
 Single static binary with the UI embedded — the distribution story is `curl | sh`,
