@@ -1,22 +1,24 @@
-// Command agent-team drives a configurable pipeline of scripts over items
-// pulled from configurable sources. See docs/CONTRACTS.md.
+// Command agent-team runs a configurable pipeline of scripts over items pulled
+// from configurable sources. See docs/CONTRACTS.md.
 package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"text/tabwriter"
-	"time"
 
 	"github.com/AmirRaptoR/agent-team/internal/config"
 	"github.com/AmirRaptoR/agent-team/internal/model"
+	"github.com/AmirRaptoR/agent-team/internal/pipeline"
 	"github.com/AmirRaptoR/agent-team/internal/runner"
+	"github.com/AmirRaptoR/agent-team/internal/source"
 )
 
 func main() {
@@ -24,17 +26,16 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	cmd := os.Args[1]
-	args := os.Args[2:]
-
 	var err error
-	switch cmd {
+	switch cmd := os.Args[1]; cmd {
 	case "validate":
-		err = cmdValidate(args)
+		err = cmdValidate(os.Args[2:])
 	case "list":
-		err = cmdList(args)
+		err = cmdList(os.Args[2:])
 	case "run":
-		err = cmdRun(args)
+		err = cmdRun(os.Args[2:])
+	case "tick":
+		err = cmdTick(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -52,96 +53,105 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `agent-team — run a configurable pipeline over items from configurable sources
 
-  validate  -c <config>                       load and check a config
-  list      -c <config> [-source NAME]        run list scripts, print items
-  run       -c <config> -source NAME -item ID -stage NAME
-                                              run one stage script for one item
+  validate                              load and check the config
+  list      [-source NAME]              run list scripts, print items
+  run       -source N -item ID -stage S move one item into a stage and run it
+  tick      [-source NAME] [-n N]       one scheduling pass: pick and advance
+  
+Common flags: -c <config> (default agent-team.yaml), -v stream logs
 
-Every script follows docs/CONTRACTS.md: logs on stdout/stderr, structured data
-to $AGENT_TEAM_RESULT, exit 0 success / 10 no-op / 20 blocked / other failure.
+Scripts follow docs/CONTRACTS.md: logs on stdout/stderr, structured data to
+$AGENT_TEAM_RESULT, exit 0 success / 10 no-op / 20 blocked / other failure.
 `)
 }
 
-func fs(name string) (*flag.FlagSet, *string) {
+type common struct {
+	fs      *flag.FlagSet
+	cfgPath *string
+	verbose *bool
+}
+
+func newFlags(name string) *common {
 	f := flag.NewFlagSet(name, flag.ExitOnError)
-	cfg := f.String("c", "agent-team.yaml", "path to config")
-	return f, cfg
+	return &common{
+		fs:      f,
+		cfgPath: f.String("c", "agent-team.yaml", "path to config"),
+		verbose: f.Bool("v", false, "stream script logs to stdout"),
+	}
+}
+
+func (c *common) load(args []string) (*config.Config, *runner.Runner, context.Context, context.CancelFunc, error) {
+	if err := c.fs.Parse(args); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	cfg, err := config.Load(*c.cfgPath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	r := runner.New(filepath.Join(cfg.Dir, "data", "runs"))
+	if *c.verbose {
+		// The UI will do this over SSE; on the CLI it just prints.
+		r.OnLog = func(_ string, l runner.LogLine) {
+			fmt.Printf("  │ %s\n", l.Text)
+		}
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	return cfg, r, ctx, stop, nil
 }
 
 func cmdValidate(args []string) error {
-	f, cfgPath := fs("validate")
-	if err := f.Parse(args); err != nil {
-		return err
-	}
-	c, err := config.Load(*cfgPath)
+	c := newFlags("validate")
+	cfg, _, _, stop, err := c.load(args)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("ok  %s\n", *cfgPath)
-	fmt.Printf("    %d stages: ", len(c.Stages))
-	for i, s := range c.Stages {
-		if i > 0 {
-			fmt.Print(" -> ")
+	defer stop()
+
+	fmt.Printf("ok  %s\n", *c.cfgPath)
+	var parts []string
+	for _, s := range cfg.Stages {
+		n := s.Name
+		switch {
+		case s.OnEnter != "":
+			n += "*"
+		case s.Terminal:
+			n += "."
 		}
-		fmt.Print(s.Name)
-		if s.OnEnter != "" {
-			fmt.Print("*")
-		}
+		parts = append(parts, n)
 	}
-	fmt.Printf("\n    %d source(s), concurrency %d global / %d per source\n",
-		len(c.Sources), c.Concurrency.Global, c.Concurrency.PerSource)
+	fmt.Printf("    stages: %s\n", strings.Join(parts, " -> "))
+	fmt.Printf("    %d source(s), concurrency %d global / %d per source\n",
+		len(cfg.Sources), cfg.Concurrency.Global, cfg.Concurrency.PerSource)
 	fmt.Printf("    poll %s, default timeout %s, log retention %s\n",
-		c.Poll.D(), c.Timeout.D(), c.Logs.Retention.D())
-	fmt.Println("    (* = stage runs a script on enter)")
+		cfg.Poll.D(), cfg.Timeout.D(), cfg.Logs.Retention.D())
+	fmt.Println("    (* runs a script on enter, . terminal)")
 	return nil
 }
 
-// runsRoot resolves alongside the config. data/ is gitignored: runs are local
-// state, and a run directory holds an item snapshot that may be private.
-func runsRoot(c *config.Config) string { return filepath.Join(c.Dir, "data", "runs") }
-
-func newRunner(c *config.Config, verbose bool) *runner.Runner {
-	r := runner.New(runsRoot(c))
-	if verbose {
-		// This is what the UI will do over SSE; on the CLI it just prints.
-		r.OnLog = func(_ string, l runner.LogLine) {
-			fmt.Printf("  %s %s\n", l.At.Format("15:04:05"), l.Text)
-		}
-	}
-	return r
-}
-
 func cmdList(args []string) error {
-	f, cfgPath := fs("list")
-	only := f.String("source", "", "only this source")
-	verbose := f.Bool("v", false, "stream script logs")
-	if err := f.Parse(args); err != nil {
-		return err
-	}
-	c, err := config.Load(*cfgPath)
+	c := newFlags("list")
+	only := c.fs.String("source", "", "only this source")
+	cfg, r, ctx, stop, err := c.load(args)
 	if err != nil {
 		return err
 	}
-	ctx, stop := signalCtx()
 	defer stop()
-	r := newRunner(c, *verbose)
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tSTAGE\tPRIO\tTITLE")
 	total := 0
-	for _, src := range c.Sources {
-		if *only != "" && src.Name != *only {
+	for _, s := range cfg.Sources {
+		if *only != "" && s.Name != *only {
 			continue
 		}
-		items, res, err := listSource(ctx, c, r, src)
+		res, err := source.New(cfg, s, r).List(ctx)
 		if err != nil {
 			return err
 		}
-		if res.Run.Outcome != model.OutcomeSuccess {
-			return fmt.Errorf("source %q list exited %d (%s); log: %s",
-				src.Name, res.Run.ExitCode, res.Run.Outcome, filepath.Join(res.Run.Dir, "log.txt"))
+		for _, w := range res.Warnings {
+			fmt.Fprintf(os.Stderr, "warn: %s: %s\n", s.Name, w)
 		}
-		for _, it := range items {
+		for _, it := range res.Items {
 			prio := "-"
 			if it.Priority != nil {
 				prio = fmt.Sprint(*it.Priority)
@@ -155,181 +165,118 @@ func cmdList(args []string) error {
 	return nil
 }
 
-func listSource(ctx context.Context, c *config.Config, r *runner.Runner, src config.Source) ([]model.Item, *runner.Result, error) {
-	res, err := r.Run(ctx, runner.Spec{
-		Script:  c.ResolveScript(src.List),
-		Kind:    "list",
-		Workdir: c.Workdir(src),
-		Env:     src.Env,
-		Source:  src.Name,
-		Timeout: c.Timeout.D(),
-		Stdin:   model.ListInput{Source: src.Name, Stages: c.StageNames()},
-	})
-	if err != nil {
-		return nil, res, err
-	}
-	if res.Run.Outcome != model.OutcomeSuccess {
-		return nil, res, nil
-	}
-	var items []model.Item
-	if len(res.Data) > 0 {
-		if err := json.Unmarshal(res.Data, &items); err != nil {
-			return nil, res, fmt.Errorf("source %q: result is not a JSON array of items: %w", src.Name, err)
-		}
-	}
-	// Validate here rather than trusting a source: an unknown stage is a
-	// configuration bug that would otherwise strand the item invisibly.
-	valid := items[:0]
-	seen := map[string]bool{}
-	for _, it := range items {
-		switch {
-		case it.ID == "":
-			fmt.Fprintf(os.Stderr, "warn: source %q emitted an item with no id; skipped\n", src.Name)
-		case seen[it.ID]:
-			fmt.Fprintf(os.Stderr, "warn: source %q emitted duplicate id %q; first wins\n", src.Name, it.ID)
-		default:
-			if _, ok := c.Stage(it.Stage); !ok {
-				fmt.Fprintf(os.Stderr, "warn: item %s has unknown stage %q; skipped\n", it.ID, it.Stage)
-				continue
-			}
-			seen[it.ID] = true
-			valid = append(valid, it)
-		}
-	}
-	return valid, res, nil
-}
-
 func cmdRun(args []string) error {
-	f, cfgPath := fs("run")
-	srcName := f.String("source", "", "source name (required)")
-	itemID := f.String("item", "", "item id (required)")
-	stageName := f.String("stage", "", "stage to move the item into (required)")
-	quiet := f.Bool("q", false, "do not stream logs")
-	if err := f.Parse(args); err != nil {
-		return err
-	}
-	if *srcName == "" || *itemID == "" || *stageName == "" {
-		return fmt.Errorf("-source, -item and -stage are all required")
-	}
-	c, err := config.Load(*cfgPath)
+	c := newFlags("run")
+	srcName := c.fs.String("source", "", "source name (required)")
+	itemID := c.fs.String("item", "", "item id (required)")
+	stageName := c.fs.String("stage", "", "stage to move into (required)")
+	cfg, r, ctx, stop, err := c.load(args)
 	if err != nil {
 		return err
 	}
-	var src *config.Source
-	for i := range c.Sources {
-		if c.Sources[i].Name == *srcName {
-			src = &c.Sources[i]
-		}
+	defer stop()
+	if *srcName == "" || *itemID == "" || *stageName == "" {
+		return errors.New("-source, -item and -stage are all required")
 	}
-	if src == nil {
+
+	eng := pipeline.New(cfg, r)
+	client, ok := eng.Client(*srcName)
+	if !ok {
 		return fmt.Errorf("no source named %q", *srcName)
 	}
-	stage, ok := c.Stage(*stageName)
-	if !ok {
-		return fmt.Errorf("no stage named %q", *stageName)
-	}
-
-	ctx, stop := signalCtx()
-	defer stop()
-	r := newRunner(c, !*quiet)
-
-	items, _, err := listSource(ctx, c, r, *src)
+	res, err := client.List(ctx)
 	if err != nil {
 		return err
 	}
 	var item *model.Item
-	for i := range items {
-		if items[i].ID == *itemID {
-			item = &items[i]
+	for i := range res.Items {
+		if res.Items[i].ID == *itemID {
+			item = &res.Items[i]
 		}
 	}
 	if item == nil {
 		return fmt.Errorf("source %q has no item %q", *srcName, *itemID)
 	}
-	from := item.Stage
-
-	// CONTRACTS.md §4: the engine writes provider state BEFORE the stage script
-	// runs, so a crash mid-stage leaves a truthful record and the item is not
-	// handed out twice.
-	fmt.Printf("move %s: %s -> %s\n", item.ID, from, stage.Name)
-	moveRes, err := r.Run(ctx, runner.Spec{
-		Script: c.ResolveScript(src.Move), Kind: "move", Workdir: c.Workdir(*src),
-		Env: src.Env, Source: src.Name, Item: item, From: from, To: stage.Name,
-		Timeout: c.Timeout.D(),
-		Stdin:   model.StageInput{Item: item, Stage: stage.Name, From: from},
-	})
+	tr, err := eng.Advance(ctx, *srcName, item, *stageName)
+	report(tr)
 	if err != nil {
 		return err
 	}
-	if moveRes.Run.Outcome != model.OutcomeSuccess {
-		return fmt.Errorf("move failed (exit %d); log: %s",
-			moveRes.Run.ExitCode, filepath.Join(moveRes.Run.Dir, "log.txt"))
-	}
+	return outcomeErr(tr.Outcome)
+}
 
-	if stage.OnEnter == "" {
-		fmt.Printf("stage %q has no onEnter: it is a queue, nothing to run\n", stage.Name)
-		return nil
-	}
-
-	item.Stage = stage.Name
-	fmt.Printf("run  %s (timeout %s)\n", stage.OnEnter, stage.Timeout.D())
-	res, err := r.Run(ctx, runner.Spec{
-		Script: c.ResolveScript(stage.OnEnter), Kind: "stage", Workdir: c.Workdir(*src),
-		Env: src.Env, Source: src.Name, Item: item, From: from, To: stage.Name,
-		Timeout: stage.Timeout.D(),
-		Stdin:   model.StageInput{Item: item, Stage: stage.Name, From: from},
-	})
+func cmdTick(args []string) error {
+	c := newFlags("tick")
+	only := c.fs.String("source", "", "only this source")
+	max := c.fs.Int("n", 1, "how many items to advance before stopping")
+	cfg, r, ctx, stop, err := c.load(args)
 	if err != nil {
 		return err
 	}
+	defer stop()
 
-	next := nextStage(stage, res.Run.Outcome)
-	fmt.Printf("\n%s in %s (exit %d)\n", res.Run.Outcome, res.Run.Duration.Round(time.Millisecond), res.Run.ExitCode)
-	if len(res.Data) > 0 {
-		fmt.Printf("data: %s\n", res.Data)
+	eng := pipeline.New(cfg, r)
+	advanced := 0
+	for _, s := range cfg.Sources {
+		if *only != "" && s.Name != *only {
+			continue
+		}
+		for advanced < *max {
+			client, _ := eng.Client(s.Name)
+			res, err := client.List(ctx)
+			if err != nil {
+				return err
+			}
+			for _, w := range res.Warnings {
+				fmt.Fprintf(os.Stderr, "warn: %s: %s\n", s.Name, w)
+			}
+			// v1: order is not yet persisted, so Pick falls back to priority.
+			item, target := pipeline.Pick(cfg, res.Items, nil)
+			if item == nil {
+				fmt.Printf("%s: nothing to do\n", s.Name)
+				break
+			}
+			fmt.Printf("\n%s: %s (%s -> %s) — %s\n", s.Name, item.ID, item.Stage, target, item.Title)
+			tr, err := eng.Advance(ctx, s.Name, item, target)
+			report(tr)
+			advanced++
+			if err != nil {
+				if errors.Is(err, pipeline.ErrBusy) {
+					break
+				}
+				return err
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
 	}
-	fmt.Printf("run:  %s\n", res.Run.Dir)
-
-	if next == "" {
-		fmt.Printf("no transition configured for %s; item stays in %q\n", res.Run.Outcome, stage.Name)
-		return exitFor(res.Run.Outcome)
-	}
-	fmt.Printf("move %s: %s -> %s\n", item.ID, stage.Name, next)
-	if _, err := r.Run(ctx, runner.Spec{
-		Script: c.ResolveScript(src.Move), Kind: "move", Workdir: c.Workdir(*src),
-		Env: src.Env, Source: src.Name, Item: item, From: stage.Name, To: next,
-		Timeout: c.Timeout.D(),
-		Stdin:   model.StageInput{Item: item, Stage: next, From: stage.Name},
-	}); err != nil {
-		return err
-	}
-	return exitFor(res.Run.Outcome)
+	fmt.Printf("\nadvanced %d item(s)\n", advanced)
+	return nil
 }
 
-// nextStage applies the transition table from CONTRACTS.md §2. A no-op leaves
-// the item exactly where it is.
-func nextStage(s *config.Stage, o model.Outcome) string {
-	switch o {
-	case model.OutcomeSuccess:
-		return s.OnSuccess
-	case model.OutcomeBlocked:
-		return s.OnBlocked
-	case model.OutcomeFailure, model.OutcomeTimeout:
-		return s.OnFailure
-	default:
-		return ""
+func report(tr *pipeline.Transition) {
+	if tr == nil {
+		return
+	}
+	fmt.Printf("  %s -> %s: %s", tr.From, tr.Stage, tr.Outcome)
+	if tr.Attempts > 0 {
+		fmt.Printf(" (attempt %d)", tr.Attempts)
+	}
+	if tr.Next != "" && tr.Next != tr.Stage {
+		fmt.Printf(" -> %s", tr.Next)
+	}
+	fmt.Println()
+	if tr.RunDir != "" {
+		fmt.Printf("  run: %s\n", tr.RunDir)
 	}
 }
 
-// exitFor makes the CLI's own exit code mirror the outcome, so a shell caller
-// can branch on it the same way the engine does.
-func exitFor(o model.Outcome) error {
+// outcomeErr makes the CLI's exit code mirror the outcome, so a shell caller
+// can branch on it the same way the engine routes on it.
+func outcomeErr(o model.Outcome) error {
 	if o == model.OutcomeSuccess || o == model.OutcomeNoop {
 		return nil
 	}
-	return fmt.Errorf("stage outcome: %s", o)
-}
-
-func signalCtx() (context.Context, context.CancelFunc) {
-	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	return fmt.Errorf("outcome: %s", o)
 }
