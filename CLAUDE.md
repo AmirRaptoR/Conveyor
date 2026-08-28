@@ -20,8 +20,9 @@ Working: `internal/{model,config,runner,source,pipeline}` and the CLI
 drains the mock pipeline in priority order and routes a blocked item out.
 `providers/github/` runs against real repositories.
 
-`conveyor serve` renders the board with live logs over SSE, embedded in the
-binary. It observes by default: `-auto` is what makes it advance items.
+`conveyor serve` runs the pipeline and renders it: the board, live logs over
+SSE, run history, and drag-to-reorder. It advances items on its own — `-watch`
+is what makes it observe without touching anything.
 
 Not built yet, in build order (see `docs/DESIGN.md`):
 

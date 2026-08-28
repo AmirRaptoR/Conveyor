@@ -115,10 +115,10 @@ func sourceViews(c *config.Config) []SourceView {
 	return out
 }
 
-// Run serves until ctx is done. autoTick drives the pipeline on the poll
-// interval; without it the server only ever reads.
-func (s *Server) Run(ctx context.Context, addr string, autoTick bool) error {
-	go s.poll(ctx, autoTick)
+// Run serves until ctx is done. auto drives the pipeline; without it the server
+// only ever reads.
+func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
+	go s.poll(ctx, auto)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", s.handleState)
@@ -137,33 +137,67 @@ func (s *Server) Run(ctx context.Context, addr string, autoTick bool) error {
 
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() { <-ctx.Done(); _ = srv.Close() }()
-	fmt.Printf("conveyor: http://localhost%s  (auto-tick %v)\n", addr, autoTick)
+	mode := "running: items advance on their own"
+	if !auto {
+		mode = "watching only: -watch is set, nothing will advance"
+	}
+	fmt.Printf("conveyor: http://localhost%s\n  %s\n", addr, mode)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
 }
 
-// poll re-lists every source on the configured interval, and optionally
-// advances one item per pass.
-func (s *Server) poll(ctx context.Context, autoTick bool) {
+// poll re-lists every source on the configured interval and, when running
+// automatically, drains what it finds.
+func (s *Server) poll(ctx context.Context, auto bool) {
 	s.refresh(ctx)
+	if auto {
+		s.drain(ctx)
+	}
 	t := time.NewTicker(s.cfg.Poll.D())
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-s.tick:
+		case <-s.tick: // the button, which works whether or not auto is on
 			s.advance(ctx)
 			s.refresh(ctx)
 		case <-t.C:
-			if autoTick {
-				s.advance(ctx)
-			}
 			s.refresh(ctx)
+			if auto {
+				s.drain(ctx)
+			}
 		}
 	}
+}
+
+// drain advances until nothing can move. Waiting a whole poll interval between
+// items would mean a thirty-item backlog took hours of idling to cross a stage
+// that each item clears in a minute; the pipeline should be limited by the work,
+// not by the clock.
+//
+// The bound is a circuit breaker, not a budget: items are finite and terminal
+// stages end the walk, so reaching it means the stage graph loops. That is a
+// configuration error, and spinning on it silently would burn an agent's turns
+// until someone noticed.
+func (s *Server) drain(ctx context.Context) {
+	s.mu.RLock()
+	limit := 2*len(s.state.Items) + 1
+	s.mu.RUnlock()
+
+	for n := 0; n < limit; n++ {
+		if ctx.Err() != nil {
+			return
+		}
+		if !s.advance(ctx) {
+			return
+		}
+		s.refresh(ctx)
+	}
+	s.hub.publish(event{Kind: "state"})
+	fmt.Fprintln(os.Stderr, "conveyor: drain hit its limit; the stage graph may loop")
 }
 
 func (s *Server) refresh(ctx context.Context) {
@@ -205,15 +239,16 @@ func (s *Server) refresh(ctx context.Context) {
 	s.hub.publish(event{Kind: "state"})
 }
 
-// advance runs one scheduling pass: the highest-priority item that can move.
-func (s *Server) advance(ctx context.Context) {
+// advance runs one scheduling pass: the highest-ranked item that can move.
+// Reports whether anything did.
+func (s *Server) advance(ctx context.Context) bool {
 	s.mu.RLock()
 	items := append([]model.Item(nil), s.state.Items...)
 	s.mu.RUnlock()
 
 	item, target := pipeline.Pick(s.cfg, items, s.order.IDs())
 	if item == nil {
-		return
+		return false
 	}
 
 	s.setActive(&Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title})
@@ -223,6 +258,7 @@ func (s *Server) advance(ctx context.Context) {
 	if tr != nil {
 		s.hub.publish(event{Kind: "transition", Transition: tr})
 	}
+	return true
 }
 
 func (s *Server) setActive(a *Active) {
