@@ -15,7 +15,14 @@ if [[ -n "$(git status --porcelain)" ]]; then
 	echo "worktree is dirty; refusing to start" >&2
 	exit 20
 fi
-git pull --ff-only
+# Only pull when there is something to pull from: `git pull` exits non-zero on
+# a branch with no upstream, which under `set -e` would kill this script before
+# the agent ever runs, with an error that looks nothing like the cause.
+if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+	git pull --ff-only
+else
+	echo "no upstream for $(git branch --show-current); skipping pull" >&2
+fi
 
 echo "implementing #$ref — $title"
 

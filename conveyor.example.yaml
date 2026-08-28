@@ -5,6 +5,12 @@
 
 version: 1
 
+# Where the provider adapters live. Defaults to providers/ beside this file,
+# which is right for the checkout and wrong for a working config kept outside
+# it — point it at the checkout then:
+#
+#   providers: ~/codes/Conveyor/providers
+
 concurrency:
   perSource: 1        # one item in flight per source. See CONTRACTS.md §5.
   global: 1           # v1 ships 1; raise to run sources in parallel.

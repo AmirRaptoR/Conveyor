@@ -25,6 +25,12 @@ type Config struct {
 	Stages      []Stage     `yaml:"stages"`
 	Sources     []Source    `yaml:"sources"`
 
+	// Providers is where provider folders live. Defaults to providers/ beside
+	// the config, which is only right when the config sits in the conveyor
+	// checkout — a working config usually does not, so it can be pointed
+	// anywhere.
+	Providers string `yaml:"providers"`
+
 	// Dir is the directory the config was loaded from; relative script paths
 	// resolve against it so a config is portable.
 	Dir string `yaml:"-"`
@@ -213,7 +219,16 @@ func (c *Config) ResolveScript(p string) string {
 
 // ProvidersDir holds one directory per provider, named exactly as a source's
 // `provider:` names it. Adding a provider is creating a folder.
-func (c *Config) ProvidersDir() string { return filepath.Join(c.Dir, "providers") }
+func (c *Config) ProvidersDir() string {
+	if c.Providers == "" {
+		return filepath.Join(c.Dir, "providers")
+	}
+	p := expandHome(c.Providers)
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(c.Dir, p)
+}
 
 // providerScript finds providers/<provider>/<verb>.
 func (c *Config) providerScript(provider, verb string) (string, error) {

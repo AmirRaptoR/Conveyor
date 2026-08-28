@@ -235,3 +235,43 @@ sources:
 		t.Fatalf("error = %v, want it to mention terminal", err)
 	}
 }
+
+// A working config usually lives outside the conveyor checkout, so it must be
+// able to say where providers/ is.
+func TestProvidersDirOverride(t *testing.T) {
+	shared := t.TempDir()
+	script(t, filepath.Join(shared, "providers", "github", "list.sh"))
+	script(t, filepath.Join(shared, "providers", "github", "move.sh"))
+
+	elsewhere := t.TempDir()
+	script(t, filepath.Join(elsewhere, "repo", ".conveyor", "refining"))
+	path := filepath.Join(elsewhere, "conveyor.yaml")
+	if err := os.WriteFile(path, []byte("providers: "+filepath.Join(shared, "providers")+"\n"+stages+`  - name: s1
+    provider: github
+    workdir: ./repo
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Sources[0].OK() {
+		t.Fatalf("problems: %v", cfg.Sources[0].Problems)
+	}
+	if !strings.HasPrefix(cfg.Sources[0].List, shared) {
+		t.Errorf("list = %q, want it under %q", cfg.Sources[0].List, shared)
+	}
+}
+
+// Without the key, providers/ is beside the config as before.
+func TestProvidersDirDefaults(t *testing.T) {
+	dir, path := onboarded(t)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := filepath.Join(dir, "providers"); cfg.ProvidersDir() != want {
+		t.Errorf("ProvidersDir = %q, want %q", cfg.ProvidersDir(), want)
+	}
+}

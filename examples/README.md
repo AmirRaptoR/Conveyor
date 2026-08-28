@@ -10,7 +10,9 @@ enrolling, then edit it — that repo owns it from then on:
 cp -r examples/.conveyor ~/codes/<repo>/
 ```
 
-Then add the source to `conveyor.yaml` with its `REPO` and label mapping, and
+Then add the source to your `conveyor.yaml` with its `REPO` and label mapping.
+If that config lives outside this checkout, set `providers:` to point back at
+`providers/` here. Then
 run `conveyor validate`: it names any `work:` stage the repo has not
 implemented. A repo missing a script is skipped and reported, never quietly
 given generic behaviour.

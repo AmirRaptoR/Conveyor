@@ -56,6 +56,15 @@ go build -o conveyor ./cmd/conveyor
 `conveyor.yaml` is the working config and is deliberately untracked;
 `conveyor.example.yaml` is the template that ships.
 
+A real working config is usually kept outside the checkout entirely — it is
+machine state, not project source. It then has to say where the adapters are:
+
+```yaml
+providers: ~/codes/Conveyor/providers
+```
+
+Without the key, `providers/` is looked for beside the config file.
+
 You should see items advance in priority order, one blocked item routed out of
 the pipeline, and then `nothing to do`.
 
