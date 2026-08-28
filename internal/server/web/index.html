@@ -109,19 +109,43 @@
 
   .item {
     display:block; width:100%; text-align:left; cursor:pointer;
-    background:var(--raised); border:1px solid var(--rule); border-left:2px solid var(--faint);
+    background:var(--raised); border:1px solid var(--rule);
+    /* The left edge is the item's identity — which repository it came from.
+       Signal colours stay reserved for state, so these are muted and never
+       compete with a red card for attention. */
+    border-left:3px solid var(--src, var(--faint));
     padding:9px 11px; color:inherit; font:inherit;
   }
   .item:hover { border-color:var(--faint); }
+  .item { cursor:grab; }
+  .item:active { cursor:grabbing; }
+  .item.dragging { opacity:.35; }
+  /* Where it will land, drawn on the belt's own vocabulary: a bright rule. */
+  .item.over-before { box-shadow:0 -2px 0 var(--run); }
+  .item.over-after  { box-shadow:0 2px 0 var(--run); }
+  .queue.receiving { background:color-mix(in srgb, var(--run) 5%, transparent); }
+  .rank {
+    color:var(--faint); font-variant-numeric:tabular-nums;
+    border:1px solid var(--rule-soft); border-radius:2px; padding:0 4px;
+  }
+  .item.ranked .rank { color:var(--run); border-color:color-mix(in srgb, var(--run) 45%, var(--rule)); }
   .item .title { font-size:12px; line-height:1.45; }
   .item .foot {
     margin-top:7px; display:flex; gap:9px; align-items:center;
     color:var(--faint); font-size:10.5px; letter-spacing:.04em;
   }
   .item .prio { font-variant-numeric:tabular-nums; }
-  .item.p0 { border-left-color:var(--stop); } .item.p0 .prio { color:var(--stop); }
-  .item.p1 { border-left-color:var(--run); }  .item.p1 .prio { color:var(--run); }
-  .item.working { border-left-color:var(--run); }
+  /* Priority is loud in the badge, not on the edge: the edge says where the
+     item is from, and that does not change. */
+  .item.p0 .prio { color:var(--stop); font-weight:600; }
+  .item.p1 .prio { color:var(--run); }
+  .item.working { outline:1px solid var(--run); outline-offset:-1px; }
+  .src { color:var(--src, var(--faint)); }
+  .open {
+    margin-left:auto; color:var(--faint); text-decoration:none;
+    border:1px solid var(--rule-soft); border-radius:2px; padding:0 4px; line-height:1.5;
+  }
+  .open:hover { color:var(--ink); border-color:var(--faint); }
 
   /* Terminal stations leave the line: done at its end, blocked diverted off it. */
   .terminus { flex:0 0 auto; padding-left:30px; position:relative; z-index:1; }
@@ -244,6 +268,8 @@ const $ = s => document.querySelector(s);
 const esc = s => (s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
 let state = null, openItemId = null, followRun = null;
+// Dragging ends in a click; without this, dropping a card also opens it.
+let dragging = null, justDragged = false;
 
 async function load() {
   try {
@@ -259,9 +285,18 @@ function draw() {
   const stages = state.stages || [], items = state.items || [];
   const active = state.active;
 
+  // The saved order decides what the board shows first, because it decides what
+  // the scheduler picks first. A card's position is the claim it makes.
+  const rank = new Map((state.order || []).map((id, i) => [id, i]));
+  const seq = it => rank.has(it.id) ? rank.get(it.id) : Infinity;
+  const prio = it => (it.priority ?? 1e9);
+
   const bucket = {};
   for (const st of stages) bucket[st.name] = [];
   for (const it of items) (bucket[it.stage] ||= []).push(it);
+  for (const k of Object.keys(bucket)) {
+    bucket[k].sort((a, b) => seq(a) - seq(b) || prio(a) - prio(b) || a.id.localeCompare(b.id));
+  }
 
   // The line runs through the working stages; terminal ones leave it.
   const flow = stages.filter(s => !s.terminal);
@@ -283,8 +318,14 @@ function draw() {
     ? `<b>${esc(active.stage)}</b> running &middot; ${esc(active.itemId)}`
     : `<b>${items.length}</b> items &middot; ${(state.sources||[]).length} sources &middot; ${when}`;
 
-  document.querySelectorAll(".item").forEach(el =>
-    el.onclick = () => inspect(el.dataset.id, el.dataset.title, el.dataset.stage));
+  document.querySelectorAll(".item").forEach(el => {
+    const open = () => { if (!justDragged) inspect(el.dataset.id, el.dataset.title, el.dataset.stage); };
+    el.onclick = e => { if (!e.target.closest("a")) open(); };
+    el.onkeydown = e => {
+      if ((e.key === "Enter" || e.key === " ") && !e.target.closest("a")) { e.preventDefault(); open(); }
+    };
+    wireDrag(el);
+  });
 }
 
 function station(st, items, active) {
@@ -294,8 +335,9 @@ function station(st, items, active) {
       <div class="name">${esc(st.name)}<span class="count">${items.length}</span></div>
       <div class="runs-label">${st.script ? `runs <b>${esc(st.script)}</b>` : st.runs ? "runs inline" : "queue"}</div>
     </div>
-    <div class="queue">${items.length ? items.map(it => card(it, active)).join("")
-      : `<div class="slot">empty</div>`}</div>
+    <div class="queue" data-stage="${esc(st.name)}">${
+      items.length ? items.map((it, i) => card(it, active, i)).join("")
+                   : `<div class="slot">empty</div>`}</div>
   </section>`;
 }
 
@@ -306,21 +348,43 @@ function terminus(st, items) {
       <div class="name">${esc(st.name)}<span class="count">${items.length}</span></div>
       <div class="runs-label">${kind === "divert" ? "needs a human" : "end of line"}</div>
     </div>
-    <div class="queue">${items.map(it => card(it, null)).join("")}</div>
+    <div class="queue">${items.map(it => card(it, null, null)).join("")}</div>
   </section>`;
 }
 
-function card(it, active) {
-  const ranked = it.priority !== null && it.priority !== undefined;
+function card(it, active, place) {
+  // Number, or nothing. `undefined !== null` is true, so a missing argument
+  // used to render "NaN" in the rank badge rather than omitting it.
+  const ranked = Number.isInteger(place);
+  const hasPrio = it.priority !== null && it.priority !== undefined;
   const working = active && active.itemId === it.id;
-  return `<button class="item${ranked ? " p" + it.priority : ""}${working ? " working" : ""}"
+  const cls = ["item", hasPrio ? "p" + it.priority : "", working ? "working" : "",
+               ranked ? "ranked" : ""].filter(Boolean).join(" ");
+  return `<article class="${cls}" draggable="true" tabindex="0" role="button"
+      style="--src:${sourceColour(it.source)}"
       data-id="${esc(it.id)}" data-title="${esc(it.title)}" data-stage="${esc(it.stage)}">
     <span class="title">${esc(it.title)}</span>
     <span class="foot">
-      <span class="prio">${ranked ? "p" + it.priority : "—"}</span>
-      <span>${esc(it.id)}</span>
+      ${ranked ? `<span class="rank">${place + 1}</span>` : ""}
+      <span class="prio">${hasPrio ? "p" + it.priority : "—"}</span>
+      <span class="src">${esc(it.id)}</span>
+      ${it.url ? `<a class="open" href="${esc(it.url)}" target="_blank" rel="noopener"
+           title="Open on GitHub" aria-label="Open ${esc(it.id)} on GitHub">&#8599;</a>` : ""}
     </span>
-  </button>`;
+  </article>`;
+}
+
+// One hue per source, derived from its name so it is stable across restarts and
+// needs no configuration. Kept desaturated: identity, not a signal.
+const hues = new Map();
+function sourceColour(name) {
+  if (!hues.has(name || "")) {
+    let h = 0;
+    for (const c of (name || "")) h = (h * 31 + c.charCodeAt(0)) % 360;
+    // Skirt the reds and ambers that mean failure and work-in-progress.
+    hues.set(name || "", `hsl(${(h % 260) + 95} 42% 58%)`);
+  }
+  return hues.get(name || "");
 }
 
 async function inspect(id, title, stage) {
@@ -362,6 +426,70 @@ function closePanel() {
 $("#close").onclick = closePanel;
 $("#scrim").onclick = closePanel;
 addEventListener("keydown", e => { if (e.key === "Escape") closePanel(); });
+
+// --- reordering ------------------------------------------------------------
+// A card's position is what the scheduler reads, so a drag writes the whole
+// order back rather than a move: two browsers reordering at once should end on
+// one of the two arrangements, not a blend.
+function wireDrag(el) {
+  el.ondragstart = e => {
+    dragging = el;
+    el.classList.add("dragging");
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", el.dataset.id);
+  };
+  el.ondragend = () => {
+    el.classList.remove("dragging");
+    clearMarks();
+    dragging = null;
+    justDragged = true;
+    setTimeout(() => justDragged = false, 0);
+  };
+  el.ondragover = e => {
+    if (!dragging || dragging === el) return;
+    // Only within a stage: moving between stages is a transition, which runs
+    // scripts and belongs to the engine, not to a drag.
+    if (el.dataset.stage !== dragging.dataset.stage) return;
+    e.preventDefault();
+    clearMarks();
+    el.classList.add(below(e, el) ? "over-after" : "over-before");
+  };
+  el.ondrop = e => {
+    if (!dragging || dragging === el) return;
+    if (el.dataset.stage !== dragging.dataset.stage) return;
+    e.preventDefault();
+    el.parentNode.insertBefore(dragging, below(e, el) ? el.nextSibling : el);
+    clearMarks();
+    saveOrder();
+  };
+}
+
+const below = (e, el) => {
+  const r = el.getBoundingClientRect();
+  return e.clientY > r.top + r.height / 2;
+};
+const clearMarks = () =>
+  document.querySelectorAll(".over-before,.over-after")
+    .forEach(n => n.classList.remove("over-before", "over-after"));
+
+// Read the board back as one list, stages in pipeline order. Stage order
+// dominates and the manual order decides within a stage — an item further along
+// the line should not be overtaken by one that has not started.
+async function saveOrder() {
+  const ids = [...document.querySelectorAll(".queue[data-stage] .item")].map(el => el.dataset.id);
+  // Never save an empty order while the board holds cards. A selector that
+  // stops matching would otherwise wipe a hand-made arrangement silently —
+  // which is exactly what a missing data-stage attribute once did.
+  if (!ids.length && (state?.items || []).length) {
+    console.warn("refusing to save an empty order");
+    return;
+  }
+  await fetch("/api/order", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(ids),
+  });
+}
 
 $("#refresh").onclick = () => fetch("/api/refresh", { method:"POST" });
 $("#tick").onclick = async e => {

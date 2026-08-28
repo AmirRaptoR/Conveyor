@@ -21,6 +21,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
+	"github.com/AmirRaptoR/Conveyor/internal/store"
 )
 
 //go:embed web
@@ -33,6 +34,7 @@ type State struct {
 	Sources   []SourceView `json:"sources"`
 	Items     []model.Item `json:"items"`
 	Warnings  []string     `json:"warnings,omitempty"`
+	Order     []string     `json:"order"`
 	UpdatedAt time.Time    `json:"updatedAt"`
 	Polling   bool         `json:"polling"`
 	// Active is the stage running right now, if any. The board lights that
@@ -69,17 +71,19 @@ type Server struct {
 	mu    sync.RWMutex
 	state State
 
-	hub  *hub
-	tick chan struct{} // one buffered slot: ticks never queue up
+	hub   *hub
+	order *store.Order
+	tick  chan struct{} // one buffered slot: ticks never queue up
 }
 
 func New(cfg *config.Config, r *runner.Runner) *Server {
 	s := &Server{
-		cfg:  cfg,
-		run:  r,
-		eng:  pipeline.New(cfg, r),
-		hub:  newHub(),
-		tick: make(chan struct{}, 1),
+		cfg:   cfg,
+		run:   r,
+		eng:   pipeline.New(cfg, r),
+		hub:   newHub(),
+		order: store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
+		tick:  make(chan struct{}, 1),
 	}
 	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
 
@@ -123,6 +127,7 @@ func (s *Server) Run(ctx context.Context, addr string, autoTick bool) error {
 	mux.HandleFunc("GET /api/runs/{id}", s.handleRun)
 	mux.HandleFunc("POST /api/refresh", s.handleRefresh)
 	mux.HandleFunc("POST /api/tick", s.handleTick)
+	mux.HandleFunc("PUT /api/order", s.handleOrder)
 
 	sub, err := fs.Sub(webFS, "web")
 	if err != nil {
@@ -193,6 +198,7 @@ func (s *Server) refresh(ctx context.Context) {
 	s.state.Items = items
 	s.state.Warnings = warnings
 	s.state.Sources = sourceViews(s.cfg)
+	s.state.Order = s.order.IDs()
 	s.state.UpdatedAt = time.Now()
 	s.state.Polling = false
 	s.mu.Unlock()
@@ -205,7 +211,7 @@ func (s *Server) advance(ctx context.Context) {
 	items := append([]model.Item(nil), s.state.Items...)
 	s.mu.RUnlock()
 
-	item, target := pipeline.Pick(s.cfg, items, nil)
+	item, target := pipeline.Pick(s.cfg, items, s.order.IDs())
 	if item == nil {
 		return
 	}
@@ -248,6 +254,26 @@ func (s *Server) handleTick(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "a tick is already in flight", http.StatusConflict)
 	}
+}
+
+// handleOrder replaces the manual input order. The whole list is sent, not a
+// move: two browsers reordering at once should end with one of the two
+// arrangements, not a merge of both.
+func (s *Server) handleOrder(w http.ResponseWriter, r *http.Request) {
+	var ids []string
+	if err := json.NewDecoder(r.Body).Decode(&ids); err != nil {
+		http.Error(w, "expected a JSON array of item ids", http.StatusBadRequest)
+		return
+	}
+	if err := s.order.Set(ids); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.mu.Lock()
+	s.state.Order = s.order.IDs()
+	s.mu.Unlock()
+	s.hub.publish(event{Kind: "state"})
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // RunMeta is one run directory, as the board needs it.

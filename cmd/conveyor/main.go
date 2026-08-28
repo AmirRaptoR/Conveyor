@@ -20,6 +20,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 	"github.com/AmirRaptoR/Conveyor/internal/server"
 	"github.com/AmirRaptoR/Conveyor/internal/source"
+	"github.com/AmirRaptoR/Conveyor/internal/store"
 )
 
 func main() {
@@ -102,7 +103,7 @@ func (c *common) load(args []string) (*config.Config, *runner.Runner, context.Co
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	r := runner.New(filepath.Join(cfg.Dir, "data", "runs"))
+	r := runner.New(filepath.Join(cfg.DataDir(), "runs"))
 	if *c.verbose {
 		// The UI will do this over SSE; on the CLI it just prints.
 		r.OnLog = func(_ string, l runner.LogLine) {
@@ -255,6 +256,7 @@ func cmdTick(args []string) error {
 	defer stop()
 
 	eng := pipeline.New(cfg, r)
+	order := store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json"))
 	advanced := 0
 	for _, s := range cfg.Sources {
 		if *only != "" && s.Name != *only {
@@ -273,8 +275,9 @@ func cmdTick(args []string) error {
 			for _, w := range res.Warnings {
 				fmt.Fprintf(os.Stderr, "warn: %s: %s\n", s.Name, w)
 			}
-			// v1: order is not yet persisted, so Pick falls back to priority.
-			item, target := pipeline.Pick(cfg, res.Items, nil)
+			// The same order the board writes, so a tick from the terminal and
+			// a tick from the button choose the same item.
+			item, target := pipeline.Pick(cfg, res.Items, order.IDs())
 			if item == nil {
 				fmt.Printf("%s: nothing to do\n", s.Name)
 				break

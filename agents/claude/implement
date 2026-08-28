@@ -10,6 +10,9 @@
 #   REPO             owner/name, for the pull-request check
 set -euo pipefail
 
+# Streams the agent's work as it happens; without it a long stage looks dead.
+source "$(dirname "$0")/_stream"
+
 : "${PROMPT:?PROMPT is required (set it in this script params: block)}"
 
 payload=$(cat)
@@ -84,11 +87,9 @@ nothing and write {\"blocked\": true, \"reason\": \"<the decision needed>\"} to
 the file at ${CONVEYOR_RESULT}."
 
 set +e
-claude -p "$full" \
-	--max-turns "${MAX_TURNS:-200}" \
-	--permission-mode "${PERMISSION_MODE:-acceptEdits}" \
-	--allowedTools "${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep,Agent,Skill}" \
-	${MODEL:+--model "$MODEL"}
+MAX_TURNS="${MAX_TURNS:-200}" \
+	ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep,Agent,Skill}" \
+	run_claude "$full"
 rc=$?
 set -e
 

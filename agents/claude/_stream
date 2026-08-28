@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Sourced by the claude adapters. Not a verb: config resolves script names
+# exactly, so a leading underscore can never be mistaken for one.
+#
+# `claude -p` prints nothing until it finishes — a two-minute stage looks dead
+# in the log and on the board. --output-format stream-json emits events as they
+# happen; this turns them into lines a person can follow, without dumping whole
+# tool payloads into the run log.
+
+# render_stream reads the event stream on stdin and writes readable text.
+render_stream() {
+	jq -j --unbuffered '
+		if .type == "assistant" then
+			(.message.content[]? |
+				if .type == "text" then .text
+				elif .type == "tool_use" then
+					"\n  · \(.name): \((.input.command // .input.file_path // .input.pattern
+					                   // .input.description // "") | tostring | .[0:100])\n"
+				else empty end)
+		elif .type == "result" then "\n"
+		else empty end' 2>/dev/null
+}
+
+# run_claude "<prompt>" — honours STREAM=0 for the terse, final-message-only log.
+# Returns claude's exit status, not jq's.
+run_claude() {
+	local prompt=$1
+	local -a flags=(
+		--max-turns "${MAX_TURNS:-40}"
+		--permission-mode "${PERMISSION_MODE:-acceptEdits}"
+		--allowedTools "${ALLOWED_TOOLS:-Bash,Read,Glob,Grep}"
+	)
+	[[ -n "${MODEL:-}" ]] && flags+=(--model "$MODEL")
+
+	if [[ "${STREAM:-1}" == "0" ]]; then
+		claude -p "$prompt" "${flags[@]}"
+		return $?
+	fi
+	claude -p "$prompt" --output-format stream-json --verbose "${flags[@]}" | render_stream
+	return "${PIPESTATUS[0]}"
+}

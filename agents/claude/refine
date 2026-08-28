@@ -20,6 +20,9 @@
 # CONVEYOR_RESULT, plus the whole item as JSON on stdin.
 set -euo pipefail
 
+# Streams the agent's work as it happens; without it a long stage looks dead.
+source "$(dirname "$0")/_stream"
+
 : "${PROMPT:?PROMPT is required (set it in the source env: block)}"
 
 payload=$(cat)
@@ -62,11 +65,9 @@ nothing and write {\"blocked\": true, \"reason\": \"<the decision needed>\"} to
 the file at ${CONVEYOR_RESULT}."
 
 set +e
-claude -p "$full" \
-	--max-turns "${MAX_TURNS:-40}" \
-	--permission-mode "${PERMISSION_MODE:-acceptEdits}" \
-	--allowedTools "${ALLOWED_TOOLS:-Bash,Read,Glob,Grep}" \
-	${MODEL:+--model "$MODEL"}
+MAX_TURNS="${MAX_TURNS:-40}" \
+	ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Glob,Grep}" \
+	run_claude "$full"
 rc=$?
 set -e
 

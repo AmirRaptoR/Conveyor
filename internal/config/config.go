@@ -277,6 +277,11 @@ func (s Stage) runs() bool { return s.Script != "" || s.Run != "" }
 // Runs is runs, for callers outside this package.
 func (s Stage) Runs() bool { return s.runs() }
 
+// DataDir is where conveyor keeps the little it cannot re-derive by asking the
+// sources: run history, and the manual order. Beside the config, because it is
+// machine state and not project source.
+func (c *Config) DataDir() string { return filepath.Join(c.Dir, "data") }
+
 // StageNames is what gets handed to a list script so a source knows which
 // stage names it is allowed to emit.
 func (c *Config) StageNames() []string {
