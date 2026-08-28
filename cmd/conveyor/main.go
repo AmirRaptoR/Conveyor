@@ -105,11 +105,6 @@ func (c *common) load(args []string) (*config.Config, *runner.Runner, context.Co
 		return nil, nil, nil, nil, err
 	}
 	r := runner.New(filepath.Join(cfg.DataDir(), "runs"))
-	// Settle anything a previous process left mid-flight, so the history never
-	// shows two runs in flight at once.
-	if n, err := runner.SweepInterrupted(r.Root); err == nil && n > 0 {
-		fmt.Fprintf(os.Stderr, "conveyor: marked %d interrupted run(s) from a previous process\n", n)
-	}
 	if *c.verbose {
 		// The UI will do this over SSE; on the CLI it just prints.
 		r.OnLog = func(_ string, l runner.LogLine) {
@@ -118,6 +113,31 @@ func (c *common) load(args []string) (*config.Config, *runner.Runner, context.Co
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	return cfg, r, ctx, stop, nil
+}
+
+// own claims the data directory for a command that is about to run stages, and
+// settles what a previous process left mid-flight.
+//
+// Only the commands that write take it. `validate` and `list` promise to read,
+// and a read that rewrites a live engine's history — marking a refine that is
+// still running "interrupted" — makes the run record untrustworthy exactly
+// where it is meant to be authoritative.
+//
+// The sweep lives here, behind the claim, for the same reason: a run still
+// marked running is abandoned only once nobody else could be running it. settle
+// is what asks for it — a watching server holds the claim, because it still
+// writes the order, but it advances nothing and so has nothing to settle.
+func own(cfg *config.Config, r *runner.Runner, settle bool) (func(), error) {
+	lock, err := store.AcquireLock(filepath.Join(cfg.DataDir(), "owner.lock"))
+	if err != nil {
+		return nil, err
+	}
+	if settle {
+		if n, err := runner.SweepInterrupted(r.Root); err == nil && n > 0 {
+			fmt.Fprintf(os.Stderr, "conveyor: marked %d interrupted run(s) from a previous process\n", n)
+		}
+	}
+	return func() { _ = lock.Release() }, nil
 }
 
 func cmdValidate(args []string) error {
@@ -224,6 +244,11 @@ func cmdRun(args []string) error {
 	if *srcName == "" || *itemID == "" || *stageName == "" {
 		return errors.New("-source, -item and -stage are all required")
 	}
+	release, err := own(cfg, r, true)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	eng := pipeline.New(cfg, r)
 	client, ok := eng.Client(*srcName)
@@ -260,6 +285,11 @@ func cmdTick(args []string) error {
 		return err
 	}
 	defer stop()
+	release, err := own(cfg, r, true)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	eng := pipeline.New(cfg, r)
 	order := store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json"))
@@ -348,5 +378,10 @@ func cmdServe(args []string) error {
 		return err
 	}
 	defer stop()
+	release, err := own(cfg, r, !*watch)
+	if err != nil {
+		return err
+	}
+	defer release()
 	return server.New(cfg, r).Run(ctx, server.Addr(*addr), !*watch)
 }

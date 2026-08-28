@@ -13,7 +13,10 @@ node_modules/
 
 # The working config; conveyor.example.yaml is the tracked template.
 /conveyor.yaml
+# The binary, and the two names the deploy script builds and rolls back through.
 /conveyor
+/conveyor.new
+/conveyor.prev
 
 # Migration material from the old machine: personal skills, a systemd unit, and
 # repos.conf naming private repositories. Local to this machine, not the project.
