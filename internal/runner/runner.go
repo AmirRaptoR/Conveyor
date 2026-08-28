@@ -94,6 +94,10 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		run.ItemID = spec.Item.ID
 	}
 
+	// Recorded before the script starts, so a killed run still says what it was.
+	run.Outcome = model.OutcomeRunning
+	writeMeta(&run, dir)
+
 	script := spec.Script
 	if spec.Inline != "" {
 		script = filepath.Join(dir, "script")
@@ -239,6 +243,14 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 func (r *Runner) finish(run *model.Run, dir string, started time.Time) {
 	run.FinishedAt = time.Now()
 	run.Duration = run.FinishedAt.Sub(started)
+	writeMeta(run, dir)
+}
+
+// writeMeta is called twice: once before the process starts and again when it
+// ends. A run killed mid-flight — a timeout, a crash, an interrupted session —
+// otherwise leaves a zero-byte meta.json and no record of what it was doing,
+// which is exactly the run someone needs to read afterwards.
+func writeMeta(run *model.Run, dir string) {
 	b, _ := json.MarshalIndent(run, "", "  ")
 	_ = os.WriteFile(filepath.Join(dir, "meta.json"), b, 0o644)
 }

@@ -40,6 +40,9 @@ const (
 	OutcomeBlocked Outcome = "blocked" // 20
 	OutcomeFailure Outcome = "failure" // anything else
 	OutcomeTimeout Outcome = "timeout" // killed at the deadline
+	// OutcomeRunning is stamped before the script starts and replaced when it
+	// ends. A meta.json still saying "running" is a run that was killed.
+	OutcomeRunning Outcome = "running"
 )
 
 // Exit codes with defined meaning. Every other non-zero code is a failure.

@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>conveyor</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --line:#262b36; --ink:#e6e9ef; --dim:#8b93a7;
+    --accent:#5b9dff; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --run:#a371f7;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f7f9; --panel:#fff; --line:#e2e5ea; --ink:#12151b; --dim:#5d6577; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font:14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display:flex; align-items:center; gap:12px; padding:10px 16px;
+    border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:5;
+  }
+  header h1 { font-size:15px; margin:0; font-weight:650; letter-spacing:.01em; }
+  header .sp { flex:1; }
+  button {
+    font:inherit; color:var(--ink); background:transparent; border:1px solid var(--line);
+    border-radius:6px; padding:5px 11px; cursor:pointer;
+  }
+  button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  .meta { color:var(--dim); font-size:12px; }
+  .dot { width:7px; height:7px; border-radius:50%; background:var(--dim); display:inline-block; }
+  .dot.live { background:var(--ok); }
+  .dot.poll { background:var(--warn); }
+
+  .board { display:flex; gap:12px; padding:16px; align-items:flex-start; overflow-x:auto; }
+  .col { flex:0 0 260px; background:var(--panel); border:1px solid var(--line); border-radius:9px; }
+  .col > h2 {
+    font-size:12px; margin:0; padding:9px 11px; border-bottom:1px solid var(--line);
+    display:flex; align-items:center; gap:7px; font-weight:600;
+  }
+  .col h2 .n { color:var(--dim); font-weight:400; }
+  .col h2 .script { color:var(--accent); font-family:var(--mono); font-size:11px; }
+  .col .body { padding:8px; display:flex; flex-direction:column; gap:7px; min-height:44px; }
+  .empty { color:var(--dim); font-size:12px; padding:6px 3px; }
+
+  .card {
+    background:var(--bg); border:1px solid var(--line); border-radius:7px; padding:8px 9px;
+    cursor:pointer; text-align:left; width:100%; display:block;
+  }
+  .card:hover { border-color:var(--accent); }
+  .card .t { font-size:13px; margin-bottom:5px; }
+  .card .r { display:flex; gap:6px; align-items:center; color:var(--dim); font-size:11px; font-family:var(--mono); }
+  .pill { border:1px solid var(--line); border-radius:20px; padding:0 6px; font-size:10px; }
+  .p0 { color:var(--bad); border-color:var(--bad); }
+  .p1 { color:var(--warn); border-color:var(--warn); }
+
+  .problems { margin:0 16px 4px; padding:9px 12px; border-radius:8px;
+    border:1px solid var(--bad); background:color-mix(in srgb, var(--bad) 9%, transparent); font-size:13px; }
+  .problems b { color:var(--bad); }
+  .problems ul { margin:5px 0 0; padding-left:18px; color:var(--dim); }
+
+  aside {
+    position:fixed; top:0; right:0; width:min(660px, 94vw); height:100vh; background:var(--panel);
+    border-left:1px solid var(--line); display:flex; flex-direction:column; transform:translateX(100%);
+    transition:transform .16s ease; z-index:10;
+  }
+  aside.open { transform:none; }
+  aside header { background:transparent; }
+  /* Capped and scrollable: an item with a long history would otherwise push the
+     log — the thing worth reading — down to a single line. */
+  aside .runs {
+    padding:8px 14px; border-bottom:1px solid var(--line); display:flex; gap:6px;
+    flex-wrap:wrap; max-height:27vh; overflow-y:auto; flex:0 0 auto;
+  }
+  aside .runs button { font-family:var(--mono); font-size:11px; padding:3px 8px; }
+  aside .runs button.sel { border-color:var(--accent); color:var(--accent); }
+  pre#log {
+    margin:0; flex:1 1 auto; min-height:0; overflow:auto; padding:12px 14px; font-family:var(--mono);
+    font-size:12px; line-height:1.55; white-space:pre-wrap; word-break:break-word;
+  }
+  .success { color:var(--ok); } .failure, .timeout { color:var(--bad); }
+  .blocked { color:var(--warn); } .running { color:var(--run); } .noop { color:var(--dim); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>conveyor</h1>
+  <span class="dot" id="live"></span>
+  <span class="meta" id="status">connecting…</span>
+  <span class="sp"></span>
+  <button id="refresh">Refresh</button>
+  <button id="tick">Tick once</button>
+</header>
+
+<div id="problems"></div>
+<div class="board" id="board"></div>
+
+<aside id="panel">
+  <header>
+    <h1 id="pt">item</h1><span class="sp"></span>
+    <button id="close">Close</button>
+  </header>
+  <div class="runs" id="runs"></div>
+  <pre id="log">Select a run.</pre>
+</aside>
+
+<script>
+const $ = s => document.querySelector(s);
+let state = null, selectedItem = null, followRun = null;
+
+const esc = s => (s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+async function loadState() {
+  state = await (await fetch("/api/state")).json();
+  render();
+}
+
+function render() {
+  if (!state) return;
+  const byStage = {};
+  for (const st of state.stages) byStage[st.name] = [];
+  for (const it of state.items || []) (byStage[it.stage] ||= []).push(it);
+
+  $("#board").innerHTML = state.stages.map(st => {
+    const items = byStage[st.name] || [];
+    return `<section class="col">
+      <h2>${esc(st.name)} <span class="n">${items.length}</span>
+        ${st.script ? `<span class="script">${esc(st.script)}</span>` : ""}</h2>
+      <div class="body">${
+        items.length ? items.map(card).join("") : `<div class="empty">—</div>`
+      }</div></section>`;
+  }).join("");
+
+  const bad = (state.sources || []).filter(s => (s.problems || []).length);
+  $("#problems").innerHTML = bad.length ? bad.map(s =>
+    `<div class="problems"><b>${esc(s.name)}</b> cannot run:
+      <ul>${s.problems.map(p => `<li>${esc(p)}</li>`).join("")}</ul></div>`).join("") : "";
+
+  const t = state.updatedAt ? new Date(state.updatedAt).toLocaleTimeString() : "—";
+  $("#status").textContent = `${(state.items || []).length} items · updated ${t}`;
+  $("#live").className = "dot " + (state.polling ? "poll" : "live");
+
+  document.querySelectorAll(".card").forEach(el =>
+    el.onclick = () => openItem(el.dataset.id, el.dataset.title));
+}
+
+function card(it) {
+  const p = it.priority === null || it.priority === undefined ? "" :
+    `<span class="pill p${it.priority}">p${it.priority}</span>`;
+  return `<button class="card" data-id="${esc(it.id)}" data-title="${esc(it.title)}">
+    <div class="t">${esc(it.title)}</div>
+    <div class="r">${p}<span>${esc(it.id)}</span></div></button>`;
+}
+
+async function openItem(id, title) {
+  selectedItem = id;
+  $("#pt").textContent = title || id;
+  $("#panel").classList.add("open");
+  $("#log").textContent = "Loading…";
+  const runs = await (await fetch(`/api/runs?item=${encodeURIComponent(id)}`)).json();
+  $("#runs").innerHTML = runs.length ? runs.map(r =>
+    `<button data-run="${r.id}" class="${r.outcome}">
+       ${esc(r.kind)} ${esc(r.from || "")}→${esc(r.to || "")} · ${esc(r.outcome)}</button>`).join("")
+    : `<span class="meta">no runs yet</span>`;
+  document.querySelectorAll("[data-run]").forEach(b => b.onclick = () => openRun(b.dataset.run));
+  if (runs.length) openRun(runs[0].id);
+  else $("#log").textContent = "No runs for this item yet.";
+}
+
+async function openRun(id) {
+  followRun = id;
+  document.querySelectorAll("[data-run]").forEach(b => b.classList.toggle("sel", b.dataset.run === id));
+  const r = await (await fetch(`/api/runs/${id}`)).json();
+  $("#log").textContent = r.log || "(no output)";
+  $("#log").scrollTop = $("#log").scrollHeight;
+}
+
+$("#close").onclick = () => { $("#panel").classList.remove("open"); followRun = null; };
+$("#refresh").onclick = () => fetch("/api/refresh", {method:"POST"});
+$("#tick").onclick = async e => {
+  e.target.disabled = true;
+  const res = await fetch("/api/tick", {method:"POST"});
+  if (res.status === 409) $("#status").textContent = "a tick is already in flight";
+  setTimeout(() => e.target.disabled = false, 1200);
+};
+
+// Live: log lines append to the open run, everything else re-reads state.
+const es = new EventSource("/api/events");
+es.onmessage = ev => {
+  const e = JSON.parse(ev.data);
+  if (e.kind === "log") {
+    if (e.runId === followRun && e.line) {
+      const pre = $("#log");
+      const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+      pre.textContent += (pre.textContent === "(no output)" ? "" : "") + e.line.text + "\n";
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+    }
+    return;
+  }
+  if (e.kind === "transition" && selectedItem && e.transition?.item?.id === selectedItem) {
+    openItem(selectedItem, $("#pt").textContent);
+  }
+  loadState();
+};
+es.onerror = () => { $("#live").className = "dot"; $("#status").textContent = "disconnected"; };
+
+loadState();
+</script>
+</body>
+</html>

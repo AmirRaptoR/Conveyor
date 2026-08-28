@@ -92,9 +92,8 @@ internal/model/       Item, Stage, Source, Run — the shapes in CONTRACTS.md
 internal/source/      list + move invocation, item validation and dedupe
 internal/pipeline/    state machine: which item moves where, and why
 internal/runner/      os/exec + context timeout + line-streaming log capture
-internal/store/       items, run history, manual order    (not built yet)
-internal/server/      HTTP API + SSE hub; embed.FS serves web/  (not built yet)
-web/                  the board                                 (not built yet)
+internal/server/      HTTP API + SSE hub; embed.FS serves its own web/
+internal/store/       manual order                              (not built yet)
 providers/            one folder per provider; list/move resolved by name
 agents/<name>/        reusable agent adapters, resolved by `agent:`
 ```
@@ -109,7 +108,7 @@ stage. Port one only when there is a reason.
 2. ~~`runner`~~ — exec one script, stream logs, honour timeout, return exit code.
 3. ~~`source`~~ — list and move against the mocks.
 4. ~~`pipeline`~~ — the transition rules in CONTRACTS.md §4, plus locks.
-5. `server` — SSE for live logs; board reads real state.
+5. ~~`server`~~ — SSE for live logs; board reads real state.
 6. ~~A real GitHub source~~ — `providers/github/`.
 
 Steps 5 and 6 traded places: a board rendering mock data proves less than a

@@ -18,6 +18,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
+	"github.com/AmirRaptoR/Conveyor/internal/server"
 	"github.com/AmirRaptoR/Conveyor/internal/source"
 )
 
@@ -36,6 +37,8 @@ func main() {
 		err = cmdRun(os.Args[2:])
 	case "tick":
 		err = cmdTick(os.Args[2:])
+	case "serve":
+		err = cmdServe(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -57,6 +60,7 @@ func usage() {
   list      [-source NAME]              run list scripts, print items
   run       -source N -item ID -stage S move one item into a stage and run it
   tick      [-source NAME] [-n N]       one scheduling pass: pick and advance
+  serve     [-addr :8080] [-auto]       the board, live logs, run history
   
 Common flags:
   -c <config>       path to the config (default conveyor.yaml). Stage scripts
@@ -318,4 +322,18 @@ func outcomeErr(o model.Outcome) error {
 		return nil
 	}
 	return fmt.Errorf("outcome: %s", o)
+}
+
+func cmdServe(args []string) error {
+	c := newFlags("serve")
+	addr := c.fs.String("addr", ":8080", "listen address")
+	// Off by default: ticking advances items, and that opens pull requests on
+	// real repositories. Watching should never be the thing that starts work.
+	auto := c.fs.Bool("auto", false, "advance one item every poll interval")
+	cfg, r, ctx, stop, err := c.load(args)
+	if err != nil {
+		return err
+	}
+	defer stop()
+	return server.New(cfg, r).Run(ctx, server.Addr(*addr), *auto)
 }

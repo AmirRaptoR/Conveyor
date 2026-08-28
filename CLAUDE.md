@@ -20,12 +20,15 @@ Working: `internal/{model,config,runner,source,pipeline}` and the CLI
 drains the mock pipeline in priority order and routes a blocked item out.
 `providers/github/` runs against real repositories.
 
+`conveyor serve` renders the board with live logs over SSE, embedded in the
+binary. It observes by default: `-auto` is what makes it advance items.
+
 Not built yet, in build order (see `docs/DESIGN.md`):
 
-1. `internal/server` — HTTP + SSE, live logs, the pipeline view
-2. `web/` — served from the Go binary via `embed.FS`
-3. Log retention sweep (`logs.retention`, with the pinning rule in CONTRACTS §6)
-4. Persisted manual input order — v1's only human control lever, so it matters
+1. `internal/store` — persisted manual input order, v1's only human control
+   lever. `Pick` already takes an order argument and is handed nil everywhere.
+2. Log retention sweep (`logs.retention`, with the pinning rule in CONTRACTS §6)
+3. Reordering in the UI, once there is a store to persist it into
 
 ## Invariants — do not break these
 
