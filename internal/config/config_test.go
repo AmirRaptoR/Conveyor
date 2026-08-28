@@ -7,6 +7,15 @@ import (
 	"testing"
 )
 
+// workdir creates the directory a source's scripts will run in. It holds no
+// scripts any more — those live beside the config, in conveyor.d/<source>/.
+func workdir(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // script creates an executable file, making parents as needed.
 func script(t *testing.T, path string) {
 	t.Helper()
@@ -48,7 +57,8 @@ func onboarded(t *testing.T) (dir string, path string) {
 	dir = t.TempDir()
 	script(t, filepath.Join(dir, "providers", "github", "list.sh"))
 	script(t, filepath.Join(dir, "providers", "github", "move.sh"))
-	script(t, filepath.Join(dir, "repo", ".conveyor", "refining"))
+	script(t, filepath.Join(dir, "conveyor.d", "s1", "refining"))
+	workdir(t, filepath.Join(dir, "repo"))
 	return dir, write(t, dir, `  - name: s1
     provider: github
     workdir: ./repo
@@ -68,10 +78,11 @@ func TestResolvesProviderAndStageScripts(t *testing.T) {
 	if got := filepath.Base(s.List); got != "list.sh" {
 		t.Errorf("list = %q, want list.sh", got)
 	}
-	// The stage script comes from the source's own repo, not the config dir:
-	// that is what lets two repos do different work in the same stage.
-	if got := s.Scripts["refining"]; !strings.HasSuffix(got, "/repo/.conveyor/refining") {
-		t.Errorf("refining script = %q, want it under the repo", got)
+	// Scripts live beside the config, keyed by source name — nothing is written
+	// into the repo being worked, so an agent told to "commit and push" cannot
+	// sweep the pipeline into somebody's project.
+	if got := s.Scripts["refining"]; !strings.HasSuffix(got, "/conveyor.d/s1/refining") {
+		t.Errorf("refining script = %q, want it under conveyor.d/s1", got)
 	}
 }
 
@@ -82,7 +93,8 @@ func TestStageScriptExtensionAgnostic(t *testing.T) {
 			dir := t.TempDir()
 			script(t, filepath.Join(dir, "providers", "github", "list.sh"))
 			script(t, filepath.Join(dir, "providers", "github", "move.sh"))
-			script(t, filepath.Join(dir, "repo", ".conveyor", name))
+			script(t, filepath.Join(dir, "conveyor.d", "s1", name))
+			workdir(t, filepath.Join(dir, "repo"))
 			cfg, err := Load(write(t, dir, "  - name: s1\n    provider: github\n    workdir: ./repo\n"))
 			if err != nil {
 				t.Fatalf("Load: %v", err)
@@ -100,10 +112,9 @@ func TestUnonboardedRepoIsNotFatal(t *testing.T) {
 	dir := t.TempDir()
 	script(t, filepath.Join(dir, "providers", "github", "list.sh"))
 	script(t, filepath.Join(dir, "providers", "github", "move.sh"))
-	script(t, filepath.Join(dir, "good", ".conveyor", "refining"))
-	if err := os.MkdirAll(filepath.Join(dir, "bad"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	script(t, filepath.Join(dir, "conveyor.d", "good", "refining"))
+	workdir(t, filepath.Join(dir, "good"))
+	workdir(t, filepath.Join(dir, "bad")) // exists, but was never onboarded
 
 	cfg, err := Load(write(t, dir, `  - name: good
     provider: github
@@ -133,17 +144,20 @@ func TestSourceProblems(t *testing.T) {
 		want  string
 	}{
 		{"unknown provider", func(t *testing.T, dir string) {
-			script(t, filepath.Join(dir, "repo", ".conveyor", "refining"))
+			script(t, filepath.Join(dir, "conveyor.d", "s1", "refining"))
+			workdir(t, filepath.Join(dir, "repo"))
 		}, `provider "github"`},
 		{"provider missing move", func(t *testing.T, dir string) {
 			script(t, filepath.Join(dir, "providers", "github", "list.sh"))
-			script(t, filepath.Join(dir, "repo", ".conveyor", "refining"))
+			script(t, filepath.Join(dir, "conveyor.d", "s1", "refining"))
+			workdir(t, filepath.Join(dir, "repo"))
 		}, "no move script"},
 		{"ambiguous provider script", func(t *testing.T, dir string) {
 			script(t, filepath.Join(dir, "providers", "github", "list.sh"))
 			script(t, filepath.Join(dir, "providers", "github", "list.py"))
 			script(t, filepath.Join(dir, "providers", "github", "move.sh"))
-			script(t, filepath.Join(dir, "repo", ".conveyor", "refining"))
+			script(t, filepath.Join(dir, "conveyor.d", "s1", "refining"))
+			workdir(t, filepath.Join(dir, "repo"))
 		}, "ambiguous list script"},
 		{"missing workdir", func(t *testing.T, dir string) {
 			script(t, filepath.Join(dir, "providers", "github", "list.sh"))
@@ -152,7 +166,8 @@ func TestSourceProblems(t *testing.T) {
 		{"stage script not executable", func(t *testing.T, dir string) {
 			script(t, filepath.Join(dir, "providers", "github", "list.sh"))
 			script(t, filepath.Join(dir, "providers", "github", "move.sh"))
-			p := filepath.Join(dir, "repo", ".conveyor", "refining")
+			workdir(t, filepath.Join(dir, "repo"))
+			p := filepath.Join(dir, "conveyor.d", "s1", "refining")
 			script(t, p)
 			if err := os.Chmod(p, 0o644); err != nil {
 				t.Fatal(err)
@@ -244,7 +259,8 @@ func TestProvidersDirOverride(t *testing.T) {
 	script(t, filepath.Join(shared, "providers", "github", "move.sh"))
 
 	elsewhere := t.TempDir()
-	script(t, filepath.Join(elsewhere, "repo", ".conveyor", "refining"))
+	script(t, filepath.Join(elsewhere, "conveyor.d", "s1", "refining"))
+	workdir(t, filepath.Join(elsewhere, "repo"))
 	path := filepath.Join(elsewhere, "conveyor.yaml")
 	if err := os.WriteFile(path, []byte("providers: "+filepath.Join(shared, "providers")+"\n"+stages+`  - name: s1
     provider: github
@@ -273,5 +289,24 @@ func TestProvidersDirDefaults(t *testing.T) {
 	}
 	if want := filepath.Join(dir, "providers"); cfg.ProvidersDir() != want {
 		t.Errorf("ProvidersDir = %q, want %q", cfg.ProvidersDir(), want)
+	}
+}
+
+// Scripts must not be picked up from the repo being worked: putting them there
+// is what lets an agent told to "commit and push" sweep the pipeline into
+// somebody's project.
+func TestScriptsNotReadFromWorkdir(t *testing.T) {
+	dir := t.TempDir()
+	script(t, filepath.Join(dir, "providers", "github", "list.sh"))
+	script(t, filepath.Join(dir, "providers", "github", "move.sh"))
+	// the old location, which must now be ignored
+	script(t, filepath.Join(dir, "repo", ".conveyor", "refining"))
+
+	cfg, err := Load(write(t, dir, "  - name: s1\n    provider: github\n    workdir: ./repo\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Sources[0].OK() {
+		t.Fatal("a script inside the worked repo was accepted; it must be ignored")
 	}
 }

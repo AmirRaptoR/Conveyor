@@ -20,9 +20,9 @@ builds, that is CI, and CI already exists.
 | 2 | Stages from config, minimum two | `config/*.yaml` `stages:` — order is the board, left to right. Validated at load. |
 | 3 | Items loaded from sources | `list` scripts, one per source. Only configured sources are scanned; no directory auto-discovery. |
 | 4 | Timer picks up an item | `poll:` re-lists; the scheduler picks the highest-priority item whose stage is marked `work:` and whose source lock is free. |
-| 5 | Moving a column runs a script, logs visible | The source repo's `.conveyor/<stage>`. stdout/stderr stream line-by-line to the UI over SSE; exit code decides the next stage. |
+| 5 | Moving a column runs a script, logs visible | `conveyor.d/<source>/<stage>`. stdout/stderr stream line-by-line to the UI over SSE; exit code decides the next stage. |
 
-Mocked from day one: `providers/mock/` and this repo's own `.conveyor/`
+Mocked from day one: `providers/mock/` and `conveyor.d/mock/`
 exercise every path —
 success, blocked, provider write-back — with no GitHub and no AI. The engine is
 developed against them.
@@ -96,8 +96,8 @@ internal/store/       items, run history, manual order    (not built yet)
 internal/server/      HTTP API + SSE hub; embed.FS serves web/  (not built yet)
 web/                  the board                                 (not built yet)
 providers/            one folder per provider; list/move resolved by name
-examples/.conveyor/   the template copied into a repo being onboarded
-.conveyor/            this repo's own stage scripts, as any enrolled repo has
+conveyor.d/<source>/  per-source stage scripts, beside the config
+examples/             the template copied when enrolling a source
 ```
 
 Existing scripts are **not** rewritten to be adopted. The runner executes

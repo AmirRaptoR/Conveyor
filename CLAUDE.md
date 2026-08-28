@@ -44,10 +44,12 @@ Not built yet, in build order (see `docs/DESIGN.md`):
 - **A source names a `provider:`, never two script paths.** Naming `list` and
   `move` separately allowed pairing GitHub's list with Azure's move, which
   nothing downstream could detect.
-- **Stages declare `work:`; the script belongs to the repo being worked**, at
-  `.conveyor/<stage>`. `work:` stays in config because the scheduler needs it —
-  a stage with no work is a queue, a work stage found mid-flight is an
-  interrupted job to re-run.
+- **Stages declare `work:`; the script is per-source**, at
+  `conveyor.d/<source>/<stage>` beside the config — never inside the repo being
+  worked, where an agent told to "commit and push" would sweep it into a PR.
+  Scripts still run in the source's workdir, so repo-local skills still resolve.
+  `work:` stays in config because the scheduler needs it: a stage with no work
+  is a queue, a work stage found mid-flight is an interrupted job to re-run.
 - **An un-onboarded repo is reported, never worked around.** Per-source problems
   disable that source and leave every other repo running. There is no shared
   fallback to inherit by accident.
@@ -58,9 +60,11 @@ Not built yet, in build order (see `docs/DESIGN.md`):
 - Paths in the config resolve against the **config file's directory**. A working
   config kept outside the checkout must therefore set `providers:` to point back
   at `providers/` here.
-- The working config for this machine is `~/codes/conveyor.yaml`, outside the
-  repo: it is machine state, not project source. `conveyor.example.yaml` is the
-  template that ships.
+- The working config for this machine is `~/codes/conveyor.yaml` with its
+  scripts in `~/codes/conveyor.d/<source>/`, outside the repo: machine state,
+  not project source. `conveyor.example.yaml` is the template that ships.
+- `-c` is the only flag normally needed; everything else is found relative to
+  the config. `-providers` exists for a binary run away from its providers/.
 - Provider and stage scripts resolve by name with or without an extension —
   `list.sh`, `list.py` and a compiled `list` are equivalent, because the runner
   execs the file and never consults an interpreter. Two matches is an error.

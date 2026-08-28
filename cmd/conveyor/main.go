@@ -58,7 +58,13 @@ func usage() {
   run       -source N -item ID -stage S move one item into a stage and run it
   tick      [-source NAME] [-n N]       one scheduling pass: pick and advance
   
-Common flags: -c <config> (default conveyor.yaml), -v stream logs
+Common flags:
+  -c <config>       path to the config (default conveyor.yaml). Stage scripts
+                    are found beside it, in conveyor.d/<source>/<stage>.
+  -providers <dir>  provider root; defaults to providers/ beside the binary,
+                    or the config's providers: key. Layout inside is fixed:
+                    <dir>/<provider>/{list,move}
+  -v                stream script logs to stdout
 
 Scripts follow docs/CONTRACTS.md: logs on stdout/stderr, structured data to
 $CONVEYOR_RESULT, exit 0 success / 10 no-op / 20 blocked / other failure.
@@ -66,9 +72,10 @@ $CONVEYOR_RESULT, exit 0 success / 10 no-op / 20 blocked / other failure.
 }
 
 type common struct {
-	fs      *flag.FlagSet
-	cfgPath *string
-	verbose *bool
+	fs        *flag.FlagSet
+	cfgPath   *string
+	providers *string
+	verbose   *bool
 }
 
 func newFlags(name string) *common {
@@ -76,7 +83,10 @@ func newFlags(name string) *common {
 	return &common{
 		fs:      f,
 		cfgPath: f.String("c", "conveyor.yaml", "path to config"),
-		verbose: f.Bool("v", false, "stream script logs to stdout"),
+		// The config path is the only thing normally needed; this exists for a
+		// binary run away from its providers/ directory.
+		providers: f.String("providers", "", "provider root (default: beside the binary, then the config)"),
+		verbose:   f.Bool("v", false, "stream script logs to stdout"),
 	}
 }
 
@@ -84,7 +94,7 @@ func (c *common) load(args []string) (*config.Config, *runner.Runner, context.Co
 	if err := c.fs.Parse(args); err != nil {
 		return nil, nil, nil, nil, err
 	}
-	cfg, err := config.Load(*c.cfgPath)
+	cfg, err := config.LoadFrom(*c.cfgPath, *c.providers)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -139,9 +149,12 @@ func cmdValidate(args []string) error {
 			fmt.Printf("      - %s\n", p)
 		}
 	}
-	if bad > 0 {
-		fmt.Printf("\n%d of %d source(s) unusable; the rest will still be worked\n",
-			bad, len(cfg.Sources))
+	switch {
+	case bad == len(cfg.Sources):
+		fmt.Printf("\nall %d source(s) unusable — nothing would be worked\n", bad)
+	case bad > 0:
+		fmt.Printf("\n%d of %d source(s) unusable; the other %d will still be worked\n",
+			bad, len(cfg.Sources), len(cfg.Sources)-bad)
 	}
 	return nil
 }

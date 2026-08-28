@@ -121,7 +121,13 @@ func (d Duration) D() time.Duration { return time.Duration(d) }
 
 // Load reads, defaults and validates a config. It returns every problem found,
 // not just the first, so one run of `validate` fixes a whole file.
-func Load(path string) (*Config, error) {
+// Load reads a config, resolving providers from the config or the binary.
+func Load(path string) (*Config, error) { return LoadFrom(path, "") }
+
+// LoadFrom is Load with an explicit providers root, as passed on the command
+// line. It must be applied before resolution, not after: resolution is what
+// turns a provider name into script paths.
+func LoadFrom(path, providers string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -137,6 +143,9 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	c.Dir = filepath.Dir(abs)
+	if providers != "" {
+		c.Providers = providers
+	}
 	c.applyDefaults()
 	c.resolveSources()
 	if errs := c.Validate(); len(errs) > 0 {
@@ -219,15 +228,31 @@ func (c *Config) ResolveScript(p string) string {
 
 // ProvidersDir holds one directory per provider, named exactly as a source's
 // `provider:` names it. Adding a provider is creating a folder.
+// The layout inside is fixed — <root>/<provider>/<verb> — but the root moves:
+// -providers on the command line wins, then `providers:` in the config, then
+// the directory holding the binary, which is where a release puts them.
 func (c *Config) ProvidersDir() string {
-	if c.Providers == "" {
-		return filepath.Join(c.Dir, "providers")
+	if c.Providers != "" {
+		p := expandHome(c.Providers)
+		if filepath.IsAbs(p) {
+			return p
+		}
+		return filepath.Join(c.Dir, p)
 	}
-	p := expandHome(c.Providers)
-	if filepath.IsAbs(p) {
-		return p
+	if exe, err := os.Executable(); err == nil {
+		if beside := filepath.Join(filepath.Dir(exe), "providers"); isDir(beside) {
+			return beside
+		}
 	}
-	return filepath.Join(c.Dir, p)
+	// `go run` builds into a temp directory, so fall back to the config's own
+	// directory: without this, developing in the checkout would need the flag
+	// on every invocation.
+	return filepath.Join(c.Dir, "providers")
+}
+
+func isDir(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
 }
 
 // providerScript finds providers/<provider>/<verb>.
@@ -245,9 +270,14 @@ func (c *Config) providerScript(provider, verb string) (string, error) {
 	return path, nil
 }
 
-// StageDir is where a source's repo keeps its stage scripts. Onboarding a repo
-// is creating this directory and filling it in.
-const StageDir = ".conveyor"
+// ScriptsDir sits beside the config file and holds one directory per source,
+// named exactly as the source is. Onboarding a repo is creating that directory
+// and filling it in — nothing is written into the repo being worked, so the
+// pipeline cannot end up committed into somebody's project by an agent told to
+// "commit and push".
+//
+// Scripts still RUN in the source's workdir; only the files live here.
+const ScriptsDir = "conveyor.d"
 
 // findScript finds dir/<name>, with or without an extension: name.sh, name.py
 // and a compiled `name` are equivalent, because the runner execs the file
@@ -320,17 +350,17 @@ func (c *Config) resolveSources() {
 			}
 		}
 
-		wd := c.Workdir(*s)
-		if _, err := os.Stat(wd); err != nil {
-			note("workdir %s: %v", s.Workdir, err)
-			continue // every stage script lives under it; one message is enough
+		// The workdir is where scripts run, not where they live, so a missing
+		// one no longer hides the script problems — report both.
+		if !isDir(c.Workdir(*s)) {
+			note("workdir %s: not a directory", c.Workdir(*s))
 		}
 
 		for _, st := range c.Stages {
 			if !st.Work {
 				continue
 			}
-			path, err := findScript(filepath.Join(wd, StageDir), st.Name)
+			path, err := findScript(filepath.Join(c.Dir, ScriptsDir, s.Name), st.Name)
 			if err != nil {
 				note("stage %q: %v", st.Name, err)
 				continue

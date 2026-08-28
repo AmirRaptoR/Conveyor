@@ -99,45 +99,49 @@ detect, because by then they are just two executable paths.
 
 ## Onboarding a repo
 
-`stages:` is the state machine and nothing more. A stage marked `work: true`
-runs something, but *what* it runs belongs to the repository, at
-`.conveyor/<stage>` in the source's workdir:
+`stages:` is the state machine. A stage marked `work: true` runs something, but
+*what* it runs is per-source, in `conveyor.d/<source>/<stage>` beside the config:
 
 ```
-~/codes/midgame/.conveyor/
-  refining        claude -p "/refine" — picks up the repo's own .claude/skills
-  in-progress     claude -p "/deliver-issue $CONVEYOR_ITEM_REF"
-
-~/codes/caravan/.conveyor/
-  refining        codex exec "$(cat .conveyor/prompts/refine.md)"
-  in-progress     ...
+~/codes/
+  conveyor.yaml
+  conveyor.d/
+    midgame/
+      refining        claude -p "/refine" — resolves midgame's .claude/skills
+      in-progress
+    caravan-v2/
+      refining        codex exec with a long prompt
 ```
 
-Same pipeline, different work. One repo refines with a Claude skill, another
-with a long Codex prompt, and the engine knows about neither — it execs a file
-in a directory. Scripts resolve by name with or without an extension, exactly
-like providers.
+Same pipeline, different work. The engine knows about neither agent — it execs a
+file. Scripts resolve by name with or without an extension, exactly like
+providers.
 
-**A repo missing a script for a `work:` stage is reported, not tolerated:**
+They live beside the config rather than inside the repo being worked, so nothing
+is written into somebody's project — and an agent told to "commit and push"
+cannot sweep the pipeline into its own pull request. The script still *runs* in
+the source's workdir, so `claude` there still resolves that repo's own
+`.claude/skills/`.
+
+**A source missing a script for a `work:` stage is reported, not tolerated:**
 
 ```
-    source "caravan" cannot run:
-      - stage "in-progress": no in-progress script in ~/codes/caravan/.conveyor
+    source "caravan-v2" cannot run:
+      - stage "in-progress": no in-progress script in ~/codes/conveyor.d/caravan-v2
 
-3 of 4 source(s) unusable; the rest will still be worked
+3 of 4 source(s) unusable; the other 1 will still be worked
 ```
 
-Onboarding a repository is configuration work, and an incomplete one is a
-configuration error. But it is *that source's* error: conveyor reports it,
-skips it, and keeps working every healthy repo. There is no shared fallback to
-inherit by accident — a repo you meant to customise cannot silently do
-something generic instead.
+Onboarding is configuration work, and an incomplete one is a configuration
+error — but it is *that source's* error: conveyor reports it, skips it, and
+keeps working every healthy source. There is no shared fallback to inherit by
+accident, so a source you meant to customise cannot silently do something
+generic instead.
 
-The starting template is in [`examples/`](examples/) — copy it into the repo
-you are enrolling, then edit it there:
+The starting template is in [`examples/`](examples/):
 
 ```bash
-cp -r examples/.conveyor ~/codes/midgame/
+cp -r examples/conveyor.d/_source ~/codes/conveyor.d/midgame
 ```
 
 ## Writing a provider

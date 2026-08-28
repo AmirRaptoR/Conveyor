@@ -31,17 +31,22 @@ logs:
 # default "next stage" on success.
 #
 # This is the state machine and nothing else. `work: true` says a stage runs
-# something; WHAT it runs is the repo's business, at .conveyor/<stage> in each
-# source's workdir. That is what lets one repo refine with a Claude skill and
-# another with a long Codex prompt, on the same pipeline.
+# something; WHAT it runs is per-source, at conveyor.d/<source>/<stage> beside
+# this file. That is what lets one source refine with a Claude skill and another
+# with a long Codex prompt, on the same pipeline.
+#
+# The scripts sit here rather than inside the repo being worked: nothing is
+# written into somebody's project, and an agent told to "commit and push" cannot
+# sweep the pipeline into its own pull request. They still RUN in the source's
+# workdir, so repo-local .claude/skills still resolve.
 # ---------------------------------------------------------------------------
 stages:
   - name: backlog
     # No work: nothing runs. Items land here and wait.
 
   - name: refining
-    work: true                # the script lives in each source's repo at
-    timeout: 30m              # .conveyor/refining — see "Onboarding a repo"
+    work: true                # conveyor.d/<source>/refining
+    timeout: 30m
     onSuccess: ready          # explicit; would default to the next stage anyway
     onFailure: backlog        # a failed refine returns it to the pile
 
@@ -54,7 +59,7 @@ stages:
                               # Some stages must never be entered by hand.
 
   - name: in-progress
-    work: true                # .conveyor/in-progress in each source's repo
+    work: true                # conveyor.d/<source>/in-progress
     onSuccess: done
     onFailure: blocked
     maxAttempts: 2            # after this many failures, force to onBlocked

@@ -1,21 +1,30 @@
-# Onboarding a repo
+# Onboarding a source
 
-`stages:` in `conveyor.yaml` is the state machine. What a stage *does* belongs
-to the repository being worked, at `.conveyor/<stage>` in its workdir.
+`stages:` in `conveyor.yaml` is the state machine. What a stage *does* is
+per-source, in `conveyor.d/<source>/<stage>` beside the config.
 
-`.conveyor/` here is the starting template. Copy it into a repo you are
-enrolling, then edit it — that repo owns it from then on:
+`conveyor.d/_source/` here is the starting template. Copy it, named for the
+source you are enrolling, then edit it:
 
 ```bash
-cp -r examples/.conveyor ~/codes/<repo>/
+cp -r examples/conveyor.d/_source ~/codes/conveyor.d/midgame
 ```
 
 Then add the source to your `conveyor.yaml` with its `REPO` and label mapping.
-If that config lives outside this checkout, set `providers:` to point back at
-`providers/` here. Then
-run `conveyor validate`: it names any `work:` stage the repo has not
-implemented. A repo missing a script is skipped and reported, never quietly
-given generic behaviour.
+`conveyor validate` names any `work:` stage the source has not implemented; a
+source missing a script is skipped and reported, never quietly given generic
+behaviour.
+
+## Why not inside the repo being worked
+
+The scripts operate on a repo but do not live in it. `in-progress` tells an
+agent to commit and push — an untracked `.conveyor/` sitting in that repo is
+exactly what `git add -A` sweeps into the pull request. Keeping them beside the
+config also means enrolling somebody else's repository writes nothing into it.
+
+Nothing is lost by moving them out: the script still *runs* in the source's
+workdir, so `claude` there still resolves that repo's own `.claude/skills/`.
+`Script` and `Workdir` are separate things.
 
 ## What is in the template
 
@@ -25,9 +34,9 @@ given generic behaviour.
 | `in-progress` | Claude implements it and opens a PR. |
 | `testing` | Codex reviews that PR — deliberately not the model that wrote it. |
 
-The prompts are inline rather than in skills, so a freshly onboarded repo works
-with nothing installed. Move one into `.claude/skills/` when it outgrows the
-script; conveyor neither knows nor cares which you did.
+The prompts are inline rather than in skills, so a freshly enrolled source works
+with nothing installed. Move one into the repo's `.claude/skills/` when it
+outgrows the script; conveyor neither knows nor cares which you did.
 
 ## What the scripts are responsible for
 
