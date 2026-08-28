@@ -282,10 +282,16 @@ func Target(cfg *config.Config, it *model.Item) (string, bool) {
 
 // Pick chooses the next item to work from a listing.
 //
-// v1's only human control is the order of the inputs, so ordering is honoured
-// first: an item's position in `order` beats its priority. Items not named in
-// `order` fall back to priority, then to the source's own listing order, which
-// keeps the choice stable across polls.
+// Recovery comes first, ahead of any human ordering: an item found inside a
+// stage that runs a script is a job that started and did not finish, and the
+// provider already says so. Leaving it behind a full backlog would strand it
+// wearing a status it is not in, which is the opposite of what writing provider
+// state before the run is for.
+//
+// After that, v1's only human control is the order of the inputs, so an item's
+// position in `order` beats its priority. Items not named there fall back to
+// priority, then to the source's own listing order, which keeps the choice
+// stable across polls.
 func Pick(cfg *config.Config, items []model.Item, order []string) (*model.Item, string) {
 	pos := make(map[string]int, len(order))
 	for i, id := range order {
@@ -293,8 +299,7 @@ func Pick(cfg *config.Config, items []model.Item, order []string) (*model.Item, 
 	}
 	best := -1
 	var bestTarget string
-	var bOrdered bool
-	var bIdx, bPrio, bPos int
+	var bestC candidate
 
 	for i := range items {
 		it := &items[i]
@@ -307,9 +312,11 @@ func Pick(cfg *config.Config, items []model.Item, order []string) (*model.Item, 
 		if it.Priority != nil {
 			prio = *it.Priority
 		}
-		if best == -1 || better(ordered, oi, prio, i, bOrdered, bIdx, bPrio, bPos) {
-			best, bestTarget = i, target
-			bOrdered, bIdx, bPrio, bPos = ordered, oi, prio, i
+		// Target returns the same stage an item is already in only when that
+		// stage runs something and the previous run did not finish.
+		c := candidate{recovering: target == it.Stage, ordered: ordered, idx: oi, prio: prio, pos: i}
+		if best == -1 || better(c, bestC) {
+			best, bestTarget, bestC = i, target, c
 		}
 	}
 	if best == -1 {
@@ -318,21 +325,33 @@ func Pick(cfg *config.Config, items []model.Item, order []string) (*model.Item, 
 	return &items[best], bestTarget
 }
 
-func better(aOrdered bool, aIdx, aPrio, aPos int, bOrdered bool, bIdx, bPrio, bPos int) bool {
-	if aOrdered != bOrdered {
-		return aOrdered // an explicitly ordered item always wins
-	}
-	if aOrdered && aIdx != bIdx {
-		return aIdx < bIdx
-	}
-	if aPrio != bPrio {
-		return aPrio < bPrio // 0 is most urgent
-	}
-	return aPos < bPos
+// candidate is one item's claim on being next.
+type candidate struct {
+	recovering bool // a stage it is already in, left unfinished
+	ordered    bool // named in the manual order
+	idx        int  // where, if it is
+	prio       int  // 0 most urgent; unranked is huge
+	pos        int  // the source's own listing order
 }
 
-// mergeEnv layers a script's params over its source's env. The narrower scope
-// wins; the engine reads neither.
+// better reports whether a should be worked before b. A ladder, most decisive
+// first; each rung only matters when the ones above it tie.
+func better(a, b candidate) bool {
+	if a.recovering != b.recovering {
+		return a.recovering // finish what was started
+	}
+	if a.ordered != b.ordered {
+		return a.ordered // an explicitly ordered item beats an unordered one
+	}
+	if a.ordered && a.idx != b.idx {
+		return a.idx < b.idx
+	}
+	if a.prio != b.prio {
+		return a.prio < b.prio // 0 is most urgent
+	}
+	return a.pos < b.pos
+}
+
 func mergeEnv(env, params map[string]string) map[string]string {
 	if len(params) == 0 {
 		return env

@@ -66,3 +66,47 @@ func TestAttemptsArePerItem(t *testing.T) {
 		t.Fatalf("x:2 first failure went to %q, want in-progress", got)
 	}
 }
+
+// An item found inside a stage that runs a script is an unfinished job: the
+// provider already says it is there. It must be picked up before new work,
+// however the queue is arranged, or it sits wearing a status it is not in.
+func TestRecoveryOutranksTheOrderedBacklog(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{
+		{Name: "backlog", OnSuccess: "refining"},
+		{Name: "refining", Script: "refine", OnSuccess: "ready", OnBlocked: "blocked"},
+		{Name: "ready", OnSuccess: "done"},
+		{Name: "done", Terminal: true},
+		{Name: "blocked", Terminal: true},
+	}}
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "backlog", Title: "top of the queue"},
+		{ID: "a:2", Source: "a", Stage: "refining", Title: "interrupted mid-stage"},
+	}
+	// a:1 is first in the manual order and would otherwise win outright.
+	got, target := Pick(cfg, items, []string{"a:1", "a:2"})
+	if got == nil || got.ID != "a:2" {
+		t.Fatalf("picked %v, want the interrupted a:2", got)
+	}
+	if target != "refining" {
+		t.Errorf("target = %q, want refining (a re-run, not a move)", target)
+	}
+}
+
+// With nothing to recover, the manual order decides as before.
+func TestOrderStillDecidesWithoutRecovery(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{
+		{Name: "backlog", OnSuccess: "refining"},
+		{Name: "refining", Script: "refine", OnSuccess: "done", OnBlocked: "blocked"},
+		{Name: "done", Terminal: true},
+		{Name: "blocked", Terminal: true},
+	}}
+	p0 := 0
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "backlog", Title: "dragged to the top"},
+		{ID: "a:2", Source: "a", Stage: "backlog", Title: "urgent but lower", Priority: &p0},
+	}
+	got, _ := Pick(cfg, items, []string{"a:1", "a:2"})
+	if got == nil || got.ID != "a:1" {
+		t.Fatalf("picked %v, want a:1 — the order beats priority", got)
+	}
+}
