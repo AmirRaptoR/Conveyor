@@ -105,6 +105,11 @@ func (c *common) load(args []string) (*config.Config, *runner.Runner, context.Co
 		return nil, nil, nil, nil, err
 	}
 	r := runner.New(filepath.Join(cfg.DataDir(), "runs"))
+	// Settle anything a previous process left mid-flight, so the history never
+	// shows two runs in flight at once.
+	if n, err := runner.SweepInterrupted(r.Root); err == nil && n > 0 {
+		fmt.Fprintf(os.Stderr, "conveyor: marked %d interrupted run(s) from a previous process\n", n)
+	}
 	if *c.verbose {
 		// The UI will do this over SSE; on the CLI it just prints.
 		r.OnLog = func(_ string, l runner.LogLine) {

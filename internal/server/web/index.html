@@ -230,6 +230,7 @@
   .tr:hover { color:var(--ink); }
   .tr.sel { color:var(--ink); border-left-color:var(--faint); }
   .tr.sel::before { background:var(--ink); }
+  .tr .when { flex:0 0 62px; color:var(--faint); font-variant-numeric:tabular-nums; }
   .tr .kind { flex:0 0 54px; color:var(--faint); letter-spacing:.08em; text-transform:uppercase; font-size:10px; }
   .tr .path { flex:1; }
   .tr .arrow { color:var(--faint); }
@@ -239,6 +240,9 @@
   .tr.failure::before, .tr.timeout::before { background:var(--stop); }
   .tr.blocked .verdict { color:var(--run); }      .tr.blocked::before { background:var(--run); }
   .tr.running .verdict { color:var(--run); }      .tr.running::before { background:var(--run); animation:pulse 1.1s ease-in-out infinite; }
+  /* Killed, not failed: it never reached a verdict. */
+  .tr.interrupted .verdict { color:var(--faint); font-style:italic; }
+  .tr.interrupted::before { background:transparent; box-shadow:inset 0 0 0 1px var(--faint); }
 
   .log {
     margin:0; flex:1 1 auto; min-height:0; overflow:auto; padding:14px 18px;
@@ -433,13 +437,29 @@ async function loadHistory(id) {
   const runs = await (await fetch(`/api/runs?item=${encodeURIComponent(id)}`)).json();
   $("#history").innerHTML = runs.length ? runs.map(r => `
     <button class="tr ${esc(r.outcome)}" data-run="${esc(r.id)}">
+      <span class="when">${esc((r.startedAt || "").slice(11, 19))}</span>
       <span class="kind">${esc(r.kind)}</span>
-      <span class="path">${esc(r.from || "")} <span class="arrow">&rarr;</span> ${esc(r.to || "")}</span>
+      <span class="path">${transition(r)}</span>
       <span class="verdict">${esc(r.outcome)}</span>
     </button>`).join("")
     : `<div class="slot">No runs yet.</div>`;
   document.querySelectorAll("[data-run]").forEach(b => b.onclick = () => showRun(b.dataset.run));
   if (runs.length) showRun(runs[0].id);
+}
+
+// A run whose from and to are the same stage is not a move. For a stage script
+// it is a re-run of work that did not finish; for a provider write it is the
+// engine confirming the item is where it already says it is. Printing
+// "refining → refining" for both reads like a bug.
+function transition(r) {
+  const from = esc(r.from || ""), to = esc(r.to || "");
+  if (!from && !to) return `<span class="arrow">poll</span>`;
+  if (from === to) {
+    return r.kind === "stage"
+      ? `<span class="arrow">&#8635;</span> re-ran ${to}`
+      : `<span class="arrow">&#8801;</span> confirmed ${to}`;
+  }
+  return `${from} <span class="arrow">&rarr;</span> ${to}`;
 }
 
 async function showRun(id) {

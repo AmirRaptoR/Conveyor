@@ -308,3 +308,56 @@ func exitCode(err error) int {
 	}
 	return -1
 }
+
+// SweepInterrupted settles runs left claiming to be running. Nothing this
+// process started is alive yet, and only one scheduler works a source at a
+// time, so a run still marked running at startup was killed — a crash, a
+// timeout the process did not survive, a session closed mid-stage.
+//
+// Recording that is the difference between a history that shows two runs in
+// flight at once, which cannot happen, and one that says which was abandoned.
+func SweepInterrupted(root string) (int, error) {
+	days, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	n := 0
+	for _, day := range days {
+		if !day.IsDir() {
+			continue
+		}
+		entries, err := os.ReadDir(filepath.Join(root, day.Name()))
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			meta := filepath.Join(root, day.Name(), e.Name(), "meta.json")
+			b, err := os.ReadFile(meta)
+			if err != nil || len(b) == 0 {
+				continue
+			}
+			var run model.Run
+			if json.Unmarshal(b, &run) != nil || run.Outcome != model.OutcomeRunning {
+				continue
+			}
+			run.Outcome = model.OutcomeInterrupted
+			if run.FinishedAt.IsZero() {
+				run.FinishedAt = run.StartedAt
+			}
+			out, err := json.MarshalIndent(run, "", "  ")
+			if err != nil {
+				continue
+			}
+			if os.WriteFile(meta, out, 0o644) == nil {
+				n++
+			}
+		}
+	}
+	return n, nil
+}
