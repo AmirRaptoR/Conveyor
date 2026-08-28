@@ -10,3 +10,7 @@ node_modules/
 # to erase its own audit trail.
 /data/
 /tmp/
+
+# The working config; agent-team.example.yaml is the tracked template.
+/agent-team.yaml
+/agent-team
