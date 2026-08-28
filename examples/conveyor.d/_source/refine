@@ -1,70 +1,7 @@
 #!/usr/bin/env bash
-# refining — turn a raw issue into something implementable.
+# Which agent refines this source. That is the only decision this file makes —
+# the prompt, the tools and the model all come from the source's env: block in
+# conveyor.yaml, so changing them never touches a script.
 #
-# Copied here by conveyor onboarding; this repo owns it now. Edit freely: the
-# engine only execs the file and reads the exit code. Two repos can refine
-# completely differently and share the same pipeline.
-#
-# Conveyor already owns the timeout (it kills the process group), the source
-# lock, the working directory and the run log. This only runs the agent.
-set -euo pipefail
-
-payload=$(cat)
-ref=$(jq -r '.item.ref' <<<"$payload")
-title=$(jq -r '.item.title' <<<"$payload")
-
-echo "refining #$ref — $title"
-
-# The prompt lives inline rather than in a skill: nothing has to be installed
-# for this repo to work. Move it to .claude/skills/ when it grows.
-read -r -d '' PROMPT <<PROMPT_END || true
-Refine issue #$ref ("$title") in this repository until it is ready to implement.
-
-Read the issue with: gh issue view $ref --repo $REPO
-Map the parts of this codebase it touches, then rewrite the issue body to hold:
-
-- the observable problem, in one paragraph
-- the files and functions most likely involved
-- acceptance criteria as a checklist, each independently verifiable
-- a priority:p0-p3 label reflecting real urgency
-
-Write the refined body back with: gh issue edit $ref --repo $REPO --body-file -
-
-Do NOT implement anything and do NOT open a pull request.
-
-If refining needs a decision only a human can make, change nothing and write
-{"blocked": true, "reason": "<the decision needed>"} to the file at
-\$CONVEYOR_RESULT instead.
-PROMPT_END
-
-# How this repository refines: which agent, which model, which tools. None of it
-# is conveyor's business — the config only said "run the script named refine".
-# Change any of it here and only this repository changes.
-set +e
-claude -p "$PROMPT" \
-	--max-turns "${MAX_TURNS:-40}" \
-	--permission-mode "${PERMISSION_MODE:-acceptEdits}" \
-	--allowedTools "${ALLOWED_TOOLS:-Bash,Read,Glob,Grep,Skill}" \
-	${MODEL:+--model "$MODEL"}
-rc=$?
-set -e
-
-# An optional second opinion, also config-driven. Unset means it never runs.
-if [[ -n "${REVIEW_WITH:-}" ]]; then
-	echo "second opinion from $REVIEW_WITH"
-	body=$(gh issue view "$ref" --repo "$REPO" --json body --jq .body)
-	"$REVIEW_WITH" exec "Review this refined issue for $REPO. Are the acceptance
-criteria actually verifiable, and do the file and line references exist?
-
-$body" --skip-git-repo-check || echo "review unavailable; continuing" >&2
-fi
-
-# "Needs a human" cannot travel in the exit code: a CLI agent exits 0 whenever
-# the process ran, whatever it concluded. It comes back through the result file.
-if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
-	[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
-	echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
-	exit 20
-fi
-
-exit $rc
+# Point it at agents/codex/refine instead and only this source changes.
+exec "$HOME/codes/Conveyor/agents/claude/refine"

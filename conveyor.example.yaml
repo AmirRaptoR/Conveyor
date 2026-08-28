@@ -63,9 +63,24 @@ stages:
 
   - name: in-progress
     script: implement         # conveyor.d/<source>/implement
-    onSuccess: done
+    onSuccess: announcing
     onFailure: blocked
     maxAttempts: 2            # after this many failures, force to onBlocked
+
+  - name: announcing
+    # The other form: a body written here instead of a name resolved per source.
+    # Use it only where every source does the same thing — it cannot vary, which
+    # is what `script:` is for. It needs a shebang: the engine writes this out
+    # and execs it, and never picks an interpreter for you.
+    #
+    # Keep it small. Anything with real logic wants to be a file, where a shell
+    # can check it and a person can run it by hand.
+    run: |
+      #!/usr/bin/env bash
+      cat >/dev/null    # the item arrives as JSON on stdin; ignore it here
+      echo "$CONVEYOR_SOURCE #$CONVEYOR_ITEM_REF is done"
+    onSuccess: done
+    onFailure: blocked
 
   - name: done
     terminal: true            # no further transitions

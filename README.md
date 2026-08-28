@@ -148,6 +148,41 @@ every healthy source. There is no shared fallback to inherit by accident.
 | the source's `env:` | provider config — `REPO`, label mappings, anything |
 | stdin | the whole item as JSON, plus `stage` and `from` |
 
+### Running an agent
+
+`agents/<name>/<script>` ships reusable adapters, the way `providers/` does. The
+engine knows nothing about them — it runs the source's script, and that script
+decides to delegate:
+
+```bash
+# conveyor.d/midgame/refine — the whole file
+#!/usr/bin/env bash
+exec "$HOME/codes/Conveyor/agents/claude/refine"
+```
+
+Everything that varies is configuration, in the source's `env:`:
+
+```yaml
+  - name: midgame
+    provider: github
+    workdir: ~/codes/midgame
+    env:
+      REPO: RaptoR-Soft/midgame
+      ALLOWED_TOOLS: "Bash,Read,Glob,Grep"
+      MAX_TURNS: "40"
+      PROMPT: |
+        Refine this issue until it is ready to implement.
+        ...
+```
+
+The adapter prepends the item — id, title, url, body — so `PROMPT` is
+instructions only, with no ids to interpolate and no substitution language to
+learn. It also appends the blocked convention, so every agent reports "needs a
+human" the same way.
+
+Choosing the agent is a line in a script; choosing what it does is config. A
+source using codex is the same config with a different first line.
+
 ### An inline script
 
 For a stage where every source does the same thing, `run:` takes the body

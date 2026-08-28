@@ -30,7 +30,7 @@ workdir, so `claude` there still resolves that repo's own `.claude/skills/`.
 
 | | |
 | --- | --- |
-| `refine` | Claude rewrites the issue into something implementable, then stops. |
+| `refine` | One line: `exec agents/claude/refine`. The prompt and tools live in the source's `env:`, so this file only chooses the agent. |
 | `implement` | Claude implements it and opens a PR. |
 | `review` | Codex reviews that PR — deliberately not the model that wrote it. |
 

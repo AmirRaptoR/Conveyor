@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Refine an item with Claude Code, headless.
+#
+# Shipped here the way providers/ are: a reusable adapter, not something the
+# engine knows about. Conveyor only ever runs conveyor.d/<source>/refine — that
+# file decides to come here, and could just as well point at agents/codex/.
+#
+# Everything that varies is configuration, read from the environment the engine
+# assembled out of the source's env: block:
+#
+#   PROMPT           what to do. Required. The item is prepended for you, so
+#                    this is instructions only — no need to interpolate ids.
+#   ALLOWED_TOOLS    --allowedTools (default: read-only plus gh via Bash)
+#   MODEL            --model (default: whatever the CLI is configured with)
+#   MAX_TURNS        --max-turns (default 40)
+#   PERMISSION_MODE  --permission-mode (default acceptEdits)
+#
+# And from the engine: CONVEYOR_ITEM_REF, CONVEYOR_SOURCE, CONVEYOR_STAGE,
+# CONVEYOR_RESULT, plus the whole item as JSON on stdin.
+set -euo pipefail
+
+: "${PROMPT:?PROMPT is required (set it in the source env: block)}"
+
+payload=$(cat)
+ref=$(jq -r '.item.ref' <<<"$payload")
+title=$(jq -r '.item.title' <<<"$payload")
+body=$(jq -r '.item.description // ""' <<<"$payload")
+url=$(jq -r '.item.url // ""' <<<"$payload")
+
+echo "refining $CONVEYOR_SOURCE #$ref — $title"
+
+# The item is prepended rather than templated into PROMPT: no substitution
+# language to learn, nothing to escape, and a prompt written for one repo reads
+# the same in every other.
+full="Item #${ref}${REPO:+ in $REPO}: ${title}
+${url}
+
+--- item body ---
+${body}
+--- end item body ---
+
+${PROMPT}
+
+If this cannot be done because it needs a decision only a human can make, change
+nothing and write {\"blocked\": true, \"reason\": \"<the decision needed>\"} to
+the file at ${CONVEYOR_RESULT}."
+
+set +e
+claude -p "$full" \
+	--max-turns "${MAX_TURNS:-40}" \
+	--permission-mode "${PERMISSION_MODE:-acceptEdits}" \
+	--allowedTools "${ALLOWED_TOOLS:-Bash,Read,Glob,Grep}" \
+	${MODEL:+--model "$MODEL"}
+rc=$?
+set -e
+
+# "Needs a human" cannot ride on the exit code: a CLI agent exits 0 whenever the
+# process ran, whatever it concluded. It comes back through the result file.
+if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
+	[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
+	echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
+	exit 20
+fi
+
+exit $rc

@@ -58,6 +58,15 @@ Not built yet, in build order (see `docs/DESIGN.md`):
   disable that source and leave every other repo running. There is no shared
   fallback to inherit by accident.
 
+## Running agents
+
+`agents/<name>/<script>` holds reusable adapters, shipped like `providers/` and
+equally invisible to the engine — nothing in Go references the directory. A
+source's script is one `exec` line choosing the agent; the prompt, tools, model
+and turn limit come from the source's `env:`. The adapter prepends the item to
+the prompt and appends the blocked convention, so prompts stay portable and
+every agent signals "needs a human" identically.
+
 ## The extension seam
 
 The extension is the scripts, never the engine. A stage names one; the source
