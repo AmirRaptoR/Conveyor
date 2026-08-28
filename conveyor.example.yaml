@@ -1,0 +1,78 @@
+# conveyor — example configuration
+#
+# The engine knows nothing about GitHub, git or AI. Everything provider-specific
+# lives in the scripts referenced below. See docs/CONTRACTS.md.
+
+version: 1
+
+concurrency:
+  perSource: 1        # one item in flight per source. See CONTRACTS.md §5.
+  global: 1           # v1 ships 1; raise to run sources in parallel.
+
+poll: 5m              # how often to re-list every source
+timeout: 90m          # default per-script timeout; stages may override
+
+logs:
+  retention: 30d      # runs older than this are swept
+  sweepAt: "04:00"    # daily, and once on startup
+                      # A run is PINNED and never swept while it is the most
+                      # recent failed/blocked run of an item still in that state:
+                      # retention must not delete the evidence for the thing
+                      # currently asking for attention.
+
+# ---------------------------------------------------------------------------
+# Stages. Minimum two. Order defines the board's columns, left to right, and the
+# default "next stage" on success.
+# ---------------------------------------------------------------------------
+stages:
+  - name: backlog
+    # No onEnter: nothing runs. Items land here and wait.
+
+  - name: refining
+    onEnter: ./stages/mock/refine.sh
+    timeout: 30m
+    onSuccess: ready          # explicit; would default to the next stage anyway
+    onFailure: backlog        # a failed refine returns it to the pile
+
+  - name: ready
+    # --- reserved for v2, inert in v1 ---
+    # v1 is a pipeline: items advance automatically and there is no dragging.
+    # These keys are read and validated now so the schema does not change later.
+    manual: false             # v2: engine never auto-advances OUT of this stage
+    allowManual: true         # v2: may a human move a card INTO this stage?
+                              # Some stages must never be entered by hand.
+
+  - name: in-progress
+    onEnter: ./stages/mock/implement.sh
+    onSuccess: done
+    onFailure: blocked
+    maxAttempts: 2            # after this many failures, force to onBlocked
+
+  - name: done
+    terminal: true            # no further transitions
+
+  - name: blocked
+    terminal: true            # needs a human; the board is how they see it
+
+# ---------------------------------------------------------------------------
+# Sources. Only what is listed here is ever scanned — there is no directory
+# auto-discovery. Adding a repo is adding an entry.
+# ---------------------------------------------------------------------------
+sources:
+  - name: mock
+    workdir: .
+    list: ./sources/mock/list.sh
+    move: ./sources/mock/move.sh
+
+  # - name: midgame
+  #   workdir: ~/codes/midgame
+  #   list: ./sources/github/list.sh
+  #   move: ./sources/github/move.sh
+  #   env:
+  #     REPO: RaptoR-Soft/midgame
+  #     # The source owns the provider<->stage mapping. The engine never sees it.
+  #     STAGE_LABELS: |
+  #       refining=status:refining
+  #       ready=status:ready
+  #       in-progress=status:in-progress
+  #       blocked=status:blocked

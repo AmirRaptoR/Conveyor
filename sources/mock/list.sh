@@ -2,7 +2,7 @@
 # Mock source: five items in a file, so the engine can be exercised with no
 # provider at all. State lives in $STORE; move.sh writes it, this reads it.
 set -euo pipefail
-STORE="${MOCK_STORE:-/tmp/agent-team-mock.json}"
+STORE="${MOCK_STORE:-/tmp/conveyor-mock.json}"
 
 if [[ ! -f "$STORE" ]]; then
   cat > "$STORE" <<'SEED'
@@ -30,4 +30,4 @@ SEED
 fi
 
 echo "listing mock items from $STORE" >&2
-cp "$STORE" "$AGENT_TEAM_RESULT"
+cp "$STORE" "$CONVEYOR_RESULT"

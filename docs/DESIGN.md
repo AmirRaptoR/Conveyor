@@ -2,7 +2,7 @@
 
 ## Thesis
 
-Most tools in this space give an AI agent a goal and hope. **agent-team inverts
+Most tools in this space give an AI agent a goal and hope. **conveyor inverts
 that: the pipeline is deterministic and human-authored; the AI is a worker inside
 one stage.** A stage either exits 0 or it does not. The engine moves the card and
 writes the provider state — never the model.
@@ -31,7 +31,7 @@ developed against them.
 An AI stage script writes megabytes of prose to stdout. Parsing structured data
 out of that stream is the single most likely way this system breaks. So:
 stdout/stderr are **logs, never parsed**; structured output goes to the file at
-`$AGENT_TEAM_RESULT`. One rule, no exceptions, applies to every script kind.
+`$CONVEYOR_RESULT`. One rule, no exceptions, applies to every script kind.
 
 ## Why the engine owns provider writes
 
@@ -85,7 +85,7 @@ Single static binary with the UI embedded — the distribution story is `curl | 
 not "install node and python".
 
 ```
-cmd/agent-team/         main, flags, serve|run|validate
+cmd/conveyor/         main, flags, serve|run|validate
 internal/config/        yaml load, defaults, validation (stage graph, cycles)
 internal/model/         Item, Stage, Source, Run — the shapes in CONTRACTS.md
 internal/source/        list + move invocation, item validation and dedupe

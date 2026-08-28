@@ -1,4 +1,4 @@
-module github.com/AmirRaptoR/agent-team
+module github.com/AmirRaptoR/Conveyor
 
 go 1.27.0
 

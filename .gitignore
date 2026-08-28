@@ -11,6 +11,6 @@ node_modules/
 /data/
 /tmp/
 
-# The working config; agent-team.example.yaml is the tracked template.
-/agent-team.yaml
-/agent-team
+# The working config; conveyor.example.yaml is the tracked template.
+/conveyor.yaml
+/conveyor

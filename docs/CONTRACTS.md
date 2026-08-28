@@ -54,14 +54,14 @@ author learns it once.
 | | |
 | --- | --- |
 | `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "config": {...}}`. For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "config": {...}}` |
-| env | `AGENT_TEAM_RESULT` (path to write structured output), `AGENT_TEAM_WORKDIR`, `AGENT_TEAM_SOURCE`, `AGENT_TEAM_STAGE`, `AGENT_TEAM_ITEM_ID`, `AGENT_TEAM_ITEM_REF`, plus everything in the source's `env:` block |
+| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, plus everything in the source's `env:` block |
 
 **Output** is split deliberately:
 
 | Channel | Carries |
 | --- | --- |
 | `stdout` + `stderr` | **Logs only.** Streamed live to the UI, line by line, interleaved in order. Never parsed. |
-| `$AGENT_TEAM_RESULT` | **Structured data only.** A JSON file the script writes. Absent means "no data". |
+| `$CONVEYOR_RESULT` | **Structured data only.** A JSON file the script writes. Absent means "no data". |
 
 Logs and data are separated because an AI agent writes megabytes of prose to
 stdout. Parsing data out of that is how this kind of system breaks. If a script
@@ -80,7 +80,7 @@ writes nothing to the result file, it simply produced no data.
 ## 3. The three script kinds
 
 **`list`** — read items from a provider. Writes a JSON array of items to
-`$AGENT_TEAM_RESULT`. Exit 0 with `[]` means an empty backlog, which is normal.
+`$CONVEYOR_RESULT`. Exit 0 with `[]` means an empty backlog, which is normal.
 
 **`move`** — write a stage change back to the provider (set a label, move a card,
 update a field). Called by the **engine**, never by a stage script: the engine
@@ -134,7 +134,7 @@ data/runs/<yyyy-mm-dd>/<run-id>/
                  started/finished, duration, the env the script was given
   stdin.json     exactly what was piped in
   log.txt        stdout and stderr interleaved in real order, each line stamped
-  result.json    whatever the script wrote to $AGENT_TEAM_RESULT (may be absent)
+  result.json    whatever the script wrote to $CONVEYOR_RESULT (may be absent)
 ```
 
 Self-contained is the point: a failed run can be `tar`'d and handed to someone

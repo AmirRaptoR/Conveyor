@@ -8,9 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/AmirRaptoR/agent-team/internal/config"
-	"github.com/AmirRaptoR/agent-team/internal/model"
-	"github.com/AmirRaptoR/agent-team/internal/runner"
+	"github.com/AmirRaptoR/Conveyor/internal/config"
+	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/runner"
 )
 
 // Warning is a non-fatal problem with one item. A bad item is skipped and

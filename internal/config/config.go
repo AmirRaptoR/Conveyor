@@ -1,4 +1,4 @@
-// Package config loads and validates agent-team.yaml. Validation is strict and
+// Package config loads and validates conveyor.yaml. Validation is strict and
 // happens once at startup: a stage graph that cannot terminate, or a script that
 // does not exist, is a configuration bug and should never become a runtime
 // surprise halfway through a pipeline.

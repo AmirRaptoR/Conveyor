@@ -3,7 +3,7 @@
 // Two rules from docs/CONTRACTS.md shape this package:
 //
 //   - stdout and stderr are LOGS and are never parsed. Structured data comes
-//     back only through the file at $AGENT_TEAM_RESULT. An AI stage script
+//     back only through the file at $CONVEYOR_RESULT. An AI stage script
 //     writes megabytes of prose to stdout; treating that as a data channel is
 //     how this system would break.
 //   - a run is a self-contained directory, so a failure can be handed to
@@ -24,7 +24,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/AmirRaptoR/agent-team/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/model"
 )
 
 // LogLine is one line of script output, stamped and tagged with its stream.
@@ -51,7 +51,7 @@ type Spec struct {
 // Result is a finished run plus whatever the script wrote to the result file.
 type Result struct {
 	Run model.Run
-	// Data is the parsed $AGENT_TEAM_RESULT file; nil when the script wrote
+	// Data is the parsed $CONVEYOR_RESULT file; nil when the script wrote
 	// nothing, which is not an error.
 	Data json.RawMessage
 	Log  []LogLine
@@ -253,14 +253,14 @@ func trimNewline(s string) string {
 
 func buildEnv(spec Spec, resultPath string) ([]string, map[string]string) {
 	own := map[string]string{
-		"AGENT_TEAM_RESULT":  resultPath,
-		"AGENT_TEAM_WORKDIR": spec.Workdir,
-		"AGENT_TEAM_SOURCE":  spec.Source,
-		"AGENT_TEAM_STAGE":   spec.To,
+		"CONVEYOR_RESULT":  resultPath,
+		"CONVEYOR_WORKDIR": spec.Workdir,
+		"CONVEYOR_SOURCE":  spec.Source,
+		"CONVEYOR_STAGE":   spec.To,
 	}
 	if spec.Item != nil {
-		own["AGENT_TEAM_ITEM_ID"] = spec.Item.ID
-		own["AGENT_TEAM_ITEM_REF"] = spec.Item.Ref
+		own["CONVEYOR_ITEM_ID"] = spec.Item.ID
+		own["CONVEYOR_ITEM_REF"] = spec.Item.Ref
 	}
 	for k, v := range spec.Env {
 		own[k] = v

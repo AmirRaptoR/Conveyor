@@ -2,7 +2,7 @@
 # Mock provider write: record the new stage. A real adapter would set a label,
 # move a card, or update a work-item field here.
 set -euo pipefail
-STORE="${MOCK_STORE:-/tmp/agent-team-mock.json}"
+STORE="${MOCK_STORE:-/tmp/conveyor-mock.json}"
 payload=$(cat)
 id=$(jq -r '.item.id' <<<"$payload")
 to=$(jq -r '.stage'   <<<"$payload")

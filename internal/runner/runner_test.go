@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AmirRaptoR/agent-team/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/model"
 )
 
 func script(t *testing.T, body string) string {
@@ -51,7 +51,7 @@ func TestExitCodesMapToOutcomes(t *testing.T) {
 }
 
 // Logs must never be parsed as data: a script that prints JSON to stdout but
-// writes nothing to $AGENT_TEAM_RESULT has produced no data at all.
+// writes nothing to $CONVEYOR_RESULT has produced no data at all.
 func TestStdoutIsNeverData(t *testing.T) {
 	res := run(t, `echo '{"pr": 999}'`, time.Minute)
 	if res.Data != nil {
@@ -63,14 +63,14 @@ func TestStdoutIsNeverData(t *testing.T) {
 }
 
 func TestResultFileIsData(t *testing.T) {
-	res := run(t, `echo noise; echo '{"ok":true}' > "$AGENT_TEAM_RESULT"`, time.Minute)
+	res := run(t, `echo noise; echo '{"ok":true}' > "$CONVEYOR_RESULT"`, time.Minute)
 	if res.Data == nil || !strings.Contains(string(res.Data), "true") {
 		t.Fatalf("result file not captured: %s", res.Data)
 	}
 }
 
 func TestMalformedResultIsIgnoredNotFatal(t *testing.T) {
-	res := run(t, `echo 'not json' > "$AGENT_TEAM_RESULT"; exit 0`, time.Minute)
+	res := run(t, `echo 'not json' > "$CONVEYOR_RESULT"; exit 0`, time.Minute)
 	if res.Run.Outcome != model.OutcomeSuccess {
 		t.Errorf("outcome changed by bad result file: %s", res.Run.Outcome)
 	}
@@ -107,7 +107,7 @@ func TestTimeoutKillsProcessGroup(t *testing.T) {
 func TestRunDirectoryIsSelfContained(t *testing.T) {
 	r := New(t.TempDir())
 	res, err := r.Run(context.Background(), Spec{
-		Script: script(t, `echo hi; echo '{"a":1}' > "$AGENT_TEAM_RESULT"`),
+		Script: script(t, `echo hi; echo '{"a":1}' > "$CONVEYOR_RESULT"`),
 		Kind:   "stage", Workdir: t.TempDir(), Timeout: time.Minute, Source: "test",
 		Item:  &model.Item{ID: "x:1", Ref: "1"},
 		Stdin: map[string]string{"hello": "world"},

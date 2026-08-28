@@ -11,10 +11,10 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/AmirRaptoR/agent-team/internal/config"
-	"github.com/AmirRaptoR/agent-team/internal/model"
-	"github.com/AmirRaptoR/agent-team/internal/runner"
-	"github.com/AmirRaptoR/agent-team/internal/source"
+	"github.com/AmirRaptoR/Conveyor/internal/config"
+	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/runner"
+	"github.com/AmirRaptoR/Conveyor/internal/source"
 )
 
 // Locks enforces concurrency. perSource is 1 and not configurable above it: a

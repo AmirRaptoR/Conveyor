@@ -1,4 +1,4 @@
-// Command agent-team runs a configurable pipeline of scripts over items pulled
+// Command conveyor runs a configurable pipeline of scripts over items pulled
 // from configurable sources. See docs/CONTRACTS.md.
 package main
 
@@ -14,11 +14,11 @@ import (
 	"syscall"
 	"text/tabwriter"
 
-	"github.com/AmirRaptoR/agent-team/internal/config"
-	"github.com/AmirRaptoR/agent-team/internal/model"
-	"github.com/AmirRaptoR/agent-team/internal/pipeline"
-	"github.com/AmirRaptoR/agent-team/internal/runner"
-	"github.com/AmirRaptoR/agent-team/internal/source"
+	"github.com/AmirRaptoR/Conveyor/internal/config"
+	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
+	"github.com/AmirRaptoR/Conveyor/internal/runner"
+	"github.com/AmirRaptoR/Conveyor/internal/source"
 )
 
 func main() {
@@ -51,17 +51,17 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `agent-team — run a configurable pipeline over items from configurable sources
+	fmt.Fprint(os.Stderr, `conveyor — run a configurable pipeline over items from configurable sources
 
   validate                              load and check the config
   list      [-source NAME]              run list scripts, print items
   run       -source N -item ID -stage S move one item into a stage and run it
   tick      [-source NAME] [-n N]       one scheduling pass: pick and advance
   
-Common flags: -c <config> (default agent-team.yaml), -v stream logs
+Common flags: -c <config> (default conveyor.yaml), -v stream logs
 
 Scripts follow docs/CONTRACTS.md: logs on stdout/stderr, structured data to
-$AGENT_TEAM_RESULT, exit 0 success / 10 no-op / 20 blocked / other failure.
+$CONVEYOR_RESULT, exit 0 success / 10 no-op / 20 blocked / other failure.
 `)
 }
 
@@ -75,7 +75,7 @@ func newFlags(name string) *common {
 	f := flag.NewFlagSet(name, flag.ExitOnError)
 	return &common{
 		fs:      f,
-		cfgPath: f.String("c", "agent-team.yaml", "path to config"),
+		cfgPath: f.String("c", "conveyor.yaml", "path to config"),
 		verbose: f.Bool("v", false, "stream script logs to stdout"),
 	}
 }

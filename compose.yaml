@@ -1,8 +1,8 @@
 services:
-  agent-team:
+  conveyor:
     build: .
-    image: agent-team:local
-    container_name: agent-team
+    image: conveyor:local
+    container_name: conveyor
     # The point of the container: the daemon brings it back after a crash or reboot.
     restart: unless-stopped
     init: true
