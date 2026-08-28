@@ -8,8 +8,9 @@
 # Everything that varies is configuration, read from the environment the engine
 # assembled out of the source's env: block:
 #
-#   PROMPT           what to do. Required. The item is prepended for you, so
-#                    this is instructions only — no need to interpolate ids.
+#   PROMPT           what to do. Required. Either plain instructions, with the
+#                    item prepended for you, or a slash command such as
+#                    "/refine $REF", which leads the message as commands must.
 #   ALLOWED_TOOLS    --allowedTools (default: read-only plus gh via Bash)
 #   MODEL            --model (default: whatever the CLI is configured with)
 #   MAX_TURNS        --max-turns (default 40)
@@ -29,17 +30,32 @@ url=$(jq -r '.item.url // ""' <<<"$payload")
 
 echo "refining $CONVEYOR_SOURCE #$ref — $title"
 
-# The item is prepended rather than templated into PROMPT: no substitution
-# language to learn, nothing to escape, and a prompt written for one repo reads
-# the same in every other.
-full="Item #${ref}${REPO:+ in $REPO}: ${title}
+# A prompt beginning with "/" is a slash command and must lead the message, so
+# the item context follows it instead of preceding it. $REF is expanded either
+# way — it is the one substitution this adapter makes, because a command needs
+# the issue number as its argument.
+task=${PROMPT//\$REF/$ref}
+
+if [[ "$task" == /* ]]; then
+	full="${task}
+
+--- the item, as the pipeline sees it ---
+Item #${ref}${REPO:+ in $REPO}: ${title}
+${url}
+${body}
+--- end item ---"
+else
+	full="Item #${ref}${REPO:+ in $REPO}: ${title}
 ${url}
 
 --- item body ---
 ${body}
 --- end item body ---
 
-${PROMPT}
+${task}"
+fi
+
+full="${full}
 
 If this cannot be done because it needs a decision only a human can make, change
 nothing and write {\"blocked\": true, \"reason\": \"<the decision needed>\"} to

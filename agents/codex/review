@@ -33,10 +33,18 @@ printf '%s\n' "$out"
 
 [[ $rc -ne 0 ]] && exit $rc
 
-# A review wanting changes is not a failure of this stage — it is a fact that
-# needs a human, so it parks in blocked rather than retrying forever.
+# Exit codes are the routing, so they have to mean the right things here:
+#
+#   0   approved            -> onSuccess, normally done
+#   1   changes requested   -> onFailure, normally back to implementation. The
+#                              engine counts these, and maxAttempts forces the
+#                              item to onBlocked once the loop has run enough.
+#   20  cannot review       -> onBlocked, a human. Not a verdict on the code.
+#
+# Changes-requested must NOT be 20: blocked clears the attempt counter and goes
+# straight to a human, so the rework loop would never happen.
 if grep -q 'CHANGES_REQUESTED' <<<"$out"; then
 	echo "review requested changes on PR #$pr" >&2
-	exit 20
+	exit 1
 fi
 exit 0

@@ -2,7 +2,9 @@
 # Implement an item with Claude Code, headless, and open a pull request.
 #
 # Config (source env: + this script's params:):
-#   PROMPT           what to do. Required. The item is prepended for you.
+#   PROMPT           what to do. Required. Plain instructions, or a slash
+#                    command such as "/implement $REF auto" — a command leads
+#                    the message, so the item context follows it.
 #   ALLOWED_TOOLS    --allowedTools (default: read/write plus gh via Bash)
 #   MODEL, MAX_TURNS, PERMISSION_MODE
 #   REPO             owner/name, for the pull-request check
@@ -29,18 +31,56 @@ else
 	echo "no upstream for $(git branch --show-current); skipping pull" >&2
 fi
 
+# An open PR for this item means review sent it back. Say so, or the agent
+# starts again from scratch and throws away the work being corrected.
+rework=""
+if [[ -n "${REPO:-}" ]]; then
+	existing=$(gh pr list --repo "$REPO" --state open --search "$ref" --json number --jq '.[0].number' 2>/dev/null)
+	if [[ -n "$existing" ]]; then
+		echo "PR #$existing exists — this is a rework pass"
+		rework="
+This item already has pull request #${existing}, which a reviewer sent back.
+Read the review first:
+  gh pr view ${existing} --repo ${REPO} --comments
+Address that feedback on the existing branch and push to the same PR. Do not
+open a second one, and do not restart the work from scratch."
+	fi
+fi
+
 echo "implementing $CONVEYOR_SOURCE #$ref — $title"
 
-full="Item #${ref}${REPO:+ in $REPO}: ${title}
+# A prompt beginning with "/" is a slash command and must lead the message, so
+# the item context follows it instead of preceding it. $REF is expanded either
+# way — it is the one substitution this adapter makes, because a command needs
+# the issue number as its argument.
+task=${PROMPT//\$REF/$ref}
+
+if [[ "$task" == /* ]]; then
+	full="${task}
+
+--- the item, as the pipeline sees it ---
+Item #${ref}${REPO:+ in $REPO}: ${title}
+${url}
+${body}
+--- end item ---
+${rework}"
+else
+	full="Item #${ref}${REPO:+ in $REPO}: ${title}
+${url}
 
 --- item body ---
 ${body}
 --- end item body ---
 
-${PROMPT}
+${task}
+${rework}"
+fi
 
-If this cannot be done as written, change nothing and write
-{\"blocked\": true, \"reason\": \"<why>\"} to the file at ${CONVEYOR_RESULT}."
+full="${full}
+
+If this cannot be done because it needs a decision only a human can make, change
+nothing and write {\"blocked\": true, \"reason\": \"<the decision needed>\"} to
+the file at ${CONVEYOR_RESULT}."
 
 set +e
 claude -p "$full" \

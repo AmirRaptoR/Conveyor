@@ -66,8 +66,13 @@ func (l *Locks) Release(src string) {
 	}
 }
 
-// Attempts counts consecutive failures per item so maxAttempts can force a
-// blocked item out of a retry loop.
+// Attempts counts consecutive failures per item AND stage so maxAttempts can
+// force an item out of a retry loop.
+//
+// Per stage, not per item: stages can form a cycle — a review that sends work
+// back to be reimplemented — and the implementing stage succeeds on every pass
+// round. Counting per item alone let that success clear the reviewing stage's
+// tally, so the loop could never reach its limit and would run forever.
 type Attempts struct {
 	mu sync.Mutex
 	n  map[string]int
@@ -230,21 +235,22 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 // that keeps failing must eventually stop being retried, or the scheduler will
 // hand it the same item on every poll forever.
 func (e *Engine) route(s *config.Stage, o model.Outcome, itemID string, tr *Transition) string {
+	key := itemID + "\x00" + s.Name
 	switch o {
 	case model.OutcomeSuccess:
-		e.attempts.Clear(itemID)
+		e.attempts.Clear(key)
 		return s.OnSuccess
 	case model.OutcomeNoop:
-		e.attempts.Clear(itemID)
+		e.attempts.Clear(key)
 		return ""
 	case model.OutcomeBlocked:
-		e.attempts.Clear(itemID)
+		e.attempts.Clear(key)
 		return s.OnBlocked
 	default: // failure, timeout
-		n := e.attempts.Bump(itemID)
+		n := e.attempts.Bump(key)
 		tr.Attempts = n
 		if s.MaxAttempts > 0 && n >= s.MaxAttempts {
-			e.attempts.Clear(itemID)
+			e.attempts.Clear(key)
 			if s.OnBlocked != "" {
 				return s.OnBlocked
 			}
