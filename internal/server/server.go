@@ -68,6 +68,10 @@ type Server struct {
 	cfg *config.Config
 	run *runner.Runner
 	eng *pipeline.Engine
+	// ctx is the server's own lifetime. Work started from a request outlives
+	// the request — a transition takes an hour and the response is immediate —
+	// so it must not hang off r.Context(), which is cancelled at the reply.
+	ctx context.Context
 
 	mu    sync.RWMutex
 	state State
@@ -76,6 +80,14 @@ type Server struct {
 	order  *store.Order
 	active sync.Map      // itemID -> Active, one entry per transition in flight
 	tick   chan struct{} // one buffered slot: ticks never queue up
+	// wake asks the scheduler to look again. One buffered slot, because the
+	// question is always the same one — what can move now — and a queue of it
+	// would be a queue of duplicates.
+	wake     chan struct{}
+	inFlight atomic.Int64
+	// polling guards discovery against itself: the ticker and the button both
+	// ask for it, and running every list script twice at once buys nothing.
+	polling atomic.Bool
 }
 
 func New(cfg *config.Config, r *runner.Runner) *Server {
@@ -86,6 +98,8 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 		hub:   newHub(),
 		order: store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
 		tick:  make(chan struct{}, 1),
+		wake:  make(chan struct{}, 1),
+		ctx:   context.Background(),
 	}
 	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
 
@@ -120,7 +134,15 @@ func sourceViews(c *config.Config) []SourceView {
 // Run serves until ctx is done. auto drives the pipeline; without it the server
 // only ever reads.
 func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
-	go s.poll(ctx, auto)
+	s.ctx = ctx
+	// Three loops, and they are separate on purpose. Discovery must keep its
+	// interval while a 90-minute stage runs, so nothing that waits for work to
+	// finish may share a goroutine with it.
+	go s.poll(ctx)
+	go s.button(ctx, auto)
+	if auto {
+		go s.schedule(ctx)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", s.handleState)
@@ -156,32 +178,113 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	return nil
 }
 
-// poll re-lists every source on the configured interval and, when running
-// automatically, drains what it finds.
-func (s *Server) poll(ctx context.Context, auto bool) {
+// poll re-lists every source on the configured interval, and does nothing
+// else.
+//
+// Discovery is the only thing that finds new work, so it must not be able to
+// wait behind it. Draining used to run on this goroutine and returned only when
+// the pipeline was at rest: a 90-minute implement was a 90-minute blackout in
+// which no source was listed at all, and an issue opened in another repository
+// was not deprioritised but simply unseen.
+func (s *Server) poll(ctx context.Context) {
 	s.refresh(ctx)
-	if auto {
-		s.drain(ctx)
-	}
 	t := time.NewTicker(s.cfg.Poll.D())
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-s.tick: // the button, which works whether or not auto is on
-			s.advance(ctx)
-			s.refresh(ctx)
 		case <-t.C:
 			s.refresh(ctx)
-			if auto {
-				s.drain(ctx)
-			}
 		}
 	}
 }
 
+// button serves the tick control. In a running pipeline it means "look now", so
+// it wakes the scheduler; when watching, it is the only thing that ever moves
+// an item, so it performs the transition itself.
+//
+// Its own goroutine, for the same reason as everything else here: an advance
+// takes as long as a stage does, and the poll must not be behind it.
+func (s *Server) button(ctx context.Context, auto bool) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.tick:
+			if auto {
+				s.wakeUp()
+				continue
+			}
+			s.advance(ctx)
+			s.refresh(ctx)
+		}
+	}
+}
+
+// wakeUp asks the scheduler for another pass. Never blocks: a full slot already
+// carries the same question.
+func (s *Server) wakeUp() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// schedule launches everything the locks permit and then sleeps until something
+// could have changed — a transition finished, a listing arrived, the button was
+// pressed. It never waits for the pipeline to be at rest, which is what let a
+// long stage own the loop.
+//
+// One goroutine, so every launch decision is serialised: a concurrent refresh
+// cannot make two passes decide the same transition, and the slot is still
+// claimed before anything starts.
+func (s *Server) schedule(ctx context.Context) {
+	// since counts transitions launched since the pipeline was last at rest.
+	// The bound is a circuit breaker, not a budget: items are finite and
+	// terminal stages end the walk, so exceeding it means the stage graph
+	// loops. That is a configuration error, and spinning on it silently would
+	// burn an agent's turns until someone noticed.
+	since, stalled := 0, false
+	for {
+		n := 0
+		if !stalled {
+			n = s.launch(ctx)
+			since += n
+		}
+		switch {
+		case n == 0 && s.inFlight.Load() == 0:
+			// Nothing launchable and nothing running: the walk is over, and the
+			// next one starts its count from zero.
+			since, stalled = 0, false
+		case !stalled && since > s.walkLimit():
+			stalled = true
+			fmt.Fprintln(os.Stderr, "conveyor: launched more transitions than there are items; the stage graph may loop")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.wake:
+		}
+	}
+}
+
+// walkLimit is how many transitions one walk of the board can reasonably take.
+func (s *Server) walkLimit() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return 2*len(s.state.Items) + 1
+}
+
 func (s *Server) refresh(ctx context.Context) {
+	if !s.polling.CompareAndSwap(false, true) {
+		return // one is already running; a second would re-run every list script
+	}
+	defer s.polling.Store(false)
+	// A listing is the other thing that can make work launchable, so the
+	// scheduler is told about it the moment it lands.
+	defer s.wakeUp()
+
 	var items []model.Item
 	var warnings []string
 
@@ -220,52 +323,10 @@ func (s *Server) refresh(ctx context.Context) {
 	s.hub.publish(event{Kind: "state"})
 }
 
-// drain advances until nothing can move, running as much at once as the locks
-// allow. One item per stage by default, one per source always, capped globally.
-//
-// The bound is a circuit breaker, not a budget: items are finite and terminal
-// stages end the walk, so reaching it means the stage graph loops. That is a
-// configuration error, and spinning on it silently would burn an agent's turns
-// until someone noticed.
-func (s *Server) drain(ctx context.Context) {
-	s.mu.RLock()
-	limit := 2*len(s.state.Items) + 1
-	s.mu.RUnlock()
-
-	var wg sync.WaitGroup
-	var inFlight atomic.Int64
-	finished := make(chan struct{}, 64)
-
-	for started := 0; started < limit; {
-		n := s.launch(ctx, &wg, &inFlight, finished)
-		started += n
-		if n > 0 {
-			continue // a slot may still be free; fill it before waiting
-		}
-		// Nothing launchable. If nothing is running either, the pipeline is at
-		// rest — checked after the launch attempt, so a slot freed mid-pass is
-		// retried rather than mistaken for the end of the work.
-		if inFlight.Load() == 0 {
-			wg.Wait()
-			s.hub.publish(event{Kind: "state"})
-			return
-		}
-		select {
-		case <-finished:
-		case <-ctx.Done():
-			wg.Wait()
-			return
-		}
-	}
-	wg.Wait()
-	fmt.Fprintln(os.Stderr, "conveyor: drain hit its limit; the stage graph may loop")
-	s.hub.publish(event{Kind: "state"})
-}
-
 // launch starts every transition the locks currently permit and returns how
 // many it started. Candidates whose source or target stage is already busy are
 // skipped rather than queued, so a slow stage never holds up a free one.
-func (s *Server) launch(ctx context.Context, wg *sync.WaitGroup, inFlight *atomic.Int64, finished chan struct{}) int {
+func (s *Server) launch(ctx context.Context) int {
 	s.mu.RLock()
 	items := append([]model.Item(nil), s.state.Items...)
 	s.mu.RUnlock()
@@ -303,20 +364,23 @@ func (s *Server) launch(ctx context.Context, wg *sync.WaitGroup, inFlight *atomi
 		claimedStage[target] = true
 
 		it, to := *item, target
-		wg.Add(1)
-		inFlight.Add(1)
+		s.inFlight.Add(1)
 		n++
-		go func() {
-			defer wg.Done()
-			defer inFlight.Add(-1)
-			defer s.eng.Locks().Release(it.Source, to)
-			s.runOne(ctx, it, to)
-			select {
-			case finished <- struct{}{}:
-			default:
-			}
-		}()
+		go s.transition(ctx, it, to)
 	}
+}
+
+// transition runs one launched transition and gives its slot back.
+//
+// The order of the three finishing steps is the whole of it: the lock goes
+// first, the count second, and only then is the scheduler woken. Waking it
+// while the slot is still held would have it find the source busy and go back
+// to sleep, and the release that followed would wake nothing.
+func (s *Server) transition(ctx context.Context, item model.Item, target string) {
+	defer s.wakeUp()
+	defer s.inFlight.Add(-1)
+	defer s.eng.Locks().Release(item.Source, target)
+	s.runOne(ctx, item, target)
 }
 
 // runOne performs one transition and keeps the board honest about it.
@@ -399,7 +463,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
-	go s.refresh(context.Background())
+	go s.refresh(s.ctx)
 	w.WriteHeader(http.StatusAccepted)
 }
 
