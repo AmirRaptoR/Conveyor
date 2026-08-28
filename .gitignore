@@ -1,0 +1,12 @@
+node_modules/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Local runtime state — the reports store lives outside the repo on purpose
+# (see docs/decisions): an agent that can run `git clean -xdf` must not be able
+# to erase its own audit trail.
+/data/
+/tmp/

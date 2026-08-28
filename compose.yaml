@@ -1,0 +1,29 @@
+services:
+  agent-team:
+    build: .
+    image: agent-team:local
+    container_name: agent-team
+    # The point of the container: the daemon brings it back after a crash or reboot.
+    restart: unless-stopped
+    init: true
+    # Loopback-only on the host, exactly as the bare-metal server bound itself.
+    ports:
+      - "127.0.0.1:7788:7788"
+    volumes:
+      # The only folder the app needs. Writes belong to reports.py, so mount it read-only.
+      - ${SHIP_REPORTS_HOST_ROOT:-${HOME}/codes/reports}:/reports:ro
+    environment:
+      SHIP_REPORTS_ROOT: /reports
+      SHIP_REPORTS_HOST: 0.0.0.0
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

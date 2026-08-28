@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Team</title>
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚢</text></svg>">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Agent Team</span>
+    </div>
+    <div class="totals" id="totals"></div>
+    <div class="conn" id="conn" title="live connection">
+      <span class="conn-dot"></span><span class="conn-label">connecting</span>
+    </div>
+  </div>
+  <nav class="projnav" id="projnav"></nav>
+</header>
+
+<main id="app" class="app">
+  <div class="boot">Loading reports…</div>
+</main>
+
+<footer class="foot">
+  <span id="foot-root"></span>
+  <span id="foot-time"></span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

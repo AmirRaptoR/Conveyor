@@ -1,0 +1,8 @@
+.git
+*.log
+node_modules
+Dockerfile
+compose.yaml
+.dockerignore
+README.md
+start.sh
