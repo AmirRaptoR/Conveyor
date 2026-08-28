@@ -143,7 +143,13 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	if !auto {
 		mode = "watching only: -watch is set, nothing will advance"
 	}
-	fmt.Printf("conveyor: http://localhost%s\n  %s\n", addr, mode)
+	// ":8080" means every interface, so name a host you can actually open;
+	// "127.0.0.1:8090" already names one and must not have a second glued on.
+	shown := addr
+	if strings.HasPrefix(addr, ":") {
+		shown = "localhost" + addr
+	}
+	fmt.Printf("conveyor: http://%s\n  %s\n", shown, mode)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
