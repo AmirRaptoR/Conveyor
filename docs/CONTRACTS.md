@@ -87,7 +87,7 @@ update a field). Called by the **engine**, never by a stage script: the engine
 owns provider state so a crashed stage script cannot leave it inconsistent.
 Receives `{"item":…, "stage": "<target>", "from": "<current>"}`.
 
-**stage script** (`conveyor.d/<source>/<script>`, beside the config) — do the actual work
+**stage script** (whatever the source declares for that name) — do the actual work
 of a stage. Run an AI agent, run
 tests, deploy, cut a release. This is the extension point; everything else is
 plumbing.

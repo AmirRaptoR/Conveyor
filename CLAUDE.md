@@ -45,12 +45,12 @@ Not built yet, in build order (see `docs/DESIGN.md`):
   `move` separately allowed pairing GitHub's list with Azure's move, which
   nothing downstream could detect.
 - **A stage says only `script:`, a name.** Not a path, not a command, and
-  nothing about how to run it. Every source provides that name in
-  `conveyor.d/<source>/` beside the config — never inside the repo being worked,
-  where an agent told to "commit and push" would sweep it into a PR. Scripts
-  still run in the source's workdir, so repo-local skills resolve. A named
-  script in config is what the scheduler needs: a stage with none is a queue, a
-  running stage found mid-flight is an interrupted job to re-run.
+  nothing about how to run it. Each source declares what that name is, in its
+  own `scripts:` block — never inside the repo being worked, where an agent told
+  to "commit and push" would sweep it into a PR. Scripts still run in the
+  source's workdir, so repo-local skills resolve. A named script in config is
+  what the scheduler needs: a stage with none is a queue, a running stage found
+  mid-flight is an interrupted job to re-run.
 - **How the work happens is never in the config.** Which agent, which model,
   which tools, all of it lives in the source's script, because it differs per
   repository. Resist every request to add a key for it.
@@ -60,12 +60,11 @@ Not built yet, in build order (see `docs/DESIGN.md`):
 
 ## Running agents
 
-`agents/<name>/<script>` holds reusable adapters, shipped like `providers/` and
-equally invisible to the engine — nothing in Go references the directory. A
-source's script is one `exec` line choosing the agent; the prompt, tools, model
-and turn limit come from the source's `env:`. The adapter prepends the item to
-the prompt and appends the blocked convention, so prompts stay portable and
-every agent signals "needs a human" identically.
+`agents/<name>/<script>` holds reusable adapters, resolved by `agent:` exactly
+as `provider:` resolves under `providers/`. The prompt, tools, model and turn
+limit are that script's `params:`. The adapter prepends the item to the prompt
+and appends the blocked convention, so prompts stay portable and every agent
+signals "needs a human" identically.
 
 ## The extension seam
 
@@ -73,13 +72,14 @@ The extension is the scripts, never the engine. A stage names one; the source
 provides it; how it works is that file's business. `run:` takes an inline body
 for a stage that is identical everywhere, and must carry a shebang.
 
-Configuration the engine passes but never reads is the source's `env:` — that
-is the only place a value is opaque. Everything else in the schema is structure.
+Configuration the engine passes but never reads: the source's `env:` (what it
+is — reaches list and move too) and a script's `params:` (what that script
+needs, winning on conflict). Params are per-script because two stages both want
+a PROMPT. Everything else in the schema is structure.
 
-Deliberately not built: stage-level `env:` (settings that differ per repo belong
-in that repo's script, not in the shared state machine), `args:` for scripts (env
-carries it and reads better), and per-source stage overrides (a merge in Go to
-express what one file per source already expresses).
+Deliberately not built: stage-level `env:` (settings that differ per source
+belong to that source), and `args:` for scripts (env carries it and reads
+better).
 
 ## Gotchas
 
@@ -87,9 +87,9 @@ express what one file per source already expresses).
 - Paths in the config resolve against the **config file's directory**. A working
   config kept outside the checkout must therefore set `providers:` to point back
   at `providers/` here.
-- The working config for this machine is `~/codes/conveyor.yaml` with its
-  scripts in `~/codes/conveyor.d/<source>/`, outside the repo: machine state,
-  not project source. `conveyor.example.yaml` is the template that ships.
+- The working config for this machine is `~/codes/conveyor.yaml`, outside the
+  repo: machine state, not project source. It sets `providers:` and `agents:`
+  back at the checkout. `conveyor.example.yaml` is the template that ships.
 - `-c` is the only flag normally needed; everything else is found relative to
   the config. `-providers` exists for a binary run away from its providers/.
 - Provider and stage scripts resolve by name with or without an extension —

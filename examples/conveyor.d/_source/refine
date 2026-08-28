@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# Which agent refines this source. That is the only decision this file makes —
-# the prompt, the tools and the model all come from the source's env: block in
-# conveyor.yaml, so changing them never touches a script.
-#
-# Point it at agents/codex/refine instead and only this source changes.
-exec "$HOME/codes/Conveyor/agents/claude/refine"

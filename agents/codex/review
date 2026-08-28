@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Review the pull request for an item, with Codex.
+#
+# A different agent on purpose: the model that wrote the code is the worst
+# reviewer of it. Config: PROMPT (required), REPO.
+set -euo pipefail
+
+: "${PROMPT:?PROMPT is required (set it in this script params: block)}"
+: "${REPO:?REPO is required (set it in the source env: block)}"
+
+payload=$(cat)
+ref=$(jq -r '.item.ref' <<<"$payload")
+
+pr=$(gh pr list --repo "$REPO" --state open --search "$ref" --json number --jq '.[0].number' 2>/dev/null)
+if [[ -z "$pr" ]]; then
+	echo "no open PR for #$ref to review" >&2
+	exit 20
+fi
+
+echo "reviewing PR #$pr for item #$ref"
+
+full="Pull request #${pr} in ${REPO}, which closes item #${ref}.
+
+${PROMPT}
+
+End your reply with exactly APPROVED or CHANGES_REQUESTED on its own line."
+
+set +e
+out=$(codex exec "$full" --skip-git-repo-check 2>&1)
+rc=$?
+set -e
+printf '%s\n' "$out"
+
+[[ $rc -ne 0 ]] && exit $rc
+
+# A review wanting changes is not a failure of this stage — it is a fact that
+# needs a human, so it parks in blocked rather than retrying forever.
+if grep -q 'CHANGES_REQUESTED' <<<"$out"; then
+	echo "review requested changes on PR #$pr" >&2
+	exit 20
+fi
+exit 0

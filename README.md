@@ -100,37 +100,68 @@ detect, because by then they are just two executable paths.
 ## Onboarding a source
 
 `stages:` is the state machine: which columns exist and where an item goes next.
-The only thing a stage says about execution is `script:` — a **name**, not a
-path and not a command. A stage with no `script:` runs nothing and is a queue.
+The only thing a stage says about execution is `script:` — a **name**. A stage
+with no `script:` runs nothing and is a queue.
 
-Every source must provide that name in `conveyor.d/<source>/`:
+A source declares what those names are:
 
+```yaml
+sources:
+  - name: midgame
+    provider: github
+    workdir: ~/codes/midgame
+
+    # What this source IS — reaches every script it runs, list and move too.
+    env:
+      REPO: RaptoR-Soft/midgame
+      STAGE_LABELS: |
+        refining=status:refining
+        ready=status:ready
+
+    # What this source PROVIDES, for the names the stages ask for.
+    scripts:
+      refine:
+        agent: claude          # resolves agents/claude/refine
+        params:
+          ALLOWED_TOOLS: "Bash,Read,Glob,Grep"
+          MAX_TURNS: "40"
+          PROMPT: |
+            Refine this issue until it is ready to implement.
+            ...
+      implement:
+        agent: claude
+        params:
+          MAX_TURNS: "200"
+          PROMPT: |
+            Implement this issue.
+            ...
 ```
-~/codes/
-  conveyor.yaml
-  conveyor.d/
-    midgame/
-      refine        claude -p, this repo's own skills and tools
-      implement
-    caravan-v2/
-      refine        codex exec with a long prompt
-```
 
-Same pipeline, different work. How a stage is run — which agent, which model,
-which tools — is entirely in the script, because it differs per repository and
-the engine must never know. The stage and the script need not share a name, and
-two stages may use the same one.
+`agent: claude` resolves `agents/<name>/<script>` exactly as `provider: github`
+resolves `providers/<name>/<verb>`. Use `script: <path>` instead for anything
+that is not a shipped agent — absolute, `~/`, or relative to the config.
 
-Scripts live beside the config rather than inside the repo being worked, so
-nothing is written into somebody's project and an agent told to "commit and
-push" cannot sweep the pipeline into its own pull request. They still *run* in
-the source's workdir, so `claude` there resolves that repo's `.claude/skills/`.
+Swapping an agent is one line, and it changes only that source. Nothing is
+written into the repository being worked, so an agent told to "commit and push"
+cannot sweep the pipeline into its own pull request. Scripts still *run* in the
+source's workdir, so `claude` there resolves that repo's `.claude/skills/`.
 
-**A source missing a named script is reported, not tolerated:**
+**`env:` and `params:` are different scopes**, and the difference matters:
+
+| | reaches | for |
+| --- | --- | --- |
+| `env:` | every script, including `list` and `move` | what the source **is** — `REPO`, label mappings |
+| `params:` | one script | what that script **needs** — its prompt, its tools |
+
+Params are per-script because two stages both want to be handed a `PROMPT`. At
+source level the second would overwrite the first. Params win on conflict.
+
+**A source that does not declare a script its stages ask for is reported:**
 
 ```
     source "caravan-v2" cannot run:
-      - stage "in-progress": no implement script in ~/codes/conveyor.d/caravan-v2
+      - stage "in-progress" needs a script named "implement",
+        which this source does not declare
 
 3 of 4 source(s) unusable; the other 1 will still be worked
 ```
@@ -142,46 +173,15 @@ every healthy source. There is no shared fallback to inherit by accident.
 
 | | |
 | --- | --- |
-| `$CONVEYOR_ITEM_ID` `$CONVEYOR_ITEM_REF` | the item, and the bare id the provider knows it by |
+| `$CONVEYOR_ITEM_ID` `$CONVEYOR_ITEM_REF` | the item, and the id its provider knows it by |
 | `$CONVEYOR_SOURCE` `$CONVEYOR_STAGE` | which source, which stage is being entered |
 | `$CONVEYOR_WORKDIR` `$CONVEYOR_RESULT` | where it runs, and where to write structured output |
-| the source's `env:` | provider config — `REPO`, label mappings, anything |
+| the source's `env:` + the script's `params:` | configuration the engine carries and never reads |
 | stdin | the whole item as JSON, plus `stage` and `from` |
 
-### Running an agent
-
-`agents/<name>/<script>` ships reusable adapters, the way `providers/` does. The
-engine knows nothing about them — it runs the source's script, and that script
-decides to delegate:
-
-```bash
-# conveyor.d/midgame/refine — the whole file
-#!/usr/bin/env bash
-exec "$HOME/codes/Conveyor/agents/claude/refine"
-```
-
-Everything that varies is configuration, in the source's `env:`:
-
-```yaml
-  - name: midgame
-    provider: github
-    workdir: ~/codes/midgame
-    env:
-      REPO: RaptoR-Soft/midgame
-      ALLOWED_TOOLS: "Bash,Read,Glob,Grep"
-      MAX_TURNS: "40"
-      PROMPT: |
-        Refine this issue until it is ready to implement.
-        ...
-```
-
-The adapter prepends the item — id, title, url, body — so `PROMPT` is
-instructions only, with no ids to interpolate and no substitution language to
-learn. It also appends the blocked convention, so every agent reports "needs a
-human" the same way.
-
-Choosing the agent is a line in a script; choosing what it does is config. A
-source using codex is the same config with a different first line.
+The shipped agents prepend the item to `PROMPT`, so a prompt is instructions
+only — no ids to interpolate, no substitution language — and append the blocked
+convention, so every agent reports "needs a human" the same way.
 
 ### An inline script
 
@@ -190,22 +190,16 @@ instead. It must start with a shebang — the engine writes it out and execs it,
 and never picks an interpreter:
 
 ```yaml
-  - name: announced
+  - name: announcing
     run: |
       #!/usr/bin/env bash
-      echo "item $CONVEYOR_ITEM_REF reached $CONVEYOR_STAGE"
+      echo "$CONVEYOR_SOURCE #$CONVEYOR_ITEM_REF is done"
 ```
 
-It cannot vary per source — that is what `script:` is for — so keep it small.
+It cannot vary per source — that is what `scripts:` is for — so keep it small.
 Anything with real logic wants to be a file, where a shell can check it and a
 person can run it by hand. The body is written into the run directory, so the
 exact text that ran is archived with its own logs.
-
-The starting template is in [`examples/`](examples/):
-
-```bash
-cp -r examples/conveyor.d/_source ~/codes/conveyor.d/midgame
-```
 
 ## Writing a provider
 

@@ -104,15 +104,44 @@ sources:
     provider: mock
     workdir: .
 
+    # What this source IS — reaches every script it runs, list and move too.
+    env:
+      GREETING: "hello from the mock source"
+
+    # What this source PROVIDES, for the names the stages ask for. `agent:`
+    # resolves agents/<name>/<script>, the way `provider:` resolves under
+    # providers/. Use `script:` instead for a path of your own.
+    scripts:
+      refine:
+        agent: mock
+        params:
+          # Reach this script only. Two stages can both take a PROMPT without
+          # colliding, which is why params sit here and not in env.
+          NOTE: "refining"
+      implement:
+        agent: mock
+        params:
+          NOTE: "implementing"
+
+  # A real source, for comparison — swap `agent: claude` for `agent: codex` and
+  # only this repository changes:
+  #
   # - name: midgame
   #   provider: github
   #   workdir: ~/codes/midgame
   #   env:
   #     REPO: RaptoR-Soft/midgame
-  #     # The source owns the provider<->stage mapping. The engine never sees it.
-  #     # Stages with no entry (backlog, done) simply have no label written.
   #     STAGE_LABELS: |
   #       refining=status:refining
   #       ready=status:ready
   #       in-progress=status:in-progress
   #       blocked=status:blocked
+  #   scripts:
+  #     refine:
+  #       agent: claude
+  #       params:
+  #         ALLOWED_TOOLS: "Bash,Read,Glob,Grep"
+  #         MAX_TURNS: "40"
+  #         PROMPT: |
+  #           Refine this issue until it is ready to implement.
+  #           ...

@@ -7,15 +7,6 @@ import (
 	"testing"
 )
 
-// workdir creates the directory a source's scripts will run in. It holds no
-// scripts any more — those live beside the config, in conveyor.d/<source>/.
-func workdir(t *testing.T, path string) {
-	t.Helper()
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // script creates an executable file, making parents as needed.
 func script(t *testing.T, path string) {
 	t.Helper()
@@ -23,6 +14,15 @@ func script(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// workdir creates the directory a source's scripts run in. It holds no scripts:
+// nothing is written into the repository being worked.
+func workdir(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -41,6 +41,15 @@ stages:
 sources:
 `
 
+// declared is a source providing `refine` from the claude agent.
+const declared = `  - name: s1
+    provider: github
+    workdir: ./repo
+    scripts:
+      refine:
+        agent: claude
+`
+
 func write(t *testing.T, dir, sources string) string {
 	t.Helper()
 	path := filepath.Join(dir, "conveyor.yaml")
@@ -50,22 +59,25 @@ func write(t *testing.T, dir, sources string) string {
 	return path
 }
 
-// onboarded lays out a config dir with a working github provider and one repo
-// that has its stage scripts in place.
-func onboarded(t *testing.T) (dir string, path string) {
+// provider lays down a working github provider.
+func provider(t *testing.T, dir string) {
 	t.Helper()
-	dir = t.TempDir()
 	script(t, filepath.Join(dir, "providers", "github", "list.sh"))
 	script(t, filepath.Join(dir, "providers", "github", "move.sh"))
-	script(t, filepath.Join(dir, "conveyor.d", "s1", "refine"))
-	workdir(t, filepath.Join(dir, "repo"))
-	return dir, write(t, dir, `  - name: s1
-    provider: github
-    workdir: ./repo
-`)
 }
 
-func TestResolvesProviderAndStageScripts(t *testing.T) {
+// onboarded is a config dir with a provider, an agent, and a source declaring
+// the script its stage asks for.
+func onboarded(t *testing.T) (dir, path string) {
+	t.Helper()
+	dir = t.TempDir()
+	provider(t, dir)
+	script(t, filepath.Join(dir, "agents", "claude", "refine"))
+	workdir(t, filepath.Join(dir, "repo"))
+	return dir, write(t, dir, declared)
+}
+
+func TestResolvesProviderAndScripts(t *testing.T) {
 	_, path := onboarded(t)
 	cfg, err := Load(path)
 	if err != nil {
@@ -78,24 +90,22 @@ func TestResolvesProviderAndStageScripts(t *testing.T) {
 	if got := filepath.Base(s.List); got != "list.sh" {
 		t.Errorf("list = %q, want list.sh", got)
 	}
-	// Scripts live beside the config, keyed by source name — nothing is written
-	// into the repo being worked, so an agent told to "commit and push" cannot
-	// sweep the pipeline into somebody's project.
-	if got := s.Scripts["refining"]; !strings.HasSuffix(got, "/conveyor.d/s1/refine") {
-		t.Errorf("refine script = %q, want it under conveyor.d/s1", got)
+	// agent: claude resolves agents/claude/<script name>, the way provider:
+	// resolves under providers/.
+	if got := s.Paths["refine"]; !strings.HasSuffix(got, "/agents/claude/refine") {
+		t.Errorf("refine = %q, want it under agents/claude", got)
 	}
 }
 
 // An extension is decoration — the runner execs the file directly.
-func TestStageScriptExtensionAgnostic(t *testing.T) {
+func TestAgentScriptExtensionAgnostic(t *testing.T) {
 	for _, name := range []string{"refine", "refine.sh", "refine.py"} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			script(t, filepath.Join(dir, "providers", "github", "list.sh"))
-			script(t, filepath.Join(dir, "providers", "github", "move.sh"))
-			script(t, filepath.Join(dir, "conveyor.d", "s1", name))
+			provider(t, dir)
+			script(t, filepath.Join(dir, "agents", "claude", name))
 			workdir(t, filepath.Join(dir, "repo"))
-			cfg, err := Load(write(t, dir, "  - name: s1\n    provider: github\n    workdir: ./repo\n"))
+			cfg, err := Load(write(t, dir, declared))
 			if err != nil {
 				t.Fatalf("Load: %v", err)
 			}
@@ -106,78 +116,131 @@ func TestStageScriptExtensionAgnostic(t *testing.T) {
 	}
 }
 
-// The point of the whole per-source health model: a repo that has not been
-// onboarded is reported, and every other repo keeps working.
-func TestUnonboardedRepoIsNotFatal(t *testing.T) {
+// script: takes a path, for anything that is not a shipped agent.
+func TestExplicitScriptPath(t *testing.T) {
 	dir := t.TempDir()
-	script(t, filepath.Join(dir, "providers", "github", "list.sh"))
-	script(t, filepath.Join(dir, "providers", "github", "move.sh"))
-	script(t, filepath.Join(dir, "conveyor.d", "good", "refine"))
+	provider(t, dir)
+	script(t, filepath.Join(dir, "mine", "my-refine"))
+	workdir(t, filepath.Join(dir, "repo"))
+	cfg, err := Load(write(t, dir, `  - name: s1
+    provider: github
+    workdir: ./repo
+    scripts:
+      refine:
+        script: ./mine/my-refine
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Sources[0].OK() {
+		t.Fatalf("problems: %v", cfg.Sources[0].Problems)
+	}
+	if got := cfg.Sources[0].Paths["refine"]; !strings.HasSuffix(got, "/mine/my-refine") {
+		t.Errorf("refine = %q, want the explicit path", got)
+	}
+}
+
+// The point of the per-source health model: a source that has not been
+// onboarded is reported, and every other source keeps working.
+func TestUndeclaredScriptIsNotFatal(t *testing.T) {
+	dir := t.TempDir()
+	provider(t, dir)
+	script(t, filepath.Join(dir, "agents", "claude", "refine"))
 	workdir(t, filepath.Join(dir, "good"))
-	workdir(t, filepath.Join(dir, "bad")) // exists, but was never onboarded
+	workdir(t, filepath.Join(dir, "bad"))
 
 	cfg, err := Load(write(t, dir, `  - name: good
     provider: github
     workdir: ./good
+    scripts:
+      refine:
+        agent: claude
   - name: bad
     provider: github
     workdir: ./bad
 `))
 	if err != nil {
-		t.Fatalf("an un-onboarded repo must not fail the load: %v", err)
+		t.Fatalf("an un-onboarded source must not fail the load: %v", err)
 	}
 	if !cfg.Sources[0].OK() {
 		t.Errorf("healthy source dragged down: %v", cfg.Sources[0].Problems)
 	}
 	if cfg.Sources[1].OK() {
-		t.Fatal("un-onboarded source reported as healthy")
+		t.Fatal("source declaring no scripts reported as healthy")
 	}
-	if !strings.Contains(strings.Join(cfg.Sources[1].Problems, "; "), `stage "refining"`) {
-		t.Errorf("problems = %v, want the missing stage named", cfg.Sources[1].Problems)
+	if !strings.Contains(strings.Join(cfg.Sources[1].Problems, "; "), "does not declare") {
+		t.Errorf("problems = %v, want the missing declaration named", cfg.Sources[1].Problems)
 	}
 }
 
 func TestSourceProblems(t *testing.T) {
+	bothForms := `  - name: s1
+    provider: github
+    workdir: ./repo
+    scripts:
+      refine:
+        agent: claude
+        script: ./x
+`
+	neither := `  - name: s1
+    provider: github
+    workdir: ./repo
+    scripts:
+      refine:
+        params:
+          A: b
+`
 	for _, tc := range []struct {
-		name  string
-		setup func(t *testing.T, dir string)
-		want  string
+		name    string
+		setup   func(t *testing.T, dir string)
+		sources string
+		want    string
 	}{
 		{"unknown provider", func(t *testing.T, dir string) {
-			script(t, filepath.Join(dir, "conveyor.d", "s1", "refine"))
+			script(t, filepath.Join(dir, "agents", "claude", "refine"))
 			workdir(t, filepath.Join(dir, "repo"))
-		}, `provider "github"`},
-		{"provider missing move", func(t *testing.T, dir string) {
-			script(t, filepath.Join(dir, "providers", "github", "list.sh"))
-			script(t, filepath.Join(dir, "conveyor.d", "s1", "refine"))
+		}, declared, `provider "github"`},
+
+		{"unknown agent", func(t *testing.T, dir string) {
+			provider(t, dir)
 			workdir(t, filepath.Join(dir, "repo"))
-		}, "no move script"},
-		{"ambiguous provider script", func(t *testing.T, dir string) {
-			script(t, filepath.Join(dir, "providers", "github", "list.sh"))
-			script(t, filepath.Join(dir, "providers", "github", "list.py"))
-			script(t, filepath.Join(dir, "providers", "github", "move.sh"))
-			script(t, filepath.Join(dir, "conveyor.d", "s1", "refine"))
+		}, declared, `agent "claude"`},
+
+		{"agent lacks the script", func(t *testing.T, dir string) {
+			provider(t, dir)
+			script(t, filepath.Join(dir, "agents", "claude", "implement"))
 			workdir(t, filepath.Join(dir, "repo"))
-		}, "ambiguous list script"},
+		}, declared, "no refine script"},
+
+		{"both agent and script", func(t *testing.T, dir string) {
+			provider(t, dir)
+			workdir(t, filepath.Join(dir, "repo"))
+		}, bothForms, "pick one"},
+
+		{"neither agent nor script", func(t *testing.T, dir string) {
+			provider(t, dir)
+			workdir(t, filepath.Join(dir, "repo"))
+		}, neither, "either agent: or script:"},
+
 		{"missing workdir", func(t *testing.T, dir string) {
-			script(t, filepath.Join(dir, "providers", "github", "list.sh"))
-			script(t, filepath.Join(dir, "providers", "github", "move.sh"))
-		}, "workdir"},
-		{"stage script not executable", func(t *testing.T, dir string) {
-			script(t, filepath.Join(dir, "providers", "github", "list.sh"))
-			script(t, filepath.Join(dir, "providers", "github", "move.sh"))
+			provider(t, dir)
+			script(t, filepath.Join(dir, "agents", "claude", "refine"))
+		}, declared, "workdir"},
+
+		{"not executable", func(t *testing.T, dir string) {
+			provider(t, dir)
 			workdir(t, filepath.Join(dir, "repo"))
-			p := filepath.Join(dir, "conveyor.d", "s1", "refine")
+			p := filepath.Join(dir, "agents", "claude", "refine")
 			script(t, p)
 			if err := os.Chmod(p, 0o644); err != nil {
 				t.Fatal(err)
 			}
-		}, "not executable"},
+		}, declared, "not executable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			tc.setup(t, dir)
-			cfg, err := Load(write(t, dir, "  - name: s1\n    provider: github\n    workdir: ./repo\n"))
+			cfg, err := Load(write(t, dir, tc.sources))
 			if err != nil {
 				t.Fatalf("must not be fatal: %v", err)
 			}
@@ -198,8 +261,7 @@ func TestSchemaErrorsAreFatal(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			script(t, filepath.Join(dir, "providers", "github", "list.sh"))
-			script(t, filepath.Join(dir, "providers", "github", "move.sh"))
+			provider(t, dir)
 			_, err := Load(write(t, dir, tc.sources))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error = %v, want it to mention %q", err, tc.want)
@@ -208,115 +270,11 @@ func TestSchemaErrorsAreFatal(t *testing.T) {
 	}
 }
 
-// A source naming its two scripts separately is how a GitHub list gets paired
-// with an Azure move. KnownFields makes the old schema a loud error rather than
-// a silently ignored key.
-func TestSeparateScriptPathsRejected(t *testing.T) {
-	dir := t.TempDir()
-	_, err := Load(write(t, dir, `  - name: s1
-    list: ./providers/github/list.sh
-    move: ./providers/azure/move.sh
-`))
-	if err == nil {
-		t.Fatal("expected mixed list/move paths to be rejected")
-	}
-	if !strings.Contains(err.Error(), "list") {
-		t.Errorf("error = %v, want it to name the unknown 'list' field", err)
-	}
-}
-
-// A stage that runs nothing needs no script from any source — and a terminal
-// stage can never run one.
-func TestTerminalStageCannotRun(t *testing.T) {
-	dir := t.TempDir()
-	script(t, filepath.Join(dir, "providers", "github", "list.sh"))
-	script(t, filepath.Join(dir, "providers", "github", "move.sh"))
-	path := filepath.Join(dir, "conveyor.yaml")
-	if err := os.WriteFile(path, []byte(`version: 1
-stages:
-  - name: backlog
-  - name: done
-    terminal: true
-    script: whatever
-sources:
-  - name: s1
-    provider: github
-    workdir: .
-`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "terminal") {
-		t.Fatalf("error = %v, want it to mention terminal", err)
-	}
-}
-
-// A working config usually lives outside the conveyor checkout, so it must be
-// able to say where providers/ is.
-func TestProvidersDirOverride(t *testing.T) {
-	shared := t.TempDir()
-	script(t, filepath.Join(shared, "providers", "github", "list.sh"))
-	script(t, filepath.Join(shared, "providers", "github", "move.sh"))
-
-	elsewhere := t.TempDir()
-	script(t, filepath.Join(elsewhere, "conveyor.d", "s1", "refine"))
-	workdir(t, filepath.Join(elsewhere, "repo"))
-	path := filepath.Join(elsewhere, "conveyor.yaml")
-	if err := os.WriteFile(path, []byte("providers: "+filepath.Join(shared, "providers")+"\n"+stages+`  - name: s1
-    provider: github
-    workdir: ./repo
-`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if !cfg.Sources[0].OK() {
-		t.Fatalf("problems: %v", cfg.Sources[0].Problems)
-	}
-	if !strings.HasPrefix(cfg.Sources[0].List, shared) {
-		t.Errorf("list = %q, want it under %q", cfg.Sources[0].List, shared)
-	}
-}
-
-// Without the key, providers/ is beside the config as before.
-func TestProvidersDirDefaults(t *testing.T) {
-	dir, path := onboarded(t)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if want := filepath.Join(dir, "providers"); cfg.ProvidersDir() != want {
-		t.Errorf("ProvidersDir = %q, want %q", cfg.ProvidersDir(), want)
-	}
-}
-
-// Scripts must not be picked up from the repo being worked: putting them there
-// is what lets an agent told to "commit and push" sweep the pipeline into
-// somebody's project.
-func TestScriptsNotReadFromWorkdir(t *testing.T) {
-	dir := t.TempDir()
-	script(t, filepath.Join(dir, "providers", "github", "list.sh"))
-	script(t, filepath.Join(dir, "providers", "github", "move.sh"))
-	// the old location, which must now be ignored
-	script(t, filepath.Join(dir, "repo", ".conveyor", "refine"))
-
-	cfg, err := Load(write(t, dir, "  - name: s1\n    provider: github\n    workdir: ./repo\n"))
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Sources[0].OK() {
-		t.Fatal("a script inside the worked repo was accepted; it must be ignored")
-	}
-}
-
 // An inline stage runs the same body for every source, so it needs nothing from
 // them and can never make one unusable.
 func TestInlineStageNeedsNothingFromSources(t *testing.T) {
 	dir := t.TempDir()
-	script(t, filepath.Join(dir, "providers", "github", "list.sh"))
-	script(t, filepath.Join(dir, "providers", "github", "move.sh"))
+	provider(t, dir)
 	workdir(t, filepath.Join(dir, "repo"))
 	path := filepath.Join(dir, "conveyor.yaml")
 	if err := os.WriteFile(path, []byte(`version: 1
@@ -343,7 +301,6 @@ sources:
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	// No conveyor.d/s1/ exists at all, and the source is still healthy.
 	if !cfg.Sources[0].OK() {
 		t.Fatalf("inline stage demanded something of the source: %v", cfg.Sources[0].Problems)
 	}
@@ -360,8 +317,7 @@ func TestStageRunRules(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			script(t, filepath.Join(dir, "providers", "github", "list.sh"))
-			script(t, filepath.Join(dir, "providers", "github", "move.sh"))
+			provider(t, dir)
 			workdir(t, filepath.Join(dir, "repo"))
 			path := filepath.Join(dir, "conveyor.yaml")
 			body := "version: 1\nstages:\n  - name: backlog\n  - name: doing\n" + tc.stage +
@@ -376,5 +332,72 @@ func TestStageRunRules(t *testing.T) {
 				t.Fatalf("error = %v, want it to mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestTerminalStageCannotRun(t *testing.T) {
+	dir := t.TempDir()
+	provider(t, dir)
+	path := filepath.Join(dir, "conveyor.yaml")
+	if err := os.WriteFile(path, []byte(`version: 1
+stages:
+  - name: backlog
+  - name: done
+    terminal: true
+    script: whatever
+sources:
+  - name: s1
+    provider: github
+    workdir: .
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "terminal") {
+		t.Fatalf("error = %v, want it to mention terminal", err)
+	}
+}
+
+// A working config usually lives outside the checkout, so it must be able to
+// say where the shipped agents and providers are.
+func TestRootsOverridable(t *testing.T) {
+	shared := t.TempDir()
+	script(t, filepath.Join(shared, "providers", "github", "list.sh"))
+	script(t, filepath.Join(shared, "providers", "github", "move.sh"))
+	script(t, filepath.Join(shared, "agents", "claude", "refine"))
+
+	elsewhere := t.TempDir()
+	workdir(t, filepath.Join(elsewhere, "repo"))
+	path := filepath.Join(elsewhere, "conveyor.yaml")
+	body := "providers: " + filepath.Join(shared, "providers") + "\n" +
+		"agents: " + filepath.Join(shared, "agents") + "\n" + stages + declared
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Sources[0].OK() {
+		t.Fatalf("problems: %v", cfg.Sources[0].Problems)
+	}
+	if !strings.HasPrefix(cfg.Sources[0].Paths["refine"], shared) {
+		t.Errorf("refine = %q, want it under %q", cfg.Sources[0].Paths["refine"], shared)
+	}
+}
+
+func TestRootsDefaultBesideConfig(t *testing.T) {
+	dir, path := onboarded(t)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, tc := range []struct{ got, want string }{
+		{cfg.AgentsDir(), filepath.Join(dir, "agents")},
+		{cfg.ProvidersDir(), filepath.Join(dir, "providers")},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("root = %q, want %q", tc.got, tc.want)
+		}
 	}
 }

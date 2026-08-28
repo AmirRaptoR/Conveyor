@@ -174,15 +174,20 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	}
 
 	src := mustSource(e.cfg, srcName)
-	script, ok := src.Scripts[to]
+	script, ok := src.Paths[stage.Script]
+	// A stage's params reach only its own script, layered over what the source
+	// is: two stages both want a PROMPT, and at source level the second would
+	// overwrite the first.
+	env := mergeEnv(src.Env, src.Scripts[stage.Script].Params)
 	if stage.Run != "" {
 		script, ok = "", true // written into the run directory instead
+		env = src.Env
 	}
 	if !ok {
 		// resolveSources already recorded why, and Engine skips unhealthy
 		// sources — reaching here means one went bad after load.
 		tr.Outcome = model.OutcomeFailure
-		tr.Err = fmt.Errorf("source %q has no script for stage %q", srcName, to)
+		tr.Err = fmt.Errorf("source %q declares no script named %q", srcName, stage.Script)
 		return tr, tr.Err
 	}
 
@@ -191,7 +196,7 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 		Inline:  stage.Run,
 		Kind:    "stage",
 		Workdir: e.cfg.Workdir(mustSource(e.cfg, srcName)),
-		Env:     src.Env,
+		Env:     env,
 		Source:  srcName,
 		Item:    item,
 		From:    from,
@@ -318,6 +323,22 @@ func better(aOrdered bool, aIdx, aPrio, aPos int, bOrdered bool, bIdx, bPrio, bP
 		return aPrio < bPrio // 0 is most urgent
 	}
 	return aPos < bPos
+}
+
+// mergeEnv layers a script's params over its source's env. The narrower scope
+// wins; the engine reads neither.
+func mergeEnv(env, params map[string]string) map[string]string {
+	if len(params) == 0 {
+		return env
+	}
+	out := make(map[string]string, len(env)+len(params))
+	for k, v := range env {
+		out[k] = v
+	}
+	for k, v := range params {
+		out[k] = v
+	}
+	return out
 }
 
 func mustSource(cfg *config.Config, name string) config.Source {

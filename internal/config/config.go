@@ -25,6 +25,9 @@ type Config struct {
 	Stages      []Stage     `yaml:"stages"`
 	Sources     []Source    `yaml:"sources"`
 
+	// Agents is where agent folders live, resolved like Providers.
+	Agents string `yaml:"agents"`
+
 	// Providers is where provider folders live. Defaults to providers/ beside
 	// the config, which is only right when the config sits in the conveyor
 	// checkout — a working config usually does not, so it can be pointed
@@ -96,8 +99,31 @@ type Source struct {
 	// Problems is why this source cannot run: an un-onboarded repo, a missing
 	// provider script. Both are resolved at load and never fatal — one
 	// misconfigured repo must not stop every other repo from being worked.
-	Scripts  map[string]string `yaml:"-"`
+	// Scripts is what this source provides for the names its stages ask for.
+	// Declaring them here rather than by convention on disk means onboarding a
+	// source is one config block, and which agent runs a stage is visible
+	// without opening a file.
+	Scripts map[string]ScriptSpec `yaml:"scripts"`
+
+	// Paths is Scripts resolved to absolute files, keyed by script name.
+	Paths    map[string]string `yaml:"-"`
 	Problems []string          `yaml:"-"`
+}
+
+// ScriptSpec is one entry in a source's scripts: where the executable is, and
+// the parameters it needs. Exactly one of Agent or Script.
+type ScriptSpec struct {
+	// Agent names a folder under agents/, resolved the same way `provider:`
+	// resolves under providers/ — agent: claude finds agents/claude/<name>,
+	// where <name> is this entry's key.
+	Agent string `yaml:"agent"`
+	// Script is an explicit path, for something that is not a shipped agent.
+	// Absolute, ~/, or relative to the config file.
+	Script string `yaml:"script"`
+	// Params reach only this script, layered over the source's env. Per-script
+	// rather than per-source because two stages both want to be handed a
+	// PROMPT, and at source level the second would overwrite the first.
+	Params map[string]string `yaml:"params"`
 }
 
 // Duration accepts "30d", "90m", "5m" — Go's ParseDuration has no day unit, and
@@ -247,23 +273,30 @@ func (c *Config) ResolveScript(p string) string {
 // The layout inside is fixed — <root>/<provider>/<verb> — but the root moves:
 // -providers on the command line wins, then `providers:` in the config, then
 // the directory holding the binary, which is where a release puts them.
-func (c *Config) ProvidersDir() string {
-	if c.Providers != "" {
-		p := expandHome(c.Providers)
+// AgentsDir holds one directory per agent, named as a script's `agent:` names
+// it. Resolved exactly like ProvidersDir.
+func (c *Config) AgentsDir() string { return c.rootDir(c.Agents, "agents") }
+
+// ProvidersDir holds one directory per provider.
+func (c *Config) ProvidersDir() string { return c.rootDir(c.Providers, "providers") }
+
+// rootDir resolves a shipped-asset root: the configured value if set, else the
+// directory holding the binary, else the config's own directory — `go run`
+// builds into a temp dir, so the last one keeps development working.
+func (c *Config) rootDir(configured, name string) string {
+	if configured != "" {
+		p := expandHome(configured)
 		if filepath.IsAbs(p) {
 			return p
 		}
 		return filepath.Join(c.Dir, p)
 	}
 	if exe, err := os.Executable(); err == nil {
-		if beside := filepath.Join(filepath.Dir(exe), "providers"); isDir(beside) {
+		if beside := filepath.Join(filepath.Dir(exe), name); isDir(beside) {
 			return beside
 		}
 	}
-	// `go run` builds into a temp directory, so fall back to the config's own
-	// directory: without this, developing in the checkout would need the flag
-	// on every invocation.
-	return filepath.Join(c.Dir, "providers")
+	return filepath.Join(c.Dir, name)
 }
 
 func isDir(p string) bool {
@@ -285,15 +318,6 @@ func (c *Config) providerScript(provider, verb string) (string, error) {
 	}
 	return path, nil
 }
-
-// ScriptsDir sits beside the config file and holds one directory per source,
-// named exactly as the source is. Onboarding a repo is creating that directory
-// and filling it in — nothing is written into the repo being worked, so the
-// pipeline cannot end up committed into somebody's project by an agent told to
-// "commit and push".
-//
-// Scripts still RUN in the source's workdir; only the files live here.
-const ScriptsDir = "conveyor.d"
 
 // findScript finds dir/<name>, with or without an extension: name.sh, name.py
 // and a compiled `name` are equivalent, because the runner execs the file
@@ -332,7 +356,7 @@ func findScript(dir, name string) (string, error) {
 func (c *Config) resolveSources() {
 	for i := range c.Sources {
 		s := &c.Sources[i]
-		s.Scripts = map[string]string{}
+		s.Paths = map[string]string{}
 		s.Problems = nil
 		note := func(f string, a ...any) { s.Problems = append(s.Problems, fmt.Sprintf(f, a...)) }
 
@@ -378,17 +402,48 @@ func (c *Config) resolveSources() {
 			if st.Script == "" {
 				continue
 			}
-			path, err := findScript(filepath.Join(c.Dir, ScriptsDir, s.Name), st.Script)
-			if err != nil {
-				note("stage %q: %v", st.Name, err)
+			spec, ok := s.Scripts[st.Script]
+			if !ok {
+				note("stage %q needs a script named %q, which this source does not declare", st.Name, st.Script)
 				continue
 			}
-			if errs := checkScript(path, fmt.Sprintf("stage %q", st.Name)); len(errs) > 0 {
+			path, err := c.resolveScriptSpec(st.Script, spec)
+			if err != nil {
+				note("script %q: %v", st.Script, err)
+				continue
+			}
+			if errs := checkScript(path, fmt.Sprintf("script %q", st.Script)); len(errs) > 0 {
 				note("%s", strings.Join(errs, "; "))
 				continue
 			}
-			s.Scripts[st.Name] = path
+			s.Paths[st.Script] = path
 		}
+	}
+}
+
+// resolveScriptSpec turns one scripts: entry into an absolute executable.
+func (c *Config) resolveScriptSpec(name string, spec ScriptSpec) (string, error) {
+	switch {
+	case spec.Agent != "" && spec.Script != "":
+		return "", fmt.Errorf("has both agent: and script: — pick one")
+	case spec.Agent != "":
+		dir := filepath.Join(c.AgentsDir(), spec.Agent)
+		if !isDir(dir) {
+			return "", fmt.Errorf("agent %q: %s is not a directory", spec.Agent, dir)
+		}
+		path, err := findScript(dir, name)
+		if err != nil {
+			return "", fmt.Errorf("agent %q: %v", spec.Agent, err)
+		}
+		return path, nil
+	case spec.Script != "":
+		p := expandHome(spec.Script)
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(c.Dir, p)
+		}
+		return p, nil
+	default:
+		return "", fmt.Errorf("needs either agent: or script:")
 	}
 }
 
