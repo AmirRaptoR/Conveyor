@@ -108,15 +108,19 @@ A source declares what those names are:
 ```yaml
 sources:
   - name: midgame
-    provider: github
     workdir: ~/codes/midgame
 
-    # What this source IS — reaches every script it runs, list and move too.
+    # How it reaches its backend. Params here reach ONLY list and move.
+    provider:
+      name: github
+      params:
+        STAGE_LABELS: |
+          refining=status:refining
+          ready=status:ready
+
+    # What this source IS — reaches every script it runs.
     env:
       REPO: RaptoR-Soft/midgame
-      STAGE_LABELS: |
-        refining=status:refining
-        ready=status:ready
 
     # What this source PROVIDES, for the names the stages ask for.
     scripts:
@@ -150,8 +154,11 @@ source's workdir, so `claude` there resolves that repo's `.claude/skills/`.
 
 | | reaches | for |
 | --- | --- | --- |
-| `env:` | every script, including `list` and `move` | what the source **is** — `REPO`, label mappings |
-| `params:` | one script | what that script **needs** — its prompt, its tools |
+| `provider.params:` | `list` and `move` only | the backend's own vocabulary — `STAGE_LABELS` |
+| `env:` | every script | what the source **is** — `REPO` |
+| `scripts.*.params:` | one script | what it **needs** — its prompt, its tools |
+
+A provider needing no configuration stays the one-line `provider: github`.
 
 Params are per-script because two stages both want to be handed a `PROMPT`. At
 source level the second would overwrite the first. Params win on conflict.

@@ -84,7 +84,7 @@ type Stage struct {
 
 type Source struct {
 	Name     string            `yaml:"name"`
-	Provider string            `yaml:"provider"`
+	Provider Provider          `yaml:"provider"`
 	Workdir  string            `yaml:"workdir"`
 	Env      map[string]string `yaml:"env"`
 
@@ -108,6 +108,33 @@ type Source struct {
 	// Paths is Scripts resolved to absolute files, keyed by script name.
 	Paths    map[string]string `yaml:"-"`
 	Problems []string          `yaml:"-"`
+}
+
+// Provider is how this source reaches its backend. It accepts either a bare
+// name or a block with params:
+//
+//	provider: github
+//	provider:
+//	  name: github
+//	  params:
+//	    STAGE_LABELS: |
+//	      refining=status:refining
+//
+// Params reach only list and move. They are the provider's vocabulary — labels
+// are a GitHub idea, and a stage script running an agent has no use for them.
+type Provider struct {
+	Name   string            `yaml:"name"`
+	Params map[string]string `yaml:"params"`
+}
+
+// UnmarshalYAML accepts the scalar shorthand so a provider needing no
+// configuration stays one line.
+func (p *Provider) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.ScalarNode {
+		return n.Decode(&p.Name)
+	}
+	type raw Provider // avoids recursing into this method
+	return n.Decode((*raw)(p))
 }
 
 // ScriptSpec is one entry in a source's scripts: where the executable is, and
@@ -360,15 +387,15 @@ func (c *Config) resolveSources() {
 		s.Problems = nil
 		note := func(f string, a ...any) { s.Problems = append(s.Problems, fmt.Sprintf(f, a...)) }
 
-		if s.Provider != "" {
+		if s.Provider.Name != "" {
 			// The directory is checked once, not once per verb: a missing
 			// provider folder is one problem, and saying it twice buries the
 			// real list under noise.
-			dir := filepath.Join(c.ProvidersDir(), s.Provider)
+			dir := filepath.Join(c.ProvidersDir(), s.Provider.Name)
 			if fi, err := os.Stat(dir); err != nil {
-				note("provider %q: %v", s.Provider, err)
+				note("provider %q: %v", s.Provider.Name, err)
 			} else if !fi.IsDir() {
-				note("provider %q: %s is not a directory", s.Provider, dir)
+				note("provider %q: %s is not a directory", s.Provider.Name, dir)
 			} else {
 				// Fixed order, not a map: problem lists are read by humans and
 				// compared by tests.
@@ -376,7 +403,7 @@ func (c *Config) resolveSources() {
 					verb string
 					dst  *string
 				}{{"list", &s.List}, {"move", &s.Move}} {
-					path, err := c.providerScript(s.Provider, v.verb)
+					path, err := c.providerScript(s.Provider.Name, v.verb)
 					if err != nil {
 						note("%v", err)
 						continue
@@ -445,6 +472,23 @@ func (c *Config) resolveScriptSpec(name string, spec ScriptSpec) (string, error)
 	default:
 		return "", fmt.Errorf("needs either agent: or script:")
 	}
+}
+
+// ProviderEnv is what the provider's own scripts get: what the source is, plus
+// the provider's params. Stage scripts never see the params — they are the
+// provider's vocabulary, not the pipeline's.
+func (s Source) ProviderEnv() map[string]string {
+	if len(s.Provider.Params) == 0 {
+		return s.Env
+	}
+	out := make(map[string]string, len(s.Env)+len(s.Provider.Params))
+	for k, v := range s.Env {
+		out[k] = v
+	}
+	for k, v := range s.Provider.Params {
+		out[k] = v
+	}
+	return out
 }
 
 // OK reports whether this source can be worked.
@@ -529,7 +573,7 @@ func (c *Config) Validate() []string {
 			continue
 		}
 		srcSeen[s.Name] = true
-		if s.Provider == "" {
+		if s.Provider.Name == "" {
 			add("source %q: provider is required", s.Name)
 		}
 	}

@@ -401,3 +401,59 @@ func TestRootsDefaultBesideConfig(t *testing.T) {
 		}
 	}
 }
+
+// provider: accepts a bare name or a block, and its params reach only the
+// provider's own scripts — labels are GitHub's vocabulary, and a stage script
+// running an agent has no use for them.
+func TestProviderBlockAndScoping(t *testing.T) {
+	dir := t.TempDir()
+	provider(t, dir)
+	script(t, filepath.Join(dir, "agents", "claude", "refine"))
+	workdir(t, filepath.Join(dir, "repo"))
+
+	cfg, err := Load(write(t, dir, `  - name: s1
+    workdir: ./repo
+    provider:
+      name: github
+      params:
+        STAGE_LABELS: "refining=status:refining"
+    env:
+      REPO: owner/repo
+    scripts:
+      refine:
+        agent: claude
+        params:
+          PROMPT: "do it"
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	s := cfg.Sources[0]
+	if !s.OK() {
+		t.Fatalf("problems: %v", s.Problems)
+	}
+	if s.Provider.Name != "github" {
+		t.Errorf("provider name = %q, want github", s.Provider.Name)
+	}
+	// list and move get the provider's params on top of env
+	pe := s.ProviderEnv()
+	if pe["STAGE_LABELS"] == "" || pe["REPO"] != "owner/repo" {
+		t.Errorf("ProviderEnv = %v, want both STAGE_LABELS and REPO", pe)
+	}
+	// the source's own env must not have absorbed them
+	if _, leaked := s.Env["STAGE_LABELS"]; leaked {
+		t.Error("provider params leaked into env, which every stage script sees")
+	}
+}
+
+// The one-line form stays valid for a provider needing no configuration.
+func TestProviderScalarShorthand(t *testing.T) {
+	_, path := onboarded(t)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Sources[0].Provider.Name != "github" {
+		t.Errorf("provider = %+v, want name github", cfg.Sources[0].Provider)
+	}
+}

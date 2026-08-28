@@ -72,9 +72,10 @@ The extension is the scripts, never the engine. A stage names one; the source
 provides it; how it works is that file's business. `run:` takes an inline body
 for a stage that is identical everywhere, and must carry a shebang.
 
-Configuration the engine passes but never reads: the source's `env:` (what it
-is — reaches list and move too) and a script's `params:` (what that script
-needs, winning on conflict). Params are per-script because two stages both want
+Configuration the engine passes but never reads, narrowing: `provider.params:`
+(list and move only — labels are GitHub's vocabulary, not the pipeline's),
+`env:` (every script — what the source is), and `scripts.*.params:` (one script,
+winning on conflict). Script params are per-script because two stages both want
 a PROMPT. Everything else in the schema is structure.
 
 Deliberately not built: stage-level `env:` (settings that differ per source

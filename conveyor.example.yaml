@@ -101,6 +101,15 @@ stages:
 # ---------------------------------------------------------------------------
 sources:
   - name: mock
+    # A provider needing no configuration stays one line. The block form carries
+    # params, which reach ONLY list and move — labels are GitHub's vocabulary,
+    # and a stage script running an agent has no use for them:
+    #
+    #   provider:
+    #     name: github
+    #     params:
+    #       STAGE_LABELS: |
+    #         refining=status:refining
     provider: mock
     workdir: .
 
@@ -127,15 +136,17 @@ sources:
   # only this repository changes:
   #
   # - name: midgame
-  #   provider: github
   #   workdir: ~/codes/midgame
+  #   provider:
+  #     name: github
+  #     params:
+  #       STAGE_LABELS: |
+  #         refining=status:refining
+  #         ready=status:ready
+  #         in-progress=status:in-progress
+  #         blocked=status:blocked
   #   env:
   #     REPO: RaptoR-Soft/midgame
-  #     STAGE_LABELS: |
-  #       refining=status:refining
-  #       ready=status:ready
-  #       in-progress=status:in-progress
-  #       blocked=status:blocked
   #   scripts:
   #     refine:
   #       agent: claude
