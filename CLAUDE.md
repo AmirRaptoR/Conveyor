@@ -41,7 +41,12 @@ Not built yet, in build order (see `docs/DESIGN.md`):
 - **A timeout kills the process group**, TERM then KILL. Killing only the parent
   leaves an agent's children holding the source's lock.
 - **`perSource: 1` is a constraint, not a default.** A source maps to a git
-  worktree; two agents in one checkout corrupt each other.
+  worktree; two agents in one checkout corrupt each other. Parallelism comes
+  from `perStage` and `global`: different sources work different stages at once,
+  which is a line filling up, not two agents in one repo.
+- **The scheduler claims a slot before it launches.** Checking whether a slot is
+  free and then starting a goroutine leaves a gap in which the next pass decides
+  the same thing again. `Engine.Advance` does not lock; its caller must.
 - **Every item must be able to leave a scripted stage.** Config validation
   rejects a stage that runs a script but has no route out — a blocked item that stays
   put gets re-run on every poll forever.

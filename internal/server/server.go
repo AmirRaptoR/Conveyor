@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
@@ -37,9 +38,9 @@ type State struct {
 	Order     []string     `json:"order"`
 	UpdatedAt time.Time    `json:"updatedAt"`
 	Polling   bool         `json:"polling"`
-	// Active is the stage running right now, if any. The board lights that
-	// station; without it the page cannot tell work from stillness.
-	Active *Active `json:"active,omitempty"`
+	// Active is every transition running right now. The board lights those
+	// stations; without it the page cannot tell work from stillness.
+	Active []Active `json:"active"`
 }
 
 type Active struct {
@@ -71,9 +72,10 @@ type Server struct {
 	mu    sync.RWMutex
 	state State
 
-	hub   *hub
-	order *store.Order
-	tick  chan struct{} // one buffered slot: ticks never queue up
+	hub    *hub
+	order  *store.Order
+	active sync.Map      // itemID -> Active, one entry per transition in flight
+	tick   chan struct{} // one buffered slot: ticks never queue up
 }
 
 func New(cfg *config.Config, r *runner.Runner) *Server {
@@ -173,33 +175,6 @@ func (s *Server) poll(ctx context.Context, auto bool) {
 	}
 }
 
-// drain advances until nothing can move. Waiting a whole poll interval between
-// items would mean a thirty-item backlog took hours of idling to cross a stage
-// that each item clears in a minute; the pipeline should be limited by the work,
-// not by the clock.
-//
-// The bound is a circuit breaker, not a budget: items are finite and terminal
-// stages end the walk, so reaching it means the stage graph loops. That is a
-// configuration error, and spinning on it silently would burn an agent's turns
-// until someone noticed.
-func (s *Server) drain(ctx context.Context) {
-	s.mu.RLock()
-	limit := 2*len(s.state.Items) + 1
-	s.mu.RUnlock()
-
-	for n := 0; n < limit; n++ {
-		if ctx.Err() != nil {
-			return
-		}
-		if !s.advance(ctx) {
-			return
-		}
-		s.refresh(ctx)
-	}
-	s.hub.publish(event{Kind: "state"})
-	fmt.Fprintln(os.Stderr, "conveyor: drain hit its limit; the stage graph may loop")
-}
-
 func (s *Server) refresh(ctx context.Context) {
 	var items []model.Item
 	var warnings []string
@@ -239,8 +214,137 @@ func (s *Server) refresh(ctx context.Context) {
 	s.hub.publish(event{Kind: "state"})
 }
 
-// advance runs one scheduling pass: the highest-ranked item that can move.
-// Reports whether anything did.
+// drain advances until nothing can move, running as much at once as the locks
+// allow. One item per stage by default, one per source always, capped globally.
+//
+// The bound is a circuit breaker, not a budget: items are finite and terminal
+// stages end the walk, so reaching it means the stage graph loops. That is a
+// configuration error, and spinning on it silently would burn an agent's turns
+// until someone noticed.
+func (s *Server) drain(ctx context.Context) {
+	s.mu.RLock()
+	limit := 2*len(s.state.Items) + 1
+	s.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	var inFlight atomic.Int64
+	finished := make(chan struct{}, 64)
+
+	for started := 0; started < limit; {
+		n := s.launch(ctx, &wg, &inFlight, finished)
+		started += n
+		if n > 0 {
+			continue // a slot may still be free; fill it before waiting
+		}
+		// Nothing launchable. If nothing is running either, the pipeline is at
+		// rest — checked after the launch attempt, so a slot freed mid-pass is
+		// retried rather than mistaken for the end of the work.
+		if inFlight.Load() == 0 {
+			wg.Wait()
+			s.hub.publish(event{Kind: "state"})
+			return
+		}
+		select {
+		case <-finished:
+		case <-ctx.Done():
+			wg.Wait()
+			return
+		}
+	}
+	wg.Wait()
+	fmt.Fprintln(os.Stderr, "conveyor: drain hit its limit; the stage graph may loop")
+	s.hub.publish(event{Kind: "state"})
+}
+
+// launch starts every transition the locks currently permit and returns how
+// many it started. Candidates whose source or target stage is already busy are
+// skipped rather than queued, so a slow stage never holds up a free one.
+func (s *Server) launch(ctx context.Context, wg *sync.WaitGroup, inFlight *atomic.Int64, finished chan struct{}) int {
+	s.mu.RLock()
+	items := append([]model.Item(nil), s.state.Items...)
+	s.mu.RUnlock()
+	order := s.order.IDs()
+
+	n := 0
+	// Claimed within this pass: Busy only reflects locks already taken, and a
+	// goroutine launched a moment ago may not have taken its own yet.
+	claimedSrc := map[string]bool{}
+	claimedStage := map[string]bool{}
+
+	for {
+		free := items[:0:0]
+		for _, it := range items {
+			target, ok := pipeline.Target(s.cfg, &it)
+			if !ok || claimedSrc[it.Source] || claimedStage[target] ||
+				s.eng.Locks().Busy(it.Source, target) {
+				continue
+			}
+			free = append(free, it)
+		}
+		item, target := pipeline.Pick(s.cfg, free, order)
+		if item == nil {
+			return n
+		}
+		// Claim before launching. Checking Busy and starting a goroutine leaves
+		// a gap in which the next pass sees the slot free and decides the same
+		// thing again; the duplicate then bails, having spent a launch.
+		if !s.eng.Locks().TryAcquire(item.Source, target) {
+			claimedSrc[item.Source] = true
+			claimedStage[target] = true
+			continue
+		}
+		claimedSrc[item.Source] = true
+		claimedStage[target] = true
+
+		it, to := *item, target
+		wg.Add(1)
+		inFlight.Add(1)
+		n++
+		go func() {
+			defer wg.Done()
+			defer inFlight.Add(-1)
+			defer s.eng.Locks().Release(it.Source, to)
+			s.runOne(ctx, it, to)
+			select {
+			case finished <- struct{}{}:
+			default:
+			}
+		}()
+	}
+}
+
+// runOne performs one transition and keeps the board honest about it.
+func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
+	s.setActive(item.ID, &Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title})
+	defer s.setActive(item.ID, nil)
+
+	tr, _ := s.eng.Advance(ctx, item.Source, &item, target)
+	if tr != nil {
+		s.applyTransition(tr)
+		s.hub.publish(event{Kind: "transition", Transition: tr})
+	}
+}
+
+// applyTransition writes an item's new stage into the cache the moment it is
+// known, rather than waiting for the next poll.
+//
+// Without it the drain re-listed while transitions were in flight, saw an item
+// still sitting in a stage that runs a script, and treated finished work as an
+// interrupted job — running an agent over it a second time. The provider is
+// still the authority; this only stops the cache lying in the gap.
+func (s *Server) applyTransition(tr *pipeline.Transition) {
+	s.mu.Lock()
+	for i := range s.state.Items {
+		if s.state.Items[i].ID == tr.Item.ID {
+			s.state.Items[i] = tr.Item
+			break
+		}
+	}
+	s.mu.Unlock()
+}
+
+// advance runs a single transition: the button, which works whether or not the
+// pipeline is running itself.
 func (s *Server) advance(ctx context.Context) bool {
 	s.mu.RLock()
 	items := append([]model.Item(nil), s.state.Items...)
@@ -250,22 +354,35 @@ func (s *Server) advance(ctx context.Context) bool {
 	if item == nil {
 		return false
 	}
-
-	s.setActive(&Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title})
-	defer s.setActive(nil)
-
-	tr, _ := s.eng.Advance(ctx, item.Source, item, target)
-	if tr != nil {
-		s.hub.publish(event{Kind: "transition", Transition: tr})
+	if !s.eng.Locks().TryAcquire(item.Source, target) {
+		return false
 	}
+	defer s.eng.Locks().Release(item.Source, target)
+	s.runOne(ctx, *item, target)
 	return true
 }
 
-func (s *Server) setActive(a *Active) {
+// setActive records a transition as in flight, or clears it when a is nil.
+func (s *Server) setActive(itemID string, a *Active) {
+	if a == nil {
+		s.active.Delete(itemID)
+	} else {
+		s.active.Store(itemID, *a)
+	}
 	s.mu.Lock()
-	s.state.Active = a
+	s.state.Active = s.activeList()
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
+}
+
+func (s *Server) activeList() []Active {
+	out := []Active{}
+	s.active.Range(func(_, v any) bool {
+		out = append(out, v.(Active))
+		return true
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].ItemID < out[j].ItemID })
+	return out
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {

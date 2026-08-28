@@ -17,48 +17,82 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/source"
 )
 
-// Locks enforces concurrency. perSource is 1 and not configurable above it: a
-// source maps to a git worktree, and two agents in one checkout corrupt each
-// other. global bounds how many sources run at once.
+// Locks enforces concurrency along three axes at once.
+//
+//   - perSource is 1 and not configurable above it: a source maps to a git
+//     worktree, and two agents in one checkout corrupt each other.
+//   - perStage bounds how many items sit in one stage at a time. One means the
+//     pipeline behaves like a real line — a station works a single item, and
+//     the next waits — while different stations run at once.
+//   - global caps the total, because every slot is an agent and they are not
+//     free.
+//
+// A transition needs a slot on all three, and takes none unless it can have
+// them all: holding one while waiting for another is how two schedulers
+// deadlock each other.
 type Locks struct {
-	mu     sync.Mutex
-	inUse  map[string]bool
-	global chan struct{}
+	mu       sync.Mutex
+	bySource map[string]bool
+	byStage  map[string]int
+	perStage int
+	global   chan struct{}
 }
 
-func NewLocks(global int) *Locks {
+func NewLocks(global, perStage int) *Locks {
 	if global < 1 {
 		global = 1
 	}
-	return &Locks{inUse: map[string]bool{}, global: make(chan struct{}, global)}
+	if perStage < 1 {
+		perStage = 1
+	}
+	return &Locks{
+		bySource: map[string]bool{},
+		byStage:  map[string]int{},
+		perStage: perStage,
+		global:   make(chan struct{}, global),
+	}
 }
 
-// TryAcquire takes the source's slot and one global slot, or reports false
-// without blocking. Never blocks, so a busy source is skipped rather than
-// queueing work behind it.
-func (l *Locks) TryAcquire(src string) bool {
+// TryAcquire takes a slot on all three axes, or reports false without blocking.
+// Never blocks, so a busy source is skipped rather than queueing work behind it.
+func (l *Locks) TryAcquire(src, stage string) bool {
 	l.mu.Lock()
-	if l.inUse[src] {
+	if l.bySource[src] || l.byStage[stage] >= l.perStage {
 		l.mu.Unlock()
 		return false
 	}
-	l.inUse[src] = true
+	l.bySource[src] = true
+	l.byStage[stage]++
 	l.mu.Unlock()
 
 	select {
 	case l.global <- struct{}{}:
 		return true
 	default:
+		// The global cap is full; give back what was taken rather than hold it.
 		l.mu.Lock()
-		delete(l.inUse, src)
+		delete(l.bySource, src)
+		l.byStage[stage]--
 		l.mu.Unlock()
 		return false
 	}
 }
 
-func (l *Locks) Release(src string) {
+// Busy reports whether a transition would be refused right now. Advisory: the
+// scheduler uses it to skip candidates cheaply, and TryAcquire remains the
+// only authority.
+func (l *Locks) Busy(src, stage string) bool {
 	l.mu.Lock()
-	delete(l.inUse, src)
+	defer l.mu.Unlock()
+	return l.bySource[src] || l.byStage[stage] >= l.perStage
+}
+
+func (l *Locks) Release(src, stage string) {
+	l.mu.Lock()
+	delete(l.bySource, src)
+	if l.byStage[stage] > 0 {
+		l.byStage[stage]--
+	}
 	l.mu.Unlock()
 	select {
 	case <-l.global:
@@ -125,7 +159,7 @@ type Engine struct {
 func New(cfg *config.Config, r *runner.Runner) *Engine {
 	e := &Engine{
 		cfg: cfg, runner: r,
-		locks:    NewLocks(cfg.Concurrency.Global),
+		locks:    NewLocks(cfg.Concurrency.Global, cfg.Concurrency.PerStage),
 		attempts: NewAttempts(),
 		clients:  map[string]*source.Client{},
 	}
@@ -134,6 +168,10 @@ func New(cfg *config.Config, r *runner.Runner) *Engine {
 	}
 	return e
 }
+
+// Locks lets a scheduler ask what is currently refused, so it can skip a busy
+// candidate instead of launching work that would only be turned away.
+func (e *Engine) Locks() *Locks { return e.locks }
 
 func (e *Engine) Client(name string) (*source.Client, bool) {
 	c, ok := e.clients[name]
@@ -148,6 +186,13 @@ var ErrBusy = errors.New("source is busy")
 // The order is fixed by CONTRACTS.md §4 and the move comes first deliberately:
 // if the process dies mid-stage the provider already reflects reality, so the
 // item is not handed out twice on the next poll.
+// Advance performs one transition. The caller must already hold the slot for
+// (source, stage) and must release it afterwards — see Locks.TryAcquire.
+//
+// Scheduling is the caller's business, not the engine's: a scheduler that
+// launches work concurrently has to claim the slot before it starts a
+// goroutine, because the gap between deciding and acquiring is long enough to
+// decide the same thing twice.
 func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, to string) (*Transition, error) {
 	client, ok := e.clients[srcName]
 	if !ok {
@@ -157,10 +202,6 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	if !ok {
 		return nil, fmt.Errorf("no stage named %q", to)
 	}
-	if !e.locks.TryAcquire(srcName) {
-		return nil, ErrBusy
-	}
-	defer e.locks.Release(srcName)
 
 	from := item.Stage
 	tr := &Transition{Item: *item, Stage: to, From: from}

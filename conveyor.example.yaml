@@ -12,8 +12,11 @@ version: 1
 #   providers: ~/codes/Conveyor/providers
 
 concurrency:
-  perSource: 1        # one item in flight per source. See CONTRACTS.md §5.
-  global: 1           # v1 ships 1; raise to run sources in parallel.
+  perSource: 1        # fixed at 1: a source maps to a git worktree, and two
+                      # agents in one checkout corrupt each other. See §5.
+  perStage: 1         # one item per stage, so the pipeline behaves like a line:
+                      # a station works a single item while others run their own
+  global: 4           # total in flight. Every slot is an agent.
 
 poll: 5m              # how often to re-list every source
 timeout: 90m          # default per-script timeout; stages may override

@@ -141,8 +141,8 @@ func cmdValidate(args []string) error {
 		parts = append(parts, n)
 	}
 	fmt.Printf("    stages: %s\n", strings.Join(parts, " -> "))
-	fmt.Printf("    %d source(s), concurrency %d global / %d per source\n",
-		len(cfg.Sources), cfg.Concurrency.Global, cfg.Concurrency.PerSource)
+	fmt.Printf("    %d source(s), concurrency %d global / %d per stage / %d per source\n",
+		len(cfg.Sources), cfg.Concurrency.Global, cfg.Concurrency.PerStage, cfg.Concurrency.PerSource)
 	fmt.Printf("    poll %s, default timeout %s, log retention %s\n",
 		cfg.Poll.D(), cfg.Timeout.D(), cfg.Logs.Retention.D())
 	fmt.Println("    (* runs a script on enter, . terminal)")
@@ -289,7 +289,11 @@ func cmdTick(args []string) error {
 				break
 			}
 			fmt.Printf("\n%s: %s (%s -> %s) — %s\n", s.Name, item.ID, item.Stage, target, item.Title)
+			if !eng.Locks().TryAcquire(s.Name, target) {
+				break // something else holds this source or stage
+			}
 			tr, err := eng.Advance(ctx, s.Name, item, target)
+			eng.Locks().Release(s.Name, target)
 			report(tr)
 			advanced++
 			if err != nil {

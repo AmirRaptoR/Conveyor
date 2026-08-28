@@ -40,8 +40,16 @@ type Config struct {
 }
 
 type Concurrency struct {
+	// PerSource is 1 and validated as 1: a source maps to a git worktree, and
+	// two agents in one checkout corrupt each other. It is in the schema to be
+	// explicit about the constraint, not to be tuned.
 	PerSource int `yaml:"perSource"`
-	Global    int `yaml:"global"`
+	// PerStage bounds how many items occupy one stage at a time. One makes the
+	// pipeline behave like a line: a station works a single item while other
+	// stations run their own.
+	PerStage int `yaml:"perStage"`
+	// Global caps the total in flight. Every slot is an agent.
+	Global int `yaml:"global"`
 }
 
 type Logs struct {
@@ -223,6 +231,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Concurrency.Global == 0 {
 		c.Concurrency.Global = 1
+	}
+	if c.Concurrency.PerStage == 0 {
+		c.Concurrency.PerStage = 1
 	}
 	if c.Poll == 0 {
 		c.Poll = Duration(5 * time.Minute)
@@ -505,6 +516,9 @@ func (c *Config) Validate() []string {
 
 	if c.Version != 1 {
 		add("version must be 1, got %d", c.Version)
+	}
+	if c.Concurrency.PerStage < 1 {
+		add("concurrency.perStage must be at least 1, got %d", c.Concurrency.PerStage)
 	}
 	if c.Concurrency.PerSource != 1 {
 		// Not a style preference: a source maps to a git worktree, and two
