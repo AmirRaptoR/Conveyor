@@ -87,7 +87,7 @@ update a field). Called by the **engine**, never by a stage script: the engine
 owns provider state so a crashed stage script cannot leave it inconsistent.
 Receives `{"item":…, "stage": "<target>", "from": "<current>"}`.
 
-**stage script** (`conveyor.d/<source>/<stage>`, beside the config) — do the actual work
+**stage script** (`conveyor.d/<source>/<script>`, beside the config) — do the actual work
 of a stage. Run an AI agent, run
 tests, deploy, cut a release. This is the extension point; everything else is
 plumbing.
@@ -100,7 +100,7 @@ Moving an item from stage A to stage B is always, in this order:
 1. acquire the source's lock        (one item in flight per source)
 2. move(item, B)                    provider now says B — before any work starts,
                                     so a crash leaves a truthful record
-3. run conveyor.d/<source>/B      logs stream to the UI
+3. run B's named script          logs stream to the UI
 4. on exit 0   → move(item, next)   and release
    on exit 20  → move(item, blocked)
    on failure  → move(item, onFailure) or leave, count attempt

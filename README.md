@@ -78,7 +78,7 @@ concurrency:
 stages:
   - name: backlog                        # no script: a queue
   - name: refining
-    work: true        # the script lives in each source's repo
+    script: refine    # every source must provide a script by this name
     onSuccess: ready
     onFailure: backlog
   - name: done
@@ -97,46 +97,74 @@ It cannot name `list` and `move` separately, deliberately — that would let one
 source pair GitHub's list with Azure's move, a mismatch nothing downstream could
 detect, because by then they are just two executable paths.
 
-## Onboarding a repo
+## Onboarding a source
 
-`stages:` is the state machine. A stage marked `work: true` runs something, but
-*what* it runs is per-source, in `conveyor.d/<source>/<stage>` beside the config:
+`stages:` is the state machine: which columns exist and where an item goes next.
+The only thing a stage says about execution is `script:` — a **name**, not a
+path and not a command. A stage with no `script:` runs nothing and is a queue.
+
+Every source must provide that name in `conveyor.d/<source>/`:
 
 ```
 ~/codes/
   conveyor.yaml
   conveyor.d/
     midgame/
-      refining        claude -p "/refine" — resolves midgame's .claude/skills
-      in-progress
+      refine        claude -p, this repo's own skills and tools
+      implement
     caravan-v2/
-      refining        codex exec with a long prompt
+      refine        codex exec with a long prompt
 ```
 
-Same pipeline, different work. The engine knows about neither agent — it execs a
-file. Scripts resolve by name with or without an extension, exactly like
-providers.
+Same pipeline, different work. How a stage is run — which agent, which model,
+which tools — is entirely in the script, because it differs per repository and
+the engine must never know. The stage and the script need not share a name, and
+two stages may use the same one.
 
-They live beside the config rather than inside the repo being worked, so nothing
-is written into somebody's project — and an agent told to "commit and push"
-cannot sweep the pipeline into its own pull request. The script still *runs* in
-the source's workdir, so `claude` there still resolves that repo's own
-`.claude/skills/`.
+Scripts live beside the config rather than inside the repo being worked, so
+nothing is written into somebody's project and an agent told to "commit and
+push" cannot sweep the pipeline into its own pull request. They still *run* in
+the source's workdir, so `claude` there resolves that repo's `.claude/skills/`.
 
-**A source missing a script for a `work:` stage is reported, not tolerated:**
+**A source missing a named script is reported, not tolerated:**
 
 ```
     source "caravan-v2" cannot run:
-      - stage "in-progress": no in-progress script in ~/codes/conveyor.d/caravan-v2
+      - stage "in-progress": no implement script in ~/codes/conveyor.d/caravan-v2
 
 3 of 4 source(s) unusable; the other 1 will still be worked
 ```
 
-Onboarding is configuration work, and an incomplete one is a configuration
-error — but it is *that source's* error: conveyor reports it, skips it, and
-keeps working every healthy source. There is no shared fallback to inherit by
-accident, so a source you meant to customise cannot silently do something
-generic instead.
+It is *that source's* error: conveyor reports it, skips it, and keeps working
+every healthy source. There is no shared fallback to inherit by accident.
+
+### What a script gets
+
+| | |
+| --- | --- |
+| `$CONVEYOR_ITEM_ID` `$CONVEYOR_ITEM_REF` | the item, and the bare id the provider knows it by |
+| `$CONVEYOR_SOURCE` `$CONVEYOR_STAGE` | which source, which stage is being entered |
+| `$CONVEYOR_WORKDIR` `$CONVEYOR_RESULT` | where it runs, and where to write structured output |
+| the source's `env:` | provider config — `REPO`, label mappings, anything |
+| stdin | the whole item as JSON, plus `stage` and `from` |
+
+### An inline script
+
+For a stage where every source does the same thing, `run:` takes the body
+instead. It must start with a shebang — the engine writes it out and execs it,
+and never picks an interpreter:
+
+```yaml
+  - name: announced
+    run: |
+      #!/usr/bin/env bash
+      echo "item $CONVEYOR_ITEM_REF reached $CONVEYOR_STAGE"
+```
+
+It cannot vary per source — that is what `script:` is for — so keep it small.
+Anything with real logic wants to be a file, where a shell can check it and a
+person can run it by hand. The body is written into the run directory, so the
+exact text that ran is archived with its own logs.
 
 The starting template is in [`examples/`](examples/):
 

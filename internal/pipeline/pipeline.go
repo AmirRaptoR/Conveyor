@@ -168,13 +168,16 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 
 	// A stage with no script is a queue, not an error: the item rests here
 	// until something else moves it.
-	if !stage.Work {
+	if !stage.Runs() {
 		tr.Outcome = model.OutcomeNoop
 		return tr, nil
 	}
 
 	src := mustSource(e.cfg, srcName)
 	script, ok := src.Scripts[to]
+	if stage.Run != "" {
+		script, ok = "", true // written into the run directory instead
+	}
 	if !ok {
 		// resolveSources already recorded why, and Engine skips unhealthy
 		// sources — reaching here means one went bad after load.
@@ -185,9 +188,10 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 
 	res, err := e.runner.Run(ctx, runner.Spec{
 		Script:  script,
+		Inline:  stage.Run,
 		Kind:    "stage",
 		Workdir: e.cfg.Workdir(mustSource(e.cfg, srcName)),
-		Env:     mergeEnv(src.Env, stage.Env),
+		Env:     src.Env,
 		Source:  srcName,
 		Item:    item,
 		From:    from,
@@ -256,7 +260,7 @@ func Target(cfg *config.Config, it *model.Item) (string, bool) {
 	if !ok || stage.Terminal {
 		return "", false
 	}
-	if stage.Work {
+	if stage.Runs() {
 		return stage.Name, true // re-run: recover an interrupted stage
 	}
 	if stage.OnSuccess == "" {
@@ -314,22 +318,6 @@ func better(aOrdered bool, aIdx, aPrio, aPos int, bOrdered bool, bIdx, bPrio, bP
 		return aPrio < bPrio // 0 is most urgent
 	}
 	return aPos < bPos
-}
-
-// mergeEnv layers a stage's env over its source's. A stage overrides a
-// repo-wide default, never the reverse: the narrower scope wins.
-func mergeEnv(source, stage map[string]string) map[string]string {
-	if len(stage) == 0 {
-		return source
-	}
-	out := make(map[string]string, len(source)+len(stage))
-	for k, v := range source {
-		out[k] = v
-	}
-	for k, v := range stage {
-		out[k] = v
-	}
-	return out
 }
 
 func mustSource(cfg *config.Config, name string) config.Source {

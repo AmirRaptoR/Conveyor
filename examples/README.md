@@ -3,7 +3,8 @@
 `stages:` in `conveyor.yaml` is the state machine. What a stage *does* is
 per-source, in `conveyor.d/<source>/<stage>` beside the config.
 
-`conveyor.d/_source/` here is the starting template. Copy it, named for the
+`conveyor.d/_source/` here is the starting template — one file per script name
+the stages ask for (`refine`, `implement`, `review`). Copy it, named for the
 source you are enrolling, then edit it:
 
 ```bash
@@ -11,9 +12,8 @@ cp -r examples/conveyor.d/_source ~/codes/conveyor.d/midgame
 ```
 
 Then add the source to your `conveyor.yaml` with its `REPO` and label mapping.
-`conveyor validate` names any `work:` stage the source has not implemented; a
-source missing a script is skipped and reported, never quietly given generic
-behaviour.
+`conveyor validate` names any script the source has not provided; a source
+missing one is skipped and reported, never quietly given generic behaviour.
 
 ## Why not inside the repo being worked
 
@@ -30,9 +30,14 @@ workdir, so `claude` there still resolves that repo's own `.claude/skills/`.
 
 | | |
 | --- | --- |
-| `refining` | Claude rewrites the issue into something implementable, then stops. |
-| `in-progress` | Claude implements it and opens a PR. |
-| `testing` | Codex reviews that PR — deliberately not the model that wrote it. |
+| `refine` | Claude rewrites the issue into something implementable, then stops. |
+| `implement` | Claude implements it and opens a PR. |
+| `review` | Codex reviews that PR — deliberately not the model that wrote it. |
+
+These are the *names the stages ask for*, not the stage names — a stage called
+`in-progress` runs a script called `implement`. Which agent each one uses is
+this file's business and nothing conveyor knows: swap `claude` for `codex` in
+one source's copy and only that repository changes.
 
 The prompts are inline rather than in skills, so a freshly enrolled source works
 with nothing installed. Move one into the repo's `.claude/skills/` when it

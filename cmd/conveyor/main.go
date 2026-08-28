@@ -122,7 +122,7 @@ func cmdValidate(args []string) error {
 	for _, s := range cfg.Stages {
 		n := s.Name
 		switch {
-		case s.Work:
+		case s.Runs():
 			n += "*"
 		case s.Terminal:
 			n += "."

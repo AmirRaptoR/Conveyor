@@ -36,7 +36,12 @@ type LogLine struct {
 
 // Spec is one invocation.
 type Spec struct {
-	Script  string // absolute path
+	Script string // absolute path; empty when Inline is set
+	// Inline is a script body given in the config instead of a file. It is
+	// written into the run directory and executed from there, so the exact
+	// text that ran is archived with its own logs. It needs a shebang: the
+	// engine writes the file and execs it, and never picks an interpreter.
+	Inline  string
 	Kind    string // "list" | "move" | "stage"
 	Workdir string
 	Env     map[string]string
@@ -89,6 +94,15 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		run.ItemID = spec.Item.ID
 	}
 
+	script := spec.Script
+	if spec.Inline != "" {
+		script = filepath.Join(dir, "script")
+		if err := os.WriteFile(script, []byte(spec.Inline), 0o755); err != nil {
+			return nil, fmt.Errorf("write inline script: %w", err)
+		}
+		run.Script = script
+	}
+
 	stdinJSON := []byte("{}")
 	if spec.Stdin != nil {
 		b, err := json.MarshalIndent(spec.Stdin, "", "  ")
@@ -115,7 +129,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		defer cancel()
 	}
 
-	cmd := exec.Command(spec.Script)
+	cmd := exec.Command(script)
 	cmd.Dir = spec.Workdir
 	cmd.Env = env
 	cmd.Stdin = bytesReader(stdinJSON)
@@ -158,7 +172,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		run.Outcome = model.OutcomeFailure
 		run.ExitCode = -1
 		r.finish(&run, dir, started)
-		return &Result{Run: run, Log: lines}, fmt.Errorf("start %s: %w", spec.Script, err)
+		return &Result{Run: run, Log: lines}, fmt.Errorf("start %s: %w", script, err)
 	}
 
 	var wg sync.WaitGroup

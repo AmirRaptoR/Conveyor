@@ -30,33 +30,25 @@ logs:
 # Stages. Minimum two. Order defines the board's columns, left to right, and the
 # default "next stage" on success.
 #
-# This is the state machine and nothing else. `work: true` says a stage runs
-# something; WHAT it runs is per-source, at conveyor.d/<source>/<stage> beside
-# this file. That is what lets one source refine with a Claude skill and another
-# with a long Codex prompt, on the same pipeline.
+# This is the state machine and nothing else — which columns exist and where an
+# item goes next. It says nothing about how any work is done.
 #
-# The scripts sit here rather than inside the repo being worked: nothing is
-# written into somebody's project, and an agent told to "commit and push" cannot
-# sweep the pipeline into its own pull request. They still RUN in the source's
-# workdir, so repo-local .claude/skills still resolve.
+# `script:` names what runs on entering a stage. It is a name, not a path and
+# not a command: every source must provide that name in conveyor.d/<source>/,
+# and a source missing one is reported and skipped. A stage with no `script:`
+# runs nothing and is simply a queue.
+#
+# How the work is actually done — which agent, which model, which tools — lives
+# in each source's script, because it differs per repository and the engine must
+# never know. Onboarding a repository is writing its scripts.
 # ---------------------------------------------------------------------------
 stages:
   - name: backlog
-    # No work: nothing runs. Items land here and wait.
+    # No script: nothing runs. Items land here and wait.
 
   - name: refining
-    work: true                # conveyor.d/<source>/refining
-    # Opaque to the engine: it copies these into the script's environment and
-    # attaches no meaning to any of them. This is the whole extension seam —
-    # "call claude with these tools" is a string here and a decision there.
-    #
-    # Three scopes, narrowest wins:
-    #   stage env    this stage, every source
-    #   source env   this source, every stage
-    #   the script   this source, this stage — it is already one file per pair,
-    #                so per-repo-per-stage needs no configuration at all
-    env:
-      MAX_TURNS: "40"
+    script: refine            # conveyor.d/<source>/refine — the stage and the
+                              # script need not share a name
     timeout: 30m
     onSuccess: ready          # explicit; would default to the next stage anyway
     onFailure: backlog        # a failed refine returns it to the pile
@@ -70,7 +62,7 @@ stages:
                               # Some stages must never be entered by hand.
 
   - name: in-progress
-    work: true                # conveyor.d/<source>/in-progress
+    script: implement         # conveyor.d/<source>/implement
     onSuccess: done
     onFailure: blocked
     maxAttempts: 2            # after this many failures, force to onBlocked

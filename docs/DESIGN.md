@@ -20,7 +20,7 @@ builds, that is CI, and CI already exists.
 | 2 | Stages from config, minimum two | `config/*.yaml` `stages:` — order is the board, left to right. Validated at load. |
 | 3 | Items loaded from sources | `list` scripts, one per source. Only configured sources are scanned; no directory auto-discovery. |
 | 4 | Timer picks up an item | `poll:` re-lists; the scheduler picks the highest-priority item whose stage is marked `work:` and whose source lock is free. |
-| 5 | Moving a column runs a script, logs visible | `conveyor.d/<source>/<stage>`. stdout/stderr stream line-by-line to the UI over SSE; exit code decides the next stage. |
+| 5 | Moving a column runs a script, logs visible | the stage's named script in `conveyor.d/<source>/`. stdout/stderr stream line-by-line to the UI over SSE; exit code decides the next stage. |
 
 Mocked from day one: `providers/mock/` and `conveyor.d/mock/`
 exercise every path —
@@ -59,7 +59,7 @@ In:
 
 - one agent (`global: 1`, `perSource: 1`)
 - automatic transitions driven entirely by exit codes
-- optional `work:` — a stage that runs nothing is a queue, not an error
+- optional `script:` — a stage that names none is a queue, not an error
 - persisted runs, live log streaming, 30-day retention with pinning
 - failure as a first-class state: red, surfaced first, one click to the log
 - reordering the input queue
@@ -96,7 +96,7 @@ internal/store/       items, run history, manual order    (not built yet)
 internal/server/      HTTP API + SSE hub; embed.FS serves web/  (not built yet)
 web/                  the board                                 (not built yet)
 providers/            one folder per provider; list/move resolved by name
-conveyor.d/<source>/  per-source stage scripts, beside the config
+conveyor.d/<source>/  the scripts a source provides, beside the config
 examples/             the template copied when enrolling a source
 ```
 

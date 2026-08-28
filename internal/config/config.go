@@ -48,14 +48,24 @@ type Logs struct {
 
 type Stage struct {
 	Name string `yaml:"name"`
-	// Work declares that this stage runs something; the script itself lives in
-	// each source's repo at .conveyor/<stage>. The config owns the state
-	// machine, the repo owns what the work actually is.
+	// Script names what runs on entering this stage — a key every source must
+	// provide, resolved to conveyor.d/<source>/<script>. Empty means nothing
+	// runs and the stage is a queue.
 	//
-	// It stays in config because the scheduler needs it: a stage with no work
-	// is a queue, while a work stage found mid-flight is an interrupted job to
-	// re-run. A per-repo file cannot answer that for a repo not yet onboarded.
-	Work        bool     `yaml:"work"`
+	// It is a name, not a path and not a command: the stage says WHICH script,
+	// each source says what that script IS. Two stages may share one name, and
+	// a stage may be called something different from the script it runs.
+	//
+	// This is the only thing a stage says about execution. How to run the work
+	// — which agent, which model, which tools — belongs to the source's script,
+	// because it differs per repository and the engine must never know.
+	Script string `yaml:"script"`
+	// Run is a script body written inline in the config, for a stage where
+	// every source does the same thing. It cannot vary per source — that is
+	// what `script:` is for — so keep it small: anything with real logic in it
+	// wants to be a file, where a shell can check it and a person can run it.
+	// It must start with a shebang; the engine writes it out and execs it.
+	Run         string   `yaml:"run"`
 	Timeout     Duration `yaml:"timeout"`
 	OnSuccess   string   `yaml:"onSuccess"`
 	OnFailure   string   `yaml:"onFailure"`
@@ -65,13 +75,6 @@ type Stage struct {
 
 	// Reserved for v2 and inert in v1: parsed and validated now so adding
 	// human-driven moves later is not a schema migration. See DESIGN.md.
-	// Env is handed to this stage's script on top of the source's. The engine
-	// never reads a key or attaches meaning to a value — it is opaque
-	// configuration for whatever the script happens to run. That is the whole
-	// point: "call claude with these tools" is a string here and a decision
-	// there.
-	Env map[string]string `yaml:"env"`
-
 	Manual      bool `yaml:"manual"`
 	AllowManual bool `yaml:"allowManual"`
 }
@@ -199,7 +202,7 @@ func (c *Config) applyDefaults() {
 		// A blocked item must always leave the stage it blocked in. Staying
 		// would mean the scheduler re-runs the same script on the next poll,
 		// which is the exact infinite loop this design exists to avoid.
-		if s.OnBlocked == "" && s.Work && hasBlocked {
+		if s.OnBlocked == "" && s.runs() && hasBlocked {
 			s.OnBlocked = "blocked"
 		}
 	}
@@ -214,6 +217,12 @@ func (c *Config) Stage(name string) (*Stage, bool) {
 	}
 	return nil, false
 }
+
+// runs reports whether entering this stage executes anything.
+func (s Stage) runs() bool { return s.Script != "" || s.Run != "" }
+
+// Runs is runs, for callers outside this package.
+func (s Stage) Runs() bool { return s.runs() }
 
 // StageNames is what gets handed to a list script so a source knows which
 // stage names it is allowed to emit.
@@ -364,10 +373,12 @@ func (c *Config) resolveSources() {
 		}
 
 		for _, st := range c.Stages {
-			if !st.Work {
+			// An inline stage needs nothing from the source: the same body runs
+			// everywhere, so it can never make a source unusable.
+			if st.Script == "" {
 				continue
 			}
-			path, err := findScript(filepath.Join(c.Dir, ScriptsDir, s.Name), st.Name)
+			path, err := findScript(filepath.Join(c.Dir, ScriptsDir, s.Name), st.Script)
 			if err != nil {
 				note("stage %q: %v", st.Name, err)
 				continue
@@ -415,20 +426,26 @@ func (c *Config) Validate() []string {
 		}
 		seen[s.Name] = true
 
-		if s.Terminal && s.Work {
-			add("stage %q: terminal stages cannot do work", s.Name)
+		if s.Terminal && s.runs() {
+			add("stage %q: terminal stages cannot run a script", s.Name)
+		}
+		if s.Script != "" && s.Run != "" {
+			add("stage %q: has both script: and run: — pick one", s.Name)
+		}
+		if s.Run != "" && !strings.HasPrefix(s.Run, "#!") {
+			add("stage %q: run: must start with a shebang; the engine execs it and never picks an interpreter", s.Name)
 		}
 		if s.MaxAttempts < 0 {
 			add("stage %q: maxAttempts cannot be negative", s.Name)
 		}
 		// A non-terminal stage that runs a script must be able to leave.
-		if !s.Terminal && s.Work && s.OnSuccess == "" {
-			add("stage %q: does work but has no onSuccess and is not terminal — items would have nowhere to go", s.Name)
+		if !s.Terminal && s.runs() && s.OnSuccess == "" {
+			add("stage %q: runs a script but has no onSuccess and is not terminal — items would have nowhere to go", s.Name)
 		}
 		// Without a blocked target the item stays put and the scheduler runs
 		// the same script again on the next poll.
-		if s.Work && s.OnBlocked == "" {
-			add("stage %q: does work but has no onBlocked, and there is no stage named \"blocked\" to default to — a blocked item would be re-run forever", s.Name)
+		if s.runs() && s.OnBlocked == "" {
+			add("stage %q: runs a script but has no onBlocked, and there is no stage named \"blocked\" to default to — a blocked item would be re-run forever", s.Name)
 		}
 	}
 	// Targets must exist. Checked after the name set is complete so ordering

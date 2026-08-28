@@ -37,9 +37,9 @@ If refining needs a decision only a human can make, change nothing and write
 \$CONVEYOR_RESULT instead.
 PROMPT_END
 
-# Everything tunable comes from the stage's env: block in conveyor.yaml. The
-# engine passes those through without knowing what any of them mean — they are
-# claude's vocabulary, not conveyor's. Defaults keep the script runnable alone.
+# How this repository refines: which agent, which model, which tools. None of it
+# is conveyor's business — the config only said "run the script named refine".
+# Change any of it here and only this repository changes.
 set +e
 claude -p "$PROMPT" \
 	--max-turns "${MAX_TURNS:-40}" \

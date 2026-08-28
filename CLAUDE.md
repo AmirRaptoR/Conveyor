@@ -39,35 +39,38 @@ Not built yet, in build order (see `docs/DESIGN.md`):
 - **`perSource: 1` is a constraint, not a default.** A source maps to a git
   worktree; two agents in one checkout corrupt each other.
 - **Every item must be able to leave a scripted stage.** Config validation
-  rejects a `work: true` stage with no route out — a blocked item that stays
+  rejects a stage that runs a script but has no route out — a blocked item that stays
   put gets re-run on every poll forever.
 - **A source names a `provider:`, never two script paths.** Naming `list` and
   `move` separately allowed pairing GitHub's list with Azure's move, which
   nothing downstream could detect.
-- **Stages declare `work:`; the script is per-source**, at
-  `conveyor.d/<source>/<stage>` beside the config — never inside the repo being
-  worked, where an agent told to "commit and push" would sweep it into a PR.
-  Scripts still run in the source's workdir, so repo-local skills still resolve.
-  `work:` stays in config because the scheduler needs it: a stage with no work
-  is a queue, a work stage found mid-flight is an interrupted job to re-run.
+- **A stage says only `script:`, a name.** Not a path, not a command, and
+  nothing about how to run it. Every source provides that name in
+  `conveyor.d/<source>/` beside the config — never inside the repo being worked,
+  where an agent told to "commit and push" would sweep it into a PR. Scripts
+  still run in the source's workdir, so repo-local skills resolve. A named
+  script in config is what the scheduler needs: a stage with none is a queue, a
+  running stage found mid-flight is an interrupted job to re-run.
+- **How the work happens is never in the config.** Which agent, which model,
+  which tools, all of it lives in the source's script, because it differs per
+  repository. Resist every request to add a key for it.
 - **An un-onboarded repo is reported, never worked around.** Per-source problems
   disable that source and leave every other repo running. There is no shared
   fallback to inherit by accident.
 
 ## The extension seam
 
-`env:` is the only key whose values the engine never reads; every other key is
-structure it needs to run the state machine. Adding a capability should almost
-always be a string in `env:` and a line in a script, never a new key.
+The extension is the scripts, never the engine. A stage names one; the source
+provides it; how it works is that file's business. `run:` takes an inline body
+for a stage that is identical everywhere, and must carry a shebang.
 
-Three scopes, narrowest wins: stage env (this stage, every source), source env
-(this source, every stage), and the script itself at
-`conveyor.d/<source>/<stage>` — already one file per pair, so per-repo-per-stage
-behaviour needs no configuration.
+Configuration the engine passes but never reads is the source's `env:` — that
+is the only place a value is opaque. Everything else in the schema is structure.
 
-Deliberately not built: `args:` for scripts (env carries it, and `${FOO}` reads
-better than `$3`), and per-source stage overrides (a three-way merge in Go to
-express what the file layout expresses for free).
+Deliberately not built: stage-level `env:` (settings that differ per repo belong
+in that repo's script, not in the shared state machine), `args:` for scripts (env
+carries it and reads better), and per-source stage overrides (a merge in Go to
+express what one file per source already expresses).
 
 ## Gotchas
 
