@@ -169,28 +169,34 @@
   }
   .open:hover { color:var(--ink); border-color:var(--faint); }
 
-  /* Terminal stations leave the line: done at its end, blocked diverted off it. */
+  /* Terminal stations sit after a gap, joined by a short spur. They were once
+     offset vertically to draw the divert literally; it read as misalignment
+     rather than as meaning, so the colour carries it instead. */
   .terminus { flex:0 0 auto; padding-left:30px; position:relative; z-index:1; }
   .terminus .plate { min-width:158px; }
   .terminus .queue { margin-right:0; padding-right:0; border-top-color:var(--rule-soft); }
-  /* done sits at the end of the line; blocked is diverted off it. */
-  .terminus.done::before {
+  .terminus::before {
     content:""; position:absolute; left:0; top:calc(14px + 52px); width:30px; height:1px;
     background:var(--rule);
-  }
-  .terminus.divert { margin-top:78px; }
-  .terminus.divert::before {
-    content:""; position:absolute; left:0; top:-26px; width:1px; height:26px;
-    background:color-mix(in srgb, var(--stop) 55%, var(--rule));
-  }
-  .terminus.divert::after {
-    content:""; position:absolute; left:0; top:calc(14px + 52px); width:30px; height:1px;
-    background:color-mix(in srgb, var(--stop) 55%, var(--rule));
   }
   .terminus.done .plate { border-color:color-mix(in srgb, var(--ok) 45%, var(--rule)); }
   .terminus.done .name { color:var(--ok); }
   .terminus.divert .plate { border-color:color-mix(in srgb, var(--stop) 55%, var(--rule)); }
   .terminus.divert .name { color:var(--stop); }
+  .terminus.divert::before { background:color-mix(in srgb, var(--stop) 55%, var(--rule)); }
+
+  /* ---- sources ---------------------------------------------------------- */
+  .sources {
+    display:flex; gap:16px; flex-wrap:wrap; align-items:center;
+    padding:10px 22px; border-bottom:1px solid var(--rule); background:var(--panel);
+    font-size:11px; color:var(--dim);
+  }
+  .src-chip { display:flex; align-items:center; gap:7px; }
+  .src-chip .swatch { width:9px; height:2px; background:var(--src); }
+  .src-chip .repo { color:var(--faint); }
+  .src-chip .n { color:var(--ink); font-variant-numeric:tabular-nums; }
+  .src-chip.broken .name { color:var(--stop); }
+  .src-chip.broken .swatch { background:var(--stop); }
 
   /* ---- faults ------------------------------------------------------------ */
   .faults { margin:0 22px; border-left:2px solid var(--stop); background:var(--panel); padding:12px 16px; }
@@ -273,6 +279,7 @@
   <button class="ctl primary" id="tick">Tick once</button>
 </div>
 
+<div id="sources"></div>
 <div id="faults"></div>
 <div class="line"><div class="rail" id="rail"></div></div>
 
@@ -339,6 +346,23 @@ function draw() {
   $("#rail").innerHTML =
     flow.map(st => station(st, bucket[st.name] || [], active)).join("") +
     ends.map(st => terminus(st, bucket[st.name] || [])).join("");
+
+  // A key for the edge colours, and the list of what is enrolled: without it
+  // the colours are decoration, because nothing says which repo is which.
+  const counts = {};
+  for (const it of items) counts[it.source] = (counts[it.source] || 0) + 1;
+  $("#sources").innerHTML = `<div class="sources">${
+    (state.sources || []).map(s => {
+      const broken = (s.problems || []).length > 0;
+      return `<span class="src-chip${broken ? " broken" : ""}" style="--src:${sourceColour(s.name)}"
+          title="${esc(s.workdir || "")}">
+        <span class="swatch"></span>
+        <span class="name">${esc(s.name)}</span>
+        <span class="n">${counts[s.name] || 0}</span>
+        ${broken ? `<span class="repo">cannot run</span>` : ""}
+      </span>`;
+    }).join("")
+  }</div>`;
 
   const bad = (state.sources || []).filter(s => (s.problems || []).length);
   $("#faults").innerHTML = bad.length ? `<div class="faults">
