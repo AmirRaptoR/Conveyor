@@ -50,9 +50,28 @@ type State struct {
 	// limit, a quota, whatever its own status script chose to report. Empty
 	// when no agent provides one.
 	Agents []AgentView `json:"agents,omitempty"`
+	// Slots is what the concurrency locks are holding, against their limits. It
+	// is here rather than behind a debug flag because "nothing is starting" is
+	// the question this board gets asked most, and a held slot is the one cause
+	// that leaves no other trace.
+	Slots SlotsView `json:"slots"`
 	// Active is every transition running right now. The board lights those
 	// stations; without it the page cannot tell work from stillness.
 	Active []Active `json:"active"`
+}
+
+// SlotsView is the concurrency state, as the scheduler sees it.
+type SlotsView struct {
+	BySource  map[string]int `json:"bySource"`
+	ByStage   map[string]int `json:"byStage"`
+	Global    int            `json:"global"`
+	GlobalMax int            `json:"globalMax"`
+	PerSource int            `json:"perSource"`
+	PerStage  int            `json:"perStage"`
+	// Running is how many transitions are actually in flight. It should equal
+	// Global; anything else is a slot taken and not given back, which stops the
+	// board dead while every item still reads as free.
+	Running int `json:"running"`
 }
 
 type Active struct {
@@ -790,6 +809,9 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	st := s.state
 	st.Items = pipeline.Order(s.cfg, s.state.Items, s.state.Order)
+	bySrc, byStage, held, max, perSrc, perStage := s.eng.Locks().Snapshot()
+	st.Slots = SlotsView{BySource: bySrc, ByStage: byStage, Global: held, GlobalMax: max,
+		PerSource: perSrc, PerStage: perStage, Running: int(s.inFlight.Load())}
 	st.Blocks = make(map[string]Block, len(s.blocks))
 	for id, b := range s.blocks {
 		st.Blocks[id] = b

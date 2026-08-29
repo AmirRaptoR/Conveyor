@@ -114,6 +114,29 @@ func (l *Locks) Release(src, stage string) {
 	}
 }
 
+// Snapshot reports what the locks are currently holding.
+//
+// Diagnostic, and it exists because its absence cost an evening: a board that
+// launches nothing looks identical whether the scheduler is asleep, the items
+// are unworkable, or a slot was taken and never given back. The first two can
+// be read off /api/state; the third could not be seen at all.
+func (l *Locks) Snapshot() (bySource, byStage map[string]int, global, globalMax, perSource, perStage int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	bySource, byStage = map[string]int{}, map[string]int{}
+	for k, v := range l.bySource {
+		if v != 0 {
+			bySource[k] = v
+		}
+	}
+	for k, v := range l.byStage {
+		if v != 0 {
+			byStage[k] = v
+		}
+	}
+	return bySource, byStage, len(l.global), cap(l.global), l.perSource, l.perStage
+}
+
 // Attempts counts consecutive failures per item AND stage so maxAttempts can
 // force an item out of a retry loop.
 //
