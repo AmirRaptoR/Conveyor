@@ -272,3 +272,65 @@ func TestBulkClearingLeavesQuestionsStanding(t *testing.T) {
 		t.Errorf("quota recovery released %d item(s); the question is not a quota problem", n)
 	}
 }
+
+// A single scheduling pass must fill every slot the config allows, not one.
+//
+// It used to claim the whole stage after one launch, so `perStage: 2` ran one
+// item and the second slot opened only when something finished and woke the
+// scheduler — a board running one card while the config said two.
+func TestOnePassFillsEverySlot(t *testing.T) {
+	dir := t.TempDir()
+	started := filepath.Join(dir, "started")
+
+	writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "work.sh"), "#!/bin/sh\ncat >/dev/null\necho x >> "+started+"\nsleep 2\n")
+	if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "conveyor.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`version: 1
+concurrency:
+  perSource: 2
+  perStage: 2
+  global: 4
+stages:
+  - name: backlog
+  - name: working
+    script: work
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: fake
+    workdir: ./repo
+    scripts:
+      work:
+        script: ./work.sh
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(cfg, runner.New(filepath.Join(dir, "runs")))
+	s.ctx = context.Background()
+	// Three candidates in one source and one stage; the limits allow two.
+	for _, id := range []string{"s1:1", "s1:2", "s1:3"} {
+		s.state.Items = append(s.state.Items,
+			model.Item{ID: id, Ref: id, Source: "s1", Stage: "backlog", Title: id})
+	}
+
+	if n := s.launch(s.ctx); n != 2 {
+		t.Fatalf("one pass launched %d, want 2 — the config allows two at once", n)
+	}
+	waitFor(t, "both stages to actually start", func() bool { return countLines(started) == 2 })
+	// And not a third: the limits still hold within the pass.
+	if n := s.launch(s.ctx); n != 0 {
+		t.Errorf("a further pass launched %d; perStage 2 was exceeded", n)
+	}
+	waitFor(t, "the transitions to finish", func() bool { return s.inFlight.Load() == 0 })
+}

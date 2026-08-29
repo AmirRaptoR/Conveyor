@@ -626,16 +626,24 @@ func (s *Server) launch(ctx context.Context) int {
 	order := s.order.IDs()
 
 	n := 0
-	// Claimed within this pass: Busy only reflects locks already taken, and a
-	// goroutine launched a moment ago may not have taken its own yet.
-	claimedSrc := map[string]bool{}
-	claimedStage := map[string]bool{}
+	// Started in this pass, so an item is not picked twice before its own
+	// goroutine is running. This is per ITEM, not per stage: with perStage above
+	// 1 a stage has room for another item, and marking the whole stage claimed
+	// after one launch filled exactly one slot per pass — the second only opened
+	// when something finished and woke the scheduler again. The symptom was a
+	// board that ran one card while the config said two.
+	launched := map[string]bool{}
+	// Refused axes. A refusal means that source or that stage is genuinely full,
+	// so nothing else routed there can start either; without this the loop keeps
+	// re-picking the same candidate and never terminates.
+	fullSrc := map[string]bool{}
+	fullStage := map[string]bool{}
 
 	for {
 		free := items[:0:0]
 		for _, it := range items {
 			target, ok := pipeline.Target(s.cfg, &it)
-			if !ok || claimedSrc[it.Source] || claimedStage[target] ||
+			if !ok || launched[it.ID] || fullSrc[it.Source] || fullStage[target] ||
 				s.eng.Locks().Busy(it.Source, target) {
 				continue
 			}
@@ -647,14 +655,16 @@ func (s *Server) launch(ctx context.Context) int {
 		}
 		// Claim before launching. Checking Busy and starting a goroutine leaves
 		// a gap in which the next pass sees the slot free and decides the same
-		// thing again; the duplicate then bails, having spent a launch.
+		// thing again; the duplicate then bails, having spent a launch. The
+		// locks are the authority on capacity — Busy above re-reads them every
+		// iteration, so the pass keeps filling slots until they are actually
+		// gone.
 		if !s.eng.Locks().TryAcquire(item.Source, target) {
-			claimedSrc[item.Source] = true
-			claimedStage[target] = true
+			fullSrc[item.Source] = true
+			fullStage[target] = true
 			continue
 		}
-		claimedSrc[item.Source] = true
-		claimedStage[target] = true
+		launched[item.ID] = true
 
 		it, to := *item, target
 		s.inFlight.Add(1)
