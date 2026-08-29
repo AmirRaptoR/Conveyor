@@ -64,6 +64,9 @@ If the review cannot reach a verdict because it needs a decision only a human
 can make, change nothing and write {\"blocked\": true, \"reason\": \"<the
 decision needed>\"} to the file at ${CONVEYOR_RESULT}."
 
+# A person may have answered the question this stage stopped on last time.
+full=$(resume_prompt "$payload" "$full")
+
 set +e
 MAX_TURNS="${MAX_TURNS:-200}" \
 	ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep,Agent,Skill}" \
@@ -82,6 +85,7 @@ fi
 
 if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 	[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
+	agent_asked
 	echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
 	exit 20 # the agent wrote its own reason; leave it exactly as written
 fi

@@ -65,6 +65,9 @@ If this cannot be done because it needs a decision only a human can make, change
 nothing and write {\"blocked\": true, \"reason\": \"<the decision needed>\"} to
 the file at ${CONVEYOR_RESULT}."
 
+# A person may have answered the question this stage stopped on last time.
+full=$(resume_prompt "$payload" "$full")
+
 set +e
 MAX_TURNS="${MAX_TURNS:-40}" \
 	ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Glob,Grep}" \
@@ -85,6 +88,7 @@ fi
 # process ran, whatever it concluded. It comes back through the result file.
 if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 	[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
+	agent_asked
 	echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
 	exit 20
 fi

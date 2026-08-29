@@ -267,6 +267,16 @@
     letter-spacing:.1em; text-transform:uppercase;
   }
   .stop .hand:hover { background:color-mix(in srgb, var(--stop) 14%, transparent); }
+  .stop .answer {
+    display:block; width:100%; box-sizing:border-box; margin-top:10px;
+    background:var(--bg); color:var(--ink); font:inherit; font-size:12px;
+    line-height:1.6; border:1px solid var(--rule); border-radius:2px;
+    padding:7px 9px; resize:vertical;
+  }
+  .stop .answer:focus {
+    outline:none; border-color:color-mix(in srgb, var(--stop) 45%, var(--rule));
+  }
+  .stop .answer::placeholder { color:var(--faint); }
 
   /* ---- faults ------------------------------------------------------------ */
   .faults { margin:0 22px; border-left:2px solid var(--stop); background:var(--panel); padding:12px 16px; }
@@ -619,6 +629,8 @@ function stopNotice(id) {
       ${at && !isNaN(at) ? `stopped ${esc(at.toLocaleString())}` : ""}
       ${b.runId ? ` &middot; run ${esc(b.runId)}` : ""}
     </div>
+    <textarea class="answer" rows="3" spellcheck="true"
+      placeholder="Reply, if it asked you something. The agent takes it up in the conversation that stopped — leave it empty to just hand the item back."></textarea>
     <button class="hand"
       title="Clear the mark; the item goes straight back into the line">Hand back</button>
   </div>`;
@@ -837,16 +849,33 @@ async function saveOrder() {
 // a card that keeps its red for another second reads as a button that did
 // nothing, and the second press is the one that races.
 async function handBack(id, btn) {
-  if (btn) { btn.disabled = true; btn.textContent = "handing back"; }
-  const res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, { method:"POST" });
+  const box = document.querySelector("#stop .answer");
+  const answer = box ? box.value.trim() : "";
+  if (btn) { btn.disabled = true; btn.textContent = answer ? "answering" : "handing back"; }
+  const res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ answer }),
+  });
   if (!res.ok) { refuse(id, (await res.text()).trim() || `could not unblock ${id}`); return; }
   // The panel was showing a stop that no longer exists.
   $("#stop").innerHTML = "";
 }
 
 $("#unblock-all").onclick = async e => {
-  const n = (state?.items || []).filter(it => it.blocked).length;
-  if (!confirm(`Clear the mark on ${n} item${n === 1 ? "" : "s"}? Each goes straight back into the line.`)) return;
+  // Questions are not cleared in bulk and the button must not imply they are:
+  // a count that includes them promises something the server will not do.
+  const marked = (state?.items || []).filter(it => it.blocked);
+  const asking = marked.filter(it => (blocks[it.id] || {}).asked).length;
+  const n = marked.length - asking;
+  if (!n) {
+    alert(asking
+      ? `Nothing to retry. ${asking} item${asking === 1 ? " is" : "s are"} waiting on an answer from you — open the card and reply.`
+      : "Nothing is marked.");
+    return;
+  }
+  if (!confirm(`Clear the mark on ${n} item${n === 1 ? "" : "s"}? Each goes straight back into the line.`
+    + (asking ? `\n\n${asking} waiting on an answer from you ${asking === 1 ? "is" : "are"} left alone.` : ""))) return;
   e.target.disabled = true;
   e.target.textContent = "handing back…";
   await fetch("/api/unblock", { method:"POST" });

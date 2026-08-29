@@ -62,6 +62,14 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   only out of the first stage. Dropping a card onto a deploy stage would be a
   deploy nobody reviewed; the pipeline is authored ahead of time, not steered
   card by card. A busy slot is a refusal naming what holds it, not a queue.
+- **A stop is either a question or a condition, and the script says which.** A
+  condition (`limit`, `worktree`, a network that was down) may have passed, so
+  the engine clears it in bulk: `Unblock all`, `retryStalled`, a quota
+  returning. A question (`asked: true` in `$CONVEYOR_RESULT`, what `asks` in
+  `agents/_blocked` writes) is never bulk-cleared and never counts towards a
+  stall — nobody answers a question by waiting, and handing it back unanswered
+  spends a run to be asked it again. Condition is the default because it is the
+  safe one to get wrong. The engine reads the flag, never the word beside it.
 - **A mark is one word and a paragraph.** The word (`decision`, `limit`,
   `worktree`, `error`) is all a card shows and all a provider labels; the
   paragraph is one click away in the panel. Scripts own the vocabulary — the
@@ -72,11 +80,22 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   after a restart — never from a label, and never by parsing a log. A red card
   that cannot say what it is waiting for sends the reader to the logs, which is
   the trip the mark exists to save.
-- **Only a person clears a mark**, with one exception: `retryStalled:` clears
-  them all when *every* item is marked and the line cannot move at all. The
-  guard is "everything" deliberately. While one item can still move, a mark is a
-  decision waiting on a human and clearing it spends an agent run to be told the
-  same thing; a total stall is almost always the outside world, which comes back.
+- **Only a person clears a mark**, with two exceptions, and both are the outside
+  world coming back rather than a decision being made. `retryStalled:` clears
+  them all when *every* item is marked and the line cannot move at all — the
+  guard is "everything" deliberately. And an agent's `status` going `limited` →
+  `ok` clears the marks of kind `limit`, those and no others: the script itself
+  said nothing was wrong with the item, and the quota returning is the whole
+  answer. A `decision` mark is never touched — no amount of waiting produces an
+  answer only a person has, and clearing it spends an agent run to be told the
+  same thing.
+- **A stop can be answered, and answering is unblocking.** `POST
+  /api/items/{id}/unblock` takes `{"answer": "…"}`; the reply reaches the next
+  run of that stage in its stdin as `answer`, beside the `session` the agent
+  left in `$CONVEYOR_RESULT`. Both are opaque passthrough, like `Item.Raw` — an
+  adapter that can resume says the answer into the conversation that asked, one
+  that cannot leads its prompt with it. One endpoint, because an answer recorded
+  against an item nobody handed back is a note in a drawer. Spent on use.
 - **The board never sorts.** `/api/state` hands items over in `pipeline.Order`,
   the same ladder `Pick` maximises over, and the page draws them in the order
   they arrive. Sorting in the page is a second copy of the scheduling rules,

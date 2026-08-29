@@ -59,7 +59,7 @@ author learns it once.
 
 | | |
 | --- | --- |
-| `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "blocked": false, "config": {...}}`. For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "config": {...}}` |
+| `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "blocked": false, "config": {...}}`, plus `"answer"` and `"session"` when this run follows a stop a person answered (§5a). For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "config": {...}}` |
 | env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, plus everything in the source's `env:` block |
 
 **Output** is split deliberately:
@@ -246,9 +246,53 @@ it and recovered from run history after a restart. A red card that cannot say
 what it is waiting for sends the reader to the logs, which is the trip the mark
 exists to save. A mark someone applied by hand has no run behind it, and says so.
 
-**Only a person clears a mark**, with one exception. When *every* item is marked
-and the line cannot move at all, `retryStalled:` clears them on an interval and
-lets it try again. The guard is "everything" on purpose: while one item can
-still move, a mark is a decision waiting on a human, and clearing it spends an
-agent run to be told the same thing. A total stall is a different animal — it is
-almost always the outside world, and the outside world comes back.
+**A stop is either a question or a condition**, and the script says which. A
+condition — out of quota, a dirty checkout, a network that was down — may have
+passed by the time anyone looks, so retrying it is reasonable. A question has
+not passed: nobody answered it by waiting. A script that stopped on a question
+writes `"asked": true` beside its reason; everything else is a condition, which
+is the safe default, because a condition wrongly retried costs one run and a
+question wrongly cleared costs the run *and* asks you the same thing again.
+
+The engine reads the flag and never the word beside it. Conditions are cleared
+in bulk — `Unblock all`, `retryStalled`, an agent's quota returning. **A question
+is never cleared in bulk**, and is not counted towards a stall either: a board
+holding nothing but questions is stopped on purpose. Only answering it on its
+own card takes it off.
+
+**Only a person clears a mark**, with two exceptions, and both are the outside
+world coming back rather than a decision being made.
+
+When *every* item is marked and the line cannot move at all, `retryStalled:`
+clears them on an interval and lets it try again. The guard is "everything" on
+purpose: while one item can still move, a mark is a decision waiting on a human,
+and clearing it spends an agent run to be told the same thing. A total stall is
+a different animal — it is almost always the outside world.
+
+And when an agent's `status` script goes from `limited` back to `ok`, the
+conditions of kind `limit` are cleared — those and no others. A `limit` says, in the
+script's own words, that nothing was wrong with the item and the agent had no
+quota left; the quota returning is the whole of the answer, and it arrives on a
+schedule the agent itself reports. Leaving those for someone to clear by hand is
+a night of the line standing still for a reason that expired at 3am. A
+`decision` mark is untouched, because no amount of waiting produces an answer
+only a person has.
+
+## 5a. Answering a stop
+
+A marked item is handed back with an optional reply: `POST
+/api/items/{id}/unblock` takes `{"answer": "…"}`, and answering and unblocking
+are deliberately one gesture. An answer recorded against an item nobody handed
+back is a note in a drawer — the stage that would read it never runs.
+
+The reply reaches the next run of that stage in its stdin, as `answer`, together
+with `session` — whatever handle the agent left in `$CONVEYOR_RESULT` when it
+stopped (`{"blocked": true, …, "session": "…"}`). Both are opaque to the engine,
+which stores them, hands them back once, and never reads either: what resuming
+*means* differs per agent, and some cannot resume at all. An adapter with both
+says the answer into the conversation that asked it; an adapter with only the
+answer leads its original prompt with it and starts fresh, which costs the
+rediscovery but never costs the answer.
+
+An answer is spent when it is handed over. A second run of the same stage is not
+a second reply to one question.

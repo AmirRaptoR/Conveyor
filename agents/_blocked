@@ -34,3 +34,29 @@ blocked() {
 	echo "blocked ($kind): $reason" >&2
 	exit 20
 }
+
+# asks <kind> "<question>" — stop because a person has to answer something.
+#
+# The same mark, with one bit more: `asked`. A stop is one of two things and
+# they are not interchangeable. A condition — out of quota, a dirty checkout, a
+# network that was down — may have passed by the time anyone looks, so clearing
+# it in bulk and trying again is a reasonable thing for a tired operator or a
+# timer to do. A question has not passed. Nobody answered it by waiting, and
+# handing it back unanswered spends an agent run to be asked it a second time.
+#
+# So the engine bulk-clears conditions and never bulk-clears questions: not on
+# `Unblock all`, not on `retryStalled`, not when an agent's quota returns. The
+# only thing that clears a question is a person answering it on the card.
+#
+# Condition is the default because it is the safe one to get wrong: a condition
+# wrongly retried costs one run, a question wrongly cleared costs the run *and*
+# asks you the same thing again.
+asks() {
+	local kind=$1 question=$2
+	if [[ -n "${CONVEYOR_RESULT:-}" ]]; then
+		jq -n --arg kind "$kind" --arg reason "$question" \
+			'{blocked: true, kind: $kind, reason: $reason, asked: true}' >"$CONVEYOR_RESULT"
+	fi
+	echo "asks ($kind): $question" >&2
+	exit 20
+}

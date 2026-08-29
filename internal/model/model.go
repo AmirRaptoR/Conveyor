@@ -136,8 +136,27 @@ type StageInput struct {
 	// line of space and a paragraph to fit in it. Free text to the engine,
 	// which normalises it and passes it on; the vocabulary belongs to the
 	// scripts, because what stops a deploy is not what stops a refine.
-	BlockedKind string         `json:"blockedKind,omitempty"`
-	Config      map[string]any `json:"config,omitempty"`
+	BlockedKind string `json:"blockedKind,omitempty"`
+	// Answer and Session are set only when this run follows a stop that a
+	// person answered: the reply they typed, and the conversation to say it in.
+	// An adapter that can resume uses both; one that cannot uses the answer
+	// alone and starts fresh, which still beats asking the same question twice.
+	Answer  string         `json:"answer,omitempty"`
+	Session string         `json:"session,omitempty"`
+	Config  map[string]any `json:"config,omitempty"`
+}
+
+// Resume is what a person said, and where the agent should say it.
+//
+// Both are opaque to the engine. Answer is text a human typed into the board
+// when they cleared a mark; Session is whatever handle the agent gave itself
+// when it stopped to ask — a Claude Code session id today, anything at all
+// tomorrow. The engine stores them, hands them back, and never reads either,
+// exactly as it treats Item.Raw. What resuming *means* is the adapter's
+// business, because it differs per agent and some cannot resume at all.
+type Resume struct {
+	Answer  string `json:"answer,omitempty"`
+	Session string `json:"session,omitempty"`
 }
 
 // ListInput is the JSON piped to a list script's stdin.

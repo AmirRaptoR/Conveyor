@@ -273,7 +273,7 @@ func cmdRun(args []string) error {
 	if item == nil {
 		return fmt.Errorf("source %q has no item %q", *srcName, *itemID)
 	}
-	tr, err := eng.Advance(ctx, *srcName, item, *stageName)
+	tr, err := eng.Advance(ctx, *srcName, item, *stageName, model.Resume{})
 	report(tr)
 	if err != nil {
 		return err
@@ -327,7 +327,7 @@ func cmdTick(args []string) error {
 			if !eng.Locks().TryAcquire(s.Name, target) {
 				break // something else holds this source or stage
 			}
-			tr, err := eng.Advance(ctx, s.Name, item, target)
+			tr, err := eng.Advance(ctx, s.Name, item, target, model.Resume{})
 			eng.Locks().Release(s.Name, target)
 			report(tr)
 			advanced++

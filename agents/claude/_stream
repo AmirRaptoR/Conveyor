@@ -16,12 +16,79 @@
 # CONTRACTS §2 is about what the engine may parse, and the answer there is still
 # nothing but $CONVEYOR_RESULT.
 CLAUDE_SAID=$(mktemp)
-trap 'rm -f "$CLAUDE_SAID"' EXIT
+# The same run, unrendered. render_stream throws away everything it does not
+# print, and the session id is in that everything: it is how an answer gets said
+# back into the conversation that asked, instead of starting a new one that has
+# to rediscover the repository first.
+CLAUDE_RAW=$(mktemp)
+trap 'rm -f "$CLAUDE_SAID" "$CLAUDE_RAW"' EXIT
+
+# claude_session prints the conversation's own id, or nothing. Nothing is a
+# normal answer: STREAM=0 produces no events, and an adapter that gets no
+# session simply cannot be resumed, which the engine already tolerates.
+claude_session() {
+	[[ -s "$CLAUDE_RAW" ]] || return 0
+	jq -r 'select(.session_id != null) | .session_id' "$CLAUDE_RAW" 2>/dev/null | head -1
+}
+
+# resume_prompt <payload> <prompt> — what to actually send, given that a person
+# may have answered the question this stage stopped on last time.
+#
+# Three cases, and only the first is new work. With an answer and a session, the
+# answer alone is the whole message: the conversation still holds the item, the
+# repository and everything the agent had already worked out. With an answer and
+# no session — a different agent, a restart before the id was written — the
+# answer leads the original prompt, which costs the rediscovery but never costs
+# the answer. With no answer, nothing changes.
+resume_prompt() {
+	local payload=$1 default=$2 answer session
+	answer=$(jq -r '.answer // ""' <<<"$payload")
+	session=$(jq -r '.session // ""' <<<"$payload")
+
+	if [[ -z "$answer" ]]; then
+		printf '%s' "$default"
+		return 0
+	fi
+	if [[ -n "$session" ]]; then
+		RESUME_SESSION=$session
+		echo "resuming the conversation that asked (session ${session:0:8})" >&2
+		printf '%s' "$answer"
+		return 0
+	fi
+	printf '%s' "The question you stopped on has been answered: ${answer}
+
+Carry on from there.
+
+--- what you were asked to do originally ---
+${default}"
+}
 
 # hit_limit reports whether the account was out of quota. Claude Code says so in
 # the transcript and exits cleanly, so nothing else can tell you.
 hit_limit() {
 	[[ -s "$CLAUDE_SAID" ]] && grep -qiE "hit your (session|usage|weekly) limit" "$CLAUDE_SAID"
+}
+
+# agent_asked marks what the model wrote in $CONVEYOR_RESULT as a question, and
+# adds the conversation it can be answered in.
+#
+# Called only where the model stopped itself, which every adapter's prompt
+# defines as "this needs a decision only a human can make" — so it is a question
+# by construction, and gets `asked` for the engine and `session` for the reply.
+# Merged rather than written: the model owns that file, knows nothing about
+# either field, and its reason is the part worth keeping intact.
+agent_asked() {
+	local sess tmp
+	[[ -z "${CONVEYOR_RESULT:-}" || ! -s "$CONVEYOR_RESULT" ]] && return 0
+	sess=$(claude_session)
+	tmp=$(mktemp)
+	if jq --arg s "$sess" \
+		'. + {asked: true} + (if $s == "" then {} else {session: $s} end)' \
+		"$CONVEYOR_RESULT" >"$tmp" 2>/dev/null; then
+		mv "$tmp" "$CONVEYOR_RESULT"
+	else
+		rm -f "$tmp"
+	fi
 }
 
 # render_stream reads the event stream on stdin and writes readable text.
@@ -48,12 +115,14 @@ run_claude() {
 		--allowedTools "${ALLOWED_TOOLS:-Bash,Read,Glob,Grep}"
 	)
 	[[ -n "${MODEL:-}" ]] && flags+=(--model "$MODEL")
+	# Set by resume_prompt when a person answered and the conversation survives.
+	[[ -n "${RESUME_SESSION:-}" ]] && flags+=(--resume "$RESUME_SESSION")
 
 	if [[ "${STREAM:-1}" == "0" ]]; then
 		claude -p "$prompt" "${flags[@]}" | tee "$CLAUDE_SAID"
 		return "${PIPESTATUS[0]}"
 	fi
 	claude -p "$prompt" --output-format stream-json --verbose "${flags[@]}" |
-		render_stream | tee "$CLAUDE_SAID"
+		tee "$CLAUDE_RAW" | render_stream | tee "$CLAUDE_SAID"
 	return "${PIPESTATUS[0]}"
 }

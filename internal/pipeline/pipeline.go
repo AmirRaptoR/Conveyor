@@ -204,7 +204,7 @@ var ErrBusy = errors.New("source is busy")
 // launches work concurrently has to claim the slot before it starts a
 // goroutine, because the gap between deciding and acquiring is long enough to
 // decide the same thing twice.
-func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, to string) (*Transition, error) {
+func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, to string, resume model.Resume) (*Transition, error) {
 	client, ok := e.clients[srcName]
 	if !ok {
 		return nil, fmt.Errorf("no source named %q", srcName)
@@ -263,7 +263,7 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 		From:    from,
 		To:      to,
 		Timeout: stage.Timeout.D(),
-		Stdin:   model.StageInput{Item: item, Stage: to, From: from},
+		Stdin:   model.StageInput{Item: item, Stage: to, From: from, Answer: resume.Answer, Session: resume.Session},
 	})
 	if err != nil {
 		tr.Err = err

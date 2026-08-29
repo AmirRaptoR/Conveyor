@@ -8,6 +8,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -81,6 +82,18 @@ type Block struct {
 	Stage  string    `json:"stage"`
 	RunID  string    `json:"runId,omitempty"`
 	At     time.Time `json:"at"`
+	// Asked says this stop is a question waiting on a person, not a condition
+	// that may have passed. The engine bulk-clears conditions — Unblock all, a
+	// total stall, an agent's quota returning — and never bulk-clears
+	// questions, because nothing answered one by waiting and handing it back
+	// unanswered spends a run to be asked it again. The script declares it; the
+	// engine reads the flag and never the word beside it.
+	Asked bool `json:"asked"`
+	// Session is the agent's own handle on the conversation that stopped, if it
+	// left one. Opaque here and never shown: it exists so an answer can be said
+	// back into the same conversation instead of starting one that has to
+	// rediscover the repository first. Recovered from run history like Reason.
+	Session string `json:"-"`
 }
 
 // AgentView is one agent's own report on itself.
@@ -130,10 +143,13 @@ type Server struct {
 	// only the index into them that a board read cannot afford to rebuild.
 	blocks map[string]Block
 
-	hub    *hub
-	order  *store.Order
-	active sync.Map      // itemID -> Active, one entry per transition in flight
-	tick   chan struct{} // one buffered slot: ticks never queue up
+	hub   *hub
+	order *store.Order
+	// answers is what a person typed when handing an item back, held until the
+	// run it was written for has been given it.
+	answers *store.Answers
+	active  sync.Map      // itemID -> Active, one entry per transition in flight
+	tick    chan struct{} // one buffered slot: ticks never queue up
 	// wake asks the scheduler to look again. One buffered slot, because the
 	// question is always the same one — what can move now — and a queue of it
 	// would be a queue of duplicates.
@@ -146,14 +162,15 @@ type Server struct {
 
 func New(cfg *config.Config, r *runner.Runner) *Server {
 	s := &Server{
-		cfg:   cfg,
-		run:   r,
-		eng:   pipeline.New(cfg, r),
-		hub:   newHub(),
-		order: store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
-		tick:  make(chan struct{}, 1),
-		wake:  make(chan struct{}, 1),
-		ctx:   context.Background(),
+		cfg:     cfg,
+		run:     r,
+		eng:     pipeline.New(cfg, r),
+		hub:     newHub(),
+		order:   store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
+		answers: store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
+		tick:    make(chan struct{}, 1),
+		wake:    make(chan struct{}, 1),
+		ctx:     context.Background(),
 	}
 	s.blocks = map[string]Block{}
 	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
@@ -292,7 +309,15 @@ func (s *Server) stalled(ctx context.Context, every time.Duration) {
 		for _, it := range s.state.Items {
 			switch {
 			case it.Blocked:
-				held = append(held, it)
+				// A question is not part of a stall. It is not waiting for the
+				// world to come back, it is waiting for a person, and clearing
+				// it on a timer spends a run to be asked the same thing again.
+				// It is not counted as movable either: a board holding nothing
+				// but questions is genuinely stopped, and retrying it would be
+				// re-asking every one of them every hour.
+				if !s.blocks[it.ID].Asked {
+					held = append(held, it)
+				}
 			default:
 				if _, ok := pipeline.Target(s.cfg, &it); ok {
 					moving++
@@ -495,8 +520,28 @@ func (s *Server) askAgents(ctx context.Context) {
 		out = append(out, v)
 	}
 	s.mu.Lock()
+	was := make(map[string]string, len(s.state.Agents))
+	for _, a := range s.state.Agents {
+		was[a.Name] = a.State
+	}
 	s.state.Agents = out
 	s.mu.Unlock()
+
+	// An agent saying it is well again is the one thing besides a person that
+	// takes a mark off. See releaseLimited for why only this one.
+	//
+	// Any state but `ok` before it counts, not just `limited`, so that the first
+	// probe after a restart is an edge too: coming up in the morning to marks
+	// left by a quota that returned at 3am is the case this is for, and there is
+	// no transition to see because the process that saw the limit is gone.
+	// `ok` → `ok` is not an edge, which is what keeps a status script that lags
+	// behind a fresh limit from marking and releasing the same item in a loop.
+	for _, a := range out {
+		if a.State == "ok" && was[a.Name] != "ok" {
+			s.releaseLimited(ctx)
+			break
+		}
+	}
 }
 
 // recallBlocks fills in why the marked items are marked, for marks this process
@@ -541,12 +586,15 @@ func (s *Server) recallBlocks(items []model.Item) {
 			timeout = st.Timeout.D()
 		}
 		mark := pipeline.Marked(m.To, m.Run, data, timeout, 0)
+		asked, session := saidAt(m.Dir)
 		found[m.ItemID] = Block{
-			Kind:   mark.Kind,
-			Reason: mark.Reason,
-			Stage:  m.To,
-			RunID:  m.ID,
-			At:     m.FinishedAt,
+			Kind:    mark.Kind,
+			Reason:  mark.Reason,
+			Stage:   m.To,
+			RunID:   m.ID,
+			At:      m.FinishedAt,
+			Asked:   asked,
+			Session: session,
 		}
 		delete(want, m.ItemID)
 		return len(want) > 0
@@ -633,8 +681,23 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 	s.setActive(item.ID, &Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title})
 	defer s.setActive(item.ID, nil)
 
-	tr, _ := s.eng.Advance(ctx, item.Source, &item, target)
+	// Read, not taken. An answer is spent when the run it was written for
+	// actually ran — including one that stops to ask something else, which is a
+	// new question and wants a new answer. A run that failed outright never got
+	// to use it, and a paragraph a person typed is not something to lose to a
+	// bad agent invocation: the answer is kept and the session dropped, because
+	// a resume that did not work names a conversation worth abandoning.
+	resume := s.answers.Get(item.ID)
+	tr, _ := s.eng.Advance(ctx, item.Source, &item, target, resume)
 	if tr != nil {
+		switch tr.Outcome {
+		case model.OutcomeFailure, model.OutcomeTimeout:
+			if resume.Answer != "" && resume.Session != "" {
+				_ = s.answers.Set(item.ID, model.Resume{Answer: resume.Answer})
+			}
+		default:
+			s.answers.Take(item.ID)
+		}
 		s.applyTransition(tr)
 		s.hub.publish(event{Kind: "transition", Transition: tr})
 	}
@@ -659,7 +722,9 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// reason exists in full, and a run history sweep must not be what stands
 	// between an operator and why their board stopped.
 	if tr.Blocked {
-		s.blocks[tr.Item.ID] = Block{Kind: tr.Kind, Reason: tr.Reason, Stage: tr.Stage, RunID: tr.RunID, At: time.Now()}
+		asked, session := saidAt(tr.RunDir)
+		s.blocks[tr.Item.ID] = Block{Kind: tr.Kind, Reason: tr.Reason, Stage: tr.Stage,
+			RunID: tr.RunID, At: time.Now(), Asked: asked, Session: session}
 	} else {
 		delete(s.blocks, tr.Item.ID)
 	}
@@ -829,6 +894,18 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 // becomes pickable the instant the label is gone.
 func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+
+	// Answering is unblocking, deliberately one gesture and one endpoint. A
+	// separate "answer" verb would let an answer be recorded against an item
+	// nobody handed back, which is a note in a drawer: the pipeline would never
+	// run the stage that reads it.
+	var said struct {
+		Answer string `json:"answer"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&said)
+	}
+
 	s.mu.RLock()
 	var item model.Item
 	found := false
@@ -847,6 +924,18 @@ func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent) // already where the caller wants it
 		return
 	}
+	// Recorded before the mark comes off, and with the session read out of the
+	// block while it still exists: clearing the mark forgets why the item
+	// stopped, and the conversation that asked is part of why.
+	if strings.TrimSpace(said.Answer) != "" {
+		s.mu.RLock()
+		sess := s.blocks[id].Session
+		s.mu.RUnlock()
+		if err := s.answers.Set(id, model.Resume{Answer: said.Answer, Session: sess}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
 	if err := s.unblock(s.ctx, item); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -863,14 +952,26 @@ func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUnblockAll(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	var held []model.Item
+	skipped := 0
 	for _, it := range s.state.Items {
-		if it.Blocked {
-			held = append(held, it)
+		if !it.Blocked {
+			continue
 		}
+		// Questions are left standing. This button means "I fixed the thing
+		// that stopped you, try again" — an expired credential, a dirty
+		// checkout, an agent that was over its limit all night. None of that
+		// answers a question, and handing one back unanswered spends an agent
+		// run to be asked it a second time. A question is cleared by answering
+		// it on its own card, which is the only thing that resolves it.
+		if s.blocks[it.ID].Asked {
+			skipped++
+			continue
+		}
+		held = append(held, it)
 	}
 	s.mu.RUnlock()
 	go s.unblockAll(s.ctx, held)
-	writeJSON(w, map[string]int{"unblocking": len(held)})
+	writeJSON(w, map[string]int{"unblocking": len(held), "waitingOnYou": skipped})
 }
 
 // unblockAll clears marks one at a time. Sequentially on purpose: perSource is
@@ -887,6 +988,73 @@ func (s *Server) unblockAll(ctx context.Context, held []model.Item) int {
 	}
 	return n
 }
+
+// releaseLimited hands back the items an agent's usage limit stopped, once that
+// agent reports itself well again.
+//
+// This is the only mark the engine clears on its own initiative, and it is a
+// narrow exception on purpose. A `decision` mark is a person's answer
+// outstanding, and no amount of waiting produces one — clearing it spends an
+// agent run to be told the same thing. A `limit` is the outside world: nothing
+// was ever wrong with the item, the agent said so itself in the mark, and the
+// quota comes back on a schedule the agent's own status script reports. Leaving
+// those for a human to clear in the morning is a whole night of the line
+// standing still for a reason that expired at 3am.
+//
+// It is not the model deciding flow. The pipeline is unchanged; this only takes
+// off a mark that a script put on, when the same script says the cause is gone.
+//
+// ponytail: any agent recovering releases every `limit` mark, because there is
+// one agent in use. Match a mark to the agent whose stage set it if two agents
+// with separate quotas ever run side by side.
+func (s *Server) releaseLimited(ctx context.Context) int {
+	s.mu.RLock()
+	var held []model.Item
+	for _, it := range s.state.Items {
+		if it.Blocked && s.blocks[it.ID].Kind == limitKind && !s.blocks[it.ID].Asked {
+			held = append(held, it)
+		}
+	}
+	s.mu.RUnlock()
+	if len(held) == 0 {
+		return 0
+	}
+	fmt.Fprintf(os.Stderr, "conveyor: an agent's quota is back; handing back %d item(s) it stopped\n", len(held))
+	n := s.unblockAll(ctx, held)
+	s.wakeUp()
+	return n
+}
+
+// saidAt reads the two things a stopping script may say about its own stop,
+// beyond the reason the mark already carries.
+//
+// The engine defines neither: an adapter that can be resumed writes
+// {"session": "..."}, one that stopped on a question writes {"asked": true},
+// and a script that says nothing is a condition with no way back — all three
+// are correct. This is the same file the reason comes from, so a run pinned
+// against retention carries the whole stop, not half of it.
+func saidAt(dir string) (asked bool, session string) {
+	if dir == "" {
+		return false, ""
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "result.json"))
+	if err != nil {
+		return false, ""
+	}
+	var v struct {
+		Asked   bool   `json:"asked"`
+		Session string `json:"session"`
+	}
+	if json.Unmarshal(b, &v) != nil {
+		return false, ""
+	}
+	return v.Asked, v.Session
+}
+
+// limitKind is the one word in the agents' blocked vocabulary the engine acts
+// on. It is still the scripts' word, not the engine's: agents/_blocked defines
+// it, and an agent that never says it simply never gets this behaviour.
+const limitKind = "limit"
 
 // unblock is one provider write: the same move that set the mark, with the mark
 // off. The engine's note goes with it — the run that explains it is still

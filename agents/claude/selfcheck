@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Checks the claude adapter's own logic — the parts that are not the model:
+# how an answer becomes a prompt, and how the conversation that asked a question
+# is found again. Run it after editing _stream; it never invokes claude.
+#
+#   agents/claude/selfcheck
+#
+# Same idea as providers/github/selfcheck.sh: a script with branches in it needs
+# one runnable thing that fails when a branch breaks.
+set -euo pipefail
+source "$(dirname "$0")/_stream"
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+# 1. no answer: the prompt is untouched, and nothing is resumed.
+RESUME_SESSION=""
+out=$(resume_prompt '{"item":{"ref":"1"}}' "do the work")
+chk "no answer leaves the prompt alone" "$out" "do the work"
+chk "no answer resumes nothing" "${RESUME_SESSION:-}" ""
+
+# 2. answer + session: the answer is the whole message, said into that session.
+RESUME_SESSION=""
+out=$(resume_prompt '{"answer":"no, keep compat","session":"sess-abc"}' "do the work" 2>/dev/null)
+chk "answer with a session is sent alone" "$out" "no, keep compat"
+# subshell above cannot export; re-run in this shell to see the variable
+resume_prompt '{"answer":"no, keep compat","session":"sess-abc"}' "do the work" >/dev/null 2>&1
+chk "the session is picked up" "${RESUME_SESSION:-}" "sess-abc"
+
+# 3. answer without a session: it leads the original prompt instead.
+RESUME_SESSION=""
+out=$(resume_prompt '{"answer":"no, keep compat"}' "do the work")
+case "$out" in
+  "The question you stopped on has been answered: no, keep compat"*"do the work") echo "ok   answer without a session leads the original prompt";;
+  *) echo "FAIL answer without a session: got [$out]"; fail=1;;
+esac
+
+# 4. the session id is read out of the raw stream, first one wins.
+printf '%s\n' '{"type":"system","session_id":"sess-xyz"}' '{"type":"assistant"}' '{"type":"result","session_id":"sess-xyz"}' > "$CLAUDE_RAW"
+chk "the session id is read from the stream" "$(claude_session)" "sess-xyz"
+
+# 5. agent_asked merges into what the agent wrote, without disturbing it.
+export CONVEYOR_RESULT=$(mktemp)
+echo '{"blocked":true,"kind":"decision","reason":"may I change the schema?"}' > "$CONVEYOR_RESULT"
+agent_asked
+chk "the reason survives the merge" "$(jq -r .reason "$CONVEYOR_RESULT")" "may I change the schema?"
+chk "the session is added beside it"  "$(jq -r .session "$CONVEYOR_RESULT")" "sess-xyz"
+chk "the model's own stop is a question" "$(jq -r .asked "$CONVEYOR_RESULT")" "true"
+
+# 6. no stream, no session: nothing is invented and nothing breaks.
+: > "$CLAUDE_RAW"
+echo '{"blocked":true,"reason":"x"}' > "$CONVEYOR_RESULT"
+agent_asked
+chk "no session leaves the file alone" "$(jq -r '.session // "none"' "$CONVEYOR_RESULT")" "none"
+chk "and it is still a question"       "$(jq -r .asked "$CONVEYOR_RESULT")" "true"
+
+exit $fail
