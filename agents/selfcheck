@@ -76,6 +76,22 @@ else
 fi
 cd "$tmp/repo"
 
+# 10. a branch already checked out somewhere else. Git allows it in exactly one
+# worktree, and an earlier run that made its own directory is the common case.
+elsewhere="$tmp/held"
+git worktree add --quiet -B taken "$elsewhere" origin/main
+p5=$(item_worktree demo 50 taken 2>/dev/null)
+chk "a clean holder is reclaimed" "$p5" "$WORKTREES/demo/50"
+chk "the holder is gone"          "$([[ -d "$elsewhere" ]] && echo present || echo gone)" "gone"
+
+# and when the holder has work in it, that work is what we continue in.
+elsewhere2="$tmp/held2"
+git worktree add --quiet -B taken2 "$elsewhere2" origin/main
+echo wip > "$elsewhere2/wip.txt"
+p6=$(item_worktree demo 51 taken2 2>/dev/null)
+chk "a dirty holder is used, not destroyed" "$p6" "$elsewhere2"
+chk "its work survives"                     "$([[ -f "$elsewhere2/wip.txt" ]] && echo yes)" "yes"
+
 # 9. sourcing must not eat the caller's PATH. In zsh `path` is tied to `PATH`,
 # so a local named `path` in here silently disables every later command.
 before=$PATH

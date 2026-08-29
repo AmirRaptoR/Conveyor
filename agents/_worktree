@@ -66,6 +66,33 @@ item_worktree() {
 		return 0
 	fi
 
+	# A branch can be checked out in exactly one worktree, and something else may
+	# already hold this one — an earlier run that made its own directory, a
+	# leftover under /tmp, a person looking at the pull request. Left alone this
+	# is a fatal from deep inside `git worktree add`, and the item is marked with
+	# a message about branches that explains nothing.
+	#
+	# If that other checkout is clean it is a copy of the remote and nothing is
+	# lost by taking the branch back. If it is dirty it holds work in progress on
+	# this very item, which is the thing we were about to recreate — so use it
+	# where it stands rather than destroy it and start again.
+	if [[ -n "$branch" ]]; then
+		local held
+		held=$(git worktree list --porcelain |
+			awk -v b="refs/heads/$branch" '''/^worktree /{p=$2} /^branch /{if ($2==b) print p}''' |
+			head -1)
+		if [[ -n "$held" && "$held" != "$wt" ]]; then
+			if [[ -n "$(git -C "$held" status --porcelain 2>/dev/null)" ]]; then
+				echo "branch $branch is checked out at $held with work in it; using that" >&2
+				printf '''%s''' "$held"
+				return 0
+			fi
+			echo "reclaiming branch $branch from a clean checkout at $held" >&2
+			git worktree remove --force "$held" 2>/dev/null || rm -rf "$held"
+			git worktree prune 2>/dev/null || true
+		fi
+	fi
+
 	rm -rf "$wt"
 	mkdir -p "$(dirname "$wt")" || return 1
 	git fetch --quiet origin --prune 2>/dev/null || true
