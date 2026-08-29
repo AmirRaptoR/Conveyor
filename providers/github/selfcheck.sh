@@ -42,7 +42,10 @@ cat <<'JSON'
   "url":"https://example.test/9","assignees":[]},
  {"number":11,"title":"Needs a decision","body":"",
   "labels":[{"name":"status:in-progress"},{"name":"blocked"}],
-  "url":"https://example.test/11","assignees":[]}
+  "url":"https://example.test/11","assignees":[]},
+ {"number":13,"title":"Mine, not the pipeline's","body":"",
+  "labels":[{"name":"conveyor:ignore"},{"name":"status:ready"}],
+  "url":"https://example.test/13","assignees":[]}
 ]
 JSON
 STUB
@@ -71,6 +74,22 @@ check "a marked issue keeps the stage it stopped in" \
 	"in-progress" "$(jq -r '.[2].stage' "$tmp/out.json")"
 check "an unmarked issue is not blocked" \
 	"false" "$(jq -r '.[0].blocked' "$tmp/out.json")"
+
+# Ignoring is not blocking. A blocked issue is conveyor's, stopped; an ignored
+# one was never conveyor's and must not reach the board at all — not even in a
+# count, or "3 items" and three cards stop agreeing.
+check "an ignored issue is not listed at all" \
+	"3" "$(jq -r 'length' "$tmp/out.json")"
+check "and no ignored id survives" \
+	"" "$(jq -r '.[] | select(.ref == "13") | .id' "$tmp/out.json")"
+check "a stage label does not rescue an ignored issue" \
+	"" "$(jq -r '.[] | select(.stage == "ready") | .id' "$tmp/out.json")"
+
+# Configurable, because the label is the repo's vocabulary and not the engine's.
+PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/named.json" \
+	IGNORE_LABELS="wontfix, hold" ./list.sh 2>/dev/null
+check "a named ignore list replaces the default" \
+	"4" "$(jq -r 'length' "$tmp/named.json")"
 
 # --- move.sh: stage -> label writes ----------------------------------------
 # move.sh asks GitHub for the issue's current labels, so the stub answers that.

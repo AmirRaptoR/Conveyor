@@ -8,6 +8,11 @@
 #   BLOCKED_LABEL  the label that means "a human must decide" (default: blocked).
 #                  It is a mark, not a stage: an issue wearing it keeps whatever
 #                  status:* it stopped on, and the scheduler leaves it alone.
+#   IGNORE_LABELS  labels that mean "not conveyor's work", one per line or comma
+#                  separated (default: conveyor:ignore). An issue wearing one is
+#                  never listed, so it never reaches the board and nothing is
+#                  ever run against it — the way to open an issue and work it by
+#                  hand while the pipeline is running.
 #   DEFAULT_STAGE  where an issue carrying no mapped label lands (default: backlog)
 #   LIMIT          max issues to fetch (default: 200)
 set -euo pipefail
@@ -15,6 +20,18 @@ set -euo pipefail
 : "${REPO:?REPO is required (set it in the source env: block)}"
 DEFAULT_STAGE="${DEFAULT_STAGE:-backlog}"
 BLOCKED_LABEL="${BLOCKED_LABEL:-blocked}"
+IGNORE_LABELS="${IGNORE_LABELS:-conveyor:ignore}"
+
+# Ignoring is not blocking, and the difference is the whole point of having
+# both. A blocked issue is conveyor's, stopped, waiting for an answer, and it
+# comes back the moment the mark is cleared. An ignored issue was never
+# conveyor's: it is not on the board, it is not counted, and no stage will ever
+# be run against it.
+ignored=$(
+	printf '%s\n' "$IGNORE_LABELS" |
+		jq -R -s 'split("\n") | map(split(",")) | flatten
+			| map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))'
+)
 
 # STAGE_LABELS is written stage=label because that is the direction move.sh
 # needs. Listing needs the reverse, so invert it here into {label: stage}.
@@ -35,9 +52,11 @@ gh issue list --repo "$REPO" --state open --limit "${LIMIT:-200}" \
 	jq --arg source "$CONVEYOR_SOURCE" \
 		--arg default "$DEFAULT_STAGE" \
 		--arg blocked "$BLOCKED_LABEL" \
+		--argjson ignored "$ignored" \
 		--argjson map "$label_to_stage" '
 		map(
 			(.labels | map(.name)) as $names
+			| select(any($ignored[]; . as $skip | $names | index($skip)) | not)
 			| {
 				id:          "\($source):\(.number)",
 				ref:         (.number | tostring),
@@ -59,4 +78,8 @@ gh issue list --repo "$REPO" --state open --limit "${LIMIT:-200}" \
 			}
 		)' >"$CONVEYOR_RESULT"
 
-echo "listed $(jq length "$CONVEYOR_RESULT") item(s)" >&2
+skipping=""
+if [[ -n "$IGNORE_LABELS" ]]; then
+	skipping=", ignoring $(jq -r 'join(", ")' <<<"$ignored")"
+fi
+echo "listed $(jq length "$CONVEYOR_RESULT") item(s)$skipping" >&2
