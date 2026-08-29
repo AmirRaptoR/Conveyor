@@ -76,6 +76,24 @@ else
 fi
 cd "$tmp/repo"
 
+# 9b. the sweep: spent worktrees go, everything with anything in it stays.
+spent=$(item_worktree demo 60)          # nothing beyond the base, will go cold
+(cd "$spent" && git reset --quiet --hard origin/main)
+work=$(item_worktree demo 61)           # has a commit of its own
+(cd "$work" && echo keep > k.txt && git add -A && git commit --quiet -m mine)
+dirty=$(item_worktree demo 62)          # uncommitted changes
+echo scratch > "$dirty/wip.txt"
+warm=$(item_worktree demo 63)           # spent, but touched just now
+(cd "$warm" && git reset --quiet --hard origin/main)
+# age the three that should be considered; leave `warm` warm.
+touch -d "3 hours ago" "$spent" "$work" "$dirty"
+sweep_worktrees demo 2>/dev/null
+chk "a spent worktree is swept"          "$([[ -d "$spent" ]] && echo present || echo gone)" "gone"
+chk "an unpushed commit is not swept"    "$([[ -d "$work" ]] && echo present)" "present"
+chk "uncommitted work is not swept"      "$([[ -d "$dirty" ]] && echo present)" "present"
+chk "a warm worktree is left alone"      "$([[ -d "$warm" ]] && echo present)" "present"
+chk "the item being worked is kept"      "$(sweep_worktrees demo 63 2>/dev/null; [[ -d "$warm" ]] && echo present)" "present"
+
 # 10. a branch already checked out somewhere else. Git allows it in exactly one
 # worktree, and an earlier run that made its own directory is the common case.
 elsewhere="$tmp/held"

@@ -61,6 +61,11 @@ item_worktree() {
 	# directory deleted by hand can never be recreated under the same name.
 	git worktree prune 2>/dev/null || true
 
+	# Housekeeping rides along with the work rather than on a timer of its own.
+	# Every stage that needs a worktree calls this, so the spent ones go on the
+	# next item instead of waiting for a sweeper nobody remembered to install.
+	sweep_worktrees "$source" "$ref"
+
 	if [[ -d "$wt" ]] && git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
 		printf '%s' "$wt"
 		return 0
@@ -111,6 +116,46 @@ item_worktree() {
 	# tried next rather than about the checkout it never got.
 	[[ -d "$wt" ]] || return 1
 	printf '%s' "$wt"
+}
+
+# sweep_worktrees <source> [keep-ref] — remove this source's worktrees that
+# hold nothing.
+#
+# drop_worktree covers the happy path: review merges, the branch is gone, the
+# directory is a copy of nothing. It cannot cover the rest. An item that stops on
+# a question, one a person moves back to an earlier stage, one whose pull request
+# somebody merges by hand — each leaves a full checkout behind, and a checkout is
+# not small: seven of them were 467MB here, one of them 287MB on its own.
+#
+# Three conditions, all required, because deleting a directory is the one action
+# in this file that cannot be undone:
+#
+#   clean          nothing uncommitted. A dirty tree is somebody's work, or the
+#                  evidence from a run that died, and both outlive tidiness.
+#   nothing new    no commit that origin's default branch does not already have.
+#                  After a merge that is true by definition; before a push it is
+#                  emphatically not, which is what protects unpushed work.
+#   cold           untouched for longer than the longest stage. An item that
+#                  started ten minutes ago has an empty worktree that satisfies
+#                  both conditions above and is very much in use.
+sweep_worktrees() {
+	local source=$1 keep=${2:-} root base dir ref
+	root="$(worktree_root)/${source}"
+	[[ -d "$root" ]] || return 0
+	base="origin/$(default_branch)"
+
+	for dir in "$root"/*; do
+		[[ -d "$dir" ]] || continue
+		ref=$(basename "$dir")
+		[[ -n "$keep" && "$ref" == "$keep" ]] && continue
+		# 120 minutes: longer than the 90 the longest stage is allowed.
+		[[ -n "$(find "$dir" -maxdepth 0 -mmin -120)" ]] && continue
+		git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || continue
+		[[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]] && continue
+		[[ "$(git -C "$dir" rev-list --count "$base"..HEAD 2>/dev/null || echo 1)" == "0" ]] || continue
+		echo "sweeping spent worktree $dir" >&2
+		drop_worktree "$source" "$ref"
+	done
 }
 
 # drop_worktree <source> <ref> — remove an item's worktree once its work has
