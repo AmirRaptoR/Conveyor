@@ -63,4 +63,23 @@ rm -rf "$p2"
 p4=$(item_worktree demo 43)
 chk "a hand-deleted worktree comes back" "$(cd "$p4" && git rev-parse --is-inside-work-tree)" "true"
 
+# 8. a creation that cannot work fails loudly instead of naming a directory that
+# is not there — the agent would `cd` into nothing and report the wrong problem.
+if item_worktree demo 45 >/dev/null 2>&1 <&- ; then :; fi
+cd "$tmp" && git init --quiet "$tmp/noremote" && cd "$tmp/noremote"
+git config user.email a@b.c && git config user.name t
+echo x > f && git add -A && git commit --quiet -m only
+if out=$(item_worktree broken 99 2>/dev/null); then
+	chk "a repository with no remote is refused" "made [$out]" "refused"
+else
+	chk "a repository with no remote is refused" "refused" "refused"
+fi
+cd "$tmp/repo"
+
+# 9. sourcing must not eat the caller's PATH. In zsh `path` is tied to `PATH`,
+# so a local named `path` in here silently disables every later command.
+before=$PATH
+item_worktree demo 46 >/dev/null 2>&1 || true
+chk "PATH survives being sourced" "$PATH" "$before"
+
 exit $fail

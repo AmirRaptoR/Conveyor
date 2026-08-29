@@ -48,41 +48,51 @@ default_branch() {
 # to build on) the worktree tracks that branch. Without one it starts from the
 # remote's default branch — never from whatever the local checkout happens to
 # have, which is a human's working state and not a base anyone chose.
+# Never name a local `path` here. In zsh `path` is tied to `PATH`, so assigning
+# it inside a sourced function empties the caller's command search path and
+# every later `git` becomes "command not found" — a failure that reads like
+# anything except its cause. These files run under bash, but they are sourced,
+# and whoever sources them next may not be.
 item_worktree() {
-	local source=$1 ref=$2 branch=${3:-} path base
-	path="$(worktree_root)/${source}/${ref}"
+	local source=$1 ref=$2 branch=${3:-} wt base
+	wt="$(worktree_root)/${source}/${ref}"
 
 	# Records of worktrees whose directories are gone: cheap, and without it a
-	# path deleted by hand can never be recreated under the same name.
+	# directory deleted by hand can never be recreated under the same name.
 	git worktree prune 2>/dev/null || true
 
-	if [[ -d "$path" ]] && git -C "$path" rev-parse --git-dir >/dev/null 2>&1; then
-		printf '%s' "$path"
+	if [[ -d "$wt" ]] && git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+		printf '%s' "$wt"
 		return 0
 	fi
 
-	rm -rf "$path"
-	mkdir -p "$(dirname "$path")"
+	rm -rf "$wt"
+	mkdir -p "$(dirname "$wt")" || return 1
 	git fetch --quiet origin --prune 2>/dev/null || true
 
 	if [[ -n "$branch" ]] && git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
 		# -B so a stale local branch of the same name is repointed at the remote
 		# rather than refusing, which is what a previous run's leftovers look like.
-		git worktree add --quiet -B "$branch" "$path" "origin/$branch" >&2
+		git worktree add --quiet -B "$branch" "$wt" "origin/$branch" >&2 || return 1
 	else
 		base=$(default_branch)
-		git worktree add --quiet -B "${branch:-issue-$ref}" "$path" "origin/$base" >&2
+		git worktree add --quiet -B "${branch:-issue-$ref}" "$wt" "origin/$base" >&2 || return 1
 	fi
-	printf '%s' "$path"
+
+	# Checked, not assumed. Printing a path that was never made sends the agent
+	# to `cd` into nothing, and the error it then reports is about whatever it
+	# tried next rather than about the checkout it never got.
+	[[ -d "$wt" ]] || return 1
+	printf '%s' "$wt"
 }
 
 # drop_worktree <source> <ref> — remove an item's worktree once its work has
 # landed. Called after a merge: the branch is gone, so the directory is a copy of
 # nothing. Never called on a failure, where the tree is the evidence.
 drop_worktree() {
-	local path
-	path="$(worktree_root)/${1}/${2}"
-	[[ -d "$path" ]] || return 0
-	git worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
+	local wt
+	wt="$(worktree_root)/${1}/${2}"
+	[[ -d "$wt" ]] || return 0
+	git worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
 	git worktree prune 2>/dev/null || true
 }
