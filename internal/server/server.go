@@ -167,7 +167,22 @@ type Server struct {
 	// answers is what a person typed when handing an item back, held until the
 	// run it was written for has been given it.
 	answers *store.Answers
-	active  sync.Map      // itemID -> Active, one entry per transition in flight
+	active  sync.Map // itemID -> Active, one entry per transition in flight
+	// working is which items have a transition in flight, recorded before the
+	// goroutine starts rather than from inside it.
+	//
+	// The locks bound how many transitions run; they say nothing about *which*
+	// item each one is for. While perStage and perSource were both 1 the two were
+	// indistinguishable — a second launch of the same item needed a free slot in
+	// its own stage, and there was never one. Raising either limit separated
+	// them, and the scheduler cheerfully picked an item it had already started:
+	// the cached listing still showed it unblocked in its old stage, because the
+	// first run had not finished moving it yet.
+	//
+	// Two agents then worked the same issue in the same worktree — the exact
+	// collision worktrees exist to prevent — and whichever exited first had its
+	// outcome routed as though it were the other's.
+	working sync.Map      // itemID -> struct{}, held for the life of a transition
 	tick    chan struct{} // one buffered slot: ticks never queue up
 	// wake asks the scheduler to look again. One buffered slot, because the
 	// question is always the same one — what can move now — and a queue of it
@@ -645,13 +660,6 @@ func (s *Server) launch(ctx context.Context) int {
 	order := s.order.IDs()
 
 	n := 0
-	// Started in this pass, so an item is not picked twice before its own
-	// goroutine is running. This is per ITEM, not per stage: with perStage above
-	// 1 a stage has room for another item, and marking the whole stage claimed
-	// after one launch filled exactly one slot per pass — the second only opened
-	// when something finished and woke the scheduler again. The symptom was a
-	// board that ran one card while the config said two.
-	launched := map[string]bool{}
 	// Refused axes. A refusal means that source or that stage is genuinely full,
 	// so nothing else routed there can start either; without this the loop keeps
 	// re-picking the same candidate and never terminates.
@@ -662,9 +670,12 @@ func (s *Server) launch(ctx context.Context) int {
 		free := items[:0:0]
 		for _, it := range items {
 			target, ok := pipeline.Target(s.cfg, &it)
-			if !ok || launched[it.ID] || fullSrc[it.Source] || fullStage[target] ||
+			if !ok || fullSrc[it.Source] || fullStage[target] ||
 				s.eng.Locks().Busy(it.Source, target) {
 				continue
+			}
+			if _, running := s.working.Load(it.ID); running {
+				continue // already being worked; the locks do not know that
 			}
 			free = append(free, it)
 		}
@@ -683,9 +694,8 @@ func (s *Server) launch(ctx context.Context) int {
 			fullStage[target] = true
 			continue
 		}
-		launched[item.ID] = true
-
 		it, to := *item, target
+		s.working.Store(it.ID, struct{}{})
 		s.inFlight.Add(1)
 		n++
 		go s.transition(ctx, it, to)
@@ -701,6 +711,7 @@ func (s *Server) launch(ctx context.Context) int {
 func (s *Server) transition(ctx context.Context, item model.Item, target string) {
 	defer s.wakeUp()
 	defer s.inFlight.Add(-1)
+	defer s.working.Delete(item.ID)
 	defer s.eng.Locks().Release(item.Source, target)
 	s.runOne(ctx, item, target)
 }
@@ -775,6 +786,8 @@ func (s *Server) advance(ctx context.Context) bool {
 		return false
 	}
 	defer s.eng.Locks().Release(item.Source, target)
+	s.working.Store(item.ID, struct{}{})
+	defer s.working.Delete(item.ID)
 	s.runOne(ctx, *item, target)
 	return true
 }
@@ -913,6 +926,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, s.whyBusy(item.Source, target), http.StatusConflict)
 		return
 	}
+	s.working.Store(item.ID, struct{}{})
 	s.inFlight.Add(1)
 	go s.transition(s.ctx, item, target)
 	w.WriteHeader(http.StatusAccepted)

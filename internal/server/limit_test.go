@@ -334,3 +334,78 @@ sources:
 	}
 	waitFor(t, "the transitions to finish", func() bool { return s.inFlight.Load() == 0 })
 }
+
+// The collision that got past every other guard: the same item launched twice.
+//
+// The locks bound how many transitions run, not which item each is for. With
+// perStage and perSource both 1 those were the same thing. Above 1 they are
+// not, and the scheduler picked an item it had already started — the cached
+// listing still showed it unblocked in its old stage, because the first run had
+// not finished moving it. Two agents, one issue, one worktree.
+func TestAnItemAlreadyRunningIsNotLaunchedAgain(t *testing.T) {
+	dir := t.TempDir()
+	started := filepath.Join(dir, "started")
+	release := filepath.Join(dir, "release")
+
+	writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "work.sh"), `#!/bin/sh
+cat >/dev/null
+echo x >> `+started+`
+while [ ! -f `+release+` ]; do sleep 0.02; done
+`)
+	if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "conveyor.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`version: 1
+concurrency:
+  perSource: 2
+  perStage: 2
+  global: 4
+stages:
+  - name: backlog
+  - name: working
+    script: work
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: fake
+    workdir: ./repo
+    scripts:
+      work:
+        script: ./work.sh
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(cfg, runner.New(filepath.Join(dir, "runs")))
+	s.ctx = context.Background()
+	// One item, and room for two transitions. Nothing but the item guard stops
+	// the second pass starting it a second time.
+	s.state.Items = []model.Item{{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog", Title: "the only item"}}
+
+	if n := s.launch(s.ctx); n != 1 {
+		t.Fatalf("first pass launched %d, want 1", n)
+	}
+	waitFor(t, "the stage to start", func() bool { return countLines(started) == 1 })
+
+	// The item is still in `backlog` in the cache — the run has not moved it —
+	// and there is a free slot on every axis. This is the exact moment.
+	if n := s.launch(s.ctx); n != 0 {
+		t.Errorf("a second pass launched the same item again (%d); two agents, one worktree", n)
+	}
+	if err := os.WriteFile(release, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the transition to finish", func() bool { return s.inFlight.Load() == 0 })
+	if countLines(started) != 1 {
+		t.Errorf("the stage script ran %d times, want 1", countLines(started))
+	}
+}
