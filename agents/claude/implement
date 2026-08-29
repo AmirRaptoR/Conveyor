@@ -13,6 +13,7 @@ set -euo pipefail
 # Streams the agent's work as it happens; without it a long stage looks dead.
 source "$(dirname "$0")/_stream"
 source "$(dirname "$0")/../_blocked"
+source "$(dirname "$0")/../_worktree"
 
 : "${PROMPT:?PROMPT is required (set it in this script params: block)}"
 
@@ -22,28 +23,15 @@ title=$(jq -r '.item.title' <<<"$payload")
 body=$(jq -r '.item.description // ""' <<<"$payload")
 url=$(jq -r '.item.url // ""' <<<"$payload")
 
-# A dirty tree means the previous run died mid-edit. Building on top of that is
-# how one failure becomes a corrupted branch, so stop and ask for a human.
-if [[ -n "$(git status --porcelain)" ]]; then
-	blocked worktree "the checkout at $PWD has uncommitted changes on branch \
-$(git branch --show-current), left behind by a run that did not finish. Commit \
-or discard them; until then every item in this source stops here, because one \
-source is one worktree."
-fi
-# `git pull` exits non-zero on a branch with no upstream, which under set -e
-# would kill this before the agent runs, with an error unlike its cause.
-if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-	git pull --ff-only
-else
-	echo "no upstream for $(git branch --show-current); skipping pull" >&2
-fi
-
 # An open PR for this item means review sent it back. Say so, or the agent
-# starts again from scratch and throws away the work being corrected.
+# starts again from scratch and throws away the work being corrected — and build
+# the worktree on that branch rather than on a fresh one off the default.
 rework=""
+head=""
 if [[ -n "${REPO:-}" ]]; then
 	existing=$(gh pr list --repo "$REPO" --state open --search "$ref" --json number --jq '.[0].number' 2>/dev/null)
 	if [[ -n "$existing" ]]; then
+		head=$(gh pr view "$existing" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null || true)
 		echo "PR #$existing exists — this is a rework pass"
 		rework="
 This item already has pull request #${existing}, which a reviewer sent back.
@@ -54,7 +42,24 @@ open a second one, and do not restart the work from scratch."
 	fi
 fi
 
+# This item's own directory. The repository the human works in is never touched
+# and never has to be clean; two items in one repository no longer share a tree,
+# so they can run at the same time.
+wt=$(item_worktree "$CONVEYOR_SOURCE" "$ref" "$head")
+cd "$wt"
+
+# A dirty tree here is this item's own leftovers — a previous run for THIS issue
+# that died mid-edit. Building on top of it is how one failure becomes a
+# corrupted branch. It stops this item and nothing else.
+if [[ -n "$(git status --porcelain)" ]]; then
+	blocked worktree "the worktree for #$ref at $wt has uncommitted changes on \
+branch $(git branch --show-current), left behind by a run that did not finish. \
+Commit or discard them, or delete the directory to start the item fresh. No \
+other item is affected."
+fi
+
 echo "implementing $CONVEYOR_SOURCE #$ref — $title"
+echo "  worktree: $wt  (branch $(git branch --show-current))"
 
 # A prompt beginning with "/" is a slash command and must lead the message, so
 # the item context follows it instead of preceding it. $REF is expanded either
@@ -84,6 +89,14 @@ ${rework}"
 fi
 
 full="${full}
+
+You are in a git worktree of your own at ${wt}, already on branch \
+$(git branch --show-current), taken from the remote's default branch. Work here.
+Do NOT run \`git checkout main\`, \`git switch\` or \`git checkout -b\`: this
+directory is one of several checkouts of this repository that are live right
+now, main is checked out elsewhere, and changing branch under yourself is how
+one item's work lands on another item's branch. The branch you are on is the
+branch for this issue — commit to it and push it with \`git push -u origin HEAD\`.
 
 If this cannot be done because it needs a decision only a human can make, change
 nothing and write {\"blocked\": true, \"reason\": \"<the decision needed>\"} to

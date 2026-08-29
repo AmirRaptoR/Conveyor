@@ -43,10 +43,23 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   truthful record and the item is not handed out twice.
 - **A timeout kills the process group**, TERM then KILL. Killing only the parent
   leaves an agent's children holding the source's lock.
-- **`perSource: 1` is a constraint, not a default.** A source maps to a git
-  worktree; two agents in one checkout corrupt each other. Parallelism comes
-  from `perStage` and `global`: different sources work different stages at once,
-  which is a line filling up, not two agents in one repo.
+- **An item gets its own worktree, not the source's checkout.** `agents/_worktree`
+  puts each item in `~/codes/.worktrees/<source>/<ref>`, branched from the
+  remote's default branch (or from the pull request's branch on a rework), and
+  the implement and review adapters `cd` into it. Three things follow. Two items
+  in one repository can run at once, because they share only the object store,
+  which git already makes safe. A tree left dirty by a dead run blocks exactly
+  the item that owns it, instead of every item in the repository. And the
+  checkout a *person* works in is never touched — uncommitted work can sit in it
+  for a week and the pipeline neither notices nor cares.
+  `perSource` is therefore a throughput choice now, not a safety rule. It is
+  still not unlimited: `refine` and `deploy` run in the source's own checkout.
+  Worktrees are created by the adapter and removed by `review` after a merge —
+  the engine knows nothing about any of it, because how the work happens is the
+  script's business.
+  Agents must not change branch: several checkouts of one repository are live at
+  once and `main` is checked out elsewhere. Both adapters say so in the prompt,
+  and `/implement` step 2 defers to a branch it was handed.
 - **The scheduler claims a slot before it launches.** Checking whether a slot is
   free and then starting a goroutine leaves a gap in which the next pass decides
   the same thing again. `Engine.Advance` does not lock; its caller must.

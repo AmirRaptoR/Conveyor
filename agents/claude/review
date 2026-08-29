@@ -18,6 +18,7 @@ set -euo pipefail
 # Streams the agent's work as it happens; without it a long stage looks dead.
 source "$(dirname "$0")/_stream"
 source "$(dirname "$0")/../_blocked"
+source "$(dirname "$0")/../_worktree"
 
 : "${PROMPT:?PROMPT is required (set it in this script params: block)}"
 
@@ -36,6 +37,13 @@ review. Either the implement stage did not land its work, or the PR was closed \
 by hand."
 	fi
 	echo "reviewing PR #$pr for $CONVEYOR_SOURCE #$ref — $title"
+	# The item's own worktree, on the pull request's branch. Review applies
+	# fixes and merges, both of which are writes: doing them in the repository a
+	# person works in is how a review lands on top of somebody's evening.
+	head=$(gh pr view "$pr" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null || true)
+	wt=$(item_worktree "$CONVEYOR_SOURCE" "$ref" "$head")
+	cd "$wt"
+	echo "  worktree: $wt  (branch $(git branch --show-current))"
 else
 	echo "reviewing $CONVEYOR_SOURCE #$ref — $title"
 fi
@@ -64,6 +72,14 @@ If the review cannot reach a verdict because it needs a decision only a human
 can make, change nothing and write {\"blocked\": true, \"reason\": \"<the
 decision needed>\"} to the file at ${CONVEYOR_RESULT}."
 
+if [[ -n "${wt:-}" ]]; then
+	full="${full}
+
+You are in a git worktree of your own at ${wt}, already on the branch of the
+pull request under review. Work here, and do NOT change branch: other checkouts
+of this repository are live right now and main is checked out elsewhere."
+fi
+
 # A person may have answered the question this stage stopped on last time.
 full=$(resume_prompt "$payload" "$full")
 
@@ -90,6 +106,14 @@ if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 	exit 20 # the agent wrote its own reason; leave it exactly as written
 fi
 
+# The item's worktree, once its branch is merged and deleted, is a copy of
+# nothing. Removed only on the way out through success: on any other path the
+# tree is the evidence, and the next attempt starts where this one stopped.
+cleanup_worktree() {
+	cd "${CONVEYOR_WORKDIR:-$PWD}" 2>/dev/null || return 0
+	drop_worktree "$CONVEYOR_SOURCE" "$ref"
+}
+
 # GitHub is the record, never the transcript. A clean review ends in a merge, so
 # the PR must be gone; if it is still open the review did not converge, whatever
 # the session said.
@@ -100,5 +124,6 @@ if [[ $rc -eq 0 && -n "${REPO:-}" ]]; then
 		exit 1
 	fi
 	echo "PR merged"
+	cleanup_worktree
 fi
 exit $rc

@@ -172,14 +172,26 @@ already reflects reality and the item is not handed out twice.
 
 ```yaml
 concurrency:
-  perSource: 1      # one item in flight per source. Not configurable above 1 in
-                    # v1: a source maps to a git worktree, and two agents in one
-                    # checkout corrupt each other.
-  global: 1         # v1 ships 1. Raising it runs N sources in parallel.
+  perSource: 2      # items in flight per source
+  perStage:  2      # items in flight in one stage
+  global:    4      # items in flight anywhere
 ```
 
-`perSource: 1` is a real constraint, not a default. A stage script may spawn as
-many subagents as it likes internally — that is invisible to the engine.
+`perSource` above 1 is safe only because an item works in **its own git
+worktree**, not in the source's checkout — see `agents/_worktree`. Two agents in
+one directory overwrite each other; two agents in two worktrees of one
+repository share only the object store, which git already makes safe. Where the
+worktrees live, when they are made and when they are removed is entirely the
+adapter's business: the engine has no concept of a worktree and must not gain
+one.
+
+It is still not unbounded. Scripts that run in the source's own checkout — a
+`refine` that only reads, a `deploy` that ships from it — are bounded by
+`perSource` like everything else, and a deploy is bounded to one at a time by
+`perStage` anyway.
+
+A stage script may spawn as many subagents as it likes internally — that is
+invisible to the engine.
 
 ## 6. Runs and logs
 

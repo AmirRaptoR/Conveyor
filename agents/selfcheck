@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Checks the shared adapter helpers — the ones under agents/ that every agent
+# sources. Builds a throwaway repository and a throwaway remote; touches
+# nothing real and runs no model.
+#
+#   agents/selfcheck
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/_worktree"
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export WORKTREES="$tmp/worktrees"
+
+git init --quiet --bare "$tmp/origin.git"
+git clone --quiet "$tmp/origin.git" "$tmp/repo"
+cd "$tmp/repo"
+git config user.email a@b.c && git config user.name t
+git symbolic-ref HEAD refs/heads/main
+echo one > file.txt && git add -A && git commit --quiet -m first
+git push --quiet -u origin main
+git remote set-head origin -a >/dev/null 2>&1 || true
+
+chk "the default branch comes from the remote" "$(default_branch)" "main"
+
+# 1. a new item gets its own directory, on its own branch, off the default.
+p=$(item_worktree demo 42)
+chk "the worktree is outside the repository" "$(dirname "$(dirname "$p")")" "$WORKTREES"
+chk "it is a real checkout"                  "$(cd "$p" && git rev-parse --is-inside-work-tree)" "true"
+chk "on the item's own branch"               "$(cd "$p" && git branch --show-current)" "issue-42"
+chk "starting from the default branch"       "$(cd "$p" && git rev-parse HEAD)" "$(git rev-parse origin/main)"
+
+# 2. the repository a person works in is untouched, dirty or not.
+echo scratch > uncommitted.txt
+chk "the source checkout keeps its own state" "$(git status --porcelain | wc -l | tr -d ' ')" "1"
+p2=$(item_worktree demo 43)
+chk "a dirty source checkout blocks nothing"  "$(cd "$p2" && git branch --show-current)" "issue-43"
+
+# 3. two items at once, which is the whole point.
+chk "two items have two directories" "$([[ "$p" != "$p2" ]] && echo yes)" "yes"
+(cd "$p" && echo a > w.txt && git add -A && git commit --quiet -m a)
+(cd "$p2" && echo b > w.txt && git add -A && git commit --quiet -m b)
+chk "neither sees the other's work" "$(cd "$p" && git log --oneline | wc -l | tr -d ' ')" "2"
+
+# 4. asking again returns the same directory rather than rebuilding it.
+chk "an existing worktree is reused" "$(item_worktree demo 42)" "$p"
+
+# 5. rework: an existing remote branch is what the worktree tracks.
+git push --quiet origin "$(cd "$p" && git branch --show-current)":refs/heads/pr-branch
+p3=$(item_worktree demo 44 pr-branch)
+chk "a named branch is honoured" "$(cd "$p3" && git branch --show-current)" "pr-branch"
+
+# 6. cleanup after a merge removes it, and prune leaves git consistent.
+drop_worktree demo 44
+chk "a merged item's worktree is gone" "$([[ -d "$p3" ]] && echo present || echo gone)" "gone"
+chk "the others survive"               "$([[ -d "$p" && -d "$p2" ]] && echo yes)" "yes"
+
+# 7. a directory deleted by hand can be recreated under the same name.
+rm -rf "$p2"
+p4=$(item_worktree demo 43)
+chk "a hand-deleted worktree comes back" "$(cd "$p4" && git rev-parse --is-inside-work-tree)" "true"
+
+exit $fail

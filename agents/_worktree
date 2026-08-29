@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Sourced by the agent adapters. Not a verb: config resolves script names
+# exactly, so a leading underscore can never be mistaken for one.
+#
+# One worktree per item, instead of one per repository.
+#
+# A source used to be a checkout, which made `perSource: 1` a safety rule rather
+# than a throughput choice: two agents in one directory overwrite each other's
+# edits. It also made one dead run everybody's problem — a tree left dirty at 2am
+# stopped every other item in that repository until a person cleaned it, because
+# the next item's first act was to refuse to build on someone else's mess.
+#
+# A worktree per item removes both. Agents get their own directory and their own
+# index, sharing only the object store, which git already makes safe. A tree left
+# dirty belongs to exactly one item and blocks exactly that one. And the
+# repository the human works in is never touched at all — uncommitted work can
+# sit in it for a week without the pipeline noticing or caring.
+#
+# Worktrees live OUTSIDE the repository, deliberately: a directory inside it is
+# something an agent told to "commit everything" will eventually sweep into a
+# pull request.
+
+# worktree_root — where per-item checkouts go. Override with WORKTREES.
+worktree_root() { printf '%s' "${WORKTREES:-$HOME/codes/.worktrees}"; }
+
+# default_branch — what a new item branches from. Asks the remote rather than
+# assuming "main": the answer is per repository and getting it wrong branches
+# the work off nothing.
+default_branch() {
+	local b
+	b=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) && {
+		printf '%s' "${b#origin/}"
+		return 0
+	}
+	for b in main master; do
+		git show-ref --verify --quiet "refs/remotes/origin/$b" && {
+			printf '%s' "$b"
+			return 0
+		}
+	done
+	printf 'main'
+}
+
+# item_worktree <source> <ref> [existing-branch] — print the path to this item's
+# worktree, creating it if it is not there. Run from the source's checkout.
+#
+# With an existing branch (review sent the work back, so there is a pull request
+# to build on) the worktree tracks that branch. Without one it starts from the
+# remote's default branch — never from whatever the local checkout happens to
+# have, which is a human's working state and not a base anyone chose.
+item_worktree() {
+	local source=$1 ref=$2 branch=${3:-} path base
+	path="$(worktree_root)/${source}/${ref}"
+
+	# Records of worktrees whose directories are gone: cheap, and without it a
+	# path deleted by hand can never be recreated under the same name.
+	git worktree prune 2>/dev/null || true
+
+	if [[ -d "$path" ]] && git -C "$path" rev-parse --git-dir >/dev/null 2>&1; then
+		printf '%s' "$path"
+		return 0
+	fi
+
+	rm -rf "$path"
+	mkdir -p "$(dirname "$path")"
+	git fetch --quiet origin --prune 2>/dev/null || true
+
+	if [[ -n "$branch" ]] && git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+		# -B so a stale local branch of the same name is repointed at the remote
+		# rather than refusing, which is what a previous run's leftovers look like.
+		git worktree add --quiet -B "$branch" "$path" "origin/$branch" >&2
+	else
+		base=$(default_branch)
+		git worktree add --quiet -B "${branch:-issue-$ref}" "$path" "origin/$base" >&2
+	fi
+	printf '%s' "$path"
+}
+
+# drop_worktree <source> <ref> — remove an item's worktree once its work has
+# landed. Called after a merge: the branch is gone, so the directory is a copy of
+# nothing. Never called on a failure, where the tree is the evidence.
+drop_worktree() {
+	local path
+	path="$(worktree_root)/${1}/${2}"
+	[[ -d "$path" ]] || return 0
+	git worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
+	git worktree prune 2>/dev/null || true
+}
