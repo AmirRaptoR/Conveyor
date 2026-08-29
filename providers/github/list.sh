@@ -3,13 +3,20 @@
 #
 # Env (from the source's env: block):
 #   REPO           owner/name — required
+#   LABEL_PREFIX   what every label this pipeline owns begins with (default:
+#                  "conveyor:"). One namespace, so a repository can tell at a
+#                  glance which labels a machine writes and which are its own,
+#                  and so move.sh can find every label it manages by shape
+#                  rather than by a list that goes stale the moment a stage is
+#                  renamed.
 #   STAGE_LABELS   "stage=label" per line. The source owns the provider<->stage
 #                  mapping; the engine never sees a label.
-#   BLOCKED_LABEL  the label that means "a human must decide" (default: blocked).
-#                  It is a mark, not a stage: an issue wearing it keeps whatever
-#                  status:* it stopped on, and the scheduler leaves it alone.
+#   BLOCKED_LABEL  the label that means "a human must decide"
+#                  (default: ${LABEL_PREFIX}blocked). It is a mark, not a stage:
+#                  an issue wearing it keeps whatever stage label it stopped on,
+#                  and the scheduler leaves it alone.
 #   IGNORE_LABELS  labels that mean "not conveyor's work", one per line or comma
-#                  separated (default: conveyor:ignore). An issue wearing one is
+#                  separated (default: ${LABEL_PREFIX}ignore). An issue wearing one is
 #                  never listed, so it never reaches the board and nothing is
 #                  ever run against it — the way to open an issue and work it by
 #                  hand while the pipeline is running.
@@ -19,8 +26,9 @@ set -euo pipefail
 
 : "${REPO:?REPO is required (set it in the source env: block)}"
 DEFAULT_STAGE="${DEFAULT_STAGE:-backlog}"
-BLOCKED_LABEL="${BLOCKED_LABEL:-blocked}"
-IGNORE_LABELS="${IGNORE_LABELS:-conveyor:ignore}"
+LABEL_PREFIX="${LABEL_PREFIX:-conveyor:}"
+BLOCKED_LABEL="${BLOCKED_LABEL:-${LABEL_PREFIX}blocked}"
+IGNORE_LABELS="${IGNORE_LABELS:-${LABEL_PREFIX}ignore}"
 
 # Ignoring is not blocking, and the difference is the whole point of having
 # both. A blocked issue is conveyor's, stopped, waiting for an answer, and it
@@ -45,10 +53,22 @@ label_to_stage=$(
 			| from_entries'
 )
 
-echo "listing open issues in $REPO" >&2
+echo "listing issues in $REPO" >&2
 
-gh issue list --repo "$REPO" --state open --limit "${LIMIT:-200}" \
-	--json number,title,body,labels,url,assignees |
+# Closed issues are listed too, and only the ones this pipeline labelled.
+#
+# A finished item is a closed issue: the pull request says "Closes #N" and
+# GitHub closes it on merge. Listing open issues alone meant the last stages
+# had nobody in them — an item did not arrive in `done`, it disappeared on the
+# way, and a board whose final column is always empty cannot be read as
+# finishing anything.
+#
+# The asymmetry below is deliberate. An open issue with no stage label is new
+# work and lands in DEFAULT_STAGE; a *closed* one with no stage label was never
+# conveyor's — it is every issue the repository ever finished, and defaulting
+# those onto the board would bury the work in history.
+gh issue list --repo "$REPO" --state all --limit "${LIMIT:-200}" \
+	--json number,title,body,labels,url,assignees,state |
 	jq --arg source "$CONVEYOR_SOURCE" \
 		--arg default "$DEFAULT_STAGE" \
 		--arg blocked "$BLOCKED_LABEL" \
@@ -56,7 +76,9 @@ gh issue list --repo "$REPO" --state open --limit "${LIMIT:-200}" \
 		--argjson map "$label_to_stage" '
 		map(
 			(.labels | map(.name)) as $names
+			| ([$names[] | $map[.] // empty] | .[0]) as $mapped
 			| select(any($ignored[]; . as $skip | $names | index($skip)) | not)
+			| select(((.state // "OPEN") | ascii_downcase) == "open" or $mapped != null)
 			| {
 				id:          "\($source):\(.number)",
 				ref:         (.number | tostring),
@@ -64,7 +86,7 @@ gh issue list --repo "$REPO" --state open --limit "${LIMIT:-200}" \
 				# First mapped label wins. An issue wearing two status labels is
 				# already broken; picking deterministically beats erroring, and
 				# the next move.sh clears the loser.
-				stage:       ([$names[] | $map[.] // empty] | .[0] // $default),
+				stage:       ($mapped // $default),
 				title:       .title,
 				# The mark rides beside the stage, never instead of it: this is
 				# what keeps an unblocked issue resuming where it stopped.

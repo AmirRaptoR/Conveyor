@@ -127,6 +127,20 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
 - **How the work happens is never in the config.** Which agent, which model,
   which tools, all of it lives in the source's script, because it differs per
   repository. Resist every request to add a key for it.
+- **Every label this pipeline owns begins with `LABEL_PREFIX`** (`conveyor:`, a
+  provider param, never a config key). One namespace, so a repository can see at
+  a glance which labels a machine writes — and so `move` can find what it
+  manages by *shape* rather than by a list that goes stale. Managed used to be
+  the right-hand sides of `STAGE_LABELS` alone, which meant renaming a stage
+  orphaned its old label forever: nothing took it off, and listing takes the
+  first mapped label it finds, so an item landed in a stage nobody put it in.
+- **`list` reads closed issues it labelled, and only those.** A finished item is
+  a closed issue — the pull request says `Closes #N` — so listing open ones
+  alone left the last stages empty: an item did not arrive in `done`, it
+  disappeared on the way. The asymmetry is deliberate: an *open* issue with no
+  stage label is new work and lands in `DEFAULT_STAGE`; a *closed* one with no
+  stage label was never conveyor's, and defaulting those onto the board would
+  bury the work under every issue the repository ever finished.
 - **Ignored is not blocked.** `IGNORE_LABELS` (a provider param, GitHub's
   vocabulary) keeps an issue out of the listing entirely: it never reaches the
   board, is never counted, and no stage is ever run against it. Blocked is

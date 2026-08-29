@@ -15,7 +15,8 @@
 set -euo pipefail
 
 : "${REPO:?REPO is required (set it in the source env: block)}"
-BLOCKED_LABEL="${BLOCKED_LABEL:-blocked}"
+LABEL_PREFIX="${LABEL_PREFIX:-conveyor:}"
+BLOCKED_LABEL="${BLOCKED_LABEL:-${LABEL_PREFIX}blocked}"
 
 payload=$(cat)
 ref=$(jq -r '.item.ref' <<<"$payload")
@@ -32,8 +33,24 @@ have=$(gh issue view "$ref" --repo "$REPO" --json labels --jq '.labels[].name')
 trim() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 wearing() { grep -qxF "$1" <<<"$have"; }
 
-# Every label this provider manages — the right-hand side of every mapping.
-managed=$(printf '%s\n' "${STAGE_LABELS:-}" | sed -n 's/^[^=]*=//p' | trim)
+# Every label this provider manages: the right-hand side of every mapping, plus
+# anything the issue is already wearing that begins with the prefix.
+#
+# The second half is what makes a rename safe. Managed used to be the mappings
+# alone, so renaming a stage label orphaned the old one — the issue kept wearing
+# it forever, and listing takes the first mapped label it finds, which is how an
+# item ends up in a stage nobody put it in. Owning the whole namespace means a
+# label this pipeline wrote is a label this pipeline can take off, whether or
+# not it is still in the config.
+#
+# The mark and its kind are excluded: they are handled below, and removing them
+# here would set and clear the same label in one call.
+managed=$(
+	{
+		printf '%s\n' "${STAGE_LABELS:-}" | sed -n 's/^[^=]*=//p'
+		printf '%s\n' "$have" | grep -F "$LABEL_PREFIX" || true
+	} | trim | grep -v "^${BLOCKED_LABEL}\(:\| \|$\)" | sort -u || true
+)
 # The one this stage wants.
 want=$(printf '%s\n' "${STAGE_LABELS:-}" |
 	sed -n "s/^[[:space:]]*${to}[[:space:]]*=//p" | trim | head -1)

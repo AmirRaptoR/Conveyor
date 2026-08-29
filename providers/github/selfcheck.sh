@@ -25,6 +25,9 @@ check() { # check <label> <expected> <actual>
 }
 
 export REPO="owner/repo"
+# Explicit, and older than the prefix on purpose: a source that named its labels
+# before LABEL_PREFIX existed must keep working exactly as it did.
+export BLOCKED_LABEL="blocked"
 export STAGE_LABELS='refining=status:refining
 ready=status:ready
 in-progress=status:in-progress'
@@ -35,17 +38,23 @@ cat >"$tmp/stub/gh" <<'STUB'
 #!/usr/bin/env bash
 cat <<'JSON'
 [
- {"number":7,"title":"Checkout hangs","body":"spinner",
+ {"state":"OPEN","number":7,"title":"Checkout hangs","body":"spinner",
   "labels":[{"name":"bug"},{"name":"priority:p0"},{"name":"status:refining"}],
   "url":"https://example.test/7","assignees":[{"login":"amir"}]},
- {"number":9,"title":"Unranked","body":"","labels":[],
+ {"state":"OPEN","number":9,"title":"Unranked","body":"","labels":[],
   "url":"https://example.test/9","assignees":[]},
- {"number":11,"title":"Needs a decision","body":"",
+ {"state":"OPEN","number":11,"title":"Needs a decision","body":"",
   "labels":[{"name":"status:in-progress"},{"name":"blocked"}],
   "url":"https://example.test/11","assignees":[]},
- {"number":13,"title":"Mine, not the pipeline's","body":"",
+ {"state":"OPEN","number":13,"title":"Mine, not the pipeline's","body":"",
   "labels":[{"name":"conveyor:ignore"},{"name":"status:ready"}],
-  "url":"https://example.test/13","assignees":[]}
+  "url":"https://example.test/13","assignees":[]},
+ {"number":15,"title":"Shipped and closed","body":"","state":"CLOSED",
+  "labels":[{"name":"status:ready"}],
+  "url":"https://example.test/15","assignees":[]},
+ {"number":17,"title":"Closed years ago, never ours","body":"","state":"CLOSED",
+  "labels":[{"name":"bug"}],
+  "url":"https://example.test/17","assignees":[]}
 ]
 JSON
 STUB
@@ -79,17 +88,22 @@ check "an unmarked issue is not blocked" \
 # one was never conveyor's and must not reach the board at all — not even in a
 # count, or "3 items" and three cards stop agreeing.
 check "an ignored issue is not listed at all" \
-	"3" "$(jq -r 'length' "$tmp/out.json")"
+	"4" "$(jq -r 'length' "$tmp/out.json")"
 check "and no ignored id survives" \
 	"" "$(jq -r '.[] | select(.ref == "13") | .id' "$tmp/out.json")"
 check "a stage label does not rescue an ignored issue" \
-	"" "$(jq -r '.[] | select(.stage == "ready") | .id' "$tmp/out.json")"
+	"" "$(jq -r '.[] | select(.ref == "13") | .stage' "$tmp/out.json")"
 
 # Configurable, because the label is the repo's vocabulary and not the engine's.
 PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/named.json" \
 	IGNORE_LABELS="wontfix, hold" ./list.sh 2>/dev/null
 check "a named ignore list replaces the default" \
-	"4" "$(jq -r 'length' "$tmp/named.json")"
+	"5" "$(jq -r 'length' "$tmp/named.json")"
+
+check "a closed issue this pipeline labelled is still listed" \
+	"ready" "$(jq -r '.[] | select(.ref == "15") | .stage' "$tmp/out.json")"
+check "a closed issue it never labelled is left in history" \
+	"" "$(jq -r '.[] | select(.ref == "17") | .ref' "$tmp/out.json")"
 
 # --- move.sh: stage -> label writes ----------------------------------------
 # move.sh asks GitHub for the issue's current labels, so the stub answers that.
@@ -190,6 +204,63 @@ export COMMENTS="$tmp/other"
 printf '**Blocked** — something else entirely\n' >"$tmp/other"
 check "a different reason is still said" \
 	"yes" "$(echo "$marking" | wet | grep -q 'gh issue comment' && echo yes || echo no)"
+
+# --- the label namespace ----------------------------------------------------
+#
+# Every label this pipeline owns begins with one prefix, so a repository can see
+# at a glance which of its labels a machine writes — and so move.sh can find
+# what it manages by shape instead of by a list that goes stale the moment a
+# stage is renamed.
+echo "label namespace"
+(
+	unset BLOCKED_LABEL IGNORE_LABELS
+	export STAGE_LABELS='refining=conveyor:refining
+ready=conveyor:ready'
+	cat >"$tmp/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+cat <<'JSON'
+[
+ {"number":21,"title":"Stopped","body":"","state":"OPEN",
+  "labels":[{"name":"conveyor:refining"},{"name":"conveyor:blocked"}],
+  "url":"https://example.test/21","assignees":[]},
+ {"number":23,"title":"Not ours","body":"","state":"OPEN",
+  "labels":[{"name":"conveyor:ignore"}],
+  "url":"https://example.test/23","assignees":[]}
+]
+JSON
+STUB
+	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/ns.json" \
+		./list.sh 2>/dev/null
+	check "the mark defaults into the namespace" \
+		"true" "$(jq -r '.[] | select(.ref == "21") | .blocked' "$tmp/ns.json")"
+	check "ignore defaults into the namespace too" \
+		"" "$(jq -r '.[] | select(.ref == "23") | .ref' "$tmp/ns.json")"
+) || fail=1
+
+# A stage renamed in config used to orphan its old label forever: managed was
+# the right-hand sides of the mappings alone, so the label a previous name wrote
+# was never taken off again — and listing takes the first mapped label it finds,
+# which is how an item ends up in a stage nobody put it in. Owning the whole
+# prefix means a label this pipeline wrote is one it can still remove.
+# The namespace section above rewrote the shared stub to answer `issue list`;
+# move.sh asks it for `issue view --json labels`, so put that one back.
+cat >"$tmp/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+if [[ -n "$LABELS" ]]; then printf '%s\n' "$LABELS"; fi
+STUB
+chmod +x "$tmp/stub/gh"
+
+export LABELS=$'bug\nconveyor:refining'
+saved_labels=$STAGE_LABELS
+export STAGE_LABELS='ready=conveyor:ready'
+out=$(echo '{"item":{"ref":"31"},"stage":"ready"}' | dry)
+export STAGE_LABELS=$saved_labels
+check "a label a renamed stage left behind is still removed" \
+	"yes" "$(grep -q -- "--remove-label conveyor:refining" <<<"$out" && echo yes || echo no)"
+check "and the new one is added" \
+	"yes" "$(grep -q -- "--add-label conveyor:ready" <<<"$out" && echo yes || echo no)"
+check "a label outside the prefix is left alone" \
+	"no" "$(grep -q -- "--remove-label bug" <<<"$out" && echo yes || echo no)"
 
 [[ $fail -eq 0 ]] && echo "all checks passed" || echo "FAILURES"
 exit $fail
