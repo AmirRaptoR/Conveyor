@@ -140,5 +140,39 @@ check "a reason is commented when the mark goes on" \
 	"gh issue comment 9 --repo owner/repo --body <reason>" \
 	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedReason":"needs a product call"}' | dry | tail -1)"
 
+# --- move.sh: the reason is said once ---------------------------------------
+# Not in dry run: this path asks GitHub what it already said, so the stub has to
+# answer two different questions. The hourly stall retry clears marks and lets
+# them come back, so without this every pass leaves another identical comment.
+echo "move.sh (repeat suppression)"
+cat >"$tmp/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+	*"--json comments"*) cat "$COMMENTS" ;;
+	*"--json labels"*)   for l in $LABELS; do echo "$l"; done ;;
+	*)                   echo "CALLED: gh $*" ;;
+esac
+STUB
+chmod +x "$tmp/stub/gh"
+
+wet() { PATH="$tmp/stub:$PATH" ./move.sh 2>&1 | grep -E '^(CALLED|the same reason)' || true; }
+export LABELS="status:in-progress"
+marking='{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedReason":"the checkout is dirty"}'
+
+export COMMENTS="$tmp/none"; echo -n "" >"$tmp/none"
+check "a first mark says why" \
+	"yes" "$(echo "$marking" | wet | grep -q 'gh issue comment' && echo yes || echo no)"
+
+export COMMENTS="$tmp/said"
+printf '**Blocked** — the checkout is dirty\n' >"$tmp/said"
+check "the same reason is not commented twice" \
+	"the same reason is already commented on #9; not repeating it" \
+	"$(echo "$marking" | wet | grep '^the same reason')"
+
+export COMMENTS="$tmp/other"
+printf '**Blocked** — something else entirely\n' >"$tmp/other"
+check "a different reason is still said" \
+	"yes" "$(echo "$marking" | wet | grep -q 'gh issue comment' && echo yes || echo no)"
+
 [[ $fail -eq 0 ]] && echo "all checks passed" || echo "FAILURES"
 exit $fail

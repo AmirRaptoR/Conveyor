@@ -81,9 +81,21 @@ gh issue edit "$ref" --repo "$REPO" "${args[@]}" >&2
 # cannot repeat, and a failed comment must not fail the move — the label is the
 # state, the comment is only the explanation.
 if [[ "$marking" == "set" && -n "$reason" ]]; then
-	gh issue comment "$ref" --repo "$REPO" --body \
-		"**Blocked** — $reason
+	body="**Blocked** — $reason
 
-Remove the \`$BLOCKED_LABEL\` label to hand this back to the pipeline; it resumes in \`$to\`." >&2 ||
-		echo "could not comment the reason; the label is set regardless" >&2
+Remove the \`$BLOCKED_LABEL\` label to hand this back to the pipeline; it resumes in \`$to\`."
+
+	# The same stop, said twice, is noise. A mark that is cleared and comes
+	# straight back — an hourly stall retry, or a person handing the board back
+	# before the thing that stopped it was fixed — enters the mark again, and
+	# without this each pass leaves another identical comment on the same issue.
+	# Compared against every comment, not just the newest: a reply underneath
+	# ours does not make the explanation new.
+	if gh issue view "$ref" --repo "$REPO" --json comments \
+		--jq '.comments[].body' 2>/dev/null | grep -qxF "$(head -1 <<<"$body")"; then
+		echo "the same reason is already commented on #$ref; not repeating it" >&2
+	else
+		gh issue comment "$ref" --repo "$REPO" --body "$body" >&2 ||
+			echo "could not comment the reason; the label is set regardless" >&2
+	fi
 fi
