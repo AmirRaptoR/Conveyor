@@ -22,6 +22,7 @@ set -euo pipefail
 
 # Streams the agent's work as it happens; without it a long stage looks dead.
 source "$(dirname "$0")/_stream"
+source "$(dirname "$0")/../_blocked"
 
 : "${PROMPT:?PROMPT is required (set it in the source env: block)}"
 
@@ -70,6 +71,15 @@ MAX_TURNS="${MAX_TURNS:-40}" \
 	run_claude "$full"
 rc=$?
 set -e
+
+# Out of quota is not a fault of the item, and must not read like one: without
+# this the run ends having done nothing and the next check reports whatever it
+# failed to find, which is how "no open PR references #49" came to mean "the
+# account was rate limited".
+if hit_limit; then
+	blocked limit "the agent was out of quota and stopped before doing the work. \
+Nothing is wrong with this item; it is waiting for the window to reset."
+fi
 
 # "Needs a human" cannot ride on the exit code: a CLI agent exits 0 whenever the
 # process ran, whatever it concluded. It comes back through the result file.

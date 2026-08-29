@@ -31,7 +31,7 @@ title=$(jq -r '.item.title' <<<"$payload")
 if [[ -n "${REPO:-}" ]]; then
 	pr=$(gh pr list --repo "$REPO" --state open --search "$ref" --json number --jq '.[0].number' 2>/dev/null)
 	if [[ -z "$pr" ]]; then
-		blocked "no open pull request references #$ref, so there is nothing to \
+		blocked input "no open pull request references #$ref, so there is nothing to \
 review. Either the implement stage did not land its work, or the PR was closed \
 by hand."
 	fi
@@ -70,6 +70,15 @@ MAX_TURNS="${MAX_TURNS:-200}" \
 	run_claude "$full"
 rc=$?
 set -e
+
+# Out of quota is not a fault of the item, and must not read like one: without
+# this the run ends having done nothing and the next check reports whatever it
+# failed to find, which is how "no open PR references #49" came to mean "the
+# account was rate limited".
+if hit_limit; then
+	blocked limit "the agent was out of quota and stopped before doing the work. \
+Nothing is wrong with this item; it is waiting for the window to reset."
+fi
 
 if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 	[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then

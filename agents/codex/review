@@ -15,7 +15,7 @@ ref=$(jq -r '.item.ref' <<<"$payload")
 
 pr=$(gh pr list --repo "$REPO" --state open --search "$ref" --json number --jq '.[0].number' 2>/dev/null)
 if [[ -z "$pr" ]]; then
-	blocked "no open pull request references #$ref, so there is nothing to review."
+	blocked input "no open pull request references #$ref, so there is nothing to review."
 fi
 
 echo "reviewing PR #$pr for item #$ref"

@@ -22,6 +22,7 @@ ref=$(jq -r '.item.ref' <<<"$payload")
 to=$(jq -r '.stage' <<<"$payload")
 blocked=$(jq -r '.blocked // false' <<<"$payload")
 reason=$(jq -r '.blockedReason // ""' <<<"$payload")
+kind=$(jq -r '.blockedKind // ""' <<<"$payload")
 # Fetched, not taken from the payload. The payload's labels come from the last
 # list, which is already stale by the second move of the same tick: the engine
 # moves an item into a stage and out of it between two polls, so a cached label
@@ -48,6 +49,14 @@ if [[ -n "$want" ]] && ! wearing "$want"; then
 fi
 
 # The mark, last, so the stage labels above read as one unchanged block.
+#
+# Two labels, not one. `blocked` alone stays the mark, so "everything blocked"
+# is still one query and one label to remove; `blocked: <kind>` says which kind
+# of stop it was, which is what makes a list of them worth scanning. The kind
+# label is derived from the mark's name, so renaming BLOCKED_LABEL renames both.
+want_kind=""
+[[ "$blocked" == "true" && -n "$kind" ]] && want_kind="$BLOCKED_LABEL: $kind"
+
 marking=""
 if [[ "$blocked" == "true" ]]; then
 	if ! wearing "$BLOCKED_LABEL"; then
@@ -58,6 +67,17 @@ elif wearing "$BLOCKED_LABEL"; then
 	args+=(--remove-label "$BLOCKED_LABEL")
 fi
 
+# Every kind label it is wearing and should not be — the one it stopped for last
+# time, when this stop is a different kind, and all of them when the mark goes.
+while IFS= read -r label; do
+	[[ "$label" == "$BLOCKED_LABEL: "* && "$label" != "$want_kind" ]] &&
+		args+=(--remove-label "$label")
+done <<<"$have"
+if [[ -n "$want_kind" ]] && ! wearing "$want_kind"; then
+	args+=(--add-label "$want_kind")
+	new_kind_label="$want_kind"
+fi
+
 if [[ ${#args[@]} -eq 0 ]]; then
 	# Either the stage maps to no label (backlog, done — nothing to write), or
 	# the issue is already correct. Both are success.
@@ -65,13 +85,21 @@ if [[ ${#args[@]} -eq 0 ]]; then
 	exit 0
 fi
 
-echo "issue #$ref -> $to${want:+ ($want)}${marking:+ + $BLOCKED_LABEL}" >&2
+echo "issue #$ref -> $to${want:+ ($want)}${marking:+ + $BLOCKED_LABEL}${want_kind:+ [$kind]}" >&2
 
 if [[ -n "${CONVEYOR_DRY_RUN:-}" ]]; then
 	echo "DRY RUN: gh issue edit $ref --repo $REPO ${args[*]}" >&2
 	[[ "$marking" == "set" && -n "$reason" ]] &&
 		echo "DRY RUN: gh issue comment $ref --repo $REPO --body <reason>" >&2
 	exit 0
+fi
+
+# A kind is whatever the script that stopped called it, so its label may not
+# exist yet. Creating it is this adapter's job — the alternative is a mark that
+# fails to write because a repository has never seen this kind of stop before.
+if [[ -n "${new_kind_label:-}" ]]; then
+	gh label create "$new_kind_label" --repo "$REPO" --color d4a72c \
+		--description "Blocked: $kind. Remove the $BLOCKED_LABEL label to hand it back." >/dev/null 2>&1 || true
 fi
 
 gh issue edit "$ref" --repo "$REPO" "${args[@]}" >&2

@@ -130,8 +130,14 @@ type StageInput struct {
 	// BlockedReason is why, when the script said so — the agents' convention is
 	// a "reason" in $CONVEYOR_RESULT. A provider that can record it should; one
 	// that cannot may ignore it.
-	BlockedReason string         `json:"blockedReason,omitempty"`
-	Config        map[string]any `json:"config,omitempty"`
+	BlockedReason string `json:"blockedReason,omitempty"`
+	// BlockedKind is the same stop in one word — "decision", "limit",
+	// "worktree" — for a provider that can file it, and for a board that has a
+	// line of space and a paragraph to fit in it. Free text to the engine,
+	// which normalises it and passes it on; the vocabulary belongs to the
+	// scripts, because what stops a deploy is not what stops a refine.
+	BlockedKind string         `json:"blockedKind,omitempty"`
+	Config      map[string]any `json:"config,omitempty"`
 }
 
 // ListInput is the JSON piped to a list script's stdin.

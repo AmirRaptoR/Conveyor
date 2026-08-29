@@ -3,6 +3,7 @@ package pipeline
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
@@ -270,5 +271,38 @@ func TestOrderLeavesTheListingAlone(t *testing.T) {
 	Order(cfg, items, nil)
 	if items[0].ID != "a:1" || items[1].ID != "a:2" {
 		t.Errorf("listing was reordered in place: %q,%q", items[0].ID, items[1].ID)
+	}
+}
+
+// The kind is what the board shows and what a provider files as a label, so
+// every mark has one — the script's word when it gave one, and the run
+// record's when it did not.
+func TestEveryMarkHasAKind(t *testing.T) {
+	for _, tc := range []struct {
+		what string
+		run  model.Run
+		data string
+		kind string
+	}{
+		{"a bare exit 20 is a decision", model.Run{Outcome: model.OutcomeBlocked, ExitCode: 20}, "", "decision"},
+		{"a failure is an error", model.Run{Outcome: model.OutcomeFailure, ExitCode: 1}, "", "error"},
+		{"a timeout says so", model.Run{Outcome: model.OutcomeTimeout}, "", "timeout"},
+		{"the script's own word wins", model.Run{Outcome: model.OutcomeBlocked, ExitCode: 20},
+			`{"blocked":true,"kind":"Limit","reason":"out of quota"}`, "limit"},
+		{"a kind that would not fit a label is dropped", model.Run{Outcome: model.OutcomeBlocked, ExitCode: 20},
+			`{"blocked":true,"kind":"the agent decided that it could not proceed here","reason":"x"}`, "decision"},
+		{"and so is one with punctuation in it", model.Run{Outcome: model.OutcomeFailure, ExitCode: 1},
+			`{"blocked":true,"kind":"needs:decision"}`, "error"},
+	} {
+		got := Marked("refining", tc.run, []byte(tc.data), time.Minute, 0)
+		if got.Kind != tc.kind {
+			t.Errorf("%s: kind = %q, want %q", tc.what, got.Kind, tc.kind)
+		}
+		if got.Reason == "" {
+			t.Errorf("%s: no reason at all", tc.what)
+		}
+		if !got.Blocked {
+			t.Errorf("%s: not marked", tc.what)
+		}
 	}
 }

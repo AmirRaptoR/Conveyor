@@ -241,19 +241,32 @@
   .agent .facts { display:flex; gap:14px; flex-wrap:wrap; padding-top:6px; color:var(--faint); }
   .agent .facts b { color:var(--dim); font-weight:400; }
 
-  /* Why an item stopped, on the item. The reason is the whole point of the
-     mark: a red card that cannot say what it wants is just a red card. */
+  /* What kind of stop it was, on the card. One word: the paragraph is in the
+     panel, because a column of paragraphs cannot be read across. */
   .item .why {
-    display:block; margin-top:7px; padding-top:7px; border-top:1px solid var(--rule-soft);
-    color:var(--dim); font-size:10.5px; line-height:1.5;
+    color:var(--stop); letter-spacing:.1em; text-transform:lowercase; font-size:9.5px;
+    border:1px solid color-mix(in srgb, var(--stop) 35%, var(--rule));
+    border-radius:2px; padding:0 5px;
   }
-  .item .why .hand {
-    display:inline-block; margin-top:6px; color:var(--stop); cursor:pointer;
+
+  /* And the whole of it, in the panel, with the one control that answers it. */
+  .stop {
+    margin:0 0 14px; border-left:2px solid var(--stop);
+    background:var(--panel); padding:12px 16px;
+  }
+  .stop h3 {
+    margin:0 0 6px; font-size:10px; letter-spacing:.18em; text-transform:uppercase;
+    color:var(--stop); font-weight:500;
+  }
+  .stop p { margin:0; color:var(--ink); font-size:12px; line-height:1.65; white-space:pre-wrap; }
+  .stop .meta { margin-top:8px; color:var(--faint); font-size:10.5px; }
+  .stop .hand {
+    margin-top:10px; color:var(--stop); cursor:pointer;
     border:1px solid color-mix(in srgb, var(--stop) 45%, var(--rule)); border-radius:2px;
-    padding:1px 6px; background:none; font:inherit; font-size:10px;
-    letter-spacing:.08em; text-transform:uppercase;
+    padding:3px 10px; background:none; font:inherit; font-size:10px;
+    letter-spacing:.1em; text-transform:uppercase;
   }
-  .item .why .hand:hover { background:color-mix(in srgb, var(--stop) 14%, transparent); }
+  .stop .hand:hover { background:color-mix(in srgb, var(--stop) 14%, transparent); }
 
   /* ---- faults ------------------------------------------------------------ */
   .faults { margin:0 22px; border-left:2px solid var(--stop); background:var(--panel); padding:12px 16px; }
@@ -372,6 +385,7 @@
     </div>
     <button class="ctl" id="close">Close</button>
   </div>
+  <div id="stop"></div>
   <div class="history" id="history"></div>
   <div class="log" id="log"></div>
 </aside>
@@ -488,11 +502,7 @@ function draw() {
 
   document.querySelectorAll(".item").forEach(el => {
     const open = () => { if (!justDragged) inspect(el.dataset.id, el.dataset.title, el.dataset.stage); };
-    el.onclick = e => {
-      const hand = e.target.closest("[data-hand]");
-      if (hand) { e.stopPropagation(); handBack(hand.dataset.hand, hand); return; }
-      if (!e.target.closest("a")) open();
-    };
+    el.onclick = e => { if (!e.target.closest("a")) open(); };
     el.onkeydown = e => {
       if ((e.key === "Enter" || e.key === " ") && !e.target.closest("a")) { e.preventDefault(); open(); }
     };
@@ -559,16 +569,14 @@ function card(it, active, place) {
   </article>`;
 }
 
-// The mark's reason, and the one control that answers it. A blocked card that
-// cannot say what it is waiting for sends you to the logs to find out, which is
-// the trip the mark was supposed to save.
+// What kind of stop it was, in one word, and nothing else. The reason is a
+// paragraph and belongs in the panel: a column of paragraphs is a column you
+// cannot read across, and reading across is what a board is for. Telling "out
+// of quota" from "someone has to decide something" at a glance is the whole job
+// here — the click is for the rest.
 function why(it) {
-  const b = blocks[it.id];
-  return `<span class="why">
-    ${b ? esc(b.reason) : "no reason recorded"}
-    <button class="hand" data-hand="${esc(it.id)}"
-      title="Clear the mark and hand this back to the pipeline">Hand back</button>
-  </span>`;
+  const b = blocks[it.id] || {};
+  return `<span class="why" title="${esc(b.reason || "")}">${esc(b.kind || "blocked")}</span>`;
 }
 
 // One hue per source, spread evenly around the wheel rather than hashed from
@@ -592,7 +600,28 @@ async function inspect(id, title, stage) {
   $("#panel").classList.add("open"); $("#panel").setAttribute("aria-hidden", "false");
   $("#scrim").classList.add("open");
   $("#log").innerHTML = "";
+  $("#stop").innerHTML = stopNotice(id);
+  const hand = $("#stop").querySelector(".hand");
+  if (hand) hand.onclick = () => handBack(id, hand);
   await loadHistory(id);
+}
+
+// The whole reason, where there is room for it, and the control that answers
+// it. Shown only for a marked item: everything else on the board is moving.
+function stopNotice(id) {
+  const b = blocks[id];
+  if (!b) return "";
+  const at = b.at ? new Date(b.at) : null;
+  return `<div class="stop">
+    <h3>${esc(b.kind || "blocked")}${b.stage ? ` in ${esc(b.stage)}` : ""}</h3>
+    <p>${esc(b.reason || "no reason was recorded")}</p>
+    <div class="meta">
+      ${at && !isNaN(at) ? `stopped ${esc(at.toLocaleString())}` : ""}
+      ${b.runId ? ` &middot; run ${esc(b.runId)}` : ""}
+    </div>
+    <button class="hand"
+      title="Clear the mark; the item goes straight back into the line">Hand back</button>
+  </div>`;
 }
 
 async function loadHistory(id) {
@@ -810,7 +839,9 @@ async function saveOrder() {
 async function handBack(id, btn) {
   if (btn) { btn.disabled = true; btn.textContent = "handing back"; }
   const res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, { method:"POST" });
-  if (!res.ok) refuse(id, (await res.text()).trim() || `could not unblock ${id}`);
+  if (!res.ok) { refuse(id, (await res.text()).trim() || `could not unblock ${id}`); return; }
+  // The panel was showing a stop that no longer exists.
+  $("#stop").innerHTML = "";
 }
 
 $("#unblock-all").onclick = async e => {

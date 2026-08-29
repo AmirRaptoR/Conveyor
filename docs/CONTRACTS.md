@@ -107,7 +107,13 @@ drops those issues here, and the engine never learns there is such a thing.
 (set a label, move a card, update a field). Called by the **engine**, never by a
 stage script: the engine owns provider state so a crashed stage script cannot
 leave it inconsistent. Receives
-`{"item":…, "stage": "<target>", "from": "<current>", "blocked": <bool>, "blockedReason": "…"}`.
+`{"item":…, "stage": "<target>", "from": "<current>", "blocked": <bool>,
+"blockedReason": "…", "blockedKind": "…"}`.
+
+How a provider records the kind is its own business: the GitHub adapter writes a
+second label beside the mark, `blocked: <kind>`, creating it if the repository
+has never seen that kind of stop before. The plain mark stays exactly what it
+was, so "everything blocked" is still one query and one label to remove.
 
 Both facts go every time, and `blocked` is always present. There is no separate
 verb for the mark: a mark is provider state, and this is how provider state gets
@@ -224,6 +230,15 @@ things and the UI says which: blocked is *"a human must decide"*, failure is
 There is no blocked column. A marked item is drawn in the stage it stopped in,
 and that stage's header counts how many it is holding — because blocked is
 something an item *is*, not somewhere it went.
+
+**The mark carries a kind and a reason.** The kind is one word — `decision`,
+`limit`, `worktree`, `error` — and it is all the board puts on a card, because a
+column of paragraphs is a column nobody can read across. The reason is the whole
+of it and lives one click away. A script names its own kind in
+`$CONVEYOR_RESULT` (`{"blocked": true, "kind": "...", "reason": "..."}`); when
+it names none, the run record supplies one. The engine never interprets the
+word, only its shape: too long or punctuated and it is dropped, because it is
+about to become a label on someone's issue tracker.
 
 **The mark carries its reason.** The provider is the authority on *whether* an
 item is marked; *why* is the engine's own note, taken from the run that marked

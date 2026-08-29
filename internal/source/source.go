@@ -127,6 +127,8 @@ type Mark struct {
 	// Reason is what the script said when it blocked. Best effort: a provider
 	// that has somewhere to put it should, one that does not may ignore it.
 	Reason string
+	// Kind is the same thing in one word, for a label and for a board.
+	Kind string
 }
 
 // Move writes a stage and a mark back to the provider. CONTRACTS.md §4: the
@@ -150,7 +152,7 @@ func (c *Client) Move(ctx context.Context, item *model.Item, to string, mark Mar
 		Timeout: c.cfg.Timeout.D(),
 		Stdin: model.StageInput{
 			Item: item, Stage: to, From: from,
-			Blocked: mark.Blocked, BlockedReason: mark.Reason,
+			Blocked: mark.Blocked, BlockedReason: mark.Reason, BlockedKind: mark.Kind,
 		},
 	})
 	if err != nil {

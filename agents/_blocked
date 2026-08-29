@@ -9,14 +9,28 @@
 # in $CONVEYOR_RESULT, so the issue ended up wearing a mark with no comment
 # beside it and the board could say nothing about why it stopped.
 
-# blocked "<reason>" — record why a human is needed, then stop.
+# blocked <kind> "<reason>" — record why a human is needed, then stop.
 #
 # Writes the convention every agent shares, so one is enough to teach: exit 20,
-# with {"blocked": true, "reason": "..."} in $CONVEYOR_RESULT.
+# with {"blocked": true, "kind": "...", "reason": "..."} in $CONVEYOR_RESULT.
+#
+# The kind is one word and the board shows only that: a column of paragraphs is
+# a column you cannot read across, and telling "the agent ran out of quota" from
+# "someone has to decide something" at a glance is most of what a board is for.
+# The vocabulary is ours, not the engine's — it never reads it — so keep it
+# short, lower case, and the same word for the same situation everywhere:
+#
+#   decision    a person must choose something before the work can be specified
+#   limit       the agent was out of quota; nothing is wrong with the item
+#   worktree    the checkout is not in a state the work can start from
+#   no-output   the agent finished but produced nothing the provider can see
+#   input       the item itself is missing something (no criteria, no PR)
 blocked() {
+	local kind=$1 reason=$2
 	if [[ -n "${CONVEYOR_RESULT:-}" ]]; then
-		jq -n --arg reason "$1" '{blocked: true, reason: $reason}' >"$CONVEYOR_RESULT"
+		jq -n --arg kind "$kind" --arg reason "$reason" \
+			'{blocked: true, kind: $kind, reason: $reason}' >"$CONVEYOR_RESULT"
 	fi
-	echo "blocked: $1" >&2
+	echo "blocked ($kind): $reason" >&2
 	exit 20
 }

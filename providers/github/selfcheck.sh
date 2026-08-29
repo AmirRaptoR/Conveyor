@@ -97,13 +97,14 @@ check "a named ignore list replaces the default" \
 echo "move.sh (dry run)"
 cat >"$tmp/stub/gh" <<'STUB'
 #!/usr/bin/env bash
-for l in $LABELS; do echo "$l"; done
+# One label per line: "blocked: limit" is one label, not two.
+if [[ -n "$LABELS" ]]; then printf '%s\n' "$LABELS"; fi
 STUB
 chmod +x "$tmp/stub/gh"
 
 dry() { PATH="$tmp/stub:$PATH" CONVEYOR_DRY_RUN=1 ./move.sh 2>&1 | grep -oP '(?<=DRY RUN: ).*' || true; }
 
-export LABELS="bug status:refining"
+export LABELS=$'bug\nstatus:refining'
 check "swaps the old status label for the new" \
 	"gh issue edit 7 --repo owner/repo --remove-label status:refining --add-label status:ready" \
 	"$(echo '{"item":{"ref":"7"},"stage":"ready"}' | dry)"
@@ -127,11 +128,27 @@ export LABELS="status:in-progress"
 check "blocking marks in place and keeps the stage" \
 	"gh issue edit 9 --repo owner/repo --add-label blocked" \
 	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true}' | dry | head -1)"
-export LABELS="status:in-progress blocked"
+export LABELS=$'status:in-progress\nblocked'
 check "a set mark is not set twice" \
 	"" \
 	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true}' | dry)"
-export LABELS="status:in-progress blocked"
+
+# The kind rides beside the mark, never instead of it: "everything blocked" has
+# to stay one query and one label to remove.
+export LABELS="status:in-progress"
+check "a kind adds its own label beside the mark" \
+	"gh issue edit 9 --repo owner/repo --add-label blocked --add-label blocked: decision" \
+	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedKind":"decision"}' | dry | head -1)"
+export LABELS=$'status:in-progress\nblocked\nblocked: limit'
+check "a different kind replaces the old one" \
+	"gh issue edit 9 --repo owner/repo --remove-label blocked: limit --add-label blocked: decision" \
+	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedKind":"decision"}' | dry | head -1)"
+export LABELS=$'status:in-progress\nblocked\nblocked: limit'
+check "clearing the mark takes the kind with it" \
+	"gh issue edit 9 --repo owner/repo --remove-label status:in-progress --remove-label blocked --remove-label blocked: limit" \
+	"$(echo '{"item":{"ref":"9"},"stage":"backlog"}' | dry | head -1)"
+
+export LABELS=$'status:in-progress\nblocked'
 check "entering a stage clears the mark" \
 	"gh issue edit 9 --repo owner/repo --remove-label blocked" \
 	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":false}' | dry)"
@@ -149,7 +166,7 @@ cat >"$tmp/stub/gh" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
 	*"--json comments"*) cat "$COMMENTS" ;;
-	*"--json labels"*)   for l in $LABELS; do echo "$l"; done ;;
+	*"--json labels"*)   if [[ -n "$LABELS" ]]; then printf '%s\n' "$LABELS"; fi ;;
 	*)                   echo "CALLED: gh $*" ;;
 esac
 STUB

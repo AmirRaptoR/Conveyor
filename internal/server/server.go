@@ -73,6 +73,10 @@ type StageView struct {
 
 // Block is why an item stopped, and where to read the rest of it.
 type Block struct {
+	// Kind is the stop in one word, for the card; Reason is the whole of it,
+	// for the panel. A board that prints a paragraph on every red card is a
+	// board you cannot read across, which is the one thing it is for.
+	Kind   string    `json:"kind,omitempty"`
 	Reason string    `json:"reason"`
 	Stage  string    `json:"stage"`
 	RunID  string    `json:"runId,omitempty"`
@@ -536,8 +540,10 @@ func (s *Server) recallBlocks(items []model.Item) {
 		if st, ok := s.cfg.Stage(m.To); ok {
 			timeout = st.Timeout.D()
 		}
+		mark := pipeline.Marked(m.To, m.Run, data, timeout, 0)
 		found[m.ItemID] = Block{
-			Reason: pipeline.Reason(m.To, m.Run, data, timeout, 0),
+			Kind:   mark.Kind,
+			Reason: mark.Reason,
 			Stage:  m.To,
 			RunID:  m.ID,
 			At:     m.FinishedAt,
@@ -555,7 +561,8 @@ func (s *Server) recallBlocks(items []model.Item) {
 	// Marked, and no run to explain it: someone put the label on by hand.
 	for id := range want {
 		if _, known := s.blocks[id]; !known {
-			s.blocks[id] = Block{Reason: "marked outside the pipeline; there is no run to explain it"}
+			s.blocks[id] = Block{Kind: "by hand",
+				Reason: "marked outside the pipeline; there is no run to explain it"}
 		}
 	}
 	s.mu.Unlock()
@@ -652,7 +659,7 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// reason exists in full, and a run history sweep must not be what stands
 	// between an operator and why their board stopped.
 	if tr.Blocked {
-		s.blocks[tr.Item.ID] = Block{Reason: tr.Reason, Stage: tr.Stage, RunID: tr.RunID, At: time.Now()}
+		s.blocks[tr.Item.ID] = Block{Kind: tr.Kind, Reason: tr.Reason, Stage: tr.Stage, RunID: tr.RunID, At: time.Now()}
 	} else {
 		delete(s.blocks, tr.Item.ID)
 	}

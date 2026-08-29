@@ -62,6 +62,11 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   only out of the first stage. Dropping a card onto a deploy stage would be a
   deploy nobody reviewed; the pipeline is authored ahead of time, not steered
   card by card. A busy slot is a refusal naming what holds it, not a queue.
+- **A mark is one word and a paragraph.** The word (`decision`, `limit`,
+  `worktree`, `error`) is all a card shows and all a provider labels; the
+  paragraph is one click away in the panel. Scripts own the vocabulary — the
+  engine never reads it, only checks it is short and unpunctuated, because it
+  becomes a label on someone's tracker.
 - **The provider says whether an item is marked; the engine says why.** The
   reason comes from the run that marked it and is recovered from run history
   after a restart — never from a label, and never by parsing a log. A red card

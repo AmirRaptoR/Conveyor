@@ -7,6 +7,23 @@
 # happen; this turns them into lines a person can follow, without dumping whole
 # tool payloads into the run log.
 
+# Where the last run_claude put a copy of what the agent printed. The adapters
+# read it to tell *why* a run produced nothing — a run stopped by a usage limit
+# and a run that decided to do nothing look identical from the exit code, and
+# they are opposite problems.
+#
+# This is a script reading its own agent's output, not the engine reading a log:
+# CONTRACTS §2 is about what the engine may parse, and the answer there is still
+# nothing but $CONVEYOR_RESULT.
+CLAUDE_SAID=$(mktemp)
+trap 'rm -f "$CLAUDE_SAID"' EXIT
+
+# hit_limit reports whether the account was out of quota. Claude Code says so in
+# the transcript and exits cleanly, so nothing else can tell you.
+hit_limit() {
+	[[ -s "$CLAUDE_SAID" ]] && grep -qiE "hit your (session|usage|weekly) limit" "$CLAUDE_SAID"
+}
+
 # render_stream reads the event stream on stdin and writes readable text.
 render_stream() {
 	jq -j --unbuffered '
@@ -33,9 +50,10 @@ run_claude() {
 	[[ -n "${MODEL:-}" ]] && flags+=(--model "$MODEL")
 
 	if [[ "${STREAM:-1}" == "0" ]]; then
-		claude -p "$prompt" "${flags[@]}"
-		return $?
+		claude -p "$prompt" "${flags[@]}" | tee "$CLAUDE_SAID"
+		return "${PIPESTATUS[0]}"
 	fi
-	claude -p "$prompt" --output-format stream-json --verbose "${flags[@]}" | render_stream
+	claude -p "$prompt" --output-format stream-json --verbose "${flags[@]}" |
+		render_stream | tee "$CLAUDE_SAID"
 	return "${PIPESTATUS[0]}"
 }

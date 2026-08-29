@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -147,8 +148,9 @@ type Transition struct {
 	// it is when it does, so Next is empty and the mark is the whole story.
 	Blocked bool `json:"blocked,omitempty"`
 	// Reason is what the mark says, in the words that will reach the provider
-	// and the board. Empty unless Blocked.
+	// and the board; Kind is the same stop in one word. Empty unless Blocked.
 	Reason   string `json:"reason,omitempty"`
+	Kind     string `json:"kind,omitempty"`
 	RunID    string `json:"runId,omitempty"`
 	RunDir   string `json:"runDir,omitempty"`
 	Attempts int    `json:"attempts,omitempty"`
@@ -276,6 +278,7 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	tr.Next = next
 	tr.Blocked = mark.Blocked
 	tr.Reason = mark.Reason
+	tr.Kind = mark.Kind
 
 	// Marked where it stands. The item does not move, so whoever clears the
 	// mark gets the job back in the stage it stopped in — which, because the
@@ -321,7 +324,7 @@ func (e *Engine) route(s *config.Stage, res *runner.Result, itemID string, tr *T
 	case model.OutcomeBlocked:
 		// A decision, not a fault: no retry could change the answer.
 		e.attempts.Clear(key)
-		return "", source.Mark{Blocked: true, Reason: Reason(s.Name, res.Run, res.Data, s.Timeout.D(), 0)}
+		return "", Marked(s.Name, res.Run, res.Data, s.Timeout.D(), 0)
 	default: // failure, timeout
 		n := e.attempts.Bump(key)
 		tr.Attempts = n
@@ -335,49 +338,87 @@ func (e *Engine) route(s *config.Stage, res *runner.Result, itemID string, tr *T
 			return "", source.Mark{}
 		}
 		e.attempts.Clear(key)
-		return "", source.Mark{Blocked: true, Reason: Reason(s.Name, res.Run, res.Data, s.Timeout.D(), n)}
+		return "", Marked(s.Name, res.Run, res.Data, s.Timeout.D(), n)
 	}
 }
 
-// Reason says, in one line, why a finished run leaves the item needing a human.
+// Marked describes, in one line and one word, why a finished run leaves the
+// item needing a human.
 //
 // Two sources, and they mean different things. A script that decided a person
-// is needed writes {"blocked": true, "reason": "..."} into $CONVEYOR_RESULT —
-// that is the agents' convention and it wins, because it is the only one that
-// can say anything specific. A script that merely broke says nothing, so the
-// run record is asked instead: exit code and outcome, the same words the log
-// is filed under. Never the log itself, which is prose and is never parsed.
-func Reason(stage string, run model.Run, data json.RawMessage, timeout time.Duration, attempts int) string {
-	if r := given(data); r != "" {
-		return r
-	}
+// is needed writes {"blocked": true, "kind": "...", "reason": "..."} into
+// $CONVEYOR_RESULT — that is the agents' convention and it wins, because it is
+// the only one that can say anything specific. A script that merely broke says
+// nothing, so the run record is asked instead: exit code and outcome, the same
+// words the log is filed under. Never the log itself, which is prose and is
+// never parsed.
+func Marked(stage string, run model.Run, data json.RawMessage, timeout time.Duration, attempts int) source.Mark {
+	said := given(data)
+	m := source.Mark{Blocked: true, Reason: said.Reason, Kind: kind(said.Kind)}
+
 	switch run.Outcome {
 	case model.OutcomeBlocked:
-		return fmt.Sprintf("%s asked for a human but gave no reason; read the run log", stage)
+		if m.Kind == "" {
+			m.Kind = "decision" // exit 20 is the convention for "a human must decide"
+		}
+		if m.Reason == "" {
+			m.Reason = fmt.Sprintf("%s asked for a human but gave no reason; read the run log", stage)
+		}
 	case model.OutcomeTimeout:
-		return fmt.Sprintf("%s timed out after %s", stage, timeout)
+		if m.Kind == "" {
+			m.Kind = "timeout"
+		}
+		if m.Reason == "" {
+			m.Reason = fmt.Sprintf("%s timed out after %s", stage, timeout)
+		}
+	default:
+		if m.Kind == "" {
+			m.Kind = "error"
+		}
+		if m.Reason == "" {
+			m.Reason = fmt.Sprintf("%s failed (exit %d)", stage, run.ExitCode)
+			if attempts > 1 {
+				m.Reason += fmt.Sprintf(" on attempt %d", attempts)
+			}
+		}
 	}
-	what := fmt.Sprintf("%s failed (exit %d)", stage, run.ExitCode)
-	if attempts > 1 {
-		what += fmt.Sprintf(" on attempt %d", attempts)
-	}
-	return what
+	return m
 }
 
-// given reads the agents' convention out of the result file. It is a convention
-// and not a requirement — a script that just exits 20 has no reason to give,
-// and anything else in the file is simply not one.
-func given(data json.RawMessage) string {
-	if len(data) == 0 {
+// kind normalises a script's one-word summary, or drops it.
+//
+// The vocabulary is the scripts' and the engine never reads it — but it becomes
+// a label on someone's issue tracker and a chip on a board, so its *shape* is
+// the engine's business. A paragraph in the kind field is a script that misread
+// the contract, and passing it through would put a paragraph on a label.
+func kind(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" || len(s) > 24 {
 		return ""
 	}
-	var v struct {
-		Reason string `json:"reason"`
-	}
-	if json.Unmarshal(data, &v) != nil {
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == ' ' {
+			continue
+		}
 		return ""
 	}
-	return v.Reason
+	return s
+}
+
+// said is the agents' convention, read out of the result file. It is a
+// convention and not a requirement — a script that just exits 20 has nothing to
+// say, and anything else in the file is simply not it.
+type said struct {
+	Reason string `json:"reason"`
+	Kind   string `json:"kind"`
+}
+
+func given(data json.RawMessage) said {
+	var v said
+	if len(data) == 0 || json.Unmarshal(data, &v) != nil {
+		return said{}
+	}
+	return v
 }
 
 // Target returns the stage an item should be moved into next, if any.
