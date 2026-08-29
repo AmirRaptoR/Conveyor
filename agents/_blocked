@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Sourced by the agent adapters. Not a verb: config resolves script names
+# exactly, and `agent:` only ever looks inside agents/<name>/, so a file here
+# with a leading underscore can never be mistaken for one.
+#
+# Every adapter has preflight checks that stop before the model runs — a dirty
+# worktree, no pull request to review. Those exited 20 with the reason only in
+# the log, and a log is not structured data: the engine hands `move` whatever is
+# in $CONVEYOR_RESULT, so the issue ended up wearing a mark with no comment
+# beside it and the board could say nothing about why it stopped.
+
+# blocked "<reason>" — record why a human is needed, then stop.
+#
+# Writes the convention every agent shares, so one is enough to teach: exit 20,
+# with {"blocked": true, "reason": "..."} in $CONVEYOR_RESULT.
+blocked() {
+	if [[ -n "${CONVEYOR_RESULT:-}" ]]; then
+		jq -n --arg reason "$1" '{blocked: true, reason: $reason}' >"$CONVEYOR_RESULT"
+	fi
+	echo "blocked: $1" >&2
+	exit 20
+}

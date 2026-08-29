@@ -5,6 +5,8 @@
 # reviewer of it. Config: PROMPT (required), REPO.
 set -euo pipefail
 
+source "$(dirname "$0")/../_blocked"
+
 : "${PROMPT:?PROMPT is required (set it in this script params: block)}"
 : "${REPO:?REPO is required (set it in the source env: block)}"
 
@@ -13,8 +15,7 @@ ref=$(jq -r '.item.ref' <<<"$payload")
 
 pr=$(gh pr list --repo "$REPO" --state open --search "$ref" --json number --jq '.[0].number' 2>/dev/null)
 if [[ -z "$pr" ]]; then
-	echo "no open PR for #$ref to review" >&2
-	exit 20
+	blocked "no open pull request references #$ref, so there is nothing to review."
 fi
 
 echo "reviewing PR #$pr for item #$ref"

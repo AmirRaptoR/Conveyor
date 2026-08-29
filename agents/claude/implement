@@ -12,6 +12,7 @@ set -euo pipefail
 
 # Streams the agent's work as it happens; without it a long stage looks dead.
 source "$(dirname "$0")/_stream"
+source "$(dirname "$0")/../_blocked"
 
 : "${PROMPT:?PROMPT is required (set it in this script params: block)}"
 
@@ -24,8 +25,10 @@ url=$(jq -r '.item.url // ""' <<<"$payload")
 # A dirty tree means the previous run died mid-edit. Building on top of that is
 # how one failure becomes a corrupted branch, so stop and ask for a human.
 if [[ -n "$(git status --porcelain)" ]]; then
-	echo "worktree is dirty; refusing to start" >&2
-	exit 20
+	blocked "the checkout at $PWD has uncommitted changes on branch \
+$(git branch --show-current), left behind by a run that did not finish. Commit \
+or discard them; until then every item in this source stops here, because one \
+source is one worktree."
 fi
 # `git pull` exits non-zero on a branch with no upstream, which under set -e
 # would kill this before the agent runs, with an error unlike its cause.
@@ -96,7 +99,7 @@ set -e
 if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 	[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
 	echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
-	exit 20
+	exit 20 # the agent wrote its own reason; leave it exactly as written
 fi
 
 # The provider is the record, never the agent's claim: if no PR references the
@@ -104,8 +107,9 @@ fi
 if [[ -n "${REPO:-}" ]]; then
 	pr=$(gh pr list --repo "$REPO" --state open --search "$ref" --json number --jq '.[0].number' 2>/dev/null)
 	if [[ -z "$pr" ]]; then
-		echo "no open PR references #$ref" >&2
-		exit 20
+		blocked "the agent finished but no open pull request references #$ref, so \
+nothing landed. Read this run's log for what it did — a run cut short by a usage \
+limit looks exactly like this."
 	fi
 	echo "opened PR #$pr"
 fi
