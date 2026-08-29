@@ -22,6 +22,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
+	"github.com/AmirRaptoR/Conveyor/internal/source"
 	"github.com/AmirRaptoR/Conveyor/internal/store"
 )
 
@@ -35,11 +36,19 @@ type State struct {
 	Sources []SourceView `json:"sources"`
 	// Items is in the order the scheduler will work them (pipeline.Order),
 	// applied on the way out so a drag lands before the next poll does.
-	Items     []model.Item `json:"items"`
-	Warnings  []string     `json:"warnings,omitempty"`
-	Order     []string     `json:"order"`
-	UpdatedAt time.Time    `json:"updatedAt"`
-	Polling   bool         `json:"polling"`
+	Items    []model.Item `json:"items"`
+	Warnings []string     `json:"warnings,omitempty"`
+	Order    []string     `json:"order"`
+	// Blocks is why each marked item is standing still, keyed by item id. The
+	// provider is the authority on *whether* an item is marked; this is the
+	// engine's own note on *why*, recovered from the run that marked it.
+	Blocks    map[string]Block `json:"blocks,omitempty"`
+	UpdatedAt time.Time        `json:"updatedAt"`
+	Polling   bool             `json:"polling"`
+	// Agents is how each agent the sources call says it is doing — a usage
+	// limit, a quota, whatever its own status script chose to report. Empty
+	// when no agent provides one.
+	Agents []AgentView `json:"agents,omitempty"`
 	// Active is every transition running right now. The board lights those
 	// stations; without it the page cannot tell work from stillness.
 	Active []Active `json:"active"`
@@ -62,6 +71,38 @@ type StageView struct {
 	Terminal bool   `json:"terminal"`
 }
 
+// Block is why an item stopped, and where to read the rest of it.
+type Block struct {
+	Reason string    `json:"reason"`
+	Stage  string    `json:"stage"`
+	RunID  string    `json:"runId,omitempty"`
+	At     time.Time `json:"at"`
+}
+
+// AgentView is one agent's own report on itself.
+//
+// The engine understands exactly one field of it: State, three words wide, so
+// a lamp can be lit. Everything else is passed through and rendered as given —
+// what a usage window is, what a reset means, whether tokens or dollars are the
+// interesting number, all of that is the agent's business and differs per
+// agent, which is why it comes from a script and not from a struct here.
+type AgentView struct {
+	Name     string      `json:"name"`
+	State    string      `json:"state"` // ok | limited | unknown
+	Summary  string      `json:"summary,omitempty"`
+	Detail   []AgentFact `json:"detail,omitempty"`
+	ResetsAt string      `json:"resetsAt,omitempty"`
+	// Error is this probe failing, which is not the agent being unwell: a
+	// status script that cannot run tells you nothing about the agent.
+	Error string    `json:"error,omitempty"`
+	At    time.Time `json:"at"`
+}
+
+type AgentFact struct {
+	Label string `json:"label"`
+	Value string `json:"value"`
+}
+
 type SourceView struct {
 	Name     string   `json:"name"`
 	Provider string   `json:"provider"`
@@ -80,6 +121,10 @@ type Server struct {
 
 	mu    sync.RWMutex
 	state State
+	// blocks is the note beside each mark, kept in memory and recovered from
+	// run history after a restart: the runs are the durable record, this is
+	// only the index into them that a board read cannot afford to rebuild.
+	blocks map[string]Block
 
 	hub    *hub
 	order  *store.Order
@@ -106,6 +151,7 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 		wake:  make(chan struct{}, 1),
 		ctx:   context.Background(),
 	}
+	s.blocks = map[string]Block{}
 	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
 
 	// Every log line reaches the browser as it is produced. This is the whole
@@ -147,6 +193,9 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	go s.button(ctx, auto)
 	if auto {
 		go s.schedule(ctx)
+		if d := s.cfg.RetryStalled.D(); d > 0 {
+			go s.stalled(ctx, d)
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -158,6 +207,8 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	mux.HandleFunc("POST /api/tick", s.handleTick)
 	mux.HandleFunc("PUT /api/order", s.handleOrder)
 	mux.HandleFunc("POST /api/items/{id}/start", s.handleStart)
+	mux.HandleFunc("POST /api/items/{id}/unblock", s.handleUnblock)
+	mux.HandleFunc("POST /api/unblock", s.handleUnblockAll)
 
 	sub, err := fs.Sub(webFS, "web")
 	if err != nil {
@@ -203,6 +254,55 @@ func (s *Server) poll(ctx context.Context) {
 		case <-t.C:
 			s.refresh(ctx)
 		}
+	}
+}
+
+// stalled watches for the board stopping altogether and, on an interval, hands
+// it back. Only when *everything* is marked: while one item can still move, a
+// mark is a decision a person has to answer, and clearing it spends an agent
+// run to be told the same thing.
+//
+// A total stall is a different animal. It is almost always the outside world —
+// every agent over its usage limit, a credential that expired overnight, a
+// worktree one dead run left dirty — and those come back on their own, hours
+// after the board gave up. Without this the line stays stopped until somebody
+// looks at it, which on a Sunday is the whole weekend.
+//
+// It reports what it did. An automatic recovery nobody can see is how a board
+// starts lying about why work restarted.
+func (s *Server) stalled(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if s.inFlight.Load() != 0 {
+			continue // something is running; by definition not stalled
+		}
+		s.mu.RLock()
+		var held []model.Item
+		moving := 0
+		for _, it := range s.state.Items {
+			switch {
+			case it.Blocked:
+				held = append(held, it)
+			default:
+				if _, ok := pipeline.Target(s.cfg, &it); ok {
+					moving++
+				}
+			}
+		}
+		s.mu.RUnlock()
+		if moving > 0 || len(held) == 0 {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "conveyor: every item is marked and nothing can move; clearing %d mark(s) to try again\n", len(held))
+		n := s.unblockAll(ctx, held)
+		fmt.Fprintf(os.Stderr, "conveyor: handed %d item(s) back to the pipeline\n", n)
+		s.wakeUp()
 	}
 }
 
@@ -318,6 +418,9 @@ func (s *Server) refresh(ctx context.Context) {
 		items = append(items, res.Items...)
 	}
 
+	s.askAgents(ctx)
+	s.recallBlocks(items)
+
 	s.mu.Lock()
 	s.state.Items = items
 	s.state.Warnings = warnings
@@ -325,8 +428,137 @@ func (s *Server) refresh(ctx context.Context) {
 	s.state.Order = s.order.IDs()
 	s.state.UpdatedAt = time.Now()
 	s.state.Polling = false
+	// A mark cleared on the provider — a label removed by hand — takes its
+	// note with it. The provider is the authority on whether, always.
+	marked := map[string]bool{}
+	for _, it := range items {
+		if it.Blocked {
+			marked[it.ID] = true
+		}
+	}
+	for id := range s.blocks {
+		if !marked[id] {
+			delete(s.blocks, id)
+		}
+	}
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
+}
+
+// askAgents runs each agent's status script and collects what it says.
+//
+// On the discovery tick, beside the list scripts, because it is the same kind
+// of question: what does the outside world look like right now. Not on a timer
+// of its own — a status probe every minute would file a run a minute, and the
+// run history is the log, not a metrics store.
+//
+// The engine reads three fields and interprets one word of them. It does not
+// know what a usage window is, and must not learn: which limits an agent has,
+// and what counts against them, is the agent's business.
+func (s *Server) askAgents(ctx context.Context) {
+	agents := s.cfg.AgentsInUse()
+	out := make([]AgentView, 0, len(agents))
+	for _, a := range agents {
+		if a.Status == "" {
+			continue // an agent with nothing to say is not a problem
+		}
+		v := AgentView{Name: a.Name, State: "unknown", At: time.Now()}
+		res, err := s.run.Run(ctx, runner.Spec{
+			Script:  a.Status,
+			Kind:    "status",
+			Source:  a.Name,
+			Timeout: 30 * time.Second,
+		})
+		switch {
+		case err != nil:
+			v.Error = err.Error()
+		case res.Run.Outcome != model.OutcomeSuccess:
+			v.Error = fmt.Sprintf("status exited %d (%s)", res.Run.ExitCode, res.Run.Outcome)
+		case len(res.Data) == 0:
+			v.Error = "status wrote nothing to $CONVEYOR_RESULT"
+		default:
+			var got AgentView
+			if json.Unmarshal(res.Data, &got) != nil {
+				v.Error = "status result is not a JSON object"
+				break
+			}
+			got.Name, got.At = a.Name, time.Now()
+			if got.State != "ok" && got.State != "limited" {
+				got.State = "unknown" // the vocabulary is closed; anything else is silence
+			}
+			v = got
+		}
+		out = append(out, v)
+	}
+	s.mu.Lock()
+	s.state.Agents = out
+	s.mu.Unlock()
+}
+
+// recallBlocks fills in why the marked items are marked, for marks this process
+// did not make — everything on the board after a restart, and anything a person
+// labelled by hand.
+//
+// The runs are the durable record: the one that marked an item wrote its reason
+// to $CONVEYOR_RESULT, and CONTRACTS §6 pins that run against retention for
+// exactly this. One walk fills every gap at once, because walking it per item
+// would be one full history scan for each card on a stalled board.
+func (s *Server) recallBlocks(items []model.Item) {
+	s.mu.RLock()
+	want := map[string]bool{}
+	for _, it := range items {
+		if it.Blocked {
+			if _, known := s.blocks[it.ID]; !known {
+				want[it.ID] = true
+			}
+		}
+	}
+	s.mu.RUnlock()
+	if len(want) == 0 {
+		return
+	}
+
+	found := map[string]Block{}
+	s.walkRuns(func(m RunMeta) bool {
+		if m.Kind != "stage" || !want[m.ItemID] {
+			return true
+		}
+		switch m.Outcome {
+		case model.OutcomeBlocked, model.OutcomeFailure, model.OutcomeTimeout:
+		default:
+			return true // a success is not why it stopped
+		}
+		var data json.RawMessage
+		if b, err := os.ReadFile(filepath.Join(m.Dir, "result.json")); err == nil {
+			data = b
+		}
+		timeout := time.Duration(0)
+		if st, ok := s.cfg.Stage(m.To); ok {
+			timeout = st.Timeout.D()
+		}
+		found[m.ItemID] = Block{
+			Reason: pipeline.Reason(m.To, m.Run, data, timeout, 0),
+			Stage:  m.To,
+			RunID:  m.ID,
+			At:     m.FinishedAt,
+		}
+		delete(want, m.ItemID)
+		return len(want) > 0
+	})
+
+	s.mu.Lock()
+	for id, b := range found {
+		if _, known := s.blocks[id]; !known {
+			s.blocks[id] = b
+		}
+	}
+	// Marked, and no run to explain it: someone put the label on by hand.
+	for id := range want {
+		if _, known := s.blocks[id]; !known {
+			s.blocks[id] = Block{Reason: "marked outside the pipeline; there is no run to explain it"}
+		}
+	}
+	s.mu.Unlock()
 }
 
 // launch starts every transition the locks currently permit and returns how
@@ -416,6 +648,14 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 			break
 		}
 	}
+	// Written here rather than recovered later: this is the one moment the
+	// reason exists in full, and a run history sweep must not be what stands
+	// between an operator and why their board stopped.
+	if tr.Blocked {
+		s.blocks[tr.Item.ID] = Block{Reason: tr.Reason, Stage: tr.Stage, RunID: tr.RunID, At: time.Now()}
+	} else {
+		delete(s.blocks, tr.Item.ID)
+	}
 	s.mu.Unlock()
 }
 
@@ -468,6 +708,10 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	st := s.state
 	st.Items = pipeline.Order(s.cfg, s.state.Items, s.state.Order)
+	st.Blocks = make(map[string]Block, len(s.blocks))
+	for id, b := range s.blocks {
+		st.Blocks[id] = b
+	}
 	s.mu.RUnlock()
 	writeJSON(w, st)
 }
@@ -570,6 +814,98 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// handleUnblock clears one item's mark. It is the other half of the board: the
+// engine can mark an item, and only a person can take it back.
+//
+// The mark comes off where the item stands, never by moving it — that is the
+// whole point of a mark over a column. The scheduler is woken because the item
+// becomes pickable the instant the label is gone.
+func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	s.mu.RLock()
+	var item model.Item
+	found := false
+	for _, it := range s.state.Items {
+		if it.ID == id {
+			item, found = it, true
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if !found {
+		http.Error(w, "no item "+id+" on the board", http.StatusNotFound)
+		return
+	}
+	if !item.Blocked {
+		w.WriteHeader(http.StatusNoContent) // already where the caller wants it
+		return
+	}
+	if err := s.unblock(s.ctx, item); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleUnblockAll hands the whole board back at once, which is what an
+// operator wants after fixing the thing that stopped it — an expired credential,
+// a dirty worktree, an agent that was over its limit all night.
+//
+// In the background: each item is a provider write, and thirty of them is not a
+// request. The board is republished as they land.
+func (s *Server) handleUnblockAll(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	var held []model.Item
+	for _, it := range s.state.Items {
+		if it.Blocked {
+			held = append(held, it)
+		}
+	}
+	s.mu.RUnlock()
+	go s.unblockAll(s.ctx, held)
+	writeJSON(w, map[string]int{"unblocking": len(held)})
+}
+
+// unblockAll clears marks one at a time. Sequentially on purpose: perSource is
+// 1 because a source is a worktree, and while these writes touch no worktree,
+// thirty concurrent `gh` calls against one repository is its own outage.
+func (s *Server) unblockAll(ctx context.Context, held []model.Item) int {
+	n := 0
+	for _, it := range held {
+		if err := s.unblock(ctx, it); err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: could not unblock %s: %v\n", it.ID, err)
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// unblock is one provider write: the same move that set the mark, with the mark
+// off. The engine's note goes with it — the run that explains it is still
+// filed, but the item is no longer asking anything of anyone.
+func (s *Server) unblock(ctx context.Context, item model.Item) error {
+	client, ok := s.eng.Client(item.Source)
+	if !ok {
+		return fmt.Errorf("%s: no provider client", item.Source)
+	}
+	if _, err := client.Move(ctx, &item, item.Stage, source.Mark{}); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	for i := range s.state.Items {
+		if s.state.Items[i].ID == item.ID {
+			s.state.Items[i] = item
+			break
+		}
+	}
+	delete(s.blocks, item.ID)
+	s.mu.Unlock()
+	s.hub.publish(event{Kind: "state"})
+	s.wakeUp()
+	return nil
+}
+
 // whyStuck says why an item has nowhere to go, in the operator's terms.
 func (s *Server) whyStuck(it model.Item) string {
 	if it.Blocked {
@@ -642,17 +978,28 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 
 // listRuns walks the run root newest-day-first and stops once it has enough.
 func (s *Server) listRuns(itemID string, limit int) ([]RunMeta, error) {
+	out := []RunMeta{}
+	s.walkRuns(func(m RunMeta) bool {
+		if itemID != "" && m.ItemID != itemID {
+			return true
+		}
+		out = append(out, m)
+		return len(out) < limit
+	})
+	return out, nil
+}
+
+// walkRuns visits every run newest first, and stops when the visitor says so.
+// One walk, one definition of "newest": the directory names are the clock, day
+// then time-ordered id, so sorting them descending is the whole ordering.
+func (s *Server) walkRuns(visit func(RunMeta) bool) {
 	root := s.run.Root
 	days, err := os.ReadDir(root)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return []RunMeta{}, nil
-		}
-		return nil, err
+		return
 	}
 	sort.Slice(days, func(i, j int) bool { return days[i].Name() > days[j].Name() })
 
-	out := []RunMeta{}
 	for _, day := range days {
 		if !day.IsDir() {
 			continue
@@ -675,17 +1022,12 @@ func (s *Server) listRuns(itemID string, limit int) ([]RunMeta, error) {
 			if json.Unmarshal(b, &m) != nil {
 				continue
 			}
-			if itemID != "" && m.ItemID != itemID {
-				continue
-			}
 			m.Dir = dir
-			out = append(out, m)
-			if len(out) >= limit {
-				return out, nil
+			if !visit(m) {
+				return
 			}
 		}
 	}
-	return out, nil
 }
 
 // parseLog turns a written log back into the lines it was made of. The format

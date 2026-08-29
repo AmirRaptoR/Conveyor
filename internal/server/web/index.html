@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>conveyor</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
 <style>
   /* An instrument panel for a production line. Graphite and steel throughout;
      the only saturated colour in the interface is a signal, so state is the one
@@ -48,6 +49,7 @@
     padding:16px 22px 14px; border-bottom:1px solid var(--rule);
     background:var(--panel);
   }
+  .glyph { display:block; border-radius:5px; }
   .mark { font-size:13px; letter-spacing:.34em; text-transform:uppercase; font-weight:500; }
   .readout { display:flex; gap:16px; color:var(--dim); font-size:11px; letter-spacing:.06em; }
   .readout b { color:var(--ink); font-weight:500; font-variant-numeric:tabular-nums; }
@@ -222,6 +224,37 @@
   .src-chip.broken .name { color:var(--stop); }
   .src-chip.broken .swatch { background:var(--stop); }
 
+  /* The agents' own report on themselves. A strip above the sources, because
+     an agent over its usage limit stops every source at once, and that is the
+     first thing to know when a board has gone quiet. */
+  .agents { display:flex; gap:20px; flex-wrap:wrap; align-items:center;
+    padding:9px 22px; border-bottom:1px solid var(--rule); background:var(--panel);
+    font-size:11px; color:var(--dim); }
+  .agent { display:flex; align-items:baseline; gap:8px; }
+  .agent .who { color:var(--ink); letter-spacing:.1em; text-transform:uppercase; font-size:9.5px; }
+  .agent .say { color:var(--dim); }
+  .agent.limited .who, .agent.limited .say { color:var(--stop); }
+  .agent .resets { color:var(--faint); }
+  .agent details { display:inline; }
+  .agent summary { cursor:pointer; color:var(--faint); list-style:none; }
+  .agent summary::-webkit-details-marker { display:none; }
+  .agent .facts { display:flex; gap:14px; flex-wrap:wrap; padding-top:6px; color:var(--faint); }
+  .agent .facts b { color:var(--dim); font-weight:400; }
+
+  /* Why an item stopped, on the item. The reason is the whole point of the
+     mark: a red card that cannot say what it wants is just a red card. */
+  .item .why {
+    display:block; margin-top:7px; padding-top:7px; border-top:1px solid var(--rule-soft);
+    color:var(--dim); font-size:10.5px; line-height:1.5;
+  }
+  .item .why .hand {
+    display:inline-block; margin-top:6px; color:var(--stop); cursor:pointer;
+    border:1px solid color-mix(in srgb, var(--stop) 45%, var(--rule)); border-radius:2px;
+    padding:1px 6px; background:none; font:inherit; font-size:10px;
+    letter-spacing:.08em; text-transform:uppercase;
+  }
+  .item .why .hand:hover { background:color-mix(in srgb, var(--stop) 14%, transparent); }
+
   /* ---- faults ------------------------------------------------------------ */
   .faults { margin:0 22px; border-left:2px solid var(--stop); background:var(--panel); padding:12px 16px; }
   .faults h2 { margin:0 0 3px; font-size:11px; letter-spacing:.18em; text-transform:uppercase; color:var(--stop); font-weight:500; }
@@ -313,16 +346,19 @@
 <body>
 
 <div class="masthead">
+  <img class="glyph" src="/icon.svg" width="22" height="22" alt="">
   <span class="mark">Conveyor</span>
   <span class="readout">
     <span><span class="lamp" id="lamp"></span></span>
     <span id="line1">connecting</span>
   </span>
   <span class="grow"></span>
+  <button class="ctl" id="unblock-all" hidden>Unblock all</button>
   <button class="ctl" id="refresh">Refresh</button>
   <button class="ctl primary" id="tick">Tick once</button>
 </div>
 
+<div id="agents"></div>
 <div id="sources"></div>
 <div id="faults"></div>
 <div class="line"><div class="rail" id="rail"></div></div>
@@ -347,6 +383,11 @@ const esc = s => (s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":
 let state = null, openItemId = null, followRun = null;
 // Dragging ends in a click; without this, dropping a card also opens it.
 let dragging = null, justDragged = false;
+// Why each marked item is marked, keyed by item id — the engine's note, not the
+// provider's. See State.Blocks.
+let blocks = {};
+const clock = iso => { const d = new Date(iso);
+  return isNaN(d) ? iso : d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}); };
 
 async function load() {
   try {
@@ -364,6 +405,7 @@ function draw() {
   // A list, because stages run in parallel: one entry per transition in flight.
   const active = state.active || [];
   const workingOn = id => active.find(a => a.itemId === id);
+  blocks = state.blocks || {};
 
   // Items arrive in the order the scheduler will work them, so the board does
   // not sort: it draws them in the order it is given. A card's position is the
@@ -386,6 +428,30 @@ function draw() {
   $("#rail").innerHTML =
     flow.map(st => station(st, bucket[st.name] || [], active)).join("") +
     ends.map(st => terminus(st, bucket[st.name] || [])).join("");
+
+  // What each agent says about itself. The engine passes this through — which
+  // limits an agent has and what counts against them is the agent's business —
+  // so the page renders whatever labels came back, in the order they came.
+  $("#agents").innerHTML = !(state.agents || []).length ? "" :
+    `<div class="agents">${state.agents.map(a => {
+      const facts = (a.detail || []).map(d =>
+        `<span><b>${esc(d.label)}</b> ${esc(d.value)}</span>`).join("");
+      const say = a.error ? `cannot say — ${esc(a.error)}` : esc(a.summary || "");
+      return `<span class="agent ${esc(a.state || "unknown")}">
+        <span class="lamp ${a.state === "limited" ? "down" : a.state === "ok" ? "idle" : ""}"></span>
+        <span class="who">${esc(a.name)}</span>
+        <span class="say">${say}</span>
+        ${a.resetsAt ? `<span class="resets">resets ${esc(clock(a.resetsAt))}</span>` : ""}
+        ${facts ? `<details><summary>details</summary><span class="facts">${facts}</span></details>` : ""}
+      </span>`;
+    }).join("")}</div>`;
+
+  // Handing the whole board back is the answer to one situation — the thing
+  // that stopped everything is fixed — so the control only exists then.
+  const marked = items.filter(it => it.blocked).length;
+  const all = $("#unblock-all");
+  all.hidden = !marked;
+  all.textContent = `Unblock all (${marked})`;
 
   // A key for the edge colours, and the list of what is enrolled: without it
   // the colours are decoration, because nothing says which repo is which.
@@ -412,7 +478,7 @@ function draw() {
 
   $("#lamp").className = "lamp " + (active.length || state.polling ? "busy" : "idle");
   const when = state.updatedAt ? new Date(state.updatedAt).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"}) : "—";
-  const held = items.filter(it => it.blocked).length;
+  const held = marked;
   $("#line1").innerHTML = active.length === 1
     ? `<b>${esc(active[0].stage)}</b> running &middot; ${esc(active[0].itemId)}`
     : active.length
@@ -422,7 +488,11 @@ function draw() {
 
   document.querySelectorAll(".item").forEach(el => {
     const open = () => { if (!justDragged) inspect(el.dataset.id, el.dataset.title, el.dataset.stage); };
-    el.onclick = e => { if (!e.target.closest("a")) open(); };
+    el.onclick = e => {
+      const hand = e.target.closest("[data-hand]");
+      if (hand) { e.stopPropagation(); handBack(hand.dataset.hand, hand); return; }
+      if (!e.target.closest("a")) open();
+    };
     el.onkeydown = e => {
       if ((e.key === "Enter" || e.key === " ") && !e.target.closest("a")) { e.preventDefault(); open(); }
     };
@@ -485,7 +555,20 @@ function card(it, active, place) {
            title="Open on GitHub" aria-label="Open ${esc(it.id)} on GitHub">&#8599;</a>` : ""}
     </span>
     ${refusals.has(it.id) ? `<span class="refused">${esc(refusals.get(it.id))}</span>` : ""}
+    ${it.blocked ? why(it) : ""}
   </article>`;
+}
+
+// The mark's reason, and the one control that answers it. A blocked card that
+// cannot say what it is waiting for sends you to the logs to find out, which is
+// the trip the mark was supposed to save.
+function why(it) {
+  const b = blocks[it.id];
+  return `<span class="why">
+    ${b ? esc(b.reason) : "no reason recorded"}
+    <button class="hand" data-hand="${esc(it.id)}"
+      title="Clear the mark and hand this back to the pipeline">Hand back</button>
+  </span>`;
 }
 
 // One hue per source, spread evenly around the wheel rather than hashed from
@@ -720,6 +803,24 @@ async function saveOrder() {
     body: JSON.stringify(ids),
   });
 }
+
+// Clearing a mark is a provider write, so the control says so while it lands:
+// a card that keeps its red for another second reads as a button that did
+// nothing, and the second press is the one that races.
+async function handBack(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "handing back"; }
+  const res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, { method:"POST" });
+  if (!res.ok) refuse(id, (await res.text()).trim() || `could not unblock ${id}`);
+}
+
+$("#unblock-all").onclick = async e => {
+  const n = (state?.items || []).filter(it => it.blocked).length;
+  if (!confirm(`Clear the mark on ${n} item${n === 1 ? "" : "s"}? Each goes straight back into the line.`)) return;
+  e.target.disabled = true;
+  e.target.textContent = "handing back…";
+  await fetch("/api/unblock", { method:"POST" });
+  setTimeout(() => e.target.disabled = false, 2000);
+};
 
 $("#refresh").onclick = () => fetch("/api/refresh", { method:"POST" });
 $("#tick").onclick = async e => {

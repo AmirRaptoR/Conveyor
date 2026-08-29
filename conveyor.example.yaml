@@ -19,6 +19,15 @@ concurrency:
   global: 4           # total in flight. Every slot is an agent.
 
 poll: 5m              # how often to re-list every source
+retryStalled: 1h      # when EVERY item is marked and nothing can move at all,
+                      # clear the marks this often and let the line try again. A
+                      # total stall is almost always the outside world — every
+                      # agent over its usage limit, a credential that expired
+                      # overnight — and that comes back on its own hours after
+                      # the board gave up. The guard is "everything" on purpose:
+                      # while one item can still move, a mark is a decision
+                      # waiting on a person, and clearing it just spends an agent
+                      # run to be told the same thing. Unset means never.
 timeout: 90m          # default per-script timeout; stages may override
 
 logs:
@@ -120,6 +129,11 @@ sources:
     #       STAGE_LABELS: |
     #         refining=status:refining
     #       BLOCKED_LABEL: blocked
+    #       IGNORE_LABELS: conveyor:ignore
+    #
+    # Three vocabularies, three keys, because they are three different facts:
+    # which label means which stage, which label means "stopped, needs a human",
+    # and which labels mean "not conveyor's work — never list this at all".
     provider: mock
     workdir: .
 

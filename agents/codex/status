@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""How Codex is doing, for the board.
+
+Codex writes its own rate-limit state into every session rollout: each
+`token_count` event carries the percentage used of both windows and when each
+resets. So this reads, it does not estimate — the newest event wins.
+
+Writes to $CONVEYOR_RESULT (CONTRACTS §2):
+    {"state": "ok|limited", "summary": "...", "detail": [{"label","value"}],
+     "resetsAt": "<RFC3339>"}
+"""
+import datetime as dt
+import json
+import os
+import pathlib
+import sys
+
+SESSIONS = pathlib.Path(os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex")) / "sessions"
+
+
+def newest_limits():
+    """The most recent rate_limits Codex recorded, or None."""
+    files = sorted(SESSIONS.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in files[:20]:  # newest first; the limits are account-wide
+        latest = None
+        try:
+            for line in path.open(errors="replace"):
+                # Cheap gate: parsing 40MB of rollouts to find one field is the
+                # difference between a probe and a stage.
+                if '"rate_limits"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                lim = (ev.get("payload") or {}).get("rate_limits")
+                if lim:
+                    latest = (ev.get("timestamp"), lim)
+        except OSError:
+            continue
+        if latest:
+            return latest
+    return None
+
+
+def window(lim, key, name):
+    w = lim.get(key)
+    if not w:
+        return None, None
+    used = w.get("used_percent")
+    resets = w.get("resets_at")
+    when = ""
+    if resets:
+        when = dt.datetime.fromtimestamp(resets, dt.timezone.utc).isoformat()
+    return {"label": name, "value": f"{used:.0f}% used" if used is not None else "unknown"}, when
+
+
+def main():
+    found = newest_limits()
+    if not found:
+        out = {"state": "unknown",
+               "summary": "no Codex session has recorded a rate limit yet"}
+    else:
+        seen, lim = found
+        detail, resets = [], ""
+        for key, name in (("primary", "5-hour window"), ("secondary", "weekly")):
+            fact, when = window(lim, key, name)
+            if fact:
+                detail.append(fact)
+            if key == "primary":
+                resets = when
+        plan = lim.get("plan_type")
+        if plan:
+            detail.append({"label": "plan", "value": str(plan)})
+        if seen:
+            detail.append({"label": "last seen", "value": seen})
+
+        primary = (lim.get("primary") or {}).get("used_percent") or 0
+        secondary = (lim.get("secondary") or {}).get("used_percent") or 0
+        spent = bool(lim.get("spend_control_reached"))
+        limited = spent or primary >= 100 or secondary >= 100
+        out = {
+            "state": "limited" if limited else "ok",
+            "summary": (f"{primary:.0f}% of the 5-hour window, {secondary:.0f}% of the week"
+                        if not limited else "out of quota"),
+            "detail": detail,
+        }
+        if resets:
+            out["resetsAt"] = resets
+
+    dest = os.environ.get("CONVEYOR_RESULT")
+    if dest:
+        pathlib.Path(dest).write_text(json.dumps(out))
+    print(out.get("summary", ""), file=sys.stderr)
+
+
+main()

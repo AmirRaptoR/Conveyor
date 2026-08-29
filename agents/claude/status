@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""How Claude Code is doing, for the board.
+
+Claude Code publishes no quota endpoint, so this reads the only local record
+there is: the transcripts under ~/.claude/projects. Two facts come out of them.
+
+A refusal is exact. When the account is over its limit, Claude Code files a
+synthetic assistant message saying so and when it resets — that is the same line
+that appeared in every stage log the night the pipeline stalled, and it is
+recorded, not inferred.
+
+Usage is measured, not authoritative. Every assistant message carries its own
+token counts, so a five-hour total is a real sum of real messages — but it is
+this machine's view of them, not the account's ledger, and it is labelled that
+way. Only the five-hour window is reported: a weekly sum means reading every
+transcript on the disk, which is a stage, not a probe.
+
+Writes to $CONVEYOR_RESULT (CONTRACTS §2):
+    {"state": "ok|limited", "summary": "...", "detail": [{"label","value"}],
+     "resetsAt": "<RFC3339>"}
+"""
+import datetime as dt
+import json
+import os
+import pathlib
+import re
+import sys
+
+WINDOW = dt.timedelta(hours=5)
+HOME = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR", pathlib.Path.home() / ".claude"))
+PROJECTS = HOME / "projects"
+
+
+def when(stamp):
+    try:
+        return dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
+def scan(since):
+    """Tokens used since `since`, and the newest refusal, from recent files."""
+    tokens = {"input": 0, "output": 0, "cache read": 0, "cache write": 0}
+    messages = 0
+    cost = 0.0
+    refusal = None
+    cutoff = since.timestamp()
+
+    for path in PROJECTS.glob("*/*.jsonl"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue  # nothing in it can be inside the window
+        except OSError:
+            continue
+        try:
+            lines = path.open(errors="replace")
+        except OSError:
+            continue
+        with lines:
+            for line in lines:
+                # Cheap gate first: this walks tens of megabytes, and parsing
+                # every line as JSON to find two kinds of them is the whole cost.
+                synthetic = '"<synthetic>"' in line
+                priced = '"cost-state"' in line
+                if not synthetic and not priced and '"usage"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if priced and d.get("type") == "cost-state":
+                    # Whole-session spend. A session that straddles the window
+                    # is counted entire, which is why it is labelled as such.
+                    cost += d.get("totalCostUSD") or 0
+                    continue
+                at = when(d.get("timestamp"))
+                if at is None or at < since:
+                    continue
+                msg = d.get("message") or {}
+                if synthetic:
+                    text = " ".join(c.get("text", "") for c in (msg.get("content") or [])
+                                    if isinstance(c, dict))
+                    if "limit" in text.lower() and (refusal is None or at > refusal[0]):
+                        refusal = (at, text.strip())
+                    continue
+                u = msg.get("usage") or {}
+                if not u:
+                    continue
+                messages += 1
+                tokens["input"] += u.get("input_tokens", 0)
+                tokens["output"] += u.get("output_tokens", 0)
+                tokens["cache read"] += u.get("cache_read_input_tokens", 0)
+                tokens["cache write"] += u.get("cache_creation_input_tokens", 0)
+    return tokens, messages, cost, refusal
+
+
+def resets_at(text, seen):
+    """Turn "resets 3am (UTC)" into the next such instant after it was said."""
+    m = re.search(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)", text, re.I)
+    if not m:
+        return ""
+    hour = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "pm" else 0)
+    minute = int(m.group(2) or 0)
+    at = seen.astimezone(dt.timezone.utc).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if at <= seen:
+        at += dt.timedelta(days=1)
+    return at.isoformat()
+
+
+def human(n):
+    for unit, size in (("M", 1_000_000), ("k", 1_000)):
+        if n >= size:
+            return f"{n / size:.1f}{unit}"
+    return str(n)
+
+
+def main():
+    now = dt.datetime.now(dt.timezone.utc)
+    tokens, messages, cost, refusal = scan(now - WINDOW)
+
+    # Cache reads dominate every total and cost almost nothing, so leading with
+    # the sum would read as ten times the work actually done.
+    fresh = tokens["input"] + tokens["output"] + tokens["cache write"]
+    summary = (f"{human(fresh)} tokens in 5h ({human(tokens['cache read'])} cached) "
+               f"over {messages} messages")
+
+    detail = [{"label": k, "value": human(v)} for k, v in tokens.items() if v]
+    if cost:
+        detail.append({"label": "spend", "value":
+                       f"${cost:.2f} across the sessions touching this window"})
+    detail.append({"label": "counted from", "value": "this machine's transcripts, not the account"})
+
+    out = {"state": "ok", "summary": summary, "detail": detail}
+
+    if refusal:
+        seen, text = refusal
+        resets = resets_at(text, seen)
+        # A refusal inside the window is only current until the reset it named.
+        still = not resets or dt.datetime.fromisoformat(resets) > now
+        if still:
+            out["state"] = "limited"
+            out["summary"] = text
+            if resets:
+                out["resetsAt"] = resets
+        detail.append({"label": "last refusal", "value": f"{text} ({seen.isoformat()})"})
+
+    dest = os.environ.get("CONVEYOR_RESULT")
+    if dest:
+        pathlib.Path(dest).write_text(json.dumps(out))
+    print(out["summary"], file=sys.stderr)
+
+
+main()

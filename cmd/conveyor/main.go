@@ -165,6 +165,11 @@ func cmdValidate(args []string) error {
 		len(cfg.Sources), cfg.Concurrency.Global, cfg.Concurrency.PerStage, cfg.Concurrency.PerSource)
 	fmt.Printf("    poll %s, default timeout %s, log retention %s\n",
 		cfg.Poll.D(), cfg.Timeout.D(), cfg.Logs.Retention.D())
+	// Printed because it is the one setting that acts on its own: a reader
+	// should not have to open the config to learn the board can un-mark itself.
+	if d := cfg.RetryStalled.D(); d > 0 {
+		fmt.Printf("    a fully stalled board clears its marks every %s\n", d)
+	}
 	fmt.Println("    (* runs a script on enter, . terminal)")
 
 	// A repo that has not been onboarded is reported, not fatal: it must not

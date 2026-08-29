@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
@@ -175,4 +177,143 @@ func TestStartRefusesAMarkedItem(t *testing.T) {
 	if body := w.Body.String(); !strings.Contains(body, "waiting for a person") {
 		t.Errorf("refusal = %q, want it to say a person has to clear the mark", body)
 	}
+}
+
+// The mark is only half the story; the board has to be able to say what the
+// item is waiting for, or a red card sends you to the logs to find out.
+func TestUnblockClearsTheMarkWhereTheItemStands(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true}}
+	s.blocks["s1:1"] = Block{Reason: "needs a decision", Stage: "working"}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/items/s1:1/unblock", nil)
+	req.SetPathValue("id", "s1:1")
+	s.handleUnblock(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d (%s), want 204", w.Code, w.Body.String())
+	}
+	s.mu.RLock()
+	it, note := s.state.Items[0], s.blocks["s1:1"]
+	s.mu.RUnlock()
+	if it.Blocked {
+		t.Error("the item is still marked")
+	}
+	if it.Stage != "working" {
+		t.Errorf("stage = %q, want working — clearing a mark moves nothing", it.Stage)
+	}
+	if note.Reason != "" {
+		t.Errorf("the note outlived the mark: %q", note.Reason)
+	}
+}
+
+// The whole board at once, for after the thing that stopped it is fixed.
+func TestUnblockAllHandsBackEveryMarkedItem(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true},
+		{ID: "s1:2", Source: "s1", Stage: "backlog"},
+		{ID: "s1:3", Source: "s1", Stage: "working", Blocked: true},
+	}
+	var held []model.Item
+	for _, it := range s.state.Items {
+		if it.Blocked {
+			held = append(held, it)
+		}
+	}
+	if n := s.unblockAll(t.Context(), held); n != 2 {
+		t.Fatalf("unblocked %d, want 2", n)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, it := range s.state.Items {
+		if it.Blocked {
+			t.Errorf("%s is still marked", it.ID)
+		}
+	}
+}
+
+// The reason is recovered from the run that wrote it, so a restart does not
+// leave a board full of red cards that cannot say why.
+func TestBlockReasonsAreRecoveredFromRunHistory(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	day := filepath.Join(r.Root, "2026-08-28", "120000.000-aaaa")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"id":"120000.000-aaaa","source":"s1","itemId":"s1:1","kind":"stage",
+	          "to":"working","outcome":"blocked","exitCode":20}`
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(day, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("meta.json", meta)
+	write("result.json", `{"blocked":true,"reason":"the checkout is dirty"}`)
+
+	s.recallBlocks([]model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true}})
+	if got := s.blocks["s1:1"].Reason; got != "the checkout is dirty" {
+		t.Errorf("reason = %q, want the one the run recorded", got)
+	}
+	if got := s.blocks["s1:1"].RunID; got != "120000.000-aaaa" {
+		t.Errorf("runId = %q, want the run that marked it", got)
+	}
+}
+
+// A mark with no run behind it says so, rather than showing an empty card.
+func TestAHandPlacedMarkSaysSo(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.recallBlocks([]model.Item{{ID: "s1:9", Source: "s1", Stage: "working", Blocked: true}})
+	if got := s.blocks["s1:9"].Reason; !strings.Contains(got, "outside the pipeline") {
+		t.Errorf("reason = %q, want it to say nothing in the history explains it", got)
+	}
+}
+
+// The stall retry is guarded on "everything", not "something": while one item
+// can still move, a mark is a decision, and clearing it spends an agent run to
+// be told the same thing again.
+func TestStallRetryWaitsWhileAnythingCanStillMove(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true},
+		{ID: "s1:2", Source: "s1", Stage: "backlog"}, // this one can still go
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	go s.stalled(ctx, 10*time.Millisecond)
+	time.Sleep(60 * time.Millisecond)
+	cancel()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.state.Items[0].Blocked {
+		t.Error("the mark was cleared while another item could still move")
+	}
+}
+
+// And when nothing at all can move, it hands the board back.
+func TestStallRetryClearsATotallyStalledBoard(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true},
+		{ID: "s1:2", Source: "s1", Stage: "backlog", Blocked: true},
+		{ID: "s1:3", Source: "s1", Stage: "done"}, // finished: not a way forward
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go s.stalled(ctx, 10*time.Millisecond)
+	waitFor(t, "the stalled board to be handed back", func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return !s.state.Items[0].Blocked && !s.state.Items[1].Blocked
+	})
 }

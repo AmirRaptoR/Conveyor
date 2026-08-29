@@ -481,3 +481,35 @@ func TestRemovedRoutesAreNamed(t *testing.T) {
 		})
 	}
 }
+
+// An agent is whatever a source's scripts name, never a list of its own: two
+// places to record the same fact is two places to get it wrong.
+func TestAgentsComeFromTheSourcesThatUseThem(t *testing.T) {
+	dir := t.TempDir()
+	for _, a := range []string{"claude", "codex"} {
+		if err := os.MkdirAll(filepath.Join(dir, "agents", a), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Only one of them can say how it is doing; the other is silent, which is
+	// not a misconfiguration.
+	if err := os.WriteFile(filepath.Join(dir, "agents", "codex", "status"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{Dir: dir, Agents: filepath.Join(dir, "agents"), Sources: []Source{
+		{Name: "a", Scripts: map[string]ScriptSpec{
+			"refine": {Agent: "claude"}, "review": {Agent: "codex"}}},
+		{Name: "b", Scripts: map[string]ScriptSpec{"refine": {Agent: "claude"}}},
+		{Name: "c", Scripts: map[string]ScriptSpec{"deploy": {Script: "./ship.sh"}}},
+	}}
+	got := cfg.AgentsInUse()
+	if len(got) != 2 {
+		t.Fatalf("agents = %v, want claude and codex once each", got)
+	}
+	if got[0].Name != "claude" || got[0].Status != "" {
+		t.Errorf("claude = %+v, want no status script", got[0])
+	}
+	if got[1].Name != "codex" || got[1].Status == "" {
+		t.Errorf("codex = %+v, want its status script found", got[1])
+	}
+}

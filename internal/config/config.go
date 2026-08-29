@@ -21,9 +21,17 @@ type Config struct {
 	Concurrency Concurrency `yaml:"concurrency"`
 	Poll        Duration    `yaml:"poll"`
 	Timeout     Duration    `yaml:"timeout"`
-	Logs        Logs        `yaml:"logs"`
-	Stages      []Stage     `yaml:"stages"`
-	Sources     []Source    `yaml:"sources"`
+	// RetryStalled is how often to clear every mark when *every* item is
+	// marked and the line cannot move at all. A total stall usually means the
+	// outside world broke — an agent over its usage limit, an expired
+	// credential — and those fix themselves; a board that stays stopped until
+	// someone looks at it does not. Unset means never, and the guard is
+	// deliberately "everything": while any item can still move, a mark is a
+	// decision and clearing it would just spend an agent to be told again.
+	RetryStalled Duration `yaml:"retryStalled"`
+	Logs         Logs     `yaml:"logs"`
+	Stages       []Stage  `yaml:"stages"`
+	Sources      []Source `yaml:"sources"`
 
 	// Agents is where agent folders live, resolved like Providers.
 	Agents string `yaml:"agents"`
@@ -344,6 +352,41 @@ func (c *Config) rootDir(configured, name string) string {
 func isDir(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && fi.IsDir()
+}
+
+// Agent is one agent a source calls, and the status script it provides — the
+// optional agents/<name>/status, which reports how that agent is doing.
+type Agent struct {
+	Name   string `json:"name"`
+	Status string `json:"-"` // absolute path; empty when the agent has none
+}
+
+// AgentsInUse lists the agents this config's sources actually call.
+//
+// Derived, never declared: an agent is not a thing you enrol, it is whatever a
+// source's script block names. A top-level agents: list would be a second place
+// to keep the same fact, and the two would disagree the first time a source
+// switched adapters.
+func (c *Config) AgentsInUse() []Agent {
+	seen := map[string]bool{}
+	var out []Agent
+	for _, src := range c.Sources {
+		for _, spec := range src.Scripts {
+			if spec.Agent == "" || seen[spec.Agent] {
+				continue
+			}
+			seen[spec.Agent] = true
+			a := Agent{Name: spec.Agent}
+			// Optional, and silence is the answer when there is none: an agent
+			// that cannot say how it is doing is not a misconfiguration.
+			if path, err := findScript(filepath.Join(c.AgentsDir(), spec.Agent), "status"); err == nil {
+				a.Status = path
+			}
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // providerScript finds providers/<provider>/<verb>.

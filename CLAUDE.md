@@ -21,8 +21,9 @@ drains the mock pipeline in priority order and marks a blocked item in place.
 `providers/github/` runs against real repositories.
 
 `conveyor serve` runs the pipeline and renders it: the board, live logs over
-SSE, run history, drag-to-reorder, and drag out of the backlog to start an
-item now (`POST /api/items/{id}/start`). It advances items on its own — `-watch`
+SSE, run history, drag-to-reorder, drag out of the backlog to start an item now
+(`POST /api/items/{id}/start`), each mark's reason on its card with a hand-back
+button, `Unblock all`, and a strip saying how each agent is doing. It advances items on its own — `-watch`
 is what makes it observe without touching anything. Discovery, scheduling and
 the tick button are three goroutines, deliberately: a 90-minute stage must not
 be able to stop every source being listed.
@@ -61,6 +62,16 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   only out of the first stage. Dropping a card onto a deploy stage would be a
   deploy nobody reviewed; the pipeline is authored ahead of time, not steered
   card by card. A busy slot is a refusal naming what holds it, not a queue.
+- **The provider says whether an item is marked; the engine says why.** The
+  reason comes from the run that marked it and is recovered from run history
+  after a restart — never from a label, and never by parsing a log. A red card
+  that cannot say what it is waiting for sends the reader to the logs, which is
+  the trip the mark exists to save.
+- **Only a person clears a mark**, with one exception: `retryStalled:` clears
+  them all when *every* item is marked and the line cannot move at all. The
+  guard is "everything" deliberately. While one item can still move, a mark is a
+  decision waiting on a human and clearing it spends an agent run to be told the
+  same thing; a total stall is almost always the outside world, which comes back.
 - **The board never sorts.** `/api/state` hands items over in `pipeline.Order`,
   the same ladder `Pick` maximises over, and the page draws them in the order
   they arrive. Sorting in the page is a second copy of the scheduling rules,
@@ -79,6 +90,12 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
 - **How the work happens is never in the config.** Which agent, which model,
   which tools, all of it lives in the source's script, because it differs per
   repository. Resist every request to add a key for it.
+- **Ignored is not blocked.** `IGNORE_LABELS` (a provider param, GitHub's
+  vocabulary) keeps an issue out of the listing entirely: it never reaches the
+  board, is never counted, and no stage is ever run against it. Blocked is
+  conveyor's item, stopped, waiting for an answer, and it comes back when the
+  mark is cleared. Ignored was never conveyor's. Filtering happens in `list`,
+  so the engine never learns the concept.
 - **An un-onboarded repo is reported, never worked around.** Per-source problems
   disable that source and leave every other repo running. There is no shared
   fallback to inherit by accident.
@@ -92,6 +109,19 @@ and appends the blocked convention, so prompts stay portable and every agent
 signals "needs a human" identically: exit 20, with `{"blocked": true, "reason":
 "…"}` in `$CONVEYOR_RESULT`. The engine hands that reason to `move`, and the
 GitHub provider comments it on the issue beside the label.
+
+## Agent status
+
+`agents/<name>/status` is optional and reports how that agent is doing — run on
+the discovery tick beside the list scripts, and rendered as a strip above the
+sources. The engine reads one field of it, `state`, and knows three words: `ok`,
+`limited`, `unknown`. Everything else is passed through and drawn as given.
+What a usage window is, what counts against it, whether tokens or money is the
+interesting number — that differs per agent and belongs to the script, which is
+why there is no struct for it here. `agents/codex/status` reads the rate limits
+Codex records in its own rollouts; `agents/claude/status` sums the last five
+hours from `~/.claude/projects` and reports the refusal Claude Code files when
+the account is over its limit. Neither is the account's ledger and both say so.
 
 ## The extension seam
 

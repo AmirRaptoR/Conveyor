@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
@@ -144,7 +145,10 @@ type Transition struct {
 	Outcome model.Outcome `json:"outcome"`
 	// Blocked is whether this transition left the item marked. It stays where
 	// it is when it does, so Next is empty and the mark is the whole story.
-	Blocked  bool   `json:"blocked,omitempty"`
+	Blocked bool `json:"blocked,omitempty"`
+	// Reason is what the mark says, in the words that will reach the provider
+	// and the board. Empty unless Blocked.
+	Reason   string `json:"reason,omitempty"`
 	RunID    string `json:"runId,omitempty"`
 	RunDir   string `json:"runDir,omitempty"`
 	Attempts int    `json:"attempts,omitempty"`
@@ -271,6 +275,7 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	next, mark := e.route(stage, res, item.ID, tr)
 	tr.Next = next
 	tr.Blocked = mark.Blocked
+	tr.Reason = mark.Reason
 
 	// Marked where it stands. The item does not move, so whoever clears the
 	// mark gets the job back in the stage it stopped in — which, because the
@@ -316,11 +321,7 @@ func (e *Engine) route(s *config.Stage, res *runner.Result, itemID string, tr *T
 	case model.OutcomeBlocked:
 		// A decision, not a fault: no retry could change the answer.
 		e.attempts.Clear(key)
-		reason := blockedReason(res.Data)
-		if reason == "" {
-			reason = fmt.Sprintf("%s asked for a human", s.Name)
-		}
-		return "", source.Mark{Blocked: true, Reason: reason}
+		return "", source.Mark{Blocked: true, Reason: Reason(s.Name, res.Run, res.Data, s.Timeout.D(), 0)}
 	default: // failure, timeout
 		n := e.attempts.Bump(key)
 		tr.Attempts = n
@@ -334,15 +335,39 @@ func (e *Engine) route(s *config.Stage, res *runner.Result, itemID string, tr *T
 			return "", source.Mark{}
 		}
 		e.attempts.Clear(key)
-		return "", source.Mark{Blocked: true, Reason: failureReason(s, res, n)}
+		return "", source.Mark{Blocked: true, Reason: Reason(s.Name, res.Run, res.Data, s.Timeout.D(), n)}
 	}
 }
 
-// blockedReason reads the agents' convention out of the result file: a script
-// that needs a human writes {"blocked": true, "reason": "..."} there. It is a
-// convention and not a requirement — a script that just exits 20 has no reason
-// to give, and anything else in the file is simply not one.
-func blockedReason(data json.RawMessage) string {
+// Reason says, in one line, why a finished run leaves the item needing a human.
+//
+// Two sources, and they mean different things. A script that decided a person
+// is needed writes {"blocked": true, "reason": "..."} into $CONVEYOR_RESULT —
+// that is the agents' convention and it wins, because it is the only one that
+// can say anything specific. A script that merely broke says nothing, so the
+// run record is asked instead: exit code and outcome, the same words the log
+// is filed under. Never the log itself, which is prose and is never parsed.
+func Reason(stage string, run model.Run, data json.RawMessage, timeout time.Duration, attempts int) string {
+	if r := given(data); r != "" {
+		return r
+	}
+	switch run.Outcome {
+	case model.OutcomeBlocked:
+		return fmt.Sprintf("%s asked for a human but gave no reason; read the run log", stage)
+	case model.OutcomeTimeout:
+		return fmt.Sprintf("%s timed out after %s", stage, timeout)
+	}
+	what := fmt.Sprintf("%s failed (exit %d)", stage, run.ExitCode)
+	if attempts > 1 {
+		what += fmt.Sprintf(" on attempt %d", attempts)
+	}
+	return what
+}
+
+// given reads the agents' convention out of the result file. It is a convention
+// and not a requirement — a script that just exits 20 has no reason to give,
+// and anything else in the file is simply not one.
+func given(data json.RawMessage) string {
 	if len(data) == 0 {
 		return ""
 	}
@@ -353,19 +378,6 @@ func blockedReason(data json.RawMessage) string {
 		return ""
 	}
 	return v.Reason
-}
-
-// failureReason says what broke in the words the run record already has, so the
-// mark carries the same story as the log it came from.
-func failureReason(s *config.Stage, res *runner.Result, attempts int) string {
-	what := fmt.Sprintf("%s failed (exit %d)", s.Name, res.Run.ExitCode)
-	if res.Run.Outcome == model.OutcomeTimeout {
-		what = fmt.Sprintf("%s timed out after %s", s.Name, s.Timeout.D())
-	}
-	if attempts > 1 {
-		what += fmt.Sprintf(" on attempt %d", attempts)
-	}
-	return what
 }
 
 // Target returns the stage an item should be moved into next, if any.

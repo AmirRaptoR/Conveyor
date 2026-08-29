@@ -93,10 +93,15 @@ A blocked script may say why: `{"blocked": true, "reason": "…"}` in
 `$CONVEYOR_RESULT`. The engine passes the reason to `move`, and a provider that
 has somewhere to put it — a comment, a field — should.
 
-## 3. The three script kinds
+## 3. The script kinds
 
 **`list`** — read items from a provider. Writes a JSON array of items to
 `$CONVEYOR_RESULT`. Exit 0 with `[]` means an empty backlog, which is normal.
+
+What it does not emit does not exist: an item the lister filters out is not on
+the board, not in a count, and nothing will ever be run against it. That is the
+whole of the ignore mechanism — the GitHub provider takes `IGNORE_LABELS` and
+drops those issues here, and the engine never learns there is such a thing.
 
 **`move`** — write a stage change *and the blocked mark* back to the provider
 (set a label, move a card, update a field). Called by the **engine**, never by a
@@ -112,6 +117,23 @@ written. Setting and clearing it are the same call with a different value.
 of a stage. Run an AI agent, run
 tests, deploy, cut a release. This is the extension point; everything else is
 plumbing.
+
+**`status`** (optional, `agents/<name>/status`) — report how an agent is doing.
+Run on the discovery tick, beside the list scripts, and given no stdin. Writes:
+
+```json
+{"state": "ok" | "limited",
+ "summary": "one line, shown on the board",
+ "resetsAt": "<RFC3339>",
+ "detail": [{"label": "5-hour window", "value": "34% used"}]}
+```
+
+`state` is the only field the engine reads, and it reads three words: anything
+but `ok` or `limited` becomes `unknown`. Everything else is passed through and
+rendered as given. What a usage window is, what counts against it, whether
+tokens or money is the interesting number — all of that differs per agent and
+belongs to the script, which is why the engine holds no struct for it. An agent
+with no `status` script simply says nothing, which is not an error.
 
 ## 4. Transition order
 
@@ -202,3 +224,16 @@ things and the UI says which: blocked is *"a human must decide"*, failure is
 There is no blocked column. A marked item is drawn in the stage it stopped in,
 and that stage's header counts how many it is holding — because blocked is
 something an item *is*, not somewhere it went.
+
+**The mark carries its reason.** The provider is the authority on *whether* an
+item is marked; *why* is the engine's own note, taken from the run that marked
+it and recovered from run history after a restart. A red card that cannot say
+what it is waiting for sends the reader to the logs, which is the trip the mark
+exists to save. A mark someone applied by hand has no run behind it, and says so.
+
+**Only a person clears a mark**, with one exception. When *every* item is marked
+and the line cannot move at all, `retryStalled:` clears them on an interval and
+lets it try again. The guard is "everything" on purpose: while one item can
+still move, a mark is a decision waiting on a human, and clearing it spends an
+agent run to be told the same thing. A total stall is a different animal — it is
+almost always the outside world, and the outside world comes back.
