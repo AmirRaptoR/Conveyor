@@ -26,12 +26,13 @@ is what makes it observe without touching anything. Discovery, scheduling and
 the tick button are three goroutines, deliberately: a 90-minute stage must not
 be able to stop every source being listed.
 
+`internal/store` holds the persisted manual input order — v1's only human
+control lever — and the data directory's owner lock.
+
 Not built yet, in build order (see `docs/DESIGN.md`):
 
-1. `internal/store` — persisted manual input order, v1's only human control
-   lever. `Pick` already takes an order argument and is handed nil everywhere.
-2. Log retention sweep (`logs.retention`, with the pinning rule in CONTRACTS §6)
-3. Reordering in the UI, once there is a store to persist it into
+1. Log retention sweep (`logs.retention`, with the pinning rule in CONTRACTS §6)
+2. Starting one item on demand from the board
 
 ## Invariants — do not break these
 
@@ -56,6 +57,11 @@ Not built yet, in build order (see `docs/DESIGN.md`):
   it used to be a terminal `blocked` column, which cost the context of where the
   work stopped. `onSuccess:` is the only route; `onFailure:` and `onBlocked:` are
   rejected by name. `maxAttempts:` unset means one, so the first failure marks.
+- **The board never sorts.** `/api/state` hands items over in `pipeline.Order`,
+  the same ladder `Pick` maximises over, and the page draws them in the order
+  they arrive. Sorting in the page is a second copy of the scheduling rules,
+  and the two drift: a card at the top of a column that the engine reaches
+  fourth is a board that lies about what happens next.
 - **A source names a `provider:`, never two script paths.** Naming `list` and
   `move` separately allowed pairing GitHub's list with Azure's move, which
   nothing downstream could detect.

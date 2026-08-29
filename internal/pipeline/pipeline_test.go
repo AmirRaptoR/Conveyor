@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
@@ -177,5 +178,97 @@ func TestOrderStillDecidesWithoutRecovery(t *testing.T) {
 	got, _ := Pick(cfg, items, []string{"a:1", "a:2"})
 	if got == nil || got.ID != "a:1" {
 		t.Fatalf("picked %v, want a:1 — the order beats priority", got)
+	}
+}
+
+// The board draws items in the order the server hands them over, so that order
+// has to be the order the scheduler would reach them in — one Pick after
+// another. A card sitting above another it will be worked after is a board that
+// lies about what happens next.
+func TestOrderIsRepeatedPick(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{
+		{Name: "backlog", OnSuccess: "refining"},
+		{Name: "refining", Script: "refine", OnSuccess: "ready"},
+		{Name: "ready", OnSuccess: "done"},
+		{Name: "done", Terminal: true},
+	}}
+	p0, p2 := 0, 2
+	items := []model.Item{
+		{ID: "a:32", Source: "a", Stage: "backlog", Title: "listed first", Priority: &p2},
+		{ID: "a:109", Source: "a", Stage: "backlog", Title: "listed second", Priority: &p2},
+		{ID: "b:7", Source: "b", Stage: "backlog", Title: "urgent", Priority: &p0},
+		{ID: "b:8", Source: "b", Stage: "refining", Title: "interrupted"},
+		{ID: "a:4", Source: "a", Stage: "ready", Title: "dragged to the top"},
+	}
+	order := []string{"a:4"}
+
+	// Repeated Pick, removing each winner: the order the scheduler works them.
+	var want []string
+	rest := append([]model.Item(nil), items...)
+	for len(rest) > 0 {
+		got, _ := Pick(cfg, rest, order)
+		if got == nil {
+			break
+		}
+		want = append(want, got.ID)
+		out := rest[:0]
+		for _, it := range rest {
+			if it.ID != want[len(want)-1] {
+				out = append(out, it)
+			}
+		}
+		rest = out
+	}
+
+	sorted := Order(cfg, items, order)
+	var got []string
+	for _, it := range sorted[:len(want)] {
+		got = append(got, it.ID)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("Order = %v, want %v (the sequence Pick produces)", got, want)
+	}
+	if len(sorted) != len(items) {
+		t.Errorf("Order returned %d items, want all %d", len(sorted), len(items))
+	}
+}
+
+// Order carries everything, including what is not in the queue at all. Those
+// go to the back in listing order: they make no claim on a place in it.
+func TestUnworkableItemsKeepListingOrderAtTheBack(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{
+		{Name: "backlog", OnSuccess: "refining"},
+		{Name: "refining", Script: "refine", OnSuccess: "done"},
+		{Name: "done", Terminal: true},
+	}}
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "done", Title: "finished"},
+		{ID: "a:2", Source: "a", Stage: "refining", Title: "waiting for a human", Blocked: true},
+		{ID: "a:3", Source: "a", Stage: "backlog", Title: "workable"},
+	}
+	got := Order(cfg, items, nil)
+	if got[0].ID != "a:3" {
+		t.Errorf("first = %q, want a:3 — the only one with anywhere to go", got[0].ID)
+	}
+	if got[1].ID != "a:1" || got[2].ID != "a:2" {
+		t.Errorf("tail = %q,%q, want a:1,a:2 in listing order", got[1].ID, got[2].ID)
+	}
+}
+
+// Order must not disturb the caller's slice: the server sorts on the way out
+// while the scheduler is reading the same listing.
+func TestOrderLeavesTheListingAlone(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{
+		{Name: "backlog", OnSuccess: "done"},
+		{Name: "done", Terminal: true},
+	}}
+	p0 := 0
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "backlog"},
+		{ID: "a:2", Source: "a", Stage: "backlog", Priority: &p0},
+	}
+	Order(cfg, items, nil)
+	if items[0].ID != "a:1" || items[1].ID != "a:2" {
+		t.Errorf("listing was reordered in place: %q,%q", items[0].ID, items[1].ID)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
@@ -395,7 +396,7 @@ func Target(cfg *config.Config, it *model.Item) (string, bool) {
 	return stage.OnSuccess, true
 }
 
-// Pick chooses the next item to work from a listing.
+// The ladder below is the whole of v1's scheduling.
 //
 // Recovery comes first, ahead of any human ordering: an item found inside a
 // stage that runs a script is a job that started and did not finish, and the
@@ -407,29 +408,19 @@ func Target(cfg *config.Config, it *model.Item) (string, bool) {
 // position in `order` beats its priority. Items not named there fall back to
 // priority, then to the source's own listing order, which keeps the choice
 // stable across polls.
+//
+// Pick chooses the next item to work from a listing. It is the head of Order.
 func Pick(cfg *config.Config, items []model.Item, order []string) (*model.Item, string) {
-	pos := make(map[string]int, len(order))
-	for i, id := range order {
-		pos[id] = i
-	}
+	pos := index(order)
 	best := -1
 	var bestTarget string
 	var bestC candidate
 
 	for i := range items {
-		it := &items[i]
-		target, ok := Target(cfg, it)
-		if !ok {
+		c, target := rate(cfg, &items[i], i, pos)
+		if !c.workable {
 			continue
 		}
-		oi, ordered := pos[it.ID]
-		prio := 1 << 30
-		if it.Priority != nil {
-			prio = *it.Priority
-		}
-		// Target returns the same stage an item is already in only when that
-		// stage runs something and the previous run did not finish.
-		c := candidate{recovering: target == it.Stage, ordered: ordered, idx: oi, prio: prio, pos: i}
 		if best == -1 || better(c, bestC) {
 			best, bestTarget, bestC = i, target, c
 		}
@@ -440,8 +431,67 @@ func Pick(cfg *config.Config, items []model.Item, order []string) (*model.Item, 
 	return &items[best], bestTarget
 }
 
+// Order sorts a listing into the order the scheduler will work it: the same
+// ladder Pick maximises over, applied to everything instead of just the winner.
+//
+// It exists so the board cannot disagree with the engine. A UI that sorts the
+// cards itself is a second copy of these rules, and the two drift — a card
+// sitting at the top of a column that the scheduler will reach fourth is a
+// board that lies. The server hands out items already in this order, and
+// drawing them in the order they arrive is then enough.
+//
+// Items with nowhere to go — marked, terminal, resting in a queue with no exit
+// — keep their listing order at the back. They are not in the queue, so they
+// have no claim on a place in it.
+func Order(cfg *config.Config, items []model.Item, order []string) []model.Item {
+	pos := index(order)
+	rated := make([]candidate, len(items))
+	for i := range items {
+		rated[i], _ = rate(cfg, &items[i], i, pos)
+	}
+	seq := make([]int, len(items))
+	for i := range items {
+		seq[i] = i
+	}
+	sort.SliceStable(seq, func(a, b int) bool { return better(rated[seq[a]], rated[seq[b]]) })
+	out := make([]model.Item, len(items))
+	for i, j := range seq {
+		out[i] = items[j]
+	}
+	return out
+}
+
+func index(order []string) map[string]int {
+	pos := make(map[string]int, len(order))
+	for i, id := range order {
+		pos[id] = i
+	}
+	return pos
+}
+
+// rate scores one item's claim on being next, and reports where it would go.
+func rate(cfg *config.Config, it *model.Item, listed int, pos map[string]int) (candidate, string) {
+	target, ok := Target(cfg, it)
+	oi, ordered := pos[it.ID]
+	prio := 1 << 30
+	if it.Priority != nil {
+		prio = *it.Priority
+	}
+	// Target returns the same stage an item is already in only when that stage
+	// runs something and the previous run did not finish.
+	return candidate{
+		workable:   ok,
+		recovering: ok && target == it.Stage,
+		ordered:    ordered,
+		idx:        oi,
+		prio:       prio,
+		pos:        listed,
+	}, target
+}
+
 // candidate is one item's claim on being next.
 type candidate struct {
+	workable   bool // has anywhere to go at all
 	recovering bool // a stage it is already in, left unfinished
 	ordered    bool // named in the manual order
 	idx        int  // where, if it is
@@ -452,6 +502,9 @@ type candidate struct {
 // better reports whether a should be worked before b. A ladder, most decisive
 // first; each rung only matters when the ones above it tie.
 func better(a, b candidate) bool {
+	if a.workable != b.workable {
+		return a.workable // nothing to run is not a place in the queue
+	}
 	if a.recovering != b.recovering {
 		return a.recovering // finish what was started
 	}

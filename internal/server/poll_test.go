@@ -28,7 +28,7 @@ func writeScript(t *testing.T, path, body string) {
 func pipelineFor(t *testing.T) (*config.Config, *runner.Runner, string) {
 	t.Helper()
 	dir := t.TempDir()
-	lists := filepath.Join(dir, "lists")   // one line per list script run
+	lists := filepath.Join(dir, "lists") // one line per list script run
 	started := filepath.Join(dir, "started")
 	release := filepath.Join(dir, "release")
 

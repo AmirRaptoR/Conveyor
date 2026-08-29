@@ -354,12 +354,10 @@ function draw() {
   const active = state.active || [];
   const workingOn = id => active.find(a => a.itemId === id);
 
-  // The saved order decides what the board shows first, because it decides what
-  // the scheduler picks first. A card's position is the claim it makes.
-  const rank = new Map((state.order || []).map((id, i) => [id, i]));
-  const seq = it => rank.has(it.id) ? rank.get(it.id) : Infinity;
-  const prio = it => (it.priority ?? 1e9);
-
+  // Items arrive in the order the scheduler will work them, so the board does
+  // not sort: it draws them in the order it is given. A card's position is the
+  // claim it makes, and re-deriving that here would be a second copy of rules
+  // that live in the engine, free to disagree with it.
   const bucket = {};
   for (const st of stages) bucket[st.name] = [];
   for (const it of items) {
@@ -370,10 +368,6 @@ function draw() {
     const a = workingOn(it.id);
     (bucket[a ? a.stage : it.stage] ||= []).push(it);
   }
-  for (const k of Object.keys(bucket)) {
-    bucket[k].sort((a, b) => seq(a) - seq(b) || prio(a) - prio(b) || a.id.localeCompare(b.id));
-  }
-
   // The line runs through the working stages; terminal ones leave it.
   const flow = stages.filter(s => !s.terminal);
   const ends = stages.filter(s => s.terminal);
@@ -639,15 +633,20 @@ const clearMarks = () =>
   document.querySelectorAll(".over-before,.over-after")
     .forEach(n => n.classList.remove("over-before", "over-after"));
 
-// Read the board back as one list, stages in pipeline order. Stage order
-// dominates and the manual order decides within a stage — an item further along
-// the line should not be overtaken by one that has not started.
+// Read the board back as one list. Stage order dominates and the drag decides
+// within a stage — an item further along the line should not be overtaken by
+// one that has not started, so the queues are read from the end of the line
+// back towards the start. Reading them left to right says the opposite: it
+// ranks the whole backlog above work already under way.
 async function saveOrder() {
-  const ids = [...document.querySelectorAll(".queue[data-stage] .item")].map(el => el.dataset.id);
+  const flow = (state?.stages || []).filter(st => !st.terminal).reverse();
+  const ids = flow.flatMap(st =>
+    [...document.querySelectorAll(`.queue[data-stage="${CSS.escape(st.name)}"] .item`)]
+      .map(el => el.dataset.id));
   // Never save an empty order while the board holds cards. A selector that
   // stops matching would otherwise wipe a hand-made arrangement silently —
   // which is exactly what a missing data-stage attribute once did.
-  if (!ids.length && (state?.items || []).length) {
+  if (!ids.length && document.querySelectorAll(".queue[data-stage] .item").length) {
     console.warn("refusing to save an empty order");
     return;
   }

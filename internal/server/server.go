@@ -31,8 +31,10 @@ var webFS embed.FS
 // State is one poll of every source, cached so the board is instant and the
 // list scripts run on the poll interval rather than on every page load.
 type State struct {
-	Stages    []StageView  `json:"stages"`
-	Sources   []SourceView `json:"sources"`
+	Stages  []StageView  `json:"stages"`
+	Sources []SourceView `json:"sources"`
+	// Items is in the order the scheduler will work them (pipeline.Order),
+	// applied on the way out so a drag lands before the next poll does.
 	Items     []model.Item `json:"items"`
 	Warnings  []string     `json:"warnings,omitempty"`
 	Order     []string     `json:"order"`
@@ -455,9 +457,13 @@ func (s *Server) activeList() []Active {
 	return out
 }
 
+// handleState hands out the board. Items go out in the order the scheduler
+// will work them, so the page can draw them in the order they arrive instead of
+// keeping a second copy of the ordering rules that is free to disagree.
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	st := s.state
+	st.Items = pipeline.Order(s.cfg, s.state.Items, s.state.Order)
 	s.mu.RUnlock()
 	writeJSON(w, st)
 }
