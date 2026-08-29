@@ -21,7 +21,8 @@ drains the mock pipeline in priority order and marks a blocked item in place.
 `providers/github/` runs against real repositories.
 
 `conveyor serve` runs the pipeline and renders it: the board, live logs over
-SSE, run history, and drag-to-reorder. It advances items on its own — `-watch`
+SSE, run history, drag-to-reorder, and drag out of the backlog to start an
+item now (`POST /api/items/{id}/start`). It advances items on its own — `-watch`
 is what makes it observe without touching anything. Discovery, scheduling and
 the tick button are three goroutines, deliberately: a 90-minute stage must not
 be able to stop every source being listed.
@@ -29,10 +30,8 @@ be able to stop every source being listed.
 `internal/store` holds the persisted manual input order — v1's only human
 control lever — and the data directory's owner lock.
 
-Not built yet, in build order (see `docs/DESIGN.md`):
-
-1. Log retention sweep (`logs.retention`, with the pinning rule in CONTRACTS §6)
-2. Starting one item on demand from the board
+Not built yet: the log retention sweep (`logs.retention`, with the pinning rule
+in CONTRACTS §6). See `docs/DESIGN.md`.
 
 ## Invariants — do not break these
 
@@ -57,6 +56,11 @@ Not built yet, in build order (see `docs/DESIGN.md`):
   it used to be a terminal `blocked` column, which cost the context of where the
   work stopped. `onSuccess:` is the only route; `onFailure:` and `onBlocked:` are
   rejected by name. `maxAttempts:` unset means one, so the first failure marks.
+- **A drag decides when, never where.** The start endpoint runs only the
+  transition `pipeline.Target` already chose, and the board offers the gesture
+  only out of the first stage. Dropping a card onto a deploy stage would be a
+  deploy nobody reviewed; the pipeline is authored ahead of time, not steered
+  card by card. A busy slot is a refusal naming what holds it, not a queue.
 - **The board never sorts.** `/api/state` hands items over in `pipeline.Order`,
   the same ladder `Pick` maximises over, and the page draws them in the order
   they arrive. Sorting in the page is a second copy of the scheduling rules,

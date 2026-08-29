@@ -2,9 +2,11 @@ package server
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
@@ -87,4 +89,90 @@ func ids(items []model.Item) []string {
 		out[i] = it.ID
 	}
 	return out
+}
+
+// A drag out of the backlog starts the work there and then. The endpoint can
+// only start the transition the scheduler would have started anyway.
+func TestStartRunsTheNextTransitionNow(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "backlog", Title: "waiting"}}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/items/s1:1/start", strings.NewReader(`{"stage":"working"}`))
+	req.SetPathValue("id", "s1:1")
+	s.handleStart(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d (%s), want 202", w.Code, w.Body.String())
+	}
+	waitFor(t, "the transition to finish", func() bool { return s.inFlight.Load() == 0 })
+	s.mu.RLock()
+	got := s.state.Items[0].Stage
+	s.mu.RUnlock()
+	if got != "done" {
+		t.Errorf("stage = %q, want done — backlog is a queue, so working ran and routed on", got)
+	}
+}
+
+// A drop is a decision about when, not about which stage: hand-skipping to a
+// later stage is a deploy nobody reviewed.
+func TestStartCannotSkipAStage(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "backlog"}}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/items/s1:1/start", strings.NewReader(`{"stage":"done"}`))
+	req.SetPathValue("id", "s1:1")
+	s.handleStart(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "working") {
+		t.Errorf("refusal = %q, want it to name the stage that is actually next", w.Body.String())
+	}
+}
+
+// A busy slot is a refusal, and the refusal says what is holding it.
+func TestStartRefusesABusySourceByName(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "backlog"}}
+	if !s.eng.Locks().TryAcquire("s1", "working") {
+		t.Fatal("could not take the lock the test needs held")
+	}
+	s.setActive("s1:9", &Active{Source: "s1", Stage: "working", ItemID: "s1:9", Title: "in hand"})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/items/s1:1/start", strings.NewReader(`{"stage":"working"}`))
+	req.SetPathValue("id", "s1:1")
+	s.handleStart(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", w.Code)
+	}
+	if body := w.Body.String(); !strings.Contains(body, "s1:9") {
+		t.Errorf("refusal = %q, want it to name what s1 is busy with", body)
+	}
+}
+
+// A marked item is waiting for a person; dragging it does not override that.
+func TestStartRefusesAMarkedItem(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true}}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/items/s1:1/start", nil)
+	req.SetPathValue("id", "s1:1")
+	s.handleStart(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", w.Code)
+	}
+	if body := w.Body.String(); !strings.Contains(body, "waiting for a person") {
+		t.Errorf("refusal = %q, want it to say a person has to clear the mark", body)
+	}
 }

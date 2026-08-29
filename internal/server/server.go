@@ -53,8 +53,11 @@ type Active struct {
 }
 
 type StageView struct {
-	Name     string `json:"name"`
-	Script   string `json:"script,omitempty"`
+	Name   string `json:"name"`
+	Script string `json:"script,omitempty"`
+	// Next is the stage this one leads to, so the board knows which column a
+	// card may be dropped into. It is the only route out; see CONTRACTS §4.
+	Next     string `json:"next,omitempty"`
 	Runs     bool   `json:"runs"`
 	Terminal bool   `json:"terminal"`
 }
@@ -120,7 +123,7 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 func stageViews(c *config.Config) []StageView {
 	out := make([]StageView, len(c.Stages))
 	for i, st := range c.Stages {
-		out[i] = StageView{Name: st.Name, Script: st.Script, Runs: st.Runs(), Terminal: st.Terminal}
+		out[i] = StageView{Name: st.Name, Script: st.Script, Next: st.OnSuccess, Runs: st.Runs(), Terminal: st.Terminal}
 	}
 	return out
 }
@@ -154,6 +157,7 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	mux.HandleFunc("POST /api/refresh", s.handleRefresh)
 	mux.HandleFunc("POST /api/tick", s.handleTick)
 	mux.HandleFunc("PUT /api/order", s.handleOrder)
+	mux.HandleFunc("POST /api/items/{id}/start", s.handleStart)
 
 	sub, err := fs.Sub(webFS, "web")
 	if err != nil {
@@ -503,6 +507,99 @@ func (s *Server) handleOrder(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleStart runs one item's next transition now, rather than when the poller
+// next comes round. It is what a drag out of the backlog does.
+//
+// It can only start the transition the scheduler would have started anyway. A
+// drop is a decision about *when*, never about which stage: a card dropped
+// straight onto a deploy stage would be a deploy nobody reviewed, and the
+// pipeline being human-authored is the point.
+//
+// A busy slot is a refusal, not a queue, and the refusal says what is holding
+// it. Dropping something and seeing nothing happen reads as a broken board;
+// "midgame is busy with midgame:49" reads as a reason to wait. The persisted
+// input order is still what decides who goes next when the slot frees.
+func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var body struct {
+		Stage string `json:"stage"`
+	}
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `expected {"stage": "..."}`, http.StatusBadRequest)
+			return
+		}
+	}
+
+	var item model.Item
+	found := false
+	s.mu.RLock()
+	for _, it := range s.state.Items {
+		if it.ID == id {
+			item, found = it, true
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if !found {
+		http.Error(w, "no item "+id+" on the board", http.StatusNotFound)
+		return
+	}
+
+	target, ok := pipeline.Target(s.cfg, &item)
+	if !ok {
+		http.Error(w, s.whyStuck(item), http.StatusConflict)
+		return
+	}
+	if body.Stage != "" && body.Stage != target {
+		http.Error(w, fmt.Sprintf("%s goes to %s next, not %s — a drop starts the next stage, it cannot skip one",
+			id, target, body.Stage), http.StatusConflict)
+		return
+	}
+
+	// Claim before launching, exactly as the scheduler does: a check followed
+	// by a goroutine leaves a gap the next pass can decide the same thing in.
+	if !s.eng.Locks().TryAcquire(item.Source, target) {
+		http.Error(w, s.whyBusy(item.Source, target), http.StatusConflict)
+		return
+	}
+	s.inFlight.Add(1)
+	go s.transition(s.ctx, item, target)
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// whyStuck says why an item has nowhere to go, in the operator's terms.
+func (s *Server) whyStuck(it model.Item) string {
+	if it.Blocked {
+		return it.ID + " is waiting for a person — clear its mark and the pipeline takes it back"
+	}
+	st, ok := s.cfg.Stage(it.Stage)
+	switch {
+	case !ok:
+		return fmt.Sprintf("%s is in %s, which is not a stage in this pipeline", it.ID, it.Stage)
+	case st.Terminal:
+		return fmt.Sprintf("%s is in %s, the end of the line", it.ID, it.Stage)
+	}
+	return fmt.Sprintf("%s has nowhere to go from %s", it.ID, it.Stage)
+}
+
+// whyBusy names what is holding the slot. perSource comes first because it is
+// the constraint an operator hits: one worktree, one agent.
+func (s *Server) whyBusy(src, stage string) string {
+	active := s.activeList()
+	for _, a := range active {
+		if a.Source == src {
+			return fmt.Sprintf("%s is busy with %s in %s", src, a.ItemID, a.Stage)
+		}
+	}
+	for _, a := range active {
+		if a.Stage == stage {
+			return fmt.Sprintf("%s is busy with %s", stage, a.ItemID)
+		}
+	}
+	return fmt.Sprintf("%s or %s is already busy", src, stage)
 }
 
 // RunMeta is one run directory, as the board needs it.

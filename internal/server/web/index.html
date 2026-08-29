@@ -123,7 +123,18 @@
   /* Where it will land, drawn on the belt's own vocabulary: a bright rule. */
   .item.over-before { box-shadow:0 -2px 0 var(--run); }
   .item.over-after  { box-shadow:0 2px 0 var(--run); }
-  .queue.receiving { background:color-mix(in srgb, var(--run) 5%, transparent); }
+  /* The column a dropped card would start in. The whole column lights rather
+     than a rule between two cards, because this drop is not a position in a
+     list — it is "run this here, now". */
+  .queue.over-stage {
+    background:color-mix(in srgb, var(--run) 7%, transparent);
+    box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--run) 40%, transparent);
+  }
+  /* Why a drop did nothing, on the card that was dropped. */
+  .item .refused {
+    display:block; margin-top:6px; color:var(--stop);
+    font-size:10.5px; line-height:1.4;
+  }
   .rank {
     color:var(--faint); font-variant-numeric:tabular-nums;
     border:1px solid var(--rule-soft); border-radius:2px; padding:0 4px;
@@ -417,6 +428,7 @@ function draw() {
     };
     wireDrag(el);
   });
+  document.querySelectorAll(".queue[data-stage]").forEach(wireQueue);
 }
 
 function station(st, items, active) {
@@ -472,6 +484,7 @@ function card(it, active, place) {
       ${it.url ? `<a class="open" href="${esc(it.url)}" target="_blank" rel="noopener"
            title="Open on GitHub" aria-label="Open ${esc(it.id)} on GitHub">&#8599;</a>` : ""}
     </span>
+    ${refusals.has(it.id) ? `<span class="refused">${esc(refusals.get(it.id))}</span>` : ""}
   </article>`;
 }
 
@@ -588,10 +601,59 @@ $("#close").onclick = closePanel;
 $("#scrim").onclick = closePanel;
 addEventListener("keydown", e => { if (e.key === "Escape") closePanel(); });
 
-// --- reordering ------------------------------------------------------------
-// A card's position is what the scheduler reads, so a drag writes the whole
-// order back rather than a move: two browsers reordering at once should end on
-// one of the two arrangements, not a blend.
+// --- dragging --------------------------------------------------------------
+// Two gestures, and they are different things. Within a column a drag reorders,
+// and a card's position is what the scheduler reads. Out of the backlog and
+// into the next column it *starts* the work: backlog is the absence of a state,
+// and deciding something leaves it is the whole of v1's control lever.
+//
+// Nowhere else. A card dropped straight onto a deploy stage would be a deploy
+// nobody reviewed; the pipeline is human-authored ahead of time, not steered
+// card by card.
+const queueOf = el => el.closest(".queue[data-stage]")?.dataset.stage;
+const stageBy = name => (state?.stages || []).find(st => st.name === name);
+const startable = (from, into) => {
+  const first = (state?.stages || [])[0];
+  if (!first || from !== first.name) return false;
+  return !!into && stageBy(from)?.next === into;
+};
+
+// A refusal belongs on the card that was dropped, not in a console: an operator
+// who sees nothing happen concludes the board is broken.
+const refusals = new Map();
+function refuse(id, why) {
+  refusals.set(id, why);
+  draw();
+  setTimeout(() => { if (refusals.delete(id)) draw(); }, 8000);
+}
+
+async function startItem(id, stage) {
+  refusals.delete(id);
+  const res = await fetch(`/api/items/${encodeURIComponent(id)}/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stage }),
+  });
+  if (!res.ok) refuse(id, (await res.text()).trim() || `could not start ${id}`);
+}
+
+function wireQueue(q) {
+  const into = q.dataset.stage;
+  q.ondragover = e => {
+    if (!dragging || !startable(queueOf(dragging), into)) return;
+    e.preventDefault();
+    clearMarks();
+    q.classList.add("over-stage");
+  };
+  q.ondragleave = () => q.classList.remove("over-stage");
+  q.ondrop = e => {
+    if (!dragging || !startable(queueOf(dragging), into)) return;
+    e.preventDefault();
+    clearMarks();
+    startItem(dragging.dataset.id, into);
+  };
+}
+
 function wireDrag(el) {
   el.ondragstart = e => {
     dragging = el;
@@ -606,19 +668,21 @@ function wireDrag(el) {
     justDragged = true;
     setTimeout(() => justDragged = false, 0);
   };
+  // A card in another column is not a drop target of its own: the column is.
+  // Letting the event through to it is what makes dropping onto a full backlog's
+  // neighbour work the same as dropping onto an empty one.
+  const reorders = () => dragging && dragging !== el && queueOf(el) === queueOf(dragging);
   el.ondragover = e => {
-    if (!dragging || dragging === el) return;
-    // Only within a stage: moving between stages is a transition, which runs
-    // scripts and belongs to the engine, not to a drag.
-    if (el.dataset.stage !== dragging.dataset.stage) return;
+    if (!reorders()) return;
     e.preventDefault();
+    e.stopPropagation();
     clearMarks();
     el.classList.add(below(e, el) ? "over-after" : "over-before");
   };
   el.ondrop = e => {
-    if (!dragging || dragging === el) return;
-    if (el.dataset.stage !== dragging.dataset.stage) return;
+    if (!reorders()) return;
     e.preventDefault();
+    e.stopPropagation();
     el.parentNode.insertBefore(dragging, below(e, el) ? el.nextSibling : el);
     clearMarks();
     saveOrder();
@@ -630,8 +694,8 @@ const below = (e, el) => {
   return e.clientY > r.top + r.height / 2;
 };
 const clearMarks = () =>
-  document.querySelectorAll(".over-before,.over-after")
-    .forEach(n => n.classList.remove("over-before", "over-after"));
+  document.querySelectorAll(".over-before,.over-after,.over-stage")
+    .forEach(n => n.classList.remove("over-before", "over-after", "over-stage"));
 
 // Read the board back as one list. Stage order dominates and the drag decides
 // within a stage — an item further along the line should not be overtaken by
