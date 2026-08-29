@@ -562,10 +562,12 @@ func (c *Config) Validate() []string {
 	if c.Concurrency.PerStage < 1 {
 		add("concurrency.perStage must be at least 1, got %d", c.Concurrency.PerStage)
 	}
-	if c.Concurrency.PerSource != 1 {
-		// Not a style preference: a source maps to a git worktree, and two
-		// agents in one checkout corrupt each other.
-		add("concurrency.perSource must be 1 in v1 (got %d)", c.Concurrency.PerSource)
+	if c.Concurrency.PerSource < 1 {
+		// Above 1 is safe only because an item works in its own git worktree
+		// rather than in the source's checkout — see agents/_worktree. Two
+		// agents in one directory overwrite each other; two worktrees of one
+		// repository share only the object store, which git makes safe.
+		add("concurrency.perSource must be at least 1, got %d", c.Concurrency.PerSource)
 	}
 	if c.Concurrency.Global < 1 {
 		add("concurrency.global must be at least 1")

@@ -23,8 +23,11 @@ import (
 
 // Locks enforces concurrency along three axes at once.
 //
-//   - perSource is 1 and not configurable above it: a source maps to a git
-//     worktree, and two agents in one checkout corrupt each other.
+//   - perSource bounds how many items of one repository run at once. Above 1
+//     only because an item works in its own git worktree rather than in the
+//     source's checkout (agents/_worktree): two agents in one directory
+//     overwrite each other, two agents in two worktrees of one repository share
+//     only the object store, which git already makes safe.
 //   - perStage bounds how many items sit in one stage at a time. One means the
 //     pipeline behaves like a real line — a station works a single item, and
 //     the next waits — while different stations run at once.
@@ -35,25 +38,30 @@ import (
 // them all: holding one while waiting for another is how two schedulers
 // deadlock each other.
 type Locks struct {
-	mu       sync.Mutex
-	bySource map[string]bool
-	byStage  map[string]int
-	perStage int
-	global   chan struct{}
+	mu        sync.Mutex
+	bySource  map[string]int
+	byStage   map[string]int
+	perSource int
+	perStage  int
+	global    chan struct{}
 }
 
-func NewLocks(global, perStage int) *Locks {
+func NewLocks(global, perStage, perSource int) *Locks {
 	if global < 1 {
 		global = 1
 	}
 	if perStage < 1 {
 		perStage = 1
 	}
+	if perSource < 1 {
+		perSource = 1
+	}
 	return &Locks{
-		bySource: map[string]bool{},
-		byStage:  map[string]int{},
-		perStage: perStage,
-		global:   make(chan struct{}, global),
+		bySource:  map[string]int{},
+		byStage:   map[string]int{},
+		perSource: perSource,
+		perStage:  perStage,
+		global:    make(chan struct{}, global),
 	}
 }
 
@@ -61,11 +69,11 @@ func NewLocks(global, perStage int) *Locks {
 // Never blocks, so a busy source is skipped rather than queueing work behind it.
 func (l *Locks) TryAcquire(src, stage string) bool {
 	l.mu.Lock()
-	if l.bySource[src] || l.byStage[stage] >= l.perStage {
+	if l.bySource[src] >= l.perSource || l.byStage[stage] >= l.perStage {
 		l.mu.Unlock()
 		return false
 	}
-	l.bySource[src] = true
+	l.bySource[src]++
 	l.byStage[stage]++
 	l.mu.Unlock()
 
@@ -75,7 +83,7 @@ func (l *Locks) TryAcquire(src, stage string) bool {
 	default:
 		// The global cap is full; give back what was taken rather than hold it.
 		l.mu.Lock()
-		delete(l.bySource, src)
+		l.bySource[src]--
 		l.byStage[stage]--
 		l.mu.Unlock()
 		return false
@@ -88,12 +96,14 @@ func (l *Locks) TryAcquire(src, stage string) bool {
 func (l *Locks) Busy(src, stage string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.bySource[src] || l.byStage[stage] >= l.perStage
+	return l.bySource[src] >= l.perSource || l.byStage[stage] >= l.perStage
 }
 
 func (l *Locks) Release(src, stage string) {
 	l.mu.Lock()
-	delete(l.bySource, src)
+	if l.bySource[src] > 0 {
+		l.bySource[src]--
+	}
 	if l.byStage[stage] > 0 {
 		l.byStage[stage]--
 	}
@@ -170,7 +180,7 @@ type Engine struct {
 func New(cfg *config.Config, r *runner.Runner) *Engine {
 	e := &Engine{
 		cfg: cfg, runner: r,
-		locks:    NewLocks(cfg.Concurrency.Global, cfg.Concurrency.PerStage),
+		locks:    NewLocks(cfg.Concurrency.Global, cfg.Concurrency.PerStage, cfg.Concurrency.PerSource),
 		attempts: NewAttempts(),
 		clients:  map[string]*source.Client{},
 	}
