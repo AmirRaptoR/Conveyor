@@ -82,4 +82,22 @@ got=$(set -e; rc=3; record_model; echo "$rc")
 set -e
 chk "recording never changes the exit status" "$got" "3"
 
+# 9. nor does a write that fails. stdout is a pipe to the engine and writing to
+#    it can fail — the reader gone, the disk full — and that echo is the last
+#    command of an && list, so errexit takes its status and leaves before
+#    `return 0`. A run that did the work would be recorded as a failure because
+#    the line describing it could not be written. /dev/full is the only handy
+#    way to make a write fail on demand.
+if [[ -c /dev/full ]]; then
+	printf '%s\n' '{"type":"system","subtype":"init","model":"claude-sonnet-5"}' > "$CLAUDE_RAW"
+	set +e
+	# 2>/dev/null: the failing write is the point, so the shell's complaint
+	# about it is expected output, not a problem to show someone reading this.
+	got=$(set -e; rc=3; record_model >/dev/full 2>/dev/null; echo "$rc")
+	set -e
+	chk "a write that fails is not the verdict either" "$got" "3"
+else
+	echo "skip a write that fails is not the verdict either: no /dev/full"
+fi
+
 exit $fail

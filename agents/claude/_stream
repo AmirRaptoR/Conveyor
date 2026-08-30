@@ -56,7 +56,14 @@ claude_model() {
 record_model() {
 	local model
 	model=$(claude_model) || return 0
-	[[ -n "$model" && "$model" != "null" ]] && echo "model: $model"
+	[[ -n "$model" && "$model" != "null" ]] || return 0
+	# `|| true` is the whole of "it never fails": stdout here is a pipe to the
+	# engine, and a write to it can fail — the reader gone, the disk full. As
+	# the last command of an && list that echo is not exempt from errexit, so
+	# without this the adapter leaves on the note's status and never reaches
+	# `exit $rc`. A run that did the work would then be recorded as a failure
+	# because the line describing it could not be written.
+	echo "model: $model" || true
 	return 0
 }
 
