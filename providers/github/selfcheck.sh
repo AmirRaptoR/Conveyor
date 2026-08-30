@@ -57,7 +57,10 @@ cat <<'JSON'
   "url":"https://example.test/15","assignees":[]},
  {"number":17,"title":"Closed years ago, never ours","body":"","state":"CLOSED",
   "labels":[{"name":"bug"}],
-  "url":"https://example.test/17","assignees":[]}
+  "url":"https://example.test/17","assignees":[]},
+ {"number":21,"title":"Tagged, then closed by hand","body":"","state":"CLOSED",
+  "labels":[{"name":"conveyor"}],
+  "url":"https://example.test/21","assignees":[]}
 ]
 JSON
 STUB
@@ -114,6 +117,11 @@ check "a closed issue this pipeline labelled is still listed" \
 	"ready" "$(jq -r '.[] | select(.ref == "15") | .stage' "$tmp/out.json")"
 check "a closed issue it never labelled is left in history" \
 	"" "$(jq -r '.[] | select(.ref == "17") | .ref' "$tmp/out.json")"
+# The onboarding tag opens the door; it does not reopen a closed issue. A stage
+# label is what says the pipeline actually had this one, and without it a closed
+# issue wearing the tag would come back as new work every poll.
+check "the tag does not drag a closed issue back onto the board" \
+	"" "$(jq -r '.[] | select(.ref == "21") | .ref' "$tmp/out.json")"
 
 # --- move.sh: stage -> label writes ----------------------------------------
 # move.sh asks GitHub for the issue's current labels, so the stub answers that.
