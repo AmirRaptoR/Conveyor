@@ -66,21 +66,23 @@ PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/out.json" \
 
 check "maps a status label to its stage" \
 	"refining" "$(jq -r '.[0].stage' "$tmp/out.json")"
-check "unlabelled issue falls to DEFAULT_STAGE" \
-	"backlog" "$(jq -r '.[1].stage' "$tmp/out.json")"
+# Listing is opt-in. An issue nobody tagged is not conveyor's — not on the
+# board, not in a count, and no stage is ever run against it.
+check "an untagged issue is not listed at all" \
+	"" "$(jq -r '.[] | select(.ref == "9") | .ref' "$tmp/out.json")"
 check "priority:p0 becomes 0" \
 	"0" "$(jq -r '.[0].priority' "$tmp/out.json")"
 # null, not 0 — the model keeps "unranked" and "most urgent" distinct.
 check "no priority label stays null" \
-	"null" "$(jq -r '.[1].priority' "$tmp/out.json")"
+	"null" "$(jq -r '.[] | select(.ref == "11") | .priority' "$tmp/out.json")"
 check "id is source-qualified" \
 	"midgame:7" "$(jq -r '.[0].id' "$tmp/out.json")"
 # The mark is beside the stage, never instead of it: an unblocked issue must
 # resume where it stopped, which it cannot do if the stage was overwritten.
 check "the blocked label becomes a mark" \
-	"true" "$(jq -r '.[2].blocked' "$tmp/out.json")"
+	"true" "$(jq -r '.[] | select(.ref == "11") | .blocked' "$tmp/out.json")"
 check "a marked issue keeps the stage it stopped in" \
-	"in-progress" "$(jq -r '.[2].stage' "$tmp/out.json")"
+	"in-progress" "$(jq -r '.[] | select(.ref == "11") | .stage' "$tmp/out.json")"
 check "an unmarked issue is not blocked" \
 	"false" "$(jq -r '.[0].blocked' "$tmp/out.json")"
 
@@ -88,7 +90,7 @@ check "an unmarked issue is not blocked" \
 # one was never conveyor's and must not reach the board at all — not even in a
 # count, or "3 items" and three cards stop agreeing.
 check "an ignored issue is not listed at all" \
-	"4" "$(jq -r 'length' "$tmp/out.json")"
+	"3" "$(jq -r 'length' "$tmp/out.json")"
 check "and no ignored id survives" \
 	"" "$(jq -r '.[] | select(.ref == "13") | .id' "$tmp/out.json")"
 check "a stage label does not rescue an ignored issue" \
@@ -98,7 +100,7 @@ check "a stage label does not rescue an ignored issue" \
 PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/named.json" \
 	IGNORE_LABELS="wontfix, hold" ./list.sh 2>/dev/null
 check "a named ignore list replaces the default" \
-	"5" "$(jq -r 'length' "$tmp/named.json")"
+	"4" "$(jq -r 'length' "$tmp/named.json")"
 
 check "a closed issue this pipeline labelled is still listed" \
 	"ready" "$(jq -r '.[] | select(.ref == "15") | .stage' "$tmp/out.json")"

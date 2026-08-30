@@ -78,6 +78,11 @@ gh issue list --repo "$REPO" --state all --limit "${LIMIT:-200}" \
 			(.labels | map(.name)) as $names
 			| ([$names[] | $map[.] // empty] | .[0]) as $mapped
 			| select(any($ignored[]; . as $skip | $names | index($skip)) | not)
+			# Listing is opt-in: an issue belongs to the pipeline only
+			# because somebody said so with a label. An untagged issue is
+			# not on the board, not in a count, and no stage is ever run
+			# against it.
+			| select($mapped != null or ($names | index($blocked)) != null)
 			| select(((.state // "OPEN") | ascii_downcase) == "open" or $mapped != null)
 			| {
 				id:          "\($source):\(.number)",
