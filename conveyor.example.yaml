@@ -177,12 +177,49 @@ sources:
   #       BLOCKED_LABEL: blocked
   #   env:
   #     REPO: RaptoR-Soft/midgame
+  #     # A default for every stage of this repository. Script params layer over
+  #     # env:, so a stage that wants a different model just says so below.
+  #     MODEL: claude-sonnet-5
   #   scripts:
   #     refine:
   #       agent: claude
   #       params:
   #         ALLOWED_TOOLS: "Bash,Read,Glob,Grep"
   #         MAX_TURNS: "40"
+  #         # The expensive one, deliberately, and the only stage that gets it.
+  #         # Refinement writes the spec every later stage is judged against; a
+  #         # bad spec costs a whole implement + review cycle, which is more
+  #         # quota than the difference. This is where "cheaper is as good" is
+  #         # least likely to hold.
+  #         MODEL: claude-opus-5
   #         PROMPT: |
   #           Refine this issue until it is ready to implement.
   #           ...
+  #     implement:
+  #       agent: claude
+  #       params:
+  #         # Cheaper, with the large window kept. What this sets is the
+  #         # orchestrator of the TDD loop — the skill already fans the actual
+  #         # work out to its own sonnet and haiku subagents. The [1m] is the
+  #         # deliberate part: implement is the stage that runs long enough to
+  #         # want the window, and dropping it trades quota for running out of
+  #         # context mid-run, which is not a saving.
+  #         MODEL: claude-sonnet-5[1m]
+  #         PROMPT: "/implement $REF"
+  #     review:
+  #       agent: claude
+  #       params:
+  #         # Cheaper still: Codex is the reviewer here, and this side
+  #         # adjudicates its findings and merges. Judging a finding is a
+  #         # smaller job than producing one.
+  #         MODEL: claude-sonnet-5
+  #         PROMPT: "/review $REF"
+  #
+  # Leaving MODEL unset is a choice too, and the one this repository ships:
+  # every adapter then inherits whatever the operator's CLI is configured with,
+  # which today resolves to claude-opus-5[1m] — the most expensive tier, at the
+  # largest window, arrived at by default rather than by decision. The adapters
+  # will not pick for you; that opinion belongs here, where it can differ per
+  # repository. Whichever way it goes, each run writes the model it actually
+  # used into its log, so the choice can be checked against the blocked rate
+  # instead of argued about.
