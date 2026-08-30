@@ -30,6 +30,15 @@ LABEL_PREFIX="${LABEL_PREFIX:-conveyor:}"
 BLOCKED_LABEL="${BLOCKED_LABEL:-${LABEL_PREFIX}blocked}"
 IGNORE_LABELS="${IGNORE_LABELS:-${LABEL_PREFIX}ignore}"
 
+# The onboarding tag: the namespace word with its separator taken off, so
+# "conveyor:" gives "conveyor". Derived rather than configured, because it is
+# the same fact as LABEL_PREFIX and renaming one must rename the other.
+#
+# Outside the namespace on purpose. move.sh manages `${LABEL_PREFIX}*` by shape
+# and would take a tag inside it off at the first stage that maps to no label —
+# the issue would leave the board halfway through its own journey.
+ONBOARD_LABEL="${LABEL_PREFIX%[^[:alnum:]]}"
+
 # Ignoring is not blocking, and the difference is the whole point of having
 # both. A blocked issue is conveyor's, stopped, waiting for an answer, and it
 # comes back the moment the mark is cleared. An ignored issue was never
@@ -72,6 +81,7 @@ gh issue list --repo "$REPO" --state all --limit "${LIMIT:-200}" \
 	jq --arg source "$CONVEYOR_SOURCE" \
 		--arg default "$DEFAULT_STAGE" \
 		--arg blocked "$BLOCKED_LABEL" \
+		--arg onboard "$ONBOARD_LABEL" \
 		--argjson ignored "$ignored" \
 		--argjson map "$label_to_stage" '
 		map(
@@ -82,7 +92,9 @@ gh issue list --repo "$REPO" --state all --limit "${LIMIT:-200}" \
 			# because somebody said so with a label. An untagged issue is
 			# not on the board, not in a count, and no stage is ever run
 			# against it.
-			| select($mapped != null or ($names | index($blocked)) != null)
+			| select($mapped != null
+				or ($names | index($onboard)) != null
+				or ($names | index($blocked)) != null)
 			| select(((.state // "OPEN") | ascii_downcase) == "open" or $mapped != null)
 			| {
 				id:          "\($source):\(.number)",

@@ -49,6 +49,9 @@ cat <<'JSON'
  {"state":"OPEN","number":13,"title":"Mine, not the pipeline's","body":"",
   "labels":[{"name":"conveyor:ignore"},{"name":"status:ready"}],
   "url":"https://example.test/13","assignees":[]},
+ {"state":"OPEN","number":19,"title":"Handed to the pipeline","body":"",
+  "labels":[{"name":"conveyor"},{"name":"enhancement"}],
+  "url":"https://example.test/19","assignees":[]},
  {"number":15,"title":"Shipped and closed","body":"","state":"CLOSED",
   "labels":[{"name":"status:ready"}],
   "url":"https://example.test/15","assignees":[]},
@@ -70,6 +73,11 @@ check "maps a status label to its stage" \
 # board, not in a count, and no stage is ever run against it.
 check "an untagged issue is not listed at all" \
 	"" "$(jq -r '.[] | select(.ref == "9") | .ref' "$tmp/out.json")"
+# ...and the tag is the whole of onboarding. The bare namespace word, with no
+# stage named beside it, is how a person hands an issue over: it says "yours"
+# and nothing else, so the issue lands wherever new work lands.
+check "the bare tag onboards into DEFAULT_STAGE" \
+	"backlog" "$(jq -r '.[] | select(.ref == "19") | .stage' "$tmp/out.json")"
 check "priority:p0 becomes 0" \
 	"0" "$(jq -r '.[0].priority' "$tmp/out.json")"
 # null, not 0 — the model keeps "unranked" and "most urgent" distinct.
@@ -90,7 +98,7 @@ check "an unmarked issue is not blocked" \
 # one was never conveyor's and must not reach the board at all — not even in a
 # count, or "3 items" and three cards stop agreeing.
 check "an ignored issue is not listed at all" \
-	"3" "$(jq -r 'length' "$tmp/out.json")"
+	"4" "$(jq -r 'length' "$tmp/out.json")"
 check "and no ignored id survives" \
 	"" "$(jq -r '.[] | select(.ref == "13") | .id' "$tmp/out.json")"
 check "a stage label does not rescue an ignored issue" \
@@ -100,7 +108,7 @@ check "a stage label does not rescue an ignored issue" \
 PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/named.json" \
 	IGNORE_LABELS="wontfix, hold" ./list.sh 2>/dev/null
 check "a named ignore list replaces the default" \
-	"4" "$(jq -r 'length' "$tmp/named.json")"
+	"5" "$(jq -r 'length' "$tmp/named.json")"
 
 check "a closed issue this pipeline labelled is still listed" \
 	"ready" "$(jq -r '.[] | select(.ref == "15") | .stage' "$tmp/out.json")"
