@@ -100,8 +100,10 @@ has somewhere to put it — a comment, a field — should.
 
 What it does not emit does not exist: an item the lister filters out is not on
 the board, not in a count, and nothing will ever be run against it. That is the
-whole of the ignore mechanism — the GitHub provider takes `IGNORE_LABELS` and
-drops those issues here, and the engine never learns there is such a thing.
+whole of deciding what the pipeline works on, and it belongs to the script: the
+GitHub provider lists only the issues wearing one of its labels — a stage, the
+mark, or the bare onboarding tag — and the engine never learns that the others
+were there to skip.
 
 **`move`** — write a stage change *and the blocked mark* back to the provider
 (set a label, move a card, update a field). Called by the **engine**, never by a

@@ -137,16 +137,23 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
 - **`list` reads closed issues it labelled, and only those.** A finished item is
   a closed issue — the pull request says `Closes #N` — so listing open ones
   alone left the last stages empty: an item did not arrive in `done`, it
-  disappeared on the way. The asymmetry is deliberate: an *open* issue with no
-  stage label is new work and lands in `DEFAULT_STAGE`; a *closed* one with no
-  stage label was never conveyor's, and defaulting those onto the board would
-  bury the work under every issue the repository ever finished.
-- **Ignored is not blocked.** `IGNORE_LABELS` (a provider param, GitHub's
-  vocabulary) keeps an issue out of the listing entirely: it never reaches the
-  board, is never counted, and no stage is ever run against it. Blocked is
-  conveyor's item, stopped, waiting for an answer, and it comes back when the
-  mark is cleared. Ignored was never conveyor's. Filtering happens in `list`,
-  so the engine never learns the concept.
+  disappeared on the way. The asymmetry is deliberate: an *open* issue that was
+  handed over but carries no stage label yet is new work and lands in
+  `DEFAULT_STAGE`; a *closed* one with no stage label is finished, and letting
+  the onboarding tag alone put it back would re-list it as new work every poll.
+- **Listing is opt-in, and there is no way to opt out.** Three labels put an
+  issue on the board and nothing else does: a mapped stage label (the pipeline
+  put it there), the `BLOCKED_LABEL` (it stopped there), or the bare onboarding
+  tag — `LABEL_PREFIX` with its separator taken off, so `conveyor:` gives
+  `conveyor`. Everything else is left entirely alone: not on the board, not
+  counted, no stage ever run against it. There used to be an `IGNORE_LABELS`
+  opt-out, which was the wrong way round — it made every issue in a repository
+  conveyor's until someone said otherwise, so a repo could not be onboarded one
+  issue at a time. Saying nothing is now the opt-out, and a person can work an
+  issue by hand beside a running pipeline by simply not tagging it. The tag sits
+  *outside* the namespace on purpose: `move` manages `conveyor:*` by shape and
+  would strip a tag inside it at the first stage mapping to no label. Filtering
+  happens in `list`, so the engine never learns the concept.
 - **An un-onboarded repo is reported, never worked around.** Per-source problems
   disable that source and leave every other repo running. There is no shared
   fallback to inherit by accident.

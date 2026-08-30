@@ -97,21 +97,20 @@ check "a marked issue keeps the stage it stopped in" \
 check "an unmarked issue is not blocked" \
 	"false" "$(jq -r '.[0].blocked' "$tmp/out.json")"
 
-# Ignoring is not blocking. A blocked issue is conveyor's, stopped; an ignored
-# one was never conveyor's and must not reach the board at all — not even in a
-# count, or "3 items" and three cards stop agreeing.
-check "an ignored issue is not listed at all" \
-	"4" "$(jq -r 'length' "$tmp/out.json")"
-check "and no ignored id survives" \
-	"" "$(jq -r '.[] | select(.ref == "13") | .id' "$tmp/out.json")"
-check "a stage label does not rescue an ignored issue" \
-	"" "$(jq -r '.[] | select(.ref == "13") | .stage' "$tmp/out.json")"
+# There is no ignore list any more, because not listing is what happens by
+# default: an issue is left alone by saying nothing about it. The old opt-out
+# label is now an ordinary word a repository may keep or delete, and it decides
+# nothing — #13 is on the board because it wears a stage label, and that is the
+# only question asked of it.
+check "the old ignore label no longer keeps an issue off the board" \
+	"ready" "$(jq -r '.[] | select(.ref == "13") | .stage' "$tmp/out.json")"
 
-# Configurable, because the label is the repo's vocabulary and not the engine's.
+# The variable is gone, not merely defaulted: a config still setting it must not
+# quietly change what is listed.
 PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/named.json" \
-	IGNORE_LABELS="wontfix, hold" ./list.sh 2>/dev/null
-check "a named ignore list replaces the default" \
-	"5" "$(jq -r 'length' "$tmp/named.json")"
+	IGNORE_LABELS="status:ready, hold" ./list.sh 2>/dev/null
+check "IGNORE_LABELS is read by nothing" \
+	"$(jq -cS . "$tmp/out.json")" "$(jq -cS . "$tmp/named.json")"
 
 check "a closed issue this pipeline labelled is still listed" \
 	"ready" "$(jq -r '.[] | select(.ref == "15") | .stage' "$tmp/out.json")"
@@ -231,7 +230,7 @@ check "a different reason is still said" \
 # stage is renamed.
 echo "label namespace"
 (
-	unset BLOCKED_LABEL IGNORE_LABELS
+	unset BLOCKED_LABEL
 	export STAGE_LABELS='refining=conveyor:refining
 ready=conveyor:ready'
 	cat >"$tmp/stub/gh" <<'STUB'
@@ -243,7 +242,10 @@ cat <<'JSON'
   "url":"https://example.test/21","assignees":[]},
  {"number":23,"title":"Not ours","body":"","state":"OPEN",
   "labels":[{"name":"conveyor:ignore"}],
-  "url":"https://example.test/23","assignees":[]}
+  "url":"https://example.test/23","assignees":[]},
+ {"number":25,"title":"Handed over","body":"","state":"OPEN",
+  "labels":[{"name":"conveyor"}],
+  "url":"https://example.test/25","assignees":[]}
 ]
 JSON
 STUB
@@ -251,7 +253,14 @@ STUB
 		./list.sh 2>/dev/null
 	check "the mark defaults into the namespace" \
 		"true" "$(jq -r '.[] | select(.ref == "21") | .blocked' "$tmp/ns.json")"
-	check "ignore defaults into the namespace too" \
+	# The tag is the namespace word without its separator, so renaming the
+	# prefix renames the tag and there is no second key to keep in step.
+	check "the onboarding tag comes off the same prefix" \
+		"backlog" "$(jq -r '.[] | select(.ref == "25") | .stage' "$tmp/ns.json")"
+	# A label merely inside the namespace is not a way in. Three labels open the
+	# door — a stage, the mark, the tag — and anything else a repository invents
+	# under the prefix says nothing about whether this issue is the pipeline's.
+	check "a namespace label that is none of the three does not onboard" \
 		"" "$(jq -r '.[] | select(.ref == "23") | .ref' "$tmp/ns.json")"
 ) || fail=1
 
