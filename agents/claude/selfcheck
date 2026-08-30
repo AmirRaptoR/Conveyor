@@ -70,7 +70,16 @@ chk "and recorded on one line"          "$(record_model)" "model: claude-sonnet-
 : > "$CLAUDE_RAW"
 chk "no stream, no model"      "$(claude_model)" ""
 chk "no stream prints no line" "$(record_model)" ""
-rc=0; record_model || rc=$?
-chk "recording never changes the exit status" "$rc" "0"
+#    The shape the adapters use, exactly: bare, under set -e, with the run's
+#    own status already sitting in rc. Not `record_model || rc=$?` — an AND-OR
+#    list exempts the call from errexit, and bash carries that exemption into a
+#    command substitution as well, so a check written either of those ways
+#    cannot see the one thing that could go wrong. Hence set +e around a
+#    subshell that turns errexit back on. The status is non-zero for the same
+#    reason: a 0 survives being thrown away, so it proves nothing either.
+set +e
+got=$(set -e; rc=3; record_model; echo "$rc")
+set -e
+chk "recording never changes the exit status" "$got" "3"
 
 exit $fail
