@@ -129,11 +129,15 @@ sources:
     #       STAGE_LABELS: |
     #         refining=status:refining
     #       BLOCKED_LABEL: blocked
-    #       IGNORE_LABELS: conveyor:ignore
     #
-    # Three vocabularies, three keys, because they are three different facts:
-    # which label means which stage, which label means "stopped, needs a human",
-    # and which labels mean "not conveyor's work — never list this at all".
+    # Two vocabularies, two keys, because they are two different facts: which
+    # label means which stage, and which label means "stopped, needs a human".
+    #
+    # There is no key for "never list this", because listing is opt-in: an issue
+    # reaches the board only by wearing a stage label, the blocked mark, or the
+    # bare onboarding tag (LABEL_PREFIX without its separator — `conveyor`).
+    # Handing a repository over one issue at a time is labelling that issue;
+    # leaving one to a person is saying nothing about it.
     provider: mock
     workdir: .
 

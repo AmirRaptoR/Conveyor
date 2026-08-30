@@ -49,12 +49,18 @@ cat <<'JSON'
  {"state":"OPEN","number":13,"title":"Mine, not the pipeline's","body":"",
   "labels":[{"name":"conveyor:ignore"},{"name":"status:ready"}],
   "url":"https://example.test/13","assignees":[]},
+ {"state":"OPEN","number":19,"title":"Handed to the pipeline","body":"",
+  "labels":[{"name":"conveyor"},{"name":"enhancement"}],
+  "url":"https://example.test/19","assignees":[]},
  {"number":15,"title":"Shipped and closed","body":"","state":"CLOSED",
   "labels":[{"name":"status:ready"}],
   "url":"https://example.test/15","assignees":[]},
  {"number":17,"title":"Closed years ago, never ours","body":"","state":"CLOSED",
   "labels":[{"name":"bug"}],
-  "url":"https://example.test/17","assignees":[]}
+  "url":"https://example.test/17","assignees":[]},
+ {"number":21,"title":"Tagged, then closed by hand","body":"","state":"CLOSED",
+  "labels":[{"name":"conveyor"}],
+  "url":"https://example.test/21","assignees":[]}
 ]
 JSON
 STUB
@@ -66,44 +72,55 @@ PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/out.json" \
 
 check "maps a status label to its stage" \
 	"refining" "$(jq -r '.[0].stage' "$tmp/out.json")"
-check "unlabelled issue falls to DEFAULT_STAGE" \
-	"backlog" "$(jq -r '.[1].stage' "$tmp/out.json")"
+# Listing is opt-in. An issue nobody tagged is not conveyor's — not on the
+# board, not in a count, and no stage is ever run against it.
+check "an untagged issue is not listed at all" \
+	"" "$(jq -r '.[] | select(.ref == "9") | .ref' "$tmp/out.json")"
+# ...and the tag is the whole of onboarding. The bare namespace word, with no
+# stage named beside it, is how a person hands an issue over: it says "yours"
+# and nothing else, so the issue lands wherever new work lands.
+check "the bare tag onboards into DEFAULT_STAGE" \
+	"backlog" "$(jq -r '.[] | select(.ref == "19") | .stage' "$tmp/out.json")"
 check "priority:p0 becomes 0" \
 	"0" "$(jq -r '.[0].priority' "$tmp/out.json")"
 # null, not 0 — the model keeps "unranked" and "most urgent" distinct.
 check "no priority label stays null" \
-	"null" "$(jq -r '.[1].priority' "$tmp/out.json")"
+	"null" "$(jq -r '.[] | select(.ref == "11") | .priority' "$tmp/out.json")"
 check "id is source-qualified" \
 	"midgame:7" "$(jq -r '.[0].id' "$tmp/out.json")"
 # The mark is beside the stage, never instead of it: an unblocked issue must
 # resume where it stopped, which it cannot do if the stage was overwritten.
 check "the blocked label becomes a mark" \
-	"true" "$(jq -r '.[2].blocked' "$tmp/out.json")"
+	"true" "$(jq -r '.[] | select(.ref == "11") | .blocked' "$tmp/out.json")"
 check "a marked issue keeps the stage it stopped in" \
-	"in-progress" "$(jq -r '.[2].stage' "$tmp/out.json")"
+	"in-progress" "$(jq -r '.[] | select(.ref == "11") | .stage' "$tmp/out.json")"
 check "an unmarked issue is not blocked" \
 	"false" "$(jq -r '.[0].blocked' "$tmp/out.json")"
 
-# Ignoring is not blocking. A blocked issue is conveyor's, stopped; an ignored
-# one was never conveyor's and must not reach the board at all — not even in a
-# count, or "3 items" and three cards stop agreeing.
-check "an ignored issue is not listed at all" \
-	"4" "$(jq -r 'length' "$tmp/out.json")"
-check "and no ignored id survives" \
-	"" "$(jq -r '.[] | select(.ref == "13") | .id' "$tmp/out.json")"
-check "a stage label does not rescue an ignored issue" \
-	"" "$(jq -r '.[] | select(.ref == "13") | .stage' "$tmp/out.json")"
+# There is no ignore list any more, because not listing is what happens by
+# default: an issue is left alone by saying nothing about it. The old opt-out
+# label is now an ordinary word a repository may keep or delete, and it decides
+# nothing — #13 is on the board because it wears a stage label, and that is the
+# only question asked of it.
+check "the old ignore label no longer keeps an issue off the board" \
+	"ready" "$(jq -r '.[] | select(.ref == "13") | .stage' "$tmp/out.json")"
 
-# Configurable, because the label is the repo's vocabulary and not the engine's.
+# The variable is gone, not merely defaulted: a config still setting it must not
+# quietly change what is listed.
 PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/named.json" \
-	IGNORE_LABELS="wontfix, hold" ./list.sh 2>/dev/null
-check "a named ignore list replaces the default" \
-	"5" "$(jq -r 'length' "$tmp/named.json")"
+	IGNORE_LABELS="status:ready, hold" ./list.sh 2>/dev/null
+check "IGNORE_LABELS is read by nothing" \
+	"$(jq -cS . "$tmp/out.json")" "$(jq -cS . "$tmp/named.json")"
 
 check "a closed issue this pipeline labelled is still listed" \
 	"ready" "$(jq -r '.[] | select(.ref == "15") | .stage' "$tmp/out.json")"
 check "a closed issue it never labelled is left in history" \
 	"" "$(jq -r '.[] | select(.ref == "17") | .ref' "$tmp/out.json")"
+# The onboarding tag opens the door; it does not reopen a closed issue. A stage
+# label is what says the pipeline actually had this one, and without it a closed
+# issue wearing the tag would come back as new work every poll.
+check "the tag does not drag a closed issue back onto the board" \
+	"" "$(jq -r '.[] | select(.ref == "21") | .ref' "$tmp/out.json")"
 
 # --- move.sh: stage -> label writes ----------------------------------------
 # move.sh asks GitHub for the issue's current labels, so the stub answers that.
@@ -213,7 +230,7 @@ check "a different reason is still said" \
 # stage is renamed.
 echo "label namespace"
 (
-	unset BLOCKED_LABEL IGNORE_LABELS
+	unset BLOCKED_LABEL
 	export STAGE_LABELS='refining=conveyor:refining
 ready=conveyor:ready'
 	cat >"$tmp/stub/gh" <<'STUB'
@@ -225,7 +242,10 @@ cat <<'JSON'
   "url":"https://example.test/21","assignees":[]},
  {"number":23,"title":"Not ours","body":"","state":"OPEN",
   "labels":[{"name":"conveyor:ignore"}],
-  "url":"https://example.test/23","assignees":[]}
+  "url":"https://example.test/23","assignees":[]},
+ {"number":25,"title":"Handed over","body":"","state":"OPEN",
+  "labels":[{"name":"conveyor"}],
+  "url":"https://example.test/25","assignees":[]}
 ]
 JSON
 STUB
@@ -233,7 +253,14 @@ STUB
 		./list.sh 2>/dev/null
 	check "the mark defaults into the namespace" \
 		"true" "$(jq -r '.[] | select(.ref == "21") | .blocked' "$tmp/ns.json")"
-	check "ignore defaults into the namespace too" \
+	# The tag is the namespace word without its separator, so renaming the
+	# prefix renames the tag and there is no second key to keep in step.
+	check "the onboarding tag comes off the same prefix" \
+		"backlog" "$(jq -r '.[] | select(.ref == "25") | .stage' "$tmp/ns.json")"
+	# A label merely inside the namespace is not a way in. Three labels open the
+	# door — a stage, the mark, the tag — and anything else a repository invents
+	# under the prefix says nothing about whether this issue is the pipeline's.
+	check "a namespace label that is none of the three does not onboard" \
 		"" "$(jq -r '.[] | select(.ref == "23") | .ref' "$tmp/ns.json")"
 ) || fail=1
 

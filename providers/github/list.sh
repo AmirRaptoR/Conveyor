@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# GitHub provider: open issues in $REPO, as conveyor items.
+# GitHub provider: the issues in $REPO somebody handed to the pipeline, as
+# conveyor items.
+#
+# Listing is opt-in. An issue is conveyor's because it wears a label saying so —
+# the onboarding tag, a stage label, or the mark — and an issue nobody labelled
+# is left entirely alone: not on the board, not in a count, and no stage is ever
+# run against it. There is no opt-out label, because saying nothing is the
+# opt-out, and a repository can open an issue and work it by hand while the
+# pipeline runs beside it.
 #
 # Env (from the source's env: block):
 #   REPO           owner/name — required
@@ -15,12 +23,8 @@
 #                  (default: ${LABEL_PREFIX}blocked). It is a mark, not a stage:
 #                  an issue wearing it keeps whatever stage label it stopped on,
 #                  and the scheduler leaves it alone.
-#   IGNORE_LABELS  labels that mean "not conveyor's work", one per line or comma
-#                  separated (default: ${LABEL_PREFIX}ignore). An issue wearing one is
-#                  never listed, so it never reaches the board and nothing is
-#                  ever run against it — the way to open an issue and work it by
-#                  hand while the pipeline is running.
-#   DEFAULT_STAGE  where an issue carrying no mapped label lands (default: backlog)
+#   DEFAULT_STAGE  where an onboarded issue carrying no mapped label lands
+#                  (default: backlog)
 #   LIMIT          max issues to fetch (default: 200)
 set -euo pipefail
 
@@ -28,18 +32,15 @@ set -euo pipefail
 DEFAULT_STAGE="${DEFAULT_STAGE:-backlog}"
 LABEL_PREFIX="${LABEL_PREFIX:-conveyor:}"
 BLOCKED_LABEL="${BLOCKED_LABEL:-${LABEL_PREFIX}blocked}"
-IGNORE_LABELS="${IGNORE_LABELS:-${LABEL_PREFIX}ignore}"
 
-# Ignoring is not blocking, and the difference is the whole point of having
-# both. A blocked issue is conveyor's, stopped, waiting for an answer, and it
-# comes back the moment the mark is cleared. An ignored issue was never
-# conveyor's: it is not on the board, it is not counted, and no stage will ever
-# be run against it.
-ignored=$(
-	printf '%s\n' "$IGNORE_LABELS" |
-		jq -R -s 'split("\n") | map(split(",")) | flatten
-			| map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))'
-)
+# The onboarding tag: the namespace word with its separator taken off, so
+# "conveyor:" gives "conveyor". Derived rather than configured, because it is
+# the same fact as LABEL_PREFIX and renaming one must rename the other.
+#
+# Outside the namespace on purpose. move.sh manages `${LABEL_PREFIX}*` by shape
+# and would take a tag inside it off at the first stage that maps to no label —
+# the issue would leave the board halfway through its own journey.
+ONBOARD_LABEL="${LABEL_PREFIX%[^[:alnum:]]}"
 
 # STAGE_LABELS is written stage=label because that is the direction move.sh
 # needs. Listing needs the reverse, so invert it here into {label: stage}.
@@ -63,21 +64,25 @@ echo "listing issues in $REPO" >&2
 # way, and a board whose final column is always empty cannot be read as
 # finishing anything.
 #
-# The asymmetry below is deliberate. An open issue with no stage label is new
-# work and lands in DEFAULT_STAGE; a *closed* one with no stage label was never
-# conveyor's — it is every issue the repository ever finished, and defaulting
-# those onto the board would bury the work in history.
+# The asymmetry below is deliberate. An open issue that was handed over but has
+# no stage label yet is new work and lands in DEFAULT_STAGE; a *closed* one with
+# no stage label is finished, and letting the tag alone put it back on the board
+# would re-list it as new work on every poll.
 gh issue list --repo "$REPO" --state all --limit "${LIMIT:-200}" \
 	--json number,title,body,labels,url,assignees,state |
 	jq --arg source "$CONVEYOR_SOURCE" \
 		--arg default "$DEFAULT_STAGE" \
 		--arg blocked "$BLOCKED_LABEL" \
-		--argjson ignored "$ignored" \
+		--arg onboard "$ONBOARD_LABEL" \
 		--argjson map "$label_to_stage" '
 		map(
 			(.labels | map(.name)) as $names
 			| ([$names[] | $map[.] // empty] | .[0]) as $mapped
-			| select(any($ignored[]; . as $skip | $names | index($skip)) | not)
+			# Opt-in, and these are the three ways in: the pipeline put
+			# it here, a person handed it over, or it stopped.
+			| select($mapped != null
+				or ($names | index($onboard)) != null
+				or ($names | index($blocked)) != null)
 			| select(((.state // "OPEN") | ascii_downcase) == "open" or $mapped != null)
 			| {
 				id:          "\($source):\(.number)",
@@ -100,8 +105,4 @@ gh issue list --repo "$REPO" --state all --limit "${LIMIT:-200}" \
 			}
 		)' >"$CONVEYOR_RESULT"
 
-skipping=""
-if [[ -n "$IGNORE_LABELS" ]]; then
-	skipping=", ignoring $(jq -r 'join(", ")' <<<"$ignored")"
-fi
-echo "listed $(jq length "$CONVEYOR_RESULT") item(s)$skipping" >&2
+echo "listed $(jq length "$CONVEYOR_RESULT") item(s) (tag an issue $ONBOARD_LABEL to hand it over)" >&2
