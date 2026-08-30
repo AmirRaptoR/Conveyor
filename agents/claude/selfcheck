@@ -53,4 +53,51 @@ agent_asked
 chk "no session leaves the file alone" "$(jq -r '.session // "none"' "$CONVEYOR_RESULT")" "none"
 chk "and it is still a question"       "$(jq -r .asked "$CONVEYOR_RESULT")" "true"
 
+# 7. the model that actually ran is read out of the raw stream, first one wins,
+#    and recorded as one line. Not an echo of $MODEL: with MODEL unset the CLI
+#    picks, and that is the case worth writing down.
+printf '%s\n' \
+	'{"type":"system","subtype":"init","model":"claude-sonnet-5[1m]"}' \
+	'{"type":"assistant"}' \
+	'{"type":"system","subtype":"init","model":"claude-haiku-4-5"}' > "$CLAUDE_RAW"
+MODEL="claude-opus-5"  # what was asked for; the stream says what actually ran
+chk "the model is read from the stream" "$(claude_model)" "claude-sonnet-5[1m]"
+chk "and recorded on one line"          "$(record_model)" "model: claude-sonnet-5[1m]"
+
+# 8. no events — STREAM=0, or a run that died before the first one. Nothing is
+#    printed rather than an empty model: line, and the exit status is untouched,
+#    because the adapter's own status is the run's verdict.
+: > "$CLAUDE_RAW"
+chk "no stream, no model"      "$(claude_model)" ""
+chk "no stream prints no line" "$(record_model)" ""
+#    The shape the adapters use, exactly: bare, under set -e, with the run's
+#    own status already sitting in rc. Not `record_model || rc=$?` — an AND-OR
+#    list exempts the call from errexit, and bash carries that exemption into a
+#    command substitution as well, so a check written either of those ways
+#    cannot see the one thing that could go wrong. Hence set +e around a
+#    subshell that turns errexit back on. The status is non-zero for the same
+#    reason: a 0 survives being thrown away, so it proves nothing either.
+set +e
+got=$(set -e; rc=3; record_model; echo "$rc")
+set -e
+chk "recording never changes the exit status" "$got" "3"
+
+# 9. nor does a write that fails. stdout is a pipe to the engine and writing to
+#    it can fail — the reader gone, the disk full — and that echo is the last
+#    command of an && list, so errexit takes its status and leaves before
+#    `return 0`. A run that did the work would be recorded as a failure because
+#    the line describing it could not be written. /dev/full is the only handy
+#    way to make a write fail on demand.
+if [[ -c /dev/full ]]; then
+	printf '%s\n' '{"type":"system","subtype":"init","model":"claude-sonnet-5"}' > "$CLAUDE_RAW"
+	set +e
+	# 2>/dev/null: the failing write is the point, so the shell's complaint
+	# about it is expected output, not a problem to show someone reading this.
+	got=$(set -e; rc=3; record_model >/dev/full 2>/dev/null; echo "$rc")
+	set -e
+	chk "a write that fails is not the verdict either" "$got" "3"
+else
+	echo "skip a write that fails is not the verdict either: no /dev/full"
+fi
+
 exit $fail

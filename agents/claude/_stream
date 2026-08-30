@@ -31,6 +31,42 @@ claude_session() {
 	jq -r 'select(.session_id != null) | .session_id' "$CLAUDE_RAW" 2>/dev/null | head -1
 }
 
+# claude_model prints the model this run actually used, or nothing.
+#
+# The resolved one, out of the run's own init event — never an echo of $MODEL,
+# because the case worth writing down is $MODEL unset, where the CLI picks and
+# nothing anywhere records what it picked. Nothing is a normal answer, for the
+# same reason claude_session gives one: STREAM=0 produces no events.
+claude_model() {
+	[[ -s "$CLAUDE_RAW" ]] || return 0
+	jq -r 'select(.type == "system" and .subtype == "init") | .model' "$CLAUDE_RAW" 2>/dev/null | head -1
+}
+
+# record_model writes that model to the log, on a line of its own.
+#
+# For people and for grep over run history — which is the whole point: "is the
+# cheaper model as good" is a question about the blocked rate per stage per
+# model, and none of it is answerable while the model is only ever in a
+# temporary file this script deletes on the way out.
+#
+# It is stdout, so it is logs, and CONTRACTS §2 says the engine never parses
+# those: the engine learns nothing about models from this and must not.
+# It never fails, because the adapter's exit status is the run's verdict and a
+# note about the run has no business changing it.
+record_model() {
+	local model
+	model=$(claude_model) || return 0
+	[[ -n "$model" && "$model" != "null" ]] || return 0
+	# `|| true` is the whole of "it never fails": stdout here is a pipe to the
+	# engine, and a write to it can fail — the reader gone, the disk full. As
+	# the last command of an && list that echo is not exempt from errexit, so
+	# without this the adapter leaves on the note's status and never reaches
+	# `exit $rc`. A run that did the work would then be recorded as a failure
+	# because the line describing it could not be written.
+	echo "model: $model" || true
+	return 0
+}
+
 # resume_prompt <payload> <prompt> — what to actually send, given that a person
 # may have answered the question this stage stopped on last time.
 #

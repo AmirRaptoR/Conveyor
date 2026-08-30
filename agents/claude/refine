@@ -75,6 +75,10 @@ MAX_TURNS="${MAX_TURNS:-40}" \
 rc=$?
 set -e
 
+# What ran, said once in the log. Here rather than beside each exit, because a
+# run stopped by a usage limit is exactly the one the measurement is about.
+record_model
+
 # Out of quota is not a fault of the item, and must not read like one: without
 # this the run ends having done nothing and the next check reports whatever it
 # failed to find, which is how "no open PR references #49" came to mean "the
