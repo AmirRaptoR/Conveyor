@@ -30,8 +30,11 @@ type Config struct {
 	// decision and clearing it would just spend an agent to be told again.
 	RetryStalled Duration `yaml:"retryStalled"`
 	Logs         Logs     `yaml:"logs"`
-	Stages       []Stage  `yaml:"stages"`
-	Sources      []Source `yaml:"sources"`
+	// Auth is who may open the board. Empty is allowed only on loopback; see
+	// internal/config/auth.go and Server.Run.
+	Auth    Auth     `yaml:"auth"`
+	Stages  []Stage  `yaml:"stages"`
+	Sources []Source `yaml:"sources"`
 
 	// Agents is where agent folders live, resolved like Providers.
 	Agents string `yaml:"agents"`
@@ -578,6 +581,7 @@ func (c *Config) Validate() []string {
 	if c.Version != 1 {
 		add("version must be 1, got %d", c.Version)
 	}
+	errs = append(errs, c.Auth.validate()...)
 	if c.Concurrency.PerStage < 1 {
 		add("concurrency.perStage must be at least 1, got %d", c.Concurrency.PerStage)
 	}

@@ -31,6 +31,16 @@ be able to stop every source being listed.
 `internal/store` holds the persisted manual input order — v1's only human
 control lever — and the data directory's owner lock.
 
+Basic auth is in the app (`auth:` in the config, `conveyor passwd <name>` to
+mint a line), not in a proxy in front of it: the nginx that used to do it was a
+second server, a second config file and a second password store for one line of
+behaviour. Only hashes go in the config — pbkdf2-sha256, parameters carried in
+each line so the cost can be raised later without invalidating them — and a
+plaintext password there is a load error, not a warning. **Serving a
+non-loopback address with no `auth.users` is refused**, because the board starts
+agent runs, reorders work and hands items back: reaching it is enough to drive
+every repository the config enrols.
+
 Not built yet: the log retention sweep (`logs.retention`, with the pinning rule
 in CONTRACTS §6). See `docs/DESIGN.md`.
 

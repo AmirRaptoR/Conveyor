@@ -68,6 +68,36 @@ Without the key, `providers/` is looked for beside the config file.
 You should see items advance in priority order, one blocked item routed out of
 the pipeline, and then `nothing to do`.
 
+### Serving the board
+
+`conveyor serve` runs the pipeline and renders it. On your own machine that is
+all there is to it:
+
+```bash
+./conveyor serve -c conveyor.yaml -addr 127.0.0.1:8090
+```
+
+Anywhere else, put a password on it. The board is a control plane — it starts
+agent runs, reorders work and hands marked items back — so **serving a
+non-loopback address with no `auth.users` is refused**, not warned about:
+
+```bash
+./conveyor passwd amir      # prompts twice, prints the block to paste
+```
+
+```yaml
+auth:
+  realm: conveyor
+  users:
+    amir: "pbkdf2-sha256$600000$…$…"
+```
+
+Only hashes go in the config; a plaintext password there is a load error. Each
+line carries its own parameters, so the cost can be raised later without
+invalidating the lines already written. Auth is in the app rather than in a
+proxy in front of it because a proxy was a second server, a second config file
+and a second password store for one line of behaviour.
+
 ## Configuration
 
 ```yaml

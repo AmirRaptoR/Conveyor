@@ -3,11 +3,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -40,6 +42,8 @@ func main() {
 		err = cmdTick(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "passwd":
+		err = cmdPasswd(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -63,6 +67,8 @@ func usage() {
   tick      [-source NAME] [-n N]       one scheduling pass: pick and advance
   serve     [-addr :8080] [-watch]      run the pipeline; board, live logs,
                                         run history. -watch observes only
+  passwd    <name>                      hash a password for the config's
+                                        auth.users block
   
 Common flags:
   -c <config>       path to the config (default conveyor.yaml). Stage scripts
@@ -389,4 +395,72 @@ func cmdServe(args []string) error {
 	}
 	defer release()
 	return server.New(cfg, r).Run(ctx, server.Addr(*addr), !*watch)
+}
+
+// cmdPasswd mints one line for the config's auth.users block.
+//
+// It exists so a password never has to be typed into the config in the clear:
+// the file is read by whoever can read the directory, and lives in every backup
+// of it. The hash carries its own parameters, so raising the cost later does
+// not invalidate the lines already written.
+func cmdPasswd(args []string) error {
+	fs := flag.NewFlagSet("passwd", flag.ExitOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	user := fs.Arg(0)
+	if user == "" {
+		return fmt.Errorf("usage: conveyor passwd <name>")
+	}
+
+	pass, err := readSecret("password: ")
+	if err != nil {
+		return err
+	}
+	if pass == "" {
+		return fmt.Errorf("an empty password is not a password")
+	}
+	again, err := readSecret("again: ")
+	if err != nil {
+		return err
+	}
+	if pass != again {
+		return fmt.Errorf("they do not match")
+	}
+
+	hash, err := config.Hash(pass)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\nauth:\n  users:\n    %s: %q\n", user, hash)
+	return nil
+}
+
+// stdin is read through one buffered reader for the whole process. A fresh
+// bufio.Reader per prompt reads ahead and throws away what it did not return,
+// so the second prompt of a piped `printf 'pw\npw\n' | conveyor passwd amir`
+// saw EOF and the two never matched.
+var stdin = bufio.NewReader(os.Stdin)
+
+// readSecret reads one line without echoing it, when there is a terminal to
+// turn the echo off on. Piped input is read as it comes: a password arriving on
+// stdin was never on screen to hide.
+func readSecret(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	defer fmt.Fprintln(os.Stderr)
+
+	if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		stty := func(arg string) {
+			c := exec.Command("stty", arg)
+			c.Stdin = os.Stdin
+			_ = c.Run() // no stty, no echo suppression; the read still works
+		}
+		stty("-echo")
+		defer stty("echo")
+	}
+	line, err := stdin.ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
 }

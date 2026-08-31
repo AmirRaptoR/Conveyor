@@ -11,6 +11,25 @@ version: 1
 #
 #   providers: ~/codes/Conveyor/providers
 
+# Who may open the board. Omit it entirely and the board is open — which is
+# fine, and refused on anything but a loopback address, because the board is a
+# control plane: it starts agent runs, reorders work and hands items back.
+#
+# There is no plaintext form on purpose. A password written here is a password
+# in every backup of this file and in every `cat` of it, so the only thing that
+# goes in is a hash:
+#
+#   conveyor passwd amir      # prints the block below, ready to paste
+#
+# This replaced a reverse proxy doing basic auth in front of the process — a
+# second server, a second config and a second password store for one line of
+# behaviour.
+#
+# auth:
+#   realm: conveyor
+#   users:
+#     amir: "pbkdf2-sha256$600000$<salt>$<key>"
+
 concurrency:
   perSource: 1        # fixed at 1: a source maps to a git worktree, and two
                       # agents in one checkout corrupt each other. See §5.
