@@ -238,6 +238,36 @@ Anything with real logic wants to be a file, where a shell can check it and a
 person can run it by hand. The body is written into the run directory, so the
 exact text that ran is archived with its own logs.
 
+### Onboarding a GitHub repository
+
+Every label the pipeline needs, in one command — the stage labels, the mark, the
+onboarding tag and one per kind of stop:
+
+```bash
+REPO=owner/name STAGE_LABELS="$(…the source's provider params…)" \
+  providers/github/onboard.sh
+```
+
+Running it twice changes nothing, and it never overwrites an existing label's
+colour or description — someone may have recoloured one on purpose. Labels are
+also created lazily as they are first needed, so this is a convenience, not a
+prerequisite.
+
+Then tag an issue with the bare namespace word (`conveyor`) to hand it over.
+Listing is opt-in and there is no way to opt out: an issue nobody tagged was
+never the pipeline's.
+
+### Merging is a gate, not a judgement
+
+`review` ends when a pull request exists. The `approving` stage after it waits
+for that PR to settle and merges it only when every gate passes — no hold, not a
+draft, no conflict, checks green, no unresolved review threads, and quiet for
+`QUIET_SECONDS`. Any activity resets the clock, so there is always a window in
+which a comment can change the outcome.
+
+It never sleeps: an item resting in a script stage has that script re-run every
+poll, so waiting is exit 10, not a blocked process holding a slot.
+
 ## Writing a provider
 
 A provider is a folder under `providers/` holding one script per verb:

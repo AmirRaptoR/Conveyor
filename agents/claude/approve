@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+# The `approving` stage: wait for a pull request to settle, then merge it.
+#
+# review's job ends once a PR exists; this is the gate that decides when it is
+# safe to land. It is re-run on every poll while the item sits in `approving`
+# (CONTRACTS §2 — exit 10 is "leave it, try again next poll"), so it must never
+# sleep: a script that blocks holds one of the four global slots for however
+# long it waits, and dies with the engine on every restart. A quiet PR is a
+# handful of `gh`/GraphQL reads and nothing else — the model runs only when
+# there is an unresolved conversation to address (gate 11 below).
+#
+# Config (source env: + this script's params:):
+#   REPO             owner/name — required
+#   QUIET_SECONDS    how long the PR must be quiet before it merges (default
+#                     600). A non-integer or negative value falls back to the
+#                     default and says so on stderr. 0 is valid, so the gate
+#                     can be exercised without waiting.
+#   PROMPT           what to tell the model when addressing review threads.
+#   ALLOWED_TOOLS, MODEL, MAX_TURNS, PERMISSION_MODE — passed to run_claude.
+#
+# The gate, in precedence order (numbers referenced throughout in comments and
+# in the issue that specified this script):
+#
+#   1. a gh/GraphQL call failed              -> exit 10  (try again next poll)
+#   2. no PR closes the issue                -> exit 20  (input)
+#   3. two or more PRs close it              -> exit 20  (input)
+#   4. PR merged already                     -> exit 0   (drop worktree, move on)
+#   5. PR closed unmerged                    -> exit 20  (decision)
+#   6. hold on the PR (or the issue)         -> exit 20  (human-review)
+#   7. PR is a draft                         -> exit 10
+#   8. mergeable is CONFLICTING              -> exit 20  (conflict)
+#   9. a check failed                        -> exit 20  (checks)
+#  10. a check is still running              -> exit 10
+#  11. an unresolved thread it has not answered -> address, test, push, reply,
+#      resolve -> exit 10
+#  12. an unresolved thread it already answered -> exit 20  (decision)
+#  13. now - base < QUIET_SECONDS            -> exit 10
+#  14. otherwise -> refetch 4-12, then merge -> exit 0
+#
+# Merge gates, all required: no hold, not a draft, no conflict, checks green,
+# no unresolved review threads, quiet for QUIET_SECONDS. Any activity resets
+# the clock (see `base`, below), so the total wait is unbounded by design:
+# while review is still happening, the clock should keep giving it room.
+set -euo pipefail
+
+source "$(dirname "$0")/_stream"
+source "$(dirname "$0")/../_blocked"
+source "$(dirname "$0")/../_worktree"
+
+: "${REPO:?REPO is required (set it in the source env: block)}"
+: "${PROMPT:?PROMPT is required (set it in this script params: block)}"
+
+LABEL_PREFIX="${LABEL_PREFIX:-conveyor:}"
+BLOCKED_LABEL="${BLOCKED_LABEL:-${LABEL_PREFIX}blocked}"
+APPROVING_LABEL="${LABEL_PREFIX}approving"
+owner="${REPO%%/*}"
+name="${REPO##*/}"
+
+# The reply that marks a thread as already addressed. Fixed and invisible on
+# GitHub, durable in the API — the whole of "did the script already answer
+# this?" lives in whether the newest comment in the thread carries it, which
+# needs no store of its own (see the issue's technical note 5).
+SENTINEL='<!-- conveyor:approve -->'
+
+raw_quiet="${QUIET_SECONDS:-600}"
+if [[ "$raw_quiet" =~ ^[0-9]+$ ]]; then
+	QUIET="$raw_quiet"
+else
+	echo "QUIET_SECONDS='$raw_quiet' is not a non-negative integer; using the default 600" >&2
+	QUIET=600
+fi
+
+payload=$(cat)
+ref=$(jq -r '.item.ref' <<<"$payload")
+title=$(jq -r '.item.title' <<<"$payload")
+echo "approving $CONVEYOR_SOURCE #$ref — $title" >&2
+
+# gh_json <args...> — run a `gh` call that must return JSON. Any failure —
+# network, auth, malformed output — is gate 1: exit 10, not 1 and not 20. A
+# blip must not mark the item; the next poll retries, and the failure is named
+# on stderr so a person watching the log can tell it apart from a real stop.
+gh_json() {
+	local out
+	if ! out=$(gh "$@" 2>&1); then
+		echo "gh $* failed: $out" >&2
+		exit 10
+	fi
+	if ! jq -e . >/dev/null 2>&1 <<<"$out"; then
+		echo "gh $* returned something that is not JSON: $out" >&2
+		exit 10
+	fi
+	printf '%s' "$out"
+}
+
+# gh_do <args...> — run a `gh` call for its side effect. Same failure handling
+# as gh_json, minus the JSON check.
+gh_do() {
+	local out
+	if ! out=$(gh "$@" 2>&1); then
+		echo "gh $* failed: $out" >&2
+		exit 10
+	fi
+	printf '%s' "$out"
+}
+
+# wearing <label> <label-list-json> — exact match, as list.sh's own hold check
+# does. A bare "$BLOCKED_LABEL: <kind>" label is a different label and is not
+# a hold.
+wearing() { jq -e --arg l "$1" 'any(.[]; . == $l)' >/dev/null 2>&1 <<<"$2"; }
+
+# The PR is found by closing reference, never by `gh pr list --search`, which
+# matches substrings anywhere in the PR and silently takes the first hit
+# (agents/claude/review:34 has this weakness today; this script must not copy
+# it). --state all so a PR that has already merged, or one abandoned in an
+# earlier round of rework, is still visible to the checks below.
+discover_pr() {
+	local all matches active n_all n_active
+	all=$(gh_json pr list --repo "$REPO" --state all --limit 100 \
+		--json number,body,state,url)
+	matches=$(jq --arg ref "$ref" \
+		'[.[] | select(.body != null) | select(.body |
+			test("\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\b:?\\s*#" + $ref + "\\b"; "i"))]' \
+		<<<"$all")
+	n_all=$(jq 'length' <<<"$matches")
+	if [[ "$n_all" -eq 0 ]]; then
+		blocked input "no pull request closes issue #$ref, so there is nothing to approve."
+	fi
+
+	# A closed-and-abandoned PR from an earlier round does not count as an
+	# active candidate — only the one currently open, or already merged, does.
+	active=$(jq '[.[] | select(.state != "CLOSED")]' <<<"$matches")
+	n_active=$(jq 'length' <<<"$active")
+
+	if [[ "$n_active" -ge 2 ]]; then
+		local nums
+		nums=$(jq -r '[.[].number] | map("#\(.)") | join(" and ")' <<<"$active")
+		blocked input "more than one open pull request closes issue #$ref ($nums); resolve which one before this can proceed. It does not pick one."
+	fi
+
+	if [[ "$n_active" -eq 1 ]]; then
+		pr=$(jq -r '.[0].number' <<<"$active")
+		pr_state=$(jq -r '.[0].state' <<<"$active")
+	else
+		# Every match is CLOSED. Only one is expected here in practice; if more
+		# than one is closed-unmerged the newest is reported, which is enough
+		# to point a person at the right history without picking a winner.
+		pr=$(jq -r '.[0].number' <<<"$matches")
+		pr_state="CLOSED"
+	fi
+}
+
+# check_hold — a hold is `$BLOCKED_LABEL` worn on either object, fetched fresh
+# (never taken from the stdin payload, which is stale by up to a poll — see
+# providers/github/move.sh:27). Read off both because labels do not propagate
+# between an issue and its PR; taking it off the PR is what lets `move` write
+# it back onto the issue as the one place the mark lives (see the issue's
+# technical note 1).
+check_hold() {
+	local issue_labels pr_labels
+	issue_labels=$(gh_json issue view "$ref" --repo "$REPO" --json labels --jq '[.labels[].name]')
+	pr_labels=$(gh_json issue view "$pr" --repo "$REPO" --json labels --jq '[.labels[].name]')
+
+	if wearing "$BLOCKED_LABEL" "$pr_labels"; then
+		gh_do pr edit "$pr" --repo "$REPO" --remove-label "$BLOCKED_LABEL" >/dev/null
+		blocked human-review "a $BLOCKED_LABEL label on pull request #$pr is holding this for a human. Remove it to resume."
+	fi
+	if wearing "$BLOCKED_LABEL" "$issue_labels"; then
+		blocked human-review "a $BLOCKED_LABEL label on issue #$ref is holding this for a human. Remove it to resume."
+	fi
+}
+
+# fetch_details — everything the rest of the gate needs about the PR, in one
+# GraphQL call: draft state, mergeability, the aggregated check rollup (which
+# is already the single normalised enum this gate cares about — GitHub does
+# the per-check reconciliation, not this script), and every timestamp `base`
+# is computed from. reviewThreads and its per-thread comments each request
+# 100, the most `gh` will fetch in one page; a PR carrying more than that in
+# either dimension is vanishingly rare, and this is the safe failure mode for
+# it — deferring rather than silently working from a page that left something
+# out.
+fetch_details() {
+	details=$(gh_json api graphql -f query='
+		query($owner:String!, $name:String!, $number:Int!, $issue:Int!) {
+			repository(owner:$owner, name:$name) {
+				pullRequest(number:$number) {
+					isDraft
+					mergeable
+					headRefName
+					commits(last:1) {
+						nodes { commit { committedDate statusCheckRollup { state } } }
+					}
+					comments(last:100) { nodes { createdAt } }
+					reviews(last:100) { nodes { submittedAt } }
+					reviewThreads(first:100) {
+						pageInfo { hasNextPage }
+						nodes {
+							id
+							isResolved
+							comments(first:100) {
+								pageInfo { hasNextPage }
+								nodes { id body createdAt }
+							}
+						}
+					}
+				}
+			}
+		}' -F owner="$owner" -F name="$name" -F number="$pr" -F issue="$ref" --jq '.data.repository.pullRequest')
+
+	if [[ "$(jq -r '.reviewThreads.pageInfo.hasNextPage' <<<"$details")" == "true" ]] ||
+		jq -e '[.reviewThreads.nodes[].comments.pageInfo.hasNextPage] | any' >/dev/null 2>&1 <<<"$details"; then
+		echo "PR #$pr has more review threads or comments than fit in one page; deferring rather than working from an incomplete view" >&2
+		exit 10
+	fi
+}
+
+# base — the newest of the timestamps GitHub already keeps: the labelled
+# event that put this item in `approving`, the head commit, the newest
+# issue-style comment, the newest review, and the newest comment in any
+# review thread (which is what covers a thread being resolved — the reply
+# that resolves it is a comment in it). Stateless and restart-proof: the
+# script is re-run from scratch every poll, so nothing here can live in a
+# variable between runs.
+compute_base() {
+	local labelled_at commit_at comment_at review_at thread_at candidates
+	# gh_do, not gh_json: `--jq` reduces this to a bare timestamp or to nothing
+	# at all, and neither is JSON. Through gh_json the check would reject its
+	# own successful answer, defer, and the gate would never merge anything.
+	labelled_at=$(gh_do api "repos/$REPO/issues/$ref/timeline" --paginate \
+		--jq "[.[] | select(.event==\"labeled\" and .label.name==\"$APPROVING_LABEL\") | .created_at] | max // empty")
+	commit_at=$(jq -r '.commits.nodes[0].commit.committedDate // empty' <<<"$details")
+	comment_at=$(jq -r '[.comments.nodes[].createdAt] | max // empty' <<<"$details")
+	review_at=$(jq -r '[.reviews.nodes[].submittedAt] | max // empty' <<<"$details")
+	thread_at=$(jq -r '[.reviewThreads.nodes[].comments.nodes[].createdAt] | max // empty' <<<"$details")
+
+	base=0
+	for candidates in "$labelled_at" "$commit_at" "$comment_at" "$review_at" "$thread_at"; do
+		[[ -z "$candidates" ]] && continue
+		local epoch
+		epoch=$(date -u -d "$candidates" +%s 2>/dev/null) || continue
+		((epoch > base)) && base=$epoch
+	done
+
+	local now
+	now=$(date -u +%s)
+	# Clock skew, clamped rather than trusted: a `base` in the future would
+	# otherwise delay the merge indefinitely.
+	#
+	# Written as an `if` and not `((base > now)) && base=$now`: that form
+	# returns 1 when the condition is false, and as the last statement of a
+	# function under `set -e` it ends the run — on the ordinary path, where the
+	# clock is fine.
+	if ((base > now)); then
+		base=$now
+	fi
+}
+
+# check_status <rollup-state> — an explicit, total mapping from the
+# StatusCheckRollupState GraphQL already reduces every check to. An empty
+# rollup (no field at all — a repository with no CI) is green: it must still
+# be able to merge.
+check_status() {
+	case "$1" in
+	SUCCESS | SKIPPED | NEUTRAL | "" | null) return 0 ;;                   # green
+	FAILURE | ERROR | TIMED_OUT | CANCELLED | ACTION_REQUIRED) return 2 ;; # failed
+	PENDING | QUEUED | IN_PROGRESS | EXPECTED) return 1 ;;                 # waiting
+	*)
+		echo "unrecognised status check rollup state '$1'; treating it as not yet green" >&2
+		return 1
+		;;
+	esac
+}
+
+# run_tests — best effort. No source declares a test command today, so this
+# infers one from what the worktree looks like; a repository with none is not
+# an error, it just leans on gate 9/10 (CI) instead.
+run_tests() {
+	local wt=$1
+	if [[ -f "$wt/go.mod" ]]; then
+		(cd "$wt" && go test ./...)
+	elif [[ -f "$wt/package.json" ]]; then
+		(cd "$wt" && npm test --silent)
+	elif [[ -f "$wt/Makefile" ]] && grep -qE '^test:' "$wt/Makefile" 2>/dev/null; then
+		(cd "$wt" && make test)
+	else
+		echo "no test command could be inferred for this worktree; relying on CI (gate 9/10)" >&2
+	fi
+}
+
+# address_threads <unanswered-threads-json> — one model invocation for every
+# unresolved thread the script has not already replied to, never one per
+# thread. Runs in the item's own worktree, on the PR's branch. Exits 10 on
+# success; it never merges in the run that pushed a fix.
+address_threads() {
+	local threads=$1 head_ref before after thread_text full rc reply_body tid
+	head_ref=$(jq -r '.headRefName' <<<"$details")
+
+	local wt
+	wt=$(item_worktree "$CONVEYOR_SOURCE" "$ref" "$head_ref") ||
+		blocked worktree "could not prepare a worktree for #$ref on branch $head_ref."
+	cd "$wt"
+	before=$(git rev-parse HEAD)
+	echo "  worktree: $wt (branch $(git branch --show-current))" >&2
+
+	thread_text=$(jq -r '.[] |
+		"--- unresolved conversation ---\n" +
+		([.comments.nodes[] | "> " + .body] | join("\n\n")) + "\n"' <<<"$threads")
+
+	full="${PROMPT}
+
+--- the item, as the pipeline sees it ---
+Item #${ref} in ${REPO}: ${title}
+Pull request #${pr}
+--- end item ---
+
+Address every one of the unresolved conversations below on pull request #${pr}.
+For each, make the necessary change, or explain in your own commit message why
+none is needed. Commit and push your changes to the branch you are already on
+(${head_ref}) — do not open a new pull request, and do not change branch.
+
+${thread_text}"
+
+	full=$(resume_prompt "$payload" "$full")
+
+	set +e
+	MAX_TURNS="${MAX_TURNS:-40}" \
+		ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep}" \
+		run_claude "$full"
+	rc=$?
+	set -e
+	record_model
+
+	if hit_limit; then
+		blocked limit "the agent was out of quota and stopped before addressing the review threads on #$pr. Nothing is wrong with this item; it is waiting for the window to reset."
+	fi
+	if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
+		[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
+		agent_asked
+		echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
+		exit 20
+	fi
+	if [[ $rc -ne 0 ]]; then
+		blocked error "the agent exited $rc while addressing the review threads on #$pr."
+	fi
+
+	if [[ -n "$(git status --porcelain)" ]]; then
+		git add -A
+		git commit --quiet -m "Address review feedback on #$pr"
+	fi
+	after=$(git rev-parse HEAD)
+	if [[ "$after" == "$before" ]]; then
+		blocked no-output "the agent finished but made no change to address the review threads on #$pr."
+	fi
+
+	run_tests "$wt"
+
+	if ! git push origin "HEAD:$head_ref" 2>&1; then
+		blocked error "pushing the fix for #$pr to $head_ref was rejected."
+	fi
+
+	# Reply to, and resolve, each thread just addressed — never the ones this
+	# run did not touch (gate 12 owns those).
+	while IFS= read -r tid; do
+		[[ -z "$tid" ]] && continue
+		reply_body="Addressed in $(git rev-parse --short HEAD).
+
+$SENTINEL"
+		gh_do api graphql -f query='
+			mutation($id:ID!, $body:String!) {
+				addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $id, body: $body}) {
+					comment { id }
+				}
+			}' -F id="$tid" -F body="$reply_body" >/dev/null
+		gh_do api graphql -f query='
+			mutation($id:ID!) {
+				resolveReviewThread(input: {threadId: $id}) { thread { id } }
+			}' -F id="$tid" >/dev/null
+	done < <(jq -r '.[].id' <<<"$threads")
+
+	echo "pushed a fix for #$pr and resolved $(jq 'length' <<<"$threads") thread(s)" >&2
+	exit 10
+}
+
+# check_gates_once — gates 2 through 13. Exits directly (10 or 20) for any
+# outcome that is not "ready to merge right now"; returns normally only when
+# every gate has just passed. Called twice by the caller so gate 14's "refetch
+# 4-12 immediately before merging" is not a separate code path — it is this
+# same function, run again, closing the race between the quiet check and the
+# merge itself.
+check_gates_once() {
+	discover_pr
+
+	case "$pr_state" in
+	MERGED)
+		echo "PR #$pr is already merged" >&2
+		drop_worktree "$CONVEYOR_SOURCE" "$ref"
+		exit 0
+		;;
+	CLOSED)
+		blocked decision "pull request #$pr, which closes issue #$ref, was closed without merging."
+		;;
+	esac
+
+	check_hold
+	fetch_details
+
+	if [[ "$(jq -r '.isDraft' <<<"$details")" == "true" ]]; then
+		echo "PR #$pr is a draft; waiting" >&2
+		exit 10
+	fi
+
+	local mergeable
+	mergeable=$(jq -r '.mergeable' <<<"$details")
+	if [[ "$mergeable" == "CONFLICTING" ]]; then
+		blocked conflict "pull request #$pr has a merge conflict with its base branch."
+	fi
+	if [[ "$mergeable" != "MERGEABLE" ]]; then
+		echo "PR #$pr's mergeability is not yet known ($mergeable); waiting" >&2
+		exit 10
+	fi
+
+	local rollup status_rc
+	rollup=$(jq -r '.commits.nodes[0].commit.statusCheckRollup.state // empty' <<<"$details")
+	set +e
+	check_status "$rollup"
+	status_rc=$?
+	set -e
+	case $status_rc in
+	2) blocked checks "a status check on pull request #$pr failed (rollup: $rollup)." ;;
+	1)
+		echo "checks on PR #$pr are still running (rollup: $rollup)" >&2
+		exit 10
+		;;
+	esac
+
+	local unresolved unanswered answered
+	unresolved=$(jq '[.reviewThreads.nodes[] | select(.isResolved == false)]' <<<"$details")
+	unanswered=$(jq --arg s "$SENTINEL" \
+		'[.[] | select((.comments.nodes[-1].body // "") | contains($s) | not)]' <<<"$unresolved")
+	answered=$(jq --arg s "$SENTINEL" \
+		'[.[] | select((.comments.nodes[-1].body // "") | contains($s))]' <<<"$unresolved")
+
+	if [[ "$(jq 'length' <<<"$unanswered")" -gt 0 ]]; then
+		address_threads "$unanswered" # exits 10 or 20; never returns
+	fi
+	if [[ "$(jq 'length' <<<"$answered")" -gt 0 ]]; then
+		local quoted
+		quoted=$(jq -r '.[0].comments.nodes[0].body' <<<"$answered")
+		asks decision "a reviewer left this unresolved after the fix that addressed it: \"$quoted\""
+	fi
+
+	compute_base
+	local now elapsed
+	now=$(date -u +%s)
+	elapsed=$((now - base))
+	if ((elapsed < QUIET)); then
+		echo "PR #$pr has been quiet for ${elapsed}s of ${QUIET}s required; not yet" >&2
+		exit 10
+	fi
+	echo "PR #$pr has been quiet for ${elapsed}s (>= ${QUIET}s required)" >&2
+}
+
+check_gates_once
+echo "re-checking immediately before merging, to close the window since the check above" >&2
+check_gates_once
+
+echo "merging PR #$pr" >&2
+merge_out=""
+if ! merge_out=$(gh pr merge "$pr" --repo "$REPO" --squash --delete-branch 2>&1); then
+	blocked merge "gh pr merge #$pr failed: $merge_out"
+fi
+drop_worktree "$CONVEYOR_SOURCE" "$ref"
+exit 0

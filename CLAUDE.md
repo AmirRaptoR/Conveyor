@@ -72,9 +72,10 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   cares.
   `perSource` is therefore a throughput choice now, not a safety rule. It is
   still not unlimited: `refine` and `deploy` run in the source's own checkout.
-  Worktrees are created by the adapter and removed by `review` after a merge —
-  the engine knows nothing about any of it, because how the work happens is the
-  script's business.
+  Worktrees are created by the adapter and removed by `approve` once a merge is
+  confirmed — the engine knows nothing about any of it, because how the work
+  happens is the script's business. `review` deliberately leaves the tree
+  behind: `approving` still needs the branch.
   Agents must not change branch: several checkouts of one repository are live at
   once and `main` is checked out elsewhere. Both adapters say so in the prompt,
   and `/implement` step 2 defers to a branch it was handed.
@@ -175,6 +176,38 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
 - **An un-onboarded repo is reported, never worked around.** Per-source problems
   disable that source and leave every other repo running. There is no shared
   fallback to inherit by accident.
+
+## Merging is a gate, not a judgement
+
+`review` ends when a pull request exists; it no longer merges. The `approving`
+stage between `review` and `merged` runs `agents/claude/approve`, which waits
+for the PR to settle and then merges it: no hold, not a draft, no conflict,
+checks green, no unresolved review threads, and quiet for `QUIET_SECONDS`
+(default 600). Any activity resets the clock, so the total wait is unbounded on
+purpose — while review is still happening, the clock should keep giving it room.
+
+**It must never sleep.** An item resting in a script stage has that script
+re-run on every poll, and exit 10 is "leave it, try again next poll" — so
+waiting is a script that returns immediately, not one that blocks. A `sleep`
+there would hold a global slot for its duration and die with the engine on every
+restart. A quiet PR costs a handful of `gh` reads and no model at all; the model
+runs only to address an unresolved review thread.
+
+The gate is fourteen rules in a fixed precedence, documented at the top of the
+script and driven by `agents/claude/approve-selfcheck` against a stubbed `gh` —
+most of them cannot be reproduced against a live repository on demand. Two
+details worth keeping: the PR is found by *closing reference* and never by `gh
+pr list --search`, which matches unrelated text and silently takes the first
+hit; and a thread the script already answered but a reviewer left unresolved
+becomes `asks decision`, never another attempt, which is what bounds the loop —
+exit 10 clears the attempt count, so without it the model would re-run every
+poll forever.
+
+`providers/github/onboard.sh` creates every label a repository needs in one
+command — the stage labels, the mark, the onboarding tag and one label per kind
+of stop — idempotently, and never overwrites an existing label's colour or
+description. Labels are still created lazily by `move.sh` when they are first
+needed; this is the one-shot so that is not a discovery spread over a week.
 
 ## Running agents
 

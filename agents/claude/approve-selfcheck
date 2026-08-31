@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# Drives agents/claude/approve against a stubbed `gh`, and asserts the exit code
+# and the mark it leaves. Touches no repository and runs no model.
+#
+#   agents/claude/approve-selfcheck
+#
+# The gate is fourteen ordered rules and most of them are unreachable in a live
+# repository on demand — you cannot ask GitHub for a conflicting PR with a
+# failing check and an unresolved thread. A stub is the only way to exercise
+# them, and the same pattern providers/github/selfcheck.sh already uses.
+#
+# The model path (gate 11) is deliberately not driven here: it needs a worktree,
+# a remote and claude. What is checked is everything that decides *whether* to
+# get there.
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/bin" "$tmp/scene"
+export PATH="$tmp/bin:$PATH"
+export WORKTREES="$tmp/worktrees" # nothing there, so drop_worktree is a no-op
+
+# The stub answers by verb, out of files the scenario wrote. A missing file is a
+# missing expectation, and it says so rather than returning empty JSON that the
+# gate would read as a real answer.
+cat >"$tmp/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+scene="$SCENE"
+case "$1 $2" in
+"pr list")   what=prlist ;;
+"issue view") what=labels_$3 ;;
+"api graphql") what=graphql ;;
+"api repos"*) what=timeline ;;
+"pr edit")   echo "unlabelled"; exit 0 ;;
+"pr merge")  echo "merged"; [[ -f "$scene/merge_fails" ]] && exit 1; touch "$scene/merged"; exit 0 ;;
+*)
+	case "$1" in
+	api) what=timeline ;;
+	*) echo "stub gh: unhandled: $*" >&2; exit 97 ;;
+	esac
+	;;
+esac
+[[ -f "$scene/fail_$what" ]] && { echo "stub: $what fails"; exit 1; }
+if [[ ! -f "$scene/$what" ]]; then
+	echo "stub gh: no fixture $what for: $*" >&2
+	exit 98
+fi
+cat "$scene/$what"
+STUB
+chmod +x "$tmp/bin/gh"
+
+# run <name> — run approve in the current scene and report its exit code.
+run() {
+	local rc
+	: >"$CONVEYOR_RESULT"
+	echo '{"item":{"ref":"7","title":"an item"}}' |
+		SCENE="$tmp/scene" REPO=o/n PROMPT="fix it" CONVEYOR_SOURCE=s1 \
+			QUIET_SECONDS="${QUIET:-0}" "$here/approve" >/dev/null 2>&1
+	rc=$?
+	echo "$rc"
+}
+kind() { jq -r '.kind // "none"' "$CONVEYOR_RESULT" 2>/dev/null || echo none; }
+export CONVEYOR_RESULT="$tmp/result.json"
+
+scene() { rm -f "$tmp/scene"/*; }
+pr() { printf '[{"number":%s,"body":"Closes #7","state":"%s","url":"u"}]' "$1" "$2" >"$tmp/scene/prlist"; }
+labels() { printf '%s' "${1:-[]}" >"$tmp/scene/labels_7"; printf '%s' "${2:-[]}" >"$tmp/scene/labels_9"; }
+# details <isDraft> <mergeable> <rollup> [threads-json]
+details() {
+	local rollup_field='null'
+	[[ -n "$3" ]] && rollup_field="{\"state\":\"$3\"}"
+	cat >"$tmp/scene/graphql" <<JSON
+{"isDraft":$1,"mergeable":"$2","headRefName":"issue-7",
+ "commits":{"nodes":[{"commit":{"committedDate":"2020-01-01T00:00:00Z","statusCheckRollup":$rollup_field}}]},
+ "comments":{"nodes":[]},"reviews":{"nodes":[]},
+ "reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":${4:-[]}}}
+JSON
+	# The stub does not run --jq, so fixtures are written in post-jq form. For
+	# the timeline that is a bare timestamp, or nothing.
+	: >"$tmp/scene/timeline"
+}
+
+# --- 1. a gh call that fails is a blip, not a verdict -----------------------
+scene; pr 9 OPEN; touch "$tmp/scene/fail_prlist"
+chk "(1) a failed gh call defers"            "$(run)" "10"
+
+# --- 2/3. finding the pull request -----------------------------------------
+scene; echo '[]' >"$tmp/scene/prlist"
+chk "(2) no PR closing the issue stops"      "$(run)" "20"
+chk "     and the kind is input"             "$(kind)" "input"
+
+scene; printf '[{"number":9,"body":"Closes #7","state":"OPEN","url":"u"},{"number":10,"body":"closes #7","state":"OPEN","url":"u"}]' >"$tmp/scene/prlist"
+chk "(3) two open PRs stop rather than pick" "$(run)" "20"
+chk "     and the kind is input"             "$(kind)" "input"
+
+# A PR that merely mentions the issue is not a PR that closes it.
+scene; printf '[{"number":9,"body":"related to #7","state":"OPEN","url":"u"}]' >"$tmp/scene/prlist"
+chk "a mention is not a closing reference"   "$(run)" "20"
+
+# --- 4/5. the PR is already finished ---------------------------------------
+scene; pr 9 MERGED
+chk "(4) an already-merged PR passes through" "$(run)" "0"
+chk "     without merging again"              "$([[ -f "$tmp/scene/merged" ]] && echo merged || echo no)" "no"
+
+scene; pr 9 CLOSED
+chk "(5) a closed unmerged PR stops"          "$(run)" "20"
+chk "     and the kind is decision"           "$(kind)" "decision"
+
+# --- 6. a hold, on either object -------------------------------------------
+scene; pr 9 OPEN; labels '["conveyor:blocked"]' '[]'; details false MERGEABLE SUCCESS
+chk "(6) a hold on the issue stops"           "$(run)" "20"
+chk "     and the kind is human-review"       "$(kind)" "human-review"
+
+scene; pr 9 OPEN; labels '[]' '["conveyor:blocked"]'; details false MERGEABLE SUCCESS
+chk "(6) a hold on the PR stops"              "$(run)" "20"
+chk "     and the kind is human-review"       "$(kind)" "human-review"
+
+# The bare kind label is a different label and is not a hold.
+scene; pr 9 OPEN; labels '["conveyor:blocked: decision"]' '[]'; details false MERGEABLE SUCCESS
+chk "a kind label alone is not a hold"        "$(run)" "0"
+
+# --- 7/8. draft and conflict ------------------------------------------------
+scene; pr 9 OPEN; labels; details true MERGEABLE SUCCESS
+chk "(7) a draft waits"                       "$(run)" "10"
+
+scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS
+chk "(8) a conflict stops"                    "$(run)" "20"
+chk "     and the kind is conflict"           "$(kind)" "conflict"
+
+scene; pr 9 OPEN; labels; details false UNKNOWN SUCCESS
+chk "mergeability not yet known waits"        "$(run)" "10"
+
+# --- 9/10. the check rollup, mapped explicitly and totally ------------------
+for state in SUCCESS SKIPPED NEUTRAL; do
+	scene; pr 9 OPEN; labels; details false MERGEABLE "$state"
+	chk "(9) $state is green"                 "$(run)" "0"
+done
+scene; pr 9 OPEN; labels; details false MERGEABLE ""
+chk "(9) a repo with no CI can still merge"   "$(run)" "0"
+for state in FAILURE ERROR TIMED_OUT CANCELLED ACTION_REQUIRED; do
+	scene; pr 9 OPEN; labels; details false MERGEABLE "$state"
+	chk "(9) $state stops"                    "$(run)" "20"
+	chk "     and the kind is checks"         "$(kind)" "checks"
+done
+for state in PENDING QUEUED IN_PROGRESS EXPECTED; do
+	scene; pr 9 OPEN; labels; details false MERGEABLE "$state"
+	chk "(10) $state waits"                   "$(run)" "10"
+done
+scene; pr 9 OPEN; labels; details false MERGEABLE SOMETHING_NEW
+chk "(10) an unknown rollup waits, never merges" "$(run)" "10"
+
+# --- 12. a thread the script already answered is a question, not a retry ----
+answered='[{"id":"t1","isResolved":false,"comments":{"pageInfo":{"hasNextPage":false},"nodes":[{"id":"c1","body":"please change this","createdAt":"2020-01-01T00:00:00Z"},{"id":"c2","body":"Addressed in abc123.\n\n<!-- conveyor:approve -->","createdAt":"2020-01-01T00:00:00Z"}]}}]'
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$answered"
+chk "(12) a thread answered but still open stops" "$(run)" "20"
+chk "     and the kind is decision"               "$(kind)" "decision"
+chk "     and it is a question, never bulk-cleared" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "true"
+
+# --- 13. the quiet clock ----------------------------------------------------
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
+date -u +%Y-%m-%dT%H:%M:%SZ >"$tmp/scene/timeline"
+chk "(13) a PR that just arrived waits"       "$(QUIET=600 run)" "10"
+chk "     and did not merge"                  "$([[ -f "$tmp/scene/merged" ]] && echo merged || echo no)" "no"
+
+# A page it cannot see all of is deferred, never merged past.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
+sed -i 's/"hasNextPage":false/"hasNextPage":true/' "$tmp/scene/graphql"
+chk "an unreadable page defers rather than merging" "$(run)" "10"
+
+# --- 14. the merge itself ---------------------------------------------------
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
+chk "(14) a settled PR merges"                "$(run)" "0"
+chk "     and gh pr merge actually ran"       "$([[ -f "$tmp/scene/merged" ]] && echo merged)" "merged"
+
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS; touch "$tmp/scene/merge_fails"
+chk "a refused merge stops, never reads as merged" "$(run)" "20"
+chk "     and the kind is merge"              "$(kind)" "merge"
+
+# --- QUIET_SECONDS parsing --------------------------------------------------
+# A fresh clock, so 600 is the thing being tested and not the 2020 commit date.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
+date -u +%Y-%m-%dT%H:%M:%SZ >"$tmp/scene/timeline"
+chk "a nonsense QUIET_SECONDS falls back to the default" "$(QUIET=soon run)" "10"
+chk "     and 0 is still a valid wait of none"           "$(QUIET=0 run)" "0"
+
+exit $fail

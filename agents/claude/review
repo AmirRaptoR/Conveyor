@@ -111,24 +111,32 @@ if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 	exit 20 # the agent wrote its own reason; leave it exactly as written
 fi
 
-# The item's worktree, once its branch is merged and deleted, is a copy of
-# nothing. Removed only on the way out through success: on any other path the
-# tree is the evidence, and the next attempt starts where this one stopped.
-cleanup_worktree() {
-	cd "${CONVEYOR_WORKDIR:-$PWD}" 2>/dev/null || return 0
-	drop_worktree "$CONVEYOR_SOURCE" "$ref"
-}
-
-# GitHub is the record, never the transcript. A clean review ends in a merge, so
-# the PR must be gone; if it is still open the review did not converge, whatever
-# the session said.
+# GitHub is the record, never the transcript. The postcondition is that a pull
+# request exists — not that it has been merged.
+#
+# This used to invert: a still-open PR after a clean run meant "the review did
+# not converge" and exited 1. Merging has moved to the `approving` stage, which
+# is where the deterministic part of it belongs — checks green, no hold, nothing
+# unresolved, quiet for a while — so an open PR is now the expected outcome and
+# the reason this stage succeeded. Left as it was, every review would fail and
+# mark its item.
+#
+# An already-merged PR is success too: someone merged it by hand, or an earlier
+# `approving` run did, and `approving` will see it merged and pass the item
+# through. What is still not success is no pull request at all, which the
+# preflight above already refuses.
+#
+# The worktree is deliberately left behind. `approving` needs the branch — it
+# may have to address a review thread on it — and drops the worktree itself once
+# the merge is confirmed. Dropping it here would mean rebuilding it on the next
+# poll.
 if [[ $rc -eq 0 && -n "${REPO:-}" ]]; then
-	still=$(gh pr list --repo "$REPO" --state open --search "$ref" --json number --jq '.[0].number' 2>/dev/null)
-	if [[ -n "$still" ]]; then
-		echo "PR #$still is still open; the review did not converge" >&2
-		exit 1
+	landed=$(gh pr list --repo "$REPO" --state all --search "$ref" --json number,state \
+		--jq '[.[] | select(.state != "CLOSED")][0] | "\(.number) \(.state)"' 2>/dev/null)
+	if [[ -z "$landed" || "$landed" == "null null" ]]; then
+		blocked no-output "the review finished but no open or merged pull request \
+references #$ref any more. A run cut short by a usage limit looks exactly like this."
 	fi
-	echo "PR merged"
-	cleanup_worktree
+	echo "PR #${landed% *} is ${landed#* }; handing it to the approving stage"
 fi
 exit $rc
