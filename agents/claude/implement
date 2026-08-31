@@ -15,6 +15,7 @@ set -euo pipefail
 source "$(dirname "$0")/_stream"
 source "$(dirname "$0")/../_blocked"
 source "$(dirname "$0")/../_worktree"
+source "$(dirname "$0")/../_resume"
 
 : "${PROMPT:?PROMPT is required (set it in this script params: block)}"
 
@@ -50,14 +51,12 @@ wt=$(item_worktree "$CONVEYOR_SOURCE" "$ref" "$head")
 cd "$wt"
 
 # A dirty tree here is this item's own leftovers — a previous run for THIS issue
-# that died mid-edit. Building on top of it is how one failure becomes a
-# corrupted branch. It stops this item and nothing else.
-if [[ -n "$(git status --porcelain)" ]]; then
-	blocked worktree "the worktree for #$ref at $wt has uncommitted changes on \
-branch $(git branch --show-current), left behind by a run that did not finish. \
-Commit or discard them, or delete the directory to start the item fresh. No \
-other item is affected."
-fi
+# that died mid-edit, which is a normal thing rather than a fault. It is a
+# resume, not a stop: see agents/_resume for why, and for the two cases that do
+# still stop the item. Called directly, never in a substitution — it stops
+# through `blocked`, and a subshell would swallow that.
+resume_leftovers "$ref"
+leftovers="$RESUME_BRIEF"
 
 echo "implementing $CONVEYOR_SOURCE #$ref — $title"
 echo "  worktree: $wt  (branch $(git branch --show-current))"
@@ -76,7 +75,7 @@ Item #${ref}${REPO:+ in $REPO}: ${title}
 ${url}
 ${body}
 --- end item ---
-${rework}"
+${rework}${leftovers}"
 else
 	full="Item #${ref}${REPO:+ in $REPO}: ${title}
 ${url}
@@ -86,7 +85,7 @@ ${body}
 --- end item body ---
 
 ${task}
-${rework}"
+${rework}${leftovers}"
 fi
 
 full="${full}

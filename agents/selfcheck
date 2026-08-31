@@ -7,6 +7,8 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/_worktree"
+source "$here/_blocked"
+source "$here/_resume"
 
 fail=0
 chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
@@ -109,6 +111,52 @@ echo wip > "$elsewhere2/wip.txt"
 p6=$(item_worktree demo 51 taken2 2>/dev/null)
 chk "a dirty holder is used, not destroyed" "$p6" "$elsewhere2"
 chk "its work survives"                     "$([[ -f "$elsewhere2/wip.txt" ]] && echo yes)" "yes"
+
+# 11. resume: a worktree a dead run left dirty is carried on from, not refused.
+# The brief is what the adapter appends to its prompt, so it has to contain the
+# diff itself — an agent told to verify leftovers it cannot see cannot do it.
+res=$(item_worktree demo 70)
+cd "$res"
+resume_leftovers 70
+chk "a clean tree needs no brief" "${RESUME_BRIEF:-}" ""
+echo 'half a line' >> file.txt
+echo 'a new test' > new_test.txt
+resume_leftovers 70 2>/dev/null
+chk "a dirty tree is resumed, not blocked" "$([[ -n "$RESUME_BRIEF" ]] && echo brief)" "brief"
+chk "the brief carries the diff"           "$(grep -c 'half a line' <<<"$RESUME_BRIEF")" "1"
+chk "and names the untracked file"         "$(grep -c 'new_test.txt' <<<"$RESUME_BRIEF")" "1"
+chk "and warns against a blind commit"     "$(grep -c 'git add -A' <<<"$RESUME_BRIEF")" "1"
+
+# the count only survives while the branch tip does not move.
+chk "the attempt count is kept out of the tree" \
+	"$(git status --porcelain | grep -c conveyor-resume || true)" "0"
+resume_leftovers 70 2>/dev/null
+chk "resuming again at the same tip counts up" \
+	"$(cut -d' ' -f1 "$(git rev-parse --git-dir)/conveyor-resume")" "2"
+git add -A && git commit --quiet -m 'the resume committed something'
+echo 'more' >> file.txt
+resume_leftovers 70 2>/dev/null
+chk "a commit resets the count" \
+	"$(cut -d' ' -f1 "$(git rev-parse --git-dir)/conveyor-resume")" "1"
+
+# 12. the two things that still stop it. Both run in a subshell: `blocked`
+# exits 20, and the point is that it does.
+export CONVEYOR_RESULT="$tmp/blocked.json"
+: > "$CONVEYOR_RESULT"
+rc=0; (RESUME_MAX_ATTEMPTS=1 resume_leftovers 70 >/dev/null 2>&1) || rc=$?
+chk "a loop stops the item"        "$rc" "20"
+chk "and it stops with kind worktree" "$(jq -r .kind "$CONVEYOR_RESULT")" "worktree"
+: > "$CONVEYOR_RESULT"
+touch -d "30 days ago" file.txt new_test.txt
+rc=0; (RESUME_COLD_DAYS=14 resume_leftovers 70 >/dev/null 2>&1) || rc=$?
+chk "cold leftovers stop the item" "$rc" "20"
+chk "and say how old they are"     "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '30 days old')" "1"
+# fresh again, and it resumes as before.
+: > "$CONVEYOR_RESULT"
+touch file.txt new_test.txt
+rc=0; (RESUME_COLD_DAYS=14 resume_leftovers 70 >/dev/null 2>&1) || rc=$?
+chk "fresh leftovers do not"       "$rc" "0"
+cd "$tmp/repo"
 
 # 9. sourcing must not eat the caller's PATH. In zsh `path` is tied to `PATH`,
 # so a local named `path` in here silently disables every later command.

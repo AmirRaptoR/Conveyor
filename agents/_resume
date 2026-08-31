@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Sourced by the agent adapters. Not a verb: config resolves script names
+# exactly, so a leading underscore can never be mistaken for one.
+#
+# What to do with a worktree a run left dirty.
+#
+# A run that dies part-way through is normal, not exceptional. The usual cause
+# is the account's usage limit landing mid-stage: the process is killed cleanly
+# between tool calls, and what is on disk is whole files. Refusing to start
+# because of it costs the work already done and a person's morning.
+#
+# Since worktrees went per item (see _worktree) the leftovers are this item's
+# own work, on this item's own branch, *by construction* — no other item can
+# see them. The cross-contamination a hard block used to guard against is
+# prevented by the layout now, not by refusing to start. What is left is the
+# narrow risk of a half-written file committed blind onto a pull request
+# branch, which review exists to catch, and which the brief below is written to
+# stop: read the diff, verify it, then decide.
+#
+# Two things still stop the item, because "never block" is the wrong lesson.
+
+# How many times an item may resume into a dirty tree at the same commit before
+# it is treated as a loop rather than as interruption, and how old leftovers
+# have to be before a person should look first. Overridable for tests.
+RESUME_MAX_ATTEMPTS="${RESUME_MAX_ATTEMPTS:-3}"
+RESUME_COLD_DAYS="${RESUME_COLD_DAYS:-14}"
+
+# resume_leftovers <ref> — run from inside the item's worktree.
+#
+# Sets RESUME_BRIEF to the paragraph the adapter appends to its prompt, empty
+# when the tree is clean. Call it directly, never in a command substitution:
+# it stops the item through `blocked`, whose exit would be swallowed by the
+# subshell a substitution runs in.
+resume_leftovers() {
+	local ref=$1 wt=$PWD
+	RESUME_BRIEF=""
+
+	if [[ -z "$(git status --porcelain)" ]]; then
+		# Clean: whatever a previous resume was counting is over.
+		rm -f "$(git rev-parse --git-dir)/conveyor-resume"
+		return 0
+	fi
+
+	local head_sha newest mtime f age_days
+	head_sha=$(git rev-parse HEAD)
+
+	# Cold. Newest change wins: one stale file among fresh ones is still a
+	# resume. Untracked files count — they are usually the test the run was in
+	# the middle of writing when it was killed.
+	newest=0
+	while IFS= read -r -d '' f; do
+		[[ -e "$f" ]] || continue
+		mtime=$(stat -c %Y -- "$f" 2>/dev/null) || continue
+		((mtime > newest)) && newest=$mtime
+	done < <(
+		git diff --name-only -z HEAD
+		git ls-files --others --exclude-standard -z
+	)
+	age_days=$((($(date +%s) - newest) / 86400))
+	if ((newest > 0 && age_days >= RESUME_COLD_DAYS)); then
+		blocked worktree "the worktree for #$ref at $wt has uncommitted changes on \
+branch $(git branch --show-current) whose newest edit is $age_days days old. A run that \
+died mid-edit leaves fresh files behind; this is something else. Read them, then commit \
+or discard them, or delete the directory to start the item fresh. No other item is \
+affected."
+	fi
+
+	# A loop. Only consecutive resumes at the same tip count: a commit means the
+	# last resume did something, whatever else it left behind. The count lives
+	# in the worktree's own git dir and never in the tree itself, where an agent
+	# told to commit everything would sweep it into a pull request.
+	local state attempt=1 prev_count prev_head
+	state="$(git rev-parse --git-dir)/conveyor-resume"
+	if [[ -f "$state" ]]; then
+		read -r prev_count prev_head <"$state" || true
+		[[ "$prev_head" == "$head_sha" ]] && attempt=$((prev_count + 1))
+	fi
+	if ((attempt > RESUME_MAX_ATTEMPTS)); then
+		rm -f "$state"
+		blocked worktree "the worktree for #$ref at $wt has been resumed $((attempt - 1)) \
+times without the branch moving past $(git rev-parse --short HEAD), and is still dirty. \
+That is a run failing in a loop rather than a run being interrupted, and another attempt \
+would fail the same way. Read the leftovers, then commit or discard them, or delete the \
+directory to start the item fresh. No other item is affected."
+	fi
+	printf '%s %s\n' "$attempt" "$head_sha" >"$state"
+
+	echo "resuming #$ref from a run that did not finish (attempt $attempt of $RESUME_MAX_ATTEMPTS)" >&2
+
+	# The diff itself, not a summary of it. The agent has to be able to judge
+	# whether the leftovers are whole without spending a turn to go and read
+	# them, and "verify before you build" is not advice it can follow blind.
+	RESUME_BRIEF="
+
+This worktree already has uncommitted changes from an earlier run for this same
+item that did not finish — most often one a usage limit stopped part-way
+through. They are your own prior work, on your own branch, and nobody else's.
+
+Read the full diff below before you do anything else, and verify it: build what
+it touches and run the tests it touches. Then either build on it, or discard it
+deliberately and say why. Never \`git add -A\` without having read what you are
+adding — a run killed mid-edit can leave one file half-written, and that is the
+single thing this brief exists to catch.
+
+--- git status --porcelain ---
+$(git status --porcelain)
+--- git diff (tracked files) ---
+$(git diff)
+--- last commit on this branch ---
+$(git log -1 --format='%h %ad %s' --date=iso)
+--- end leftovers ---"
+}

@@ -48,10 +48,18 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   remote's default branch (or from the pull request's branch on a rework), and
   the implement and review adapters `cd` into it. Three things follow. Two items
   in one repository can run at once, because they share only the object store,
-  which git already makes safe. A tree left dirty by a dead run blocks exactly
-  the item that owns it, instead of every item in the repository. And the
-  checkout a *person* works in is never touched — uncommitted work can sit in it
-  for a week and the pipeline neither notices nor cares.
+  which git already makes safe. A tree left dirty by a dead run belongs to
+  exactly the item that owns it, instead of to every item in the repository —
+  which is what lets `implement` **resume** from it rather than refuse to start
+  (`agents/_resume`): the leftovers are that item's own work on its own branch
+  by construction, so the agent is handed the diff and told to read and verify
+  it before building on it. A run dying part-way is normal, and the usual cause
+  is a usage limit landing mid-stage. Two cases still stop it: resuming at the
+  same commit more than `RESUME_MAX_ATTEMPTS` times, which is a loop rather than
+  an interruption, and leftovers older than `RESUME_COLD_DAYS`, which are no
+  longer a killed run. And the checkout a *person* works in is never touched —
+  uncommitted work can sit in it for a week and the pipeline neither notices nor
+  cares.
   `perSource` is therefore a throughput choice now, not a safety rule. It is
   still not unlimited: `refine` and `deploy` run in the source's own checkout.
   Worktrees are created by the adapter and removed by `review` after a merge —
