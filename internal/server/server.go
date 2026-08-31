@@ -50,6 +50,11 @@ type State struct {
 	// limit, a quota, whatever its own status script chose to report. Empty
 	// when no agent provides one.
 	Agents []AgentView `json:"agents,omitempty"`
+	// Paused is every agent the scheduler is holding work back from, and why.
+	// Empty is the normal state, and an empty board with a pause on it is the
+	// one question this view exists to answer: a paused line and an idle line
+	// look identical otherwise.
+	Paused []PauseView `json:"paused,omitempty"`
 	// Slots is what the concurrency locks are holding, against their limits. It
 	// is here rather than behind a debug flag because "nothing is starting" is
 	// the question this board gets asked most, and a held slot is the one cause
@@ -139,6 +144,31 @@ type AgentFact struct {
 	Value string `json:"value"`
 }
 
+// PauseView is an agent the scheduler is not dispatching to, and why.
+//
+// A usage limit belongs to an agent, not to an item: every stage naming that
+// agent meets the same wall, in every repository, because the quota is one
+// account's. So the line stops for that agent rather than converting the board
+// into marked items at whatever rate it can start runs — which is what it did
+// before, once per item and then again every time a timer handed them back.
+type PauseView struct {
+	Agent string `json:"agent"`
+	// Until is when the agent said its quota returns. Zero means it did not
+	// say, and the pause lasts until a probe reports something else — never
+	// forever: every discovery tick either renews it or lifts it.
+	Until  time.Time `json:"until,omitempty"`
+	Since  time.Time `json:"since"`
+	Reason string    `json:"reason,omitempty"`
+	// FromMark is a pause the first refused run caused, rather than one a
+	// status probe found. It is the difference between stopping in seconds and
+	// stopping a poll later, which at four global slots is several more runs
+	// spent to be told the same thing.
+	FromMark bool `json:"fromMark,omitempty"`
+}
+
+// Live reports whether this pause still holds at t.
+func (p PauseView) Live(t time.Time) bool { return p.Until.IsZero() || t.Before(p.Until) }
+
 type SourceView struct {
 	Name     string   `json:"name"`
 	Provider string   `json:"provider"`
@@ -161,6 +191,13 @@ type Server struct {
 	// run history after a restart: the runs are the durable record, this is
 	// only the index into them that a board read cannot afford to rebuild.
 	blocks map[string]Block
+	// paused is the agents the scheduler is holding work back from, by name.
+	//
+	// Not persisted, deliberately: it is a fact about the outside world right
+	// now, and the first discovery tick after a restart re-establishes it from
+	// the agents' own status scripts. A pause recovered from disk would be a
+	// guess about a window that may have closed while the process was down.
+	paused map[string]PauseView
 
 	hub   *hub
 	order *store.Order
@@ -207,6 +244,7 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 		ctx:     context.Background(),
 	}
 	s.blocks = map[string]Block{}
+	s.paused = map[string]PauseView{}
 	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
 
 	// Every log line reaches the browser as it is produced. This is the whole
@@ -336,6 +374,15 @@ func (s *Server) stalled(ctx context.Context, every time.Duration) {
 		}
 		if s.inFlight.Load() != 0 {
 			continue // something is running; by definition not stalled
+		}
+		// The one stall this must not touch. Its whole premise is that the
+		// cause may have passed — but an agent out of quota is a cause with a
+		// known end, and handing every item back before that end spends one
+		// refused run per item to learn what the pause already knows. That was
+		// this timer's own worst hour: eight or nine items, every hour, all
+		// night, against a weekly limit thirty hours from resetting.
+		if s.anyPaused() {
+			continue
 		}
 		s.mu.RLock()
 		var held []model.Item
@@ -561,6 +608,8 @@ func (s *Server) askAgents(ctx context.Context) {
 	s.state.Agents = out
 	s.mu.Unlock()
 
+	s.applyAgentStates(out, agents)
+
 	// An agent saying it is well again is the one thing besides a person that
 	// takes a mark off. See releaseLimited for why only this one.
 	//
@@ -674,6 +723,13 @@ func (s *Server) launch(ctx context.Context) int {
 				s.eng.Locks().Busy(it.Source, target) {
 				continue
 			}
+			// Whose quota this would spend, and whether they have any. Checked
+			// here and not in Pick, because it is a fact about the world right
+			// now rather than about the ordering: the item is still next, the
+			// line simply cannot afford it yet.
+			if s.agentPaused(s.cfg.AgentFor(it.Source, target)) {
+				continue
+			}
 			if _, running := s.working.Load(it.ID); running {
 				continue // already being worked; the locks do not know that
 			}
@@ -769,6 +825,18 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 		delete(s.blocks, tr.Item.ID)
 	}
 	s.mu.Unlock()
+
+	// A `limit` mark is account-level news, not a fact about this one item:
+	// every other item routed to the same agent is about to meet the same wall.
+	// Waiting for the next status probe to notice costs a whole poll of runs
+	// spent to be told what this one just said, so the mark itself pauses the
+	// agent and the probe refines the deadline afterwards.
+	if tr.Blocked && tr.Kind == limitKind {
+		agent := s.cfg.AgentFor(tr.Item.Source, tr.Stage)
+		if s.pauseFor(agent, time.Time{}, tr.Reason, true) {
+			fmt.Fprintf(os.Stderr, "conveyor: %s was refused for being out of quota; holding work back from it\n", agent)
+		}
+	}
 }
 
 // advance runs a single transition: the button, which works whether or not the
@@ -1095,6 +1163,150 @@ func saidAt(dir string) (asked bool, session string) {
 		return false, ""
 	}
 	return v.Asked, v.Session
+}
+
+// applyAgentStates turns what the agents said into what the scheduler does.
+//
+// Split out of askAgents so it can be driven with reports rather than scripts:
+// the decision is the part worth testing, and running a status script to get at
+// it would test the script instead.
+//
+// The probe is the authority on whether an agent is taking work. `limited`
+// pauses it, until the reset it named if it named one. Anything else — `ok`,
+// `unknown`, a probe that could not run at all — lifts a pause, including one a
+// refused run set between probes. That direction is deliberate: a status script
+// that breaks must not wedge the line shut, and letting work through is exactly
+// the behaviour there was before any of this.
+func (s *Server) applyAgentStates(out []AgentView, known []config.Agent) {
+	for _, a := range out {
+		if a.State == "limited" {
+			until, _ := time.Parse(time.RFC3339, a.ResetsAt)
+			reason := a.Summary
+			if reason == "" {
+				reason = a.Name + " reports it is out of quota"
+			}
+			if s.pauseFor(a.Name, until, reason, false) {
+				if until.IsZero() {
+					fmt.Fprintf(os.Stderr, "conveyor: %s is out of quota; holding work back until it says otherwise\n", a.Name)
+				} else {
+					fmt.Fprintf(os.Stderr, "conveyor: %s is out of quota; holding work back until %s\n",
+						a.Name, until.Format(time.RFC3339))
+				}
+			}
+			continue
+		}
+		if s.resumeAgent(a.Name) {
+			fmt.Fprintf(os.Stderr, "conveyor: %s is taking work again\n", a.Name)
+		}
+	}
+
+	// An agent with no status script can still be paused by a refused run, and
+	// nothing above would ever lift that — it reports nothing, so there is no
+	// `ok` to see. Give it one poll and then let work through again: a bounded
+	// pause on no evidence, rather than an open-ended one nobody can end.
+	reporting := map[string]bool{}
+	for _, a := range out {
+		reporting[a.Name] = true
+	}
+	for _, a := range known {
+		if !reporting[a.Name] && s.resumeAgent(a.Name) {
+			fmt.Fprintf(os.Stderr, "conveyor: %s has no status script to confirm the limit; taking work again\n", a.Name)
+		}
+	}
+}
+
+// pauseFor records that an agent is out of quota and the scheduler should stop
+// handing it work. Returns true when this is news, so the caller can say so
+// once rather than on every poll.
+//
+// A pause a probe found carries the reset the agent reported; one a refused run
+// caused carries no deadline, because the mark does not know one. Neither
+// outranks the other on purpose — whichever arrives with a deadline keeps it,
+// so learning `resetsAt` a poll later does not lose the pause that beat it.
+func (s *Server) pauseFor(agent string, until time.Time, reason string, fromMark bool) bool {
+	if agent == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	was, had := s.paused[agent]
+	p := PauseView{Agent: agent, Until: until, Since: time.Now(), Reason: reason, FromMark: fromMark}
+	if had {
+		p.Since = was.Since // one pause, however many times it is re-reported
+		if until.IsZero() && !was.Until.IsZero() {
+			p.Until = was.Until // a mark must not erase a deadline a probe knew
+		}
+		if reason == "" {
+			p.Reason = was.Reason
+		}
+	}
+	s.paused[agent] = p
+	s.state.Paused = s.pausedList()
+	return !had
+}
+
+// resumeAgent lifts a pause. Returns true when there was one to lift.
+func (s *Server) resumeAgent(agent string) bool {
+	s.mu.Lock()
+	_, had := s.paused[agent]
+	if had {
+		delete(s.paused, agent)
+		s.state.Paused = s.pausedList()
+	}
+	s.mu.Unlock()
+	return had
+}
+
+// pausedList is the view of s.paused, in a stable order. Caller holds mu.
+func (s *Server) pausedList() []PauseView {
+	out := make([]PauseView, 0, len(s.paused))
+	for _, p := range s.paused {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Agent < out[j].Agent })
+	return out
+}
+
+// agentPaused reports whether work for this agent is being held back, and
+// clears a pause whose deadline has passed.
+//
+// Expiry is checked here rather than on a timer: the reset the agent named is
+// the moment the quota comes back, and the scheduler asks this question every
+// time it looks for work anyway.
+func (s *Server) agentPaused(agent string) bool {
+	if agent == "" {
+		return false // a stage that runs no agent spends nobody's quota
+	}
+	s.mu.RLock()
+	p, held := s.paused[agent]
+	s.mu.RUnlock()
+	if !held {
+		return false
+	}
+	if p.Live(time.Now()) {
+		return true
+	}
+	if s.resumeAgent(agent) {
+		fmt.Fprintf(os.Stderr, "conveyor: %s's quota window has passed; taking work again\n", agent)
+	}
+	return false
+}
+
+// anyPaused reports whether any agent is being held back. It is what stops the
+// stall timer clearing marks into a closed door.
+func (s *Server) anyPaused() bool {
+	s.mu.RLock()
+	names := make([]string, 0, len(s.paused))
+	for name := range s.paused {
+		names = append(names, name)
+	}
+	s.mu.RUnlock()
+	for _, name := range names {
+		if s.agentPaused(name) {
+			return true
+		}
+	}
+	return false
 }
 
 // limitKind is the one word in the agents' blocked vocabulary the engine acts

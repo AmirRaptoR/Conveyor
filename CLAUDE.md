@@ -189,6 +189,18 @@ Codex records in its own rollouts; `agents/claude/status` sums the last five
 hours from `~/.claude/projects` and reports the refusal Claude Code files when
 the account is over its limit. Neither is the account's ledger and both say so.
 
+**`limited` stops the scheduler dispatching to that agent**, until the reset it
+named or until it reports otherwise. A quota belongs to an agent, not to an item
+or a source: every stage naming that agent meets the same wall in every
+repository, so marking items one at a time was only a way of discovering the
+same fact once per item. The first refused run pauses the agent too — a `limit`
+mark is account-level news, and waiting for the next probe costs a whole poll of
+runs to be told what that one just said. `retryStalled` stands down while
+anything is paused, because its premise is that the cause may have passed and
+this is a cause with a known end. Stages that run no agent keep moving, and the
+tick button still overrides. Nothing wedges it shut: a probe that fails, or an
+agent with no status script at all, lifts the pause rather than holding it.
+
 ## The extension seam
 
 The extension is the scripts, never the engine. A stage names one; the source

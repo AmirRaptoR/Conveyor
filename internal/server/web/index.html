@@ -234,6 +234,12 @@
   .agent .who { color:var(--ink); letter-spacing:.1em; text-transform:uppercase; font-size:9.5px; }
   .agent .say { color:var(--dim); }
   .agent.limited .who, .agent.limited .say { color:var(--stop); }
+  .agent.paused .who { color:var(--stop); }
+  /* The scheduler's own state, not the agent's report: said in the agent's
+     words but boxed, so "it says it is limited" and "we stopped dispatching"
+     are not read as one sentence. */
+  .agent .held { color:var(--stop); border:1px solid var(--stop); border-radius:3px;
+    padding:0 5px; font-size:9.5px; letter-spacing:.04em; }
   .agent .resets { color:var(--faint); }
   .agent details { display:inline; }
   .agent summary { cursor:pointer; color:var(--faint); list-style:none; }
@@ -456,15 +462,23 @@ function draw() {
   // What each agent says about itself. The engine passes this through — which
   // limits an agent has and what counts against them is the agent's business —
   // so the page renders whatever labels came back, in the order they came.
+  // Being limited and being paused are two different facts and the strip says
+  // both: the first is what the agent reports about itself, the second is what
+  // the scheduler is doing about it. They usually agree, but the first refused
+  // run pauses an agent a whole poll before its status script catches up — and
+  // a paused line and an idle line look identical without this.
+  const paused = Object.fromEntries((state.paused || []).map(p => [p.agent, p]));
   $("#agents").innerHTML = !(state.agents || []).length ? "" :
     `<div class="agents">${state.agents.map(a => {
       const facts = (a.detail || []).map(d =>
         `<span><b>${esc(d.label)}</b> ${esc(d.value)}</span>`).join("");
       const say = a.error ? `cannot say — ${esc(a.error)}` : esc(a.summary || "");
-      return `<span class="agent ${esc(a.state || "unknown")}">
-        <span class="lamp ${a.state === "limited" ? "down" : a.state === "ok" ? "idle" : ""}"></span>
+      const hold = paused[a.name];
+      return `<span class="agent ${esc(a.state || "unknown")}${hold ? " paused" : ""}">
+        <span class="lamp ${a.state === "limited" || hold ? "down" : a.state === "ok" ? "idle" : ""}"></span>
         <span class="who">${esc(a.name)}</span>
         <span class="say">${say}</span>
+        ${hold ? `<span class="held">holding work back${hold.until ? ` until ${esc(clock(hold.until))}` : ""}</span>` : ""}
         ${a.resetsAt ? `<span class="resets">resets ${esc(clock(a.resetsAt))}</span>` : ""}
         ${facts ? `<details><summary>details</summary><span class="facts">${facts}</span></details>` : ""}
       </span>`;

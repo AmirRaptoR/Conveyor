@@ -361,6 +361,25 @@ type Agent struct {
 	Status string `json:"-"` // absolute path; empty when the agent has none
 }
 
+// AgentFor names the agent a source runs a stage on, or "" when that stage
+// runs a plain script, an inline body, or nothing at all.
+//
+// The scheduler needs this to know whose quota a transition would spend: a
+// usage limit belongs to an agent, not to a source or a stage, and one agent
+// is shared by every stage that names it across every repository.
+func (c *Config) AgentFor(source, stage string) string {
+	st, ok := c.Stage(stage)
+	if !ok || st.Script == "" {
+		return ""
+	}
+	for _, src := range c.Sources {
+		if src.Name == source {
+			return src.Scripts[st.Script].Agent
+		}
+	}
+	return ""
+}
+
 // AgentsInUse lists the agents this config's sources actually call.
 //
 // Derived, never declared: an agent is not a thing you enrol, it is whatever a
