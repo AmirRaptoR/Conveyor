@@ -89,6 +89,13 @@ stopped *somewhere*, and that is the one fact worth keeping. `maxAttempts:`
 defaults to 1, so a failure that is not retried marks immediately — a failure
 that neither routed nor marked would be re-run on every poll forever.
 
+Exit 10 means the next **poll**, and the engine holds the item to it. A
+finished transition wakes the scheduler, and the item that just exited 10 has
+not moved — it is still the best candidate in the stage it never left, so
+without this it is picked again immediately and the "try again later" it asked
+for arrives two seconds later, forever. A stage that deferred is skipped until
+the next listing lands; a person pressing the tick button clears that too.
+
 A blocked script may say why: `{"blocked": true, "reason": "…"}` in
 `$CONVEYOR_RESULT`. The engine passes the reason to `move`, and a provider that
 has somewhere to put it — a comment, a field — should.

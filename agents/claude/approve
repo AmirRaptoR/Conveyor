@@ -180,7 +180,7 @@ check_hold() {
 # out.
 fetch_details() {
 	details=$(gh_json api graphql -f query='
-		query($owner:String!, $name:String!, $number:Int!, $issue:Int!) {
+		query($owner:String!, $name:String!, $number:Int!) {
 			repository(owner:$owner, name:$name) {
 				pullRequest(number:$number) {
 					isDraft
@@ -204,7 +204,7 @@ fetch_details() {
 					}
 				}
 			}
-		}' -F owner="$owner" -F name="$name" -F number="$pr" -F issue="$ref" --jq '.data.repository.pullRequest')
+		}' -F owner="$owner" -F name="$name" -F number="$pr" --jq '.data.repository.pullRequest')
 
 	if [[ "$(jq -r '.reviewThreads.pageInfo.hasNextPage' <<<"$details")" == "true" ]] ||
 		jq -e '[.reviewThreads.nodes[].comments.pageInfo.hasNextPage] | any' >/dev/null 2>&1 <<<"$details"; then

@@ -93,6 +93,14 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   Manual order and priority decide *within* a stage, which is where a human
   lever belongs: a choice about what to start next, not a way to jump work
   already in flight.
+- **Exit 10 means the next poll, and the engine enforces it.** A no-op in the
+  stage the item was already in puts that item in `Server.resting`, and the
+  scheduler skips it until a listing lands (every listing clears the set; so
+  does the tick button, which means "look again now"). Without it a deferring
+  stage re-ran on the wake its own transition caused: an `approving` stage
+  waiting on a quiet pull request filed fourteen hundred runs an hour, each a
+  real API call. The circuit breaker in `schedule` capped each burst and let
+  the next one start, so it read as a warning rather than a fault.
 - **The scheduler claims a slot before it launches.** Checking whether a slot is
   free and then starting a goroutine leaves a gap in which the next pass decides
   the same thing again. `Engine.Advance` does not lock; its caller must.

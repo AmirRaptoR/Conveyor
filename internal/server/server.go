@@ -221,7 +221,24 @@ type Server struct {
 	// Two agents then worked the same issue in the same worktree — the exact
 	// collision worktrees exist to prevent — and whichever exited first had its
 	// outcome routed as though it were the other's.
-	working sync.Map      // itemID -> struct{}, held for the life of a transition
+	working sync.Map // itemID -> struct{}, held for the life of a transition
+	// resting is the items a stage asked to be left alone until the next
+	// listing, by ID.
+	//
+	// Exit 10 means "leave the item where it is, try again next poll"
+	// (CONTRACTS §2). It was being answered with "try again now": a finished
+	// transition wakes the scheduler, the item is still workable in the stage
+	// it never left, and it is by construction the best candidate there is —
+	// so it was picked again immediately. An `approving` stage deferring on a
+	// quiet pull request re-ran itself every couple of seconds, fourteen
+	// hundred runs an hour, every one of them a real API call. The circuit
+	// breaker in schedule capped each burst and then let the next one start,
+	// which is why this looked like a warning rather than a fault.
+	//
+	// Every listing clears it wholesale, because a listing IS the next poll.
+	// So does the tick button: that gesture means "look again now", and
+	// honouring a deferral against it would answer a person with nothing.
+	resting map[string]bool
 	tick    chan struct{} // one buffered slot: ticks never queue up
 	// wake asks the scheduler to look again. One buffered slot, because the
 	// question is always the same one — what can move now — and a queue of it
@@ -247,6 +264,7 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 	}
 	s.blocks = map[string]Block{}
 	s.paused = map[string]PauseView{}
+	s.resting = map[string]bool{}
 	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
 
 	// Every log line reaches the browser as it is produced. This is the whole
@@ -445,6 +463,10 @@ func (s *Server) button(ctx context.Context, auto bool) {
 			return
 		case <-s.tick:
 			if auto {
+				// "Look again now", so nothing gets to say "not yet".
+				s.mu.Lock()
+				clear(s.resting)
+				s.mu.Unlock()
 				s.wakeUp()
 				continue
 			}
@@ -554,6 +576,9 @@ func (s *Server) refresh(ctx context.Context) {
 	s.state.Order = s.order.IDs()
 	s.state.UpdatedAt = time.Now()
 	s.state.Polling = false
+	// The listing every deferred stage was waiting for. Whatever it exited 10
+	// over has had a poll interval to change.
+	clear(s.resting)
 	// A mark cleared on the provider — a label removed by hand — takes its
 	// note with it. The provider is the authority on whether, always.
 	marked := map[string]bool{}
@@ -721,6 +746,10 @@ func (s *Server) recallBlocks(items []model.Item) {
 func (s *Server) launch(ctx context.Context) int {
 	s.mu.RLock()
 	items := append([]model.Item(nil), s.state.Items...)
+	resting := make(map[string]bool, len(s.resting))
+	for id := range s.resting {
+		resting[id] = true
+	}
 	s.mu.RUnlock()
 	order := s.order.IDs()
 
@@ -748,6 +777,9 @@ func (s *Server) launch(ctx context.Context) int {
 			}
 			if _, running := s.working.Load(it.ID); running {
 				continue // already being worked; the locks do not know that
+			}
+			if resting[it.ID] {
+				continue // it exited 10 here and asked for the next poll, not this one
 			}
 			free = append(free, it)
 		}
@@ -839,6 +871,16 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 			RunID: tr.RunID, At: time.Now(), Asked: asked, Session: session}
 	} else {
 		delete(s.blocks, tr.Item.ID)
+	}
+	// A no-op in the stage the item was already in is the script saying it has
+	// nothing to do yet — a pull request still settling, a check still running.
+	// Nothing about the board will answer it differently one second later, so
+	// it waits for the listing. Any other outcome is progress, and progress
+	// ends the deferral: the item is somewhere new, or marked, or due a retry.
+	if tr.Outcome == model.OutcomeNoop && tr.From == tr.Stage {
+		s.resting[tr.Item.ID] = true
+	} else {
+		delete(s.resting, tr.Item.ID)
 	}
 	s.mu.Unlock()
 
@@ -1349,6 +1391,9 @@ func (s *Server) unblock(ctx context.Context, item model.Item) error {
 		}
 	}
 	delete(s.blocks, item.ID)
+	// Handing an item back is an answer, and an answer is exactly the change a
+	// deferred stage was waiting to see.
+	delete(s.resting, item.ID)
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
 	s.wakeUp()
