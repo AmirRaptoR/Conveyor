@@ -93,6 +93,11 @@ A blocked script may say why: `{"blocked": true, "reason": "…"}` in
 `$CONVEYOR_RESULT`. The engine passes the reason to `move`, and a provider that
 has somewhere to put it — a comment, a field — should.
 
+Any stage script may also write `{"summary": "…"}` — one line of narrative,
+unrelated to whether it blocked. The engine does not read it; the final report
+(the panel's per-item write-up, built from run history) quotes it under the
+stage that wrote it. No script is required to write one, and none does today.
+
 ## 3. The script kinds
 
 **`list`** — read items from a provider. Writes a JSON array of items to
