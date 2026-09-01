@@ -164,6 +164,97 @@ func TestRecoveryOutranksTheOrderedBacklog(t *testing.T) {
 	}
 }
 
+// The line is worked from its far end backwards: an item two stages from done
+// is picked before one that has not started, however the backlog is arranged.
+// A pipeline exists to finish items, and a scheduler that always reaches for
+// the head of the backlog widens the band of half-finished work instead.
+func TestLaterStagesAreWorkedFirst(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{
+		{Name: "backlog", OnSuccess: "refining"},
+		{Name: "refining", Script: "refine", OnSuccess: "ready"},
+		{Name: "ready", OnSuccess: "in-progress"},
+		{Name: "in-progress", Script: "implement", OnSuccess: "review"},
+		{Name: "review", Script: "review", OnSuccess: "done"},
+		{Name: "done", Terminal: true},
+	}}
+	p0 := 0
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "backlog", Title: "top of the queue, most urgent", Priority: &p0},
+		{ID: "a:2", Source: "a", Stage: "refining", Title: "interrupted early on"},
+		{ID: "a:3", Source: "a", Stage: "ready", Title: "waiting to be built"},
+		{ID: "a:4", Source: "a", Stage: "in-progress", Title: "nearly reviewable"},
+	}
+	// a:1 is first in the manual order, priority 0, and listed first: it wins
+	// every rung below depth. a:2 is an interrupted run, which used to outrank
+	// everything.
+	order := []string{"a:1", "a:2", "a:3", "a:4"}
+
+	want := []string{"a:4", "a:3", "a:2", "a:1"}
+	var got []string
+	for _, it := range Order(cfg, items, order) {
+		got = append(got, it.ID)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("Order = %v, want %v — furthest along first", got, want)
+	}
+
+	first, target := Pick(cfg, items, order)
+	if first == nil || first.ID != "a:4" {
+		t.Fatalf("picked %v, want a:4 — the item closest to done", first)
+	}
+	if target != "in-progress" {
+		t.Errorf("target = %q, want in-progress (a re-run of the stage it is in)", target)
+	}
+}
+
+// Depth is measured on the stage an item is heading INTO, so a queue and the
+// stage it feeds are one position in the line, not two. That is what keeps
+// recovery meaningful: an interrupted run only ever ties with the queue behind
+// it, and it wins that tie — nothing is stranded wearing a status it is not in.
+func TestRecoveryWinsAtEqualDepth(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{
+		{Name: "ready", OnSuccess: "in-progress"},
+		{Name: "in-progress", Script: "implement", OnSuccess: "done"},
+		{Name: "done", Terminal: true},
+	}}
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "ready", Title: "next up, dragged to the top"},
+		{ID: "a:2", Source: "a", Stage: "in-progress", Title: "interrupted mid-stage"},
+	}
+	got, target := Pick(cfg, items, []string{"a:1", "a:2"})
+	if got == nil || got.ID != "a:2" {
+		t.Fatalf("picked %v, want the interrupted a:2", got)
+	}
+	if target != "in-progress" {
+		t.Errorf("target = %q, want in-progress (a re-run, not a move)", target)
+	}
+}
+
+// Within one stage nothing changed: the manual order is still the human lever,
+// which is where it belongs — a choice about what to start next, not a way to
+// jump work already in flight.
+func TestOrderStillDecidesWithinAStage(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{
+		{Name: "backlog", OnSuccess: "refining"},
+		{Name: "refining", Script: "refine", OnSuccess: "ready"},
+		{Name: "ready", OnSuccess: "done"},
+		{Name: "done", Terminal: true},
+	}}
+	p0 := 0
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "ready", Title: "further along, unordered"},
+		{ID: "a:2", Source: "a", Stage: "backlog", Title: "dragged to the top"},
+		{ID: "a:3", Source: "a", Stage: "backlog", Title: "urgent but lower", Priority: &p0},
+	}
+	var got []string
+	for _, it := range Order(cfg, items, []string{"a:2", "a:3"}) {
+		got = append(got, it.ID)
+	}
+	if strings.Join(got, ",") != "a:1,a:2,a:3" {
+		t.Errorf("Order = %v, want a:1,a:2,a:3 — depth first, then the order inside the stage", got)
+	}
+}
+
 // With nothing to recover, the manual order decides as before.
 func TestOrderStillDecidesWithoutRecovery(t *testing.T) {
 	cfg := &config.Config{Stages: []config.Stage{

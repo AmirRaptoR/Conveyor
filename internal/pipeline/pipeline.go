@@ -484,26 +484,40 @@ func Target(cfg *config.Config, it *model.Item) (string, bool) {
 
 // The ladder below is the whole of v1's scheduling.
 //
-// Recovery comes first, ahead of any human ordering: an item found inside a
-// stage that runs a script is a job that started and did not finish, and the
+// **The line is worked from its far end backwards.** How far along an item is
+// outranks everything except being workable at all: a job one stage from done
+// is picked before a job one stage from started. A pipeline exists to finish
+// items, and a scheduler that always reaches for the head of the backlog keeps
+// widening the band of half-finished work — every one of them holding a
+// worktree, a branch and an open pull request that goes stale while the line
+// starts something new. Depth is read off the stage an item is *heading into*,
+// which is the config's own stage order, so "later" means later in the pipeline
+// the person wrote and nothing else.
+//
+// Recovery comes next, and at equal depth it comes first: an item found inside
+// a stage that runs a script is a job that started and did not finish, and the
 // provider already says so. Leaving it behind a full backlog would strand it
 // wearing a status it is not in, which is the opposite of what writing provider
-// state before the run is for.
+// state before the run is for. It only ever ties with the queue feeding its own
+// stage, so this still beats every backlog item competing with it.
 //
 // After that, v1's only human control is the order of the inputs, so an item's
 // position in `order` beats its priority. Items not named there fall back to
 // priority, then to the source's own listing order, which keeps the choice
-// stable across polls.
+// stable across polls. Those three decide *within* a stage — which is where the
+// human lever belongs, because it is a choice about what to start next, and
+// dragging a backlog card can no longer jump the queue past work in flight.
 //
 // Pick chooses the next item to work from a listing. It is the head of Order.
 func Pick(cfg *config.Config, items []model.Item, order []string) (*model.Item, string) {
 	pos := index(order)
+	depths := stageDepths(cfg)
 	best := -1
 	var bestTarget string
 	var bestC candidate
 
 	for i := range items {
-		c, target := rate(cfg, &items[i], i, pos)
+		c, target := rate(cfg, &items[i], i, pos, depths)
 		if !c.workable {
 			continue
 		}
@@ -531,9 +545,10 @@ func Pick(cfg *config.Config, items []model.Item, order []string) (*model.Item, 
 // have no claim on a place in it.
 func Order(cfg *config.Config, items []model.Item, order []string) []model.Item {
 	pos := index(order)
+	depths := stageDepths(cfg)
 	rated := make([]candidate, len(items))
 	for i := range items {
-		rated[i], _ = rate(cfg, &items[i], i, pos)
+		rated[i], _ = rate(cfg, &items[i], i, pos, depths)
 	}
 	seq := make([]int, len(items))
 	for i := range items {
@@ -555,8 +570,26 @@ func index(order []string) map[string]int {
 	return pos
 }
 
+// stageDepths numbers the stages along the line, so "further along" is a comparison
+// and not a guess.
+//
+// The number is the stage's position in the config, which is already the line's
+// order and not merely a listing: a stage that names no `onSuccess` falls
+// through to the next one declared. Nothing else could serve. Following
+// `onSuccess` from the front would have to answer what a rework edge means —
+// review sending an item back to be implemented makes the graph a cycle, with
+// no distance to measure — whereas the file says, in the order a person wrote
+// it, how far along `approving` is compared to `ready`.
+func stageDepths(cfg *config.Config) map[string]int {
+	d := make(map[string]int, len(cfg.Stages))
+	for i, s := range cfg.Stages {
+		d[s.Name] = i
+	}
+	return d
+}
+
 // rate scores one item's claim on being next, and reports where it would go.
-func rate(cfg *config.Config, it *model.Item, listed int, pos map[string]int) (candidate, string) {
+func rate(cfg *config.Config, it *model.Item, listed int, pos map[string]int, depth map[string]int) (candidate, string) {
 	target, ok := Target(cfg, it)
 	oi, ordered := pos[it.ID]
 	prio := 1 << 30
@@ -567,6 +600,7 @@ func rate(cfg *config.Config, it *model.Item, listed int, pos map[string]int) (c
 	// runs something and the previous run did not finish.
 	return candidate{
 		workable:   ok,
+		depth:      depth[target],
 		recovering: ok && target == it.Stage,
 		ordered:    ordered,
 		idx:        oi,
@@ -578,6 +612,7 @@ func rate(cfg *config.Config, it *model.Item, listed int, pos map[string]int) (c
 // candidate is one item's claim on being next.
 type candidate struct {
 	workable   bool // has anywhere to go at all
+	depth      int  // how far along the line the stage it is heading into sits
 	recovering bool // a stage it is already in, left unfinished
 	ordered    bool // named in the manual order
 	idx        int  // where, if it is
@@ -591,8 +626,11 @@ func better(a, b candidate) bool {
 	if a.workable != b.workable {
 		return a.workable // nothing to run is not a place in the queue
 	}
+	if a.depth != b.depth {
+		return a.depth > b.depth // finish an item before starting another
+	}
 	if a.recovering != b.recovering {
-		return a.recovering // finish what was started
+		return a.recovering // and at one depth, finish what was already running
 	}
 	if a.ordered != b.ordered {
 		return a.ordered // an explicitly ordered item beats an unordered one

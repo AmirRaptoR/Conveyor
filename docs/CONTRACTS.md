@@ -175,6 +175,39 @@ Step 2 before step 3 is deliberate: it is the same guarantee as marking an issue
 `in-progress` before implementing it. If the process dies mid-stage, the provider
 already reflects reality and the item is not handed out twice.
 
+## 4a. Which item is next
+
+The scheduler works the line **from its far end backwards**. Rungs, most
+decisive first:
+
+1. has anywhere to go at all — a marked item, a terminal stage or a queue with
+   no exit is not in the running
+2. **how far along it is**: the position, in the config's stage list, of the
+   stage it is heading into. Further along wins
+3. recovery — a stage that runs a script, found holding an item, is an
+   unfinished job and is re-run
+4. the manual input order, then `priority`, then the source's own listing order
+
+Rung 2 is the point of the whole thing: finish an item before starting another.
+Every half-finished item holds a worktree, a branch and an open pull request
+that goes stale while the line starts something new, so a job one stage from
+done is worth more than a job one stage from started — however urgent the
+backlog looks.
+
+Depth is read off the config because the config is already the line's order: a
+stage with no `onSuccess` falls through to the next one declared. Walking
+`onSuccess` instead could not measure anything, since a review that sends work
+back to be implemented makes the graph a cycle.
+
+A queue and the stage it feeds are one position, not two, because depth is the
+stage being *entered*. That is what keeps rung 3 meaningful: an interrupted run
+only ever ties with the queue directly behind it, and it wins that tie, so
+nothing is left stranded wearing a status it is not in.
+
+Rung 4 therefore decides *within* one stage. That is where a human lever
+belongs — it is a choice about what to start next, and dragging a backlog card
+cannot jump the queue past work already in flight.
+
 ## 5. Concurrency
 
 ```yaml

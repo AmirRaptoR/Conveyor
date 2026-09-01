@@ -79,6 +79,20 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   Agents must not change branch: several checkouts of one repository are live at
   once and `main` is checked out elsewhere. Both adapters say so in the prompt,
   and `/implement` step 2 defers to a branch it was handed.
+- **The line is worked from its far end backwards.** `pipeline.Pick` ranks by
+  how far along an item is before anything else: the item closest to done goes
+  first, and the backlog is reached last. A pipeline exists to finish items, and
+  a scheduler that always reaches for the head of the backlog widens the band of
+  half-finished work — each one holding a worktree, a branch and a pull request
+  going stale. Depth is the position of the stage an item is *heading into* in
+  the config's stage list, which is already the line's order (`onSuccess` unset
+  falls through to the next stage declared); following `onSuccess` from the
+  front could not measure anything, because a rework edge makes the graph a
+  cycle. A queue and the stage it feeds share one depth, so an interrupted run
+  still outranks the queue behind it — recovery is the tie-break, one rung down.
+  Manual order and priority decide *within* a stage, which is where a human
+  lever belongs: a choice about what to start next, not a way to jump work
+  already in flight.
 - **The scheduler claims a slot before it launches.** Checking whether a slot is
   free and then starting a goroutine leaves a gap in which the next pass decides
   the same thing again. `Engine.Advance` does not lock; its caller must.
