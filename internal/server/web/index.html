@@ -766,13 +766,21 @@ function tableHTML(rows) {
 }
 
 // inline(), plus the one piece of syntax the report adds beyond it: an
-// item's own `[text](url)` link, on the identity line.
+// item's own `[text](url)` link, on the identity line. The server only ever
+// emits that syntax for an http(s) URL (identityLine, report.go), but this
+// reader runs over every heading and paragraph, not just that one line — so
+// it re-checks the scheme itself before linking, the same rule the server
+// applied, rather than trusting that no other text node can ever contain a
+// bracket pair. A title or summary containing literal `[x](javascript:…)`
+// therefore prints as text, not as a link that runs on click.
 function paraInline(s) {
   const m = s.match(/^(.*)\[([^\]]+)\]\(([^)]+)\)(.*)$/);
   if (!m) return inline(s);
-  return paraInline(m[1]) +
-    `<a href="${esc(m[3])}" target="_blank" rel="noopener">${inline(m[2])}</a>` +
-    paraInline(m[4]);
+  const safe = /^https?:\/\//i.test(m[3]);
+  const mid = safe
+    ? `<a href="${esc(m[3])}" target="_blank" rel="noopener">${inline(m[2])}</a>`
+    : inline(`[${m[2]}](${m[3]})`);
+  return paraInline(m[1]) + mid + paraInline(m[4]);
 }
 
 // The whole reason, where there is room for it, and the control that answers
