@@ -269,6 +269,7 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 
 	src := mustSource(e.cfg, srcName)
 	script, ok := src.Paths[stage.Script]
+	timeout := timeoutFor(src, stage)
 	// A stage's params reach only its own script, layered over what the source
 	// is: two stages both want a PROMPT, and at source level the second would
 	// overwrite the first.
@@ -295,7 +296,7 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 		Item:    item,
 		From:    from,
 		To:      to,
-		Timeout: stage.Timeout.D(),
+		Timeout: timeout,
 		Stdin:   model.StageInput{Item: item, Stage: to, From: from, Answer: resume.Answer, Session: resume.Session},
 	})
 	if err != nil {
@@ -642,6 +643,28 @@ func better(a, b candidate) bool {
 		return a.prio < b.prio // 0 is most urgent
 	}
 	return a.pos < b.pos
+}
+
+// timeoutFor is how long this source's version of this stage's work gets.
+//
+// The stage says how long the work gets, and that is the right default: a
+// timeout is a statement about the job. But the same job costs different
+// amounts in different repositories — reviewing a Flutter app whose whole suite
+// runs in 38 seconds is not reviewing a .NET service whose integration tests
+// take a quarter of an hour — and one number for both is either too tight for
+// the second or no guard at all for the first. Raising the stage to fit the
+// slowest repository removes the guard everywhere it was doing its job.
+//
+// An inline `run:` stage has no per-source entry to carry an override, by
+// construction: it exists for the case where every source does the same thing.
+func timeoutFor(src config.Source, stage *config.Stage) time.Duration {
+	if stage.Run != "" {
+		return stage.Timeout.D()
+	}
+	if t := src.Scripts[stage.Script].Timeout.D(); t > 0 {
+		return t
+	}
+	return stage.Timeout.D()
 }
 
 func mergeEnv(env, params map[string]string) map[string]string {

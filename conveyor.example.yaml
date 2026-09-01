@@ -227,6 +227,12 @@ sources:
   #         PROMPT: "/implement $REF"
   #     review:
   #       agent: claude
+  #       # This stage's timeout, for this source only. Unset means the
+  #       # stage's. A repository whose integration suite alone runs for a
+  #       # quarter of an hour needs more than one whose whole suite takes
+  #       # under a minute, and raising the stage to fit the first would
+  #       # remove the guard from the second.
+  #       timeout: 75m
   #       params:
   #         # Cheaper still: Codex is the reviewer here, and this side
   #         # adjudicates its findings and merges. Judging a finding is a

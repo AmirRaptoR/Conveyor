@@ -397,3 +397,41 @@ func TestEveryMarkHasAKind(t *testing.T) {
 		}
 	}
 }
+
+// A timeout is a statement about the work, and the same work costs different
+// amounts per repository: caravan-v2's integration suite ran for 15m44s where
+// midgame's whole mobile suite takes 38 seconds. One stage number for both is
+// either too tight for the first or no guard at all for the second.
+func TestASourceMayOverrideAStageTimeout(t *testing.T) {
+	stage := &config.Stage{Name: "review", Script: "review", Timeout: config.Duration(35 * time.Minute)}
+	slow := config.Source{Name: "caravan-v2", Scripts: map[string]config.ScriptSpec{
+		"review": {Agent: "claude", Timeout: config.Duration(75 * time.Minute)},
+	}}
+	fast := config.Source{Name: "midgame", Scripts: map[string]config.ScriptSpec{
+		"review": {Agent: "claude"},
+	}}
+
+	if got := timeoutFor(slow, stage); got != 75*time.Minute {
+		t.Errorf("caravan-v2 review = %s, want 75m — the source's own number", got)
+	}
+	if got := timeoutFor(fast, stage); got != 35*time.Minute {
+		t.Errorf("midgame review = %s, want the stage's 35m", got)
+	}
+	// A source that names no script for the stage keeps the stage's number
+	// rather than losing its guard to a zero value.
+	if got := timeoutFor(config.Source{Name: "other"}, stage); got != 35*time.Minute {
+		t.Errorf("unlisted source = %s, want the stage's 35m", got)
+	}
+}
+
+// An inline `run:` stage exists for the case where every source does the same
+// thing, so there is no per-source entry that could carry an override.
+func TestAnInlineStageKeepsItsOwnTimeout(t *testing.T) {
+	stage := &config.Stage{Name: "merged", Run: "#!/bin/sh\ntrue\n", Timeout: config.Duration(2 * time.Minute)}
+	src := config.Source{Name: "s", Scripts: map[string]config.ScriptSpec{
+		"": {Timeout: config.Duration(time.Hour)},
+	}}
+	if got := timeoutFor(src, stage); got != 2*time.Minute {
+		t.Errorf("inline stage = %s, want the stage's 2m", got)
+	}
+}

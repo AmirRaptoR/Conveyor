@@ -181,6 +181,17 @@ type ScriptSpec struct {
 	// rather than per-source because two stages both want to be handed a
 	// PROMPT, and at source level the second would overwrite the first.
 	Params map[string]string `yaml:"params"`
+	// Timeout overrides the stage's, for this source only. Unset means the
+	// stage's, which is the normal case.
+	//
+	// A stage's timeout is a statement about the work, and the same work costs
+	// different amounts in different repositories: reviewing a Flutter app
+	// whose whole suite runs in 38 seconds is not reviewing a .NET service
+	// whose integration tests take a quarter of an hour. One number for both
+	// has to be either too tight for the slow repository or no guard at all for
+	// the fast one, and picking the larger silently removes the guard
+	// everywhere it was doing its job.
+	Timeout Duration `yaml:"timeout"`
 }
 
 // Duration accepts "30d", "90m", "5m" — Go's ParseDuration has no day unit, and

@@ -215,6 +215,27 @@ Rung 4 therefore decides *within* one stage. That is where a human lever
 belongs — it is a choice about what to start next, and dragging a backlog card
 cannot jump the queue past work already in flight.
 
+## 4a2. A source may cost more than the stage assumes
+
+A stage's `timeout:` is a statement about the work. The same work costs
+different amounts in different repositories, so a source's script entry may
+override it:
+
+```yaml
+scripts:
+  review:
+    agent: claude
+    timeout: 75m        # this repo's suite alone runs for a quarter of an hour
+```
+
+Unset means the stage's, which is the normal case. Raising the *stage* to fit
+the slowest repository is the wrong lever: it removes the guard everywhere it
+was doing its job.
+
+An inline `run:` stage cannot be overridden this way, by construction — it
+exists for the case where every source does the same thing, so there is no
+per-source entry to carry the number.
+
 ## 4b. The deadline
 
 A stage with a `timeout:` tells its script when it will be killed:
