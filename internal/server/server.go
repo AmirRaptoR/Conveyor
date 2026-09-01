@@ -298,6 +298,7 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("GET /api/runs", s.handleRuns)
 	mux.HandleFunc("GET /api/runs/{id}", s.handleRun)
+	mux.HandleFunc("GET /api/items/{id}/report", s.handleReport)
 	mux.HandleFunc("POST /api/refresh", s.handleRefresh)
 	mux.HandleFunc("POST /api/tick", s.handleTick)
 	mux.HandleFunc("PUT /api/order", s.handleOrder)
