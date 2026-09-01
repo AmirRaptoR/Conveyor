@@ -60,7 +60,7 @@ author learns it once.
 | | |
 | --- | --- |
 | `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "blocked": false, "config": {...}}`, plus `"answer"` and `"session"` when this run follows a stop a person answered (§5a). For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "config": {...}}` |
-| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, plus everything in the source's `env:` block |
+| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, `CONVEYOR_DEADLINE` (§4b), plus everything in the source's `env:` block |
 
 **Output** is split deliberately:
 
@@ -214,6 +214,35 @@ nothing is left stranded wearing a status it is not in.
 Rung 4 therefore decides *within* one stage. That is where a human lever
 belongs — it is a choice about what to start next, and dragging a backlog card
 cannot jump the queue past work already in flight.
+
+## 4b. The deadline
+
+A stage with a `timeout:` tells its script when it will be killed:
+`CONVEYOR_DEADLINE`, an RFC3339 instant in UTC, taken from the context that
+enforces it rather than calculated a second time. **Unset when the stage has no
+timeout** — a real configuration, and never to be read as a deadline that has
+already passed.
+
+An instant, not a duration, because a duration is only useful to something that
+knows when it started. An agent sixty turns in cannot feel elapsed time and has
+no reason to have kept count; a timestamp costs it one `date` to know exactly
+where it stands.
+
+What an adapter does with it is the adapter's business, and `agents/_deadline`
+is what the ones here do: hand the agent an earlier deadline than the engine's —
+`WRAP_UP_GRACE` seconds earlier, 300 by default — so the last minutes go on
+landing work rather than being cut mid-verification.
+
+Two properties of that brief are deliberate. It never tells an agent to hurry:
+a review that returns green because the clock was running is worse than the
+timeout it avoided, since the timeout at least marks the item and fetches a
+person. And the agent's deadline is **derived**, never configured — one number
+in `conveyor.yaml` moves both, where a budget written into a `PROMPT` would go
+stale the first time that number changed, with nothing able to catch it.
+
+Stopping unfinished is a supported outcome, not a failure: the run's session and
+the item's worktree both carry to the next run, so it continues rather than
+starting over.
 
 ## 5. Concurrency
 

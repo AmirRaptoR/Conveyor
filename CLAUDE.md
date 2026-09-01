@@ -51,6 +51,15 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
 - **The engine writes provider state before running a stage**, never after, and
   stage scripts never call `move` themselves. A crash mid-stage then leaves a
   truthful record and the item is not handed out twice.
+- **A stage's timeout reaches its agent, as an instant.** `CONVEYOR_DEADLINE`
+  is when the process group dies, in UTC, read off the context that enforces it;
+  unset means the stage has no timeout and must never be read as "expired".
+  `agents/_deadline` turns it into a brief giving the agent an earlier deadline
+  (`WRAP_UP_GRACE`, 300s) so it can commit and push before the wall instead of
+  being cut mid-verification. The brief never says to hurry — a review that goes
+  green because time ran out is worse than the timeout, which at least marks the
+  item and fetches a person — and the agent's deadline is derived from the
+  engine's, so `conveyor.yaml` stays the only place the number lives.
 - **A timeout kills the process group**, TERM then KILL. Killing only the parent
   leaves an agent's children holding the source's lock.
 - **An item gets its own worktree, not the source's checkout.** `agents/_worktree`

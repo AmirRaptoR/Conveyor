@@ -9,6 +9,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 source "$here/_worktree"
 source "$here/_blocked"
 source "$here/_resume"
+source "$here/_deadline"
 
 fail=0
 chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
@@ -163,5 +164,26 @@ cd "$tmp/repo"
 before=$PATH
 item_worktree demo 46 >/dev/null 2>&1 || true
 chk "PATH survives being sourced" "$PATH" "$before"
+
+# 10. the time budget. The agent's deadline is derived from the engine's, so a
+# stage timeout changed in conveyor.yaml moves both and neither can go stale.
+export CONVEYOR_RESULT="$tmp/result.json"
+brief=$(CONVEYOR_DEADLINE=$(date -u -d '+35 minutes' +%Y-%m-%dT%H:%M:%SZ) WRAP_UP_GRACE=300 deadline_brief)
+want_soft=$(date -u -d '+30 minutes' +'%H:%M UTC')
+want_hard=$(date -u -d '+35 minutes' +'%H:%M UTC')
+chk "the brief names the engine's kill time" "$(grep -c "killed at" <<<"$brief")" "1"
+chk "and the hard deadline itself"           "$(grep -c "$want_hard" <<<"$brief")" "1"
+chk "and a wrap-up one grace earlier"        "$(grep -c "$want_soft" <<<"$brief")" "1"
+chk "and where to write an unfinished stop"  "$(grep -c "$CONVEYOR_RESULT" <<<"$brief")" "1"
+
+# No timeout is a real configuration. An adapter must be able to tell it apart
+# from a deadline in the past — a stage with no limit that told its agent it was
+# out of time would end every run on the first instruction it read.
+chk "no deadline, no brief" "$(CONVEYOR_DEADLINE= deadline_brief | wc -c)" "0"
+chk "an unreadable one is the same" "$(CONVEYOR_DEADLINE=whenever deadline_brief | wc -c)" "0"
+
+# A grace wider than the stage would put the wrap-up before the run began.
+brief=$(CONVEYOR_DEADLINE=$(date -u -d '+2 minutes' +%Y-%m-%dT%H:%M:%SZ) WRAP_UP_GRACE=600 deadline_brief)
+chk "a grace wider than the stage still reads" "$(grep -c "$(date -u -d '+2 minutes' +'%H:%M UTC')" <<<"$brief")" "2"
 
 exit $fail

@@ -119,19 +119,24 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		return nil, err
 	}
 
-	resultPath := filepath.Join(dir, "result.json")
-	env, envMap := buildEnv(spec, resultPath)
-	run.Env = envMap
-
 	// A timeout must kill the whole process group: an AI stage script spawns
 	// children, and killing only the parent leaves them running and holding the
 	// source's lock forever.
+	//
+	// Built before the environment, not after, so the deadline handed to the
+	// script is the one the context will actually enforce rather than a second
+	// calculation of it.
 	runCtx := ctx
 	var cancel context.CancelFunc
 	if spec.Timeout > 0 {
 		runCtx, cancel = context.WithTimeout(ctx, spec.Timeout)
 		defer cancel()
 	}
+	deadline, _ := runCtx.Deadline()
+
+	resultPath := filepath.Join(dir, "result.json")
+	env, envMap := buildEnv(spec, resultPath, deadline)
+	run.Env = envMap
 
 	cmd := exec.Command(script)
 	cmd.Dir = spec.Workdir
@@ -277,12 +282,26 @@ func trimNewline(s string) string {
 	return s
 }
 
-func buildEnv(spec Spec, resultPath string) ([]string, map[string]string) {
+func buildEnv(spec Spec, resultPath string, deadline time.Time) ([]string, map[string]string) {
 	own := map[string]string{
 		"CONVEYOR_RESULT":  resultPath,
 		"CONVEYOR_WORKDIR": spec.Workdir,
 		"CONVEYOR_SOURCE":  spec.Source,
 		"CONVEYOR_STAGE":   spec.To,
+	}
+	// When the process group will be killed, as an instant rather than a
+	// duration.
+	//
+	// A duration is only useful to something that knows when it started, and an
+	// agent sixty turns into a run does not: it cannot feel elapsed time and has
+	// no reason to have kept count. An absolute timestamp it can check against
+	// `date` at any point costs it one command to know exactly where it stands.
+	//
+	// Absent when the stage has no timeout, which is a real state and not zero:
+	// an adapter reading this must treat empty as "no deadline", never as one
+	// that has already passed.
+	if !deadline.IsZero() {
+		own["CONVEYOR_DEADLINE"] = deadline.UTC().Format(time.RFC3339)
 	}
 	if spec.Item != nil {
 		own["CONVEYOR_ITEM_ID"] = spec.Item.ID

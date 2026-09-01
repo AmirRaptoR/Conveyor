@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Sourced by the agent adapters. Not a verb: config resolves script names
+# exactly, so a leading underscore can never be mistaken for one.
+#
+# Telling an agent when it will be killed.
+#
+# Two deadlines, and the gap between them is the point. CONVEYOR_DEADLINE is the
+# engine's: the moment the process group dies, taking with it anything not
+# committed and pushed, and leaving the item marked `timeout` with a run log
+# nobody asked for. The agent is told about an earlier one so the last minutes
+# can be spent landing what it has instead of being cut mid-verification.
+#
+# This is information, not pressure. An agent that hurries a review to fit a
+# budget produces a green verdict that checked nothing, which is strictly worse
+# than the timeout it avoided: the timeout is at least honest, marks the item
+# and fetches a person. So the brief below says what the clock is and what to do
+# when it runs out, and never says to go faster or to lower the bar. Stopping
+# unfinished is a supported outcome — the session and the worktree both carry
+# forward, so the next run continues rather than starting again.
+#
+# The agent's deadline is DERIVED and never configured: one number in
+# conveyor.yaml (the stage's `timeout:`) moves both. A budget typed into a
+# PROMPT would have gone stale the first time that number changed, silently, and
+# there is nothing that could have caught it.
+#
+# WRAP_UP_GRACE — seconds between the agent's deadline and the engine's,
+# default 300. It has to cover a wrap-up and nothing more: committing, pushing,
+# and writing the result file.
+
+# deadline_brief — the block to append to an agent's prompt.
+#
+# Prints nothing when the stage has no timeout, or when the timestamp cannot be
+# read. An empty CONVEYOR_DEADLINE means "no deadline" and must never be read as
+# one that has already passed: a stage with no limit is a real configuration,
+# and telling an agent it is out of time would end every run of it instantly.
+deadline_brief() {
+	[[ -n "${CONVEYOR_DEADLINE:-}" ]] || return 0
+
+	local grace hard soft now
+	grace="${WRAP_UP_GRACE:-300}"
+	[[ "$grace" =~ ^[0-9]+$ ]] || grace=300
+
+	hard=$(date -u -d "$CONVEYOR_DEADLINE" +%s 2>/dev/null) || return 0
+	[[ -n "$hard" ]] || return 0
+	now=$(date -u +%s)
+	soft=$((hard - grace))
+
+	# A grace wider than the whole stage would put the wrap-up in the past. Not
+	# a case to be clever about: say the hard deadline and let the agent plan
+	# against that.
+	((soft > now)) || soft=$hard
+
+	cat <<-BRIEF
+
+		--- your time budget ---
+		It is $(date -u -d "@$now" +'%H:%M UTC') now. This run is killed at
+		$(date -u -d "@$hard" +'%H:%M UTC') — $(((hard - now) / 60)) minutes from now — and
+		the kill takes the whole process tree with it, so anything not committed and
+		pushed by then is gone.
+
+		Plan to be wrapping up by $(date -u -d "@$soft" +'%H:%M UTC'). Check \`date -u\`
+		between steps rather than estimating: you cannot feel elapsed time, and a
+		suite that takes twelve minutes started with six left is six minutes spent
+		for no result.
+
+		This is a ceiling, not a target, and not a reason to hurry. Do not narrow the
+		review, skip a check, pad the work to fill the time, or call something good
+		because the clock is running.
+
+		If the work does not fit, stop deliberately rather than being killed:
+
+		  1. commit and push everything you have verified — pushed work is what the
+		     next run starts from,
+		  2. write {"blocked": true, "kind": "unfinished", "reason": "<what you
+		     finished, what is left, and what you would do next>"} to the file at
+		     ${CONVEYOR_RESULT}.
+
+		That stop is not a failure of the run. Your conversation and your worktree
+		are both handed to the next one, so it continues from where you left off
+		instead of starting over — and the reason you write is what a person reads
+		to decide whether to let it.
+		--- end time budget ---
+	BRIEF
+}

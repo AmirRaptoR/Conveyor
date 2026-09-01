@@ -135,3 +135,40 @@ func TestMissingScriptIsAnErrorNotAnOutcome(t *testing.T) {
 		t.Fatal("expected an error when the script cannot be run at all")
 	}
 }
+
+// An agent sixty turns into a run cannot feel elapsed time, so a duration told
+// to it at the start is worth nothing. It is handed the instant it will be
+// killed instead, which one `date` verifies.
+func TestDeadlineIsExportedAsAnInstant(t *testing.T) {
+	res := run(t, `echo "$CONVEYOR_DEADLINE" > "$CONVEYOR_RESULT".deadline`, 30*time.Minute)
+
+	got := res.Run.Env["CONVEYOR_DEADLINE"]
+	at, err := time.Parse(time.RFC3339, got)
+	if err != nil {
+		t.Fatalf("CONVEYOR_DEADLINE = %q, want an RFC3339 instant: %v", got, err)
+	}
+	// The engine's own limit, not a second calculation of it: within a second
+	// of thirty minutes out.
+	if d := time.Until(at); d < 29*time.Minute+59*time.Second || d > 30*time.Minute {
+		t.Errorf("deadline is %s away, want ~30m — it must be the limit the context enforces", d)
+	}
+	// And the script really received it, not just the record of the run.
+	b, err := os.ReadFile(filepath.Join(res.Run.Dir, "result.json.deadline"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(b)) != got {
+		t.Errorf("script saw %q, run record says %q", strings.TrimSpace(string(b)), got)
+	}
+}
+
+// A stage with no timeout is a real configuration, and an adapter must be able
+// to tell it apart from a deadline that has passed. Empty, never a zero time:
+// telling an agent it is out of time would end every run of such a stage on the
+// first instruction it read.
+func TestNoTimeoutMeansNoDeadline(t *testing.T) {
+	res := run(t, `exit 0`, 0)
+	if got, ok := res.Run.Env["CONVEYOR_DEADLINE"]; ok {
+		t.Errorf("CONVEYOR_DEADLINE = %q for a stage with no timeout, want it unset", got)
+	}
+}

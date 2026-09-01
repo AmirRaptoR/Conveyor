@@ -20,6 +20,8 @@ set -euo pipefail
 source "$(dirname "$0")/_stream"
 source "$(dirname "$0")/../_blocked"
 source "$(dirname "$0")/../_worktree"
+source "$(dirname "$0")/../_resume"
+source "$(dirname "$0")/../_deadline"
 
 : "${PROMPT:?PROMPT is required (set it in this script params: block)}"
 
@@ -45,6 +47,18 @@ by hand."
 	wt=$(item_worktree "$CONVEYOR_SOURCE" "$ref" "$head")
 	cd "$wt"
 	echo "  worktree: $wt  (branch $(git branch --show-current))"
+
+	# A review that ran out of time leaves its half-landed fixes here, and the
+	# next one used to walk straight past them: it cd'd in, saw a branch, and
+	# reviewed as though the tree were clean. implement has read its own
+	# leftovers since worktrees went per item; there is no reason review should
+	# not, and one good one why it must — the uncommitted work is the previous
+	# review's, so nobody else is ever going to come and claim it.
+	#
+	# Called directly, never in a substitution: it stops through `blocked`, and
+	# a subshell would swallow that exit.
+	resume_leftovers "$ref"
+	leftovers="$RESUME_BRIEF"
 else
 	echo "reviewing $CONVEYOR_SOURCE #$ref — $title"
 fi
@@ -67,11 +81,16 @@ Pull request #${pr}}
 ${task}"
 fi
 
-full="${full}
+full="${full}${leftovers:-}
 
 If the review cannot reach a verdict because it needs a decision only a human
 can make, change nothing and write {\"blocked\": true, \"reason\": \"<the
 decision needed>\"} to the file at ${CONVEYOR_RESULT}."
+
+# How long it has, and what to do if that is not enough. Last, because it is the
+# instruction that governs all the others.
+full="${full}
+$(deadline_brief)"
 
 if [[ -n "${wt:-}" ]]; then
 	full="${full}
