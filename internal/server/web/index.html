@@ -71,8 +71,36 @@
   .ctl.primary { color:var(--ink); border-color:var(--faint); }
 
   /* ---- the line ---------------------------------------------------------- */
+  .rail-wrap { position:relative; }
   .line { padding:30px 22px 40px; overflow-x:auto; }
   .rail { display:flex; align-items:flex-start; min-width:min-content; position:relative; }
+
+  /* Pinned above the rail, in `.line`'s own top padding, so it sits in the
+     viewport at the top of the page even when the rail itself grows past the
+     fold — the native scrollbar that lives at the rail's bottom edge does not.
+     It lives outside `.line` (a sibling in `.rail-wrap`) so it never scrolls
+     away with the rail's content. */
+  /* The strip it occupies is otherwise empty (`.line`'s top padding), but it is
+     not all drawn on — the gap between the buttons and the track's own margins
+     are still part of the box. pointer-events:none there, auto only on what is
+     actually interactive, so a touch or drag that starts in that strip still
+     reaches `.line`/`.rail` underneath instead of being swallowed by an
+     invisible hit area. */
+  .railctl {
+    position:absolute; top:6px; left:22px; right:22px; z-index:2;
+    display:flex; align-items:center; gap:8px;
+    pointer-events:none;
+  }
+  .railbtn {
+    flex:none; width:20px; height:20px; display:flex; align-items:center; justify-content:center;
+    font:inherit; line-height:1; color:var(--dim); background:var(--panel);
+    border:1px solid var(--rule); cursor:pointer; padding:0;
+    pointer-events:auto;
+  }
+  .railbtn:hover:not(:disabled) { color:var(--ink); border-color:var(--faint); }
+  .railbtn:disabled { opacity:.35; cursor:default; }
+  .railtrack { flex:1; height:3px; background:var(--rule-soft); position:relative; }
+  .railthumb { position:absolute; top:0; height:100%; background:var(--faint); }
 
   .station { flex:0 0 var(--station); position:relative; z-index:1; padding-right:14px; }
   .station:last-child { padding-right:0; }
@@ -434,7 +462,14 @@
 <div id="agents"></div>
 <div id="sources"></div>
 <div id="faults"></div>
-<div class="line"><div class="rail" id="rail"></div></div>
+<div class="rail-wrap">
+  <div class="line" id="line"><div class="rail" id="rail"></div></div>
+  <div class="railctl" id="railctl" hidden>
+    <button class="railbtn" id="rail-left" aria-label="Scroll the line left">‹</button>
+    <div class="railtrack"><div class="railthumb" id="rail-thumb"></div></div>
+    <button class="railbtn" id="rail-right" aria-label="Scroll the line right">›</button>
+  </div>
+</div>
 
 <div class="scrim" id="scrim"></div>
 <aside id="panel" aria-hidden="true">
@@ -578,6 +613,37 @@ function draw() {
     wireDrag(el);
   });
   document.querySelectorAll(".queue[data-stage]").forEach(wireQueue);
+  updateRailCtl();
+}
+
+// The rail's own horizontal scrollbar lives at its bottom edge, which on a
+// busy board is off the bottom of the viewport — see #15. This control is
+// pinned in the rail's top padding instead, so it is in view from the top of
+// the page. It lives outside `.line` so re-rendering `#rail` (every state
+// update) never touches it and never resets `.line`'s scrollLeft.
+function updateRailCtl() {
+  const line = $("#line"), ctl = $("#railctl");
+  // .line is the scroll container — its own scrollWidth includes its padding,
+  // which is what scrollLeft is measured against. #rail's scrollWidth is the
+  // flex row alone and undercounts that padding, so max would be reached
+  // before the true end of the range.
+  const overflow = line.scrollWidth > line.clientWidth + 1;
+  ctl.hidden = !overflow;
+  if (!overflow) return;
+  const max = line.scrollWidth - line.clientWidth;
+  const ratio = Math.max(line.clientWidth / line.scrollWidth, 0.06);
+  $("#rail-thumb").style.width = `${ratio * 100}%`;
+  $("#rail-thumb").style.left = `${(line.scrollLeft / max) * (1 - ratio) * 100}%`;
+  $("#rail-left").disabled = line.scrollLeft <= 0;
+  $("#rail-right").disabled = line.scrollLeft >= max - 1;
+}
+
+function scrollRail(dir) {
+  const line = $("#line");
+  const max = line.scrollWidth - line.clientWidth;
+  const step = Math.max(line.clientWidth * 0.8, 120);
+  line.scrollLeft = Math.min(Math.max(line.scrollLeft + dir * step, 0), max);
+  updateRailCtl();
 }
 
 function station(st, items, active) {
@@ -905,6 +971,11 @@ function closePanel() {
 $("#close").onclick = closePanel;
 $("#scrim").onclick = closePanel;
 addEventListener("keydown", e => { if (e.key === "Escape") closePanel(); });
+
+$("#rail-left").onclick = () => scrollRail(-1);
+$("#rail-right").onclick = () => scrollRail(1);
+$("#line").addEventListener("scroll", updateRailCtl);
+addEventListener("resize", updateRailCtl);
 
 // --- dragging --------------------------------------------------------------
 // Two gestures, and they are different things. Within a column a drag reorders,
