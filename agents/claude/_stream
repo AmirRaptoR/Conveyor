@@ -178,11 +178,19 @@ agent_asked() {
 # nothing but "exit 1" to go on. This still prints nothing the engine parses
 # (CONTRACTS §2 — stdout stays logs), it just stops throwing the one useful
 # fact away.
+#
+# TodoWrite is the one tool call whose argument the frontend also reads back
+# structurally (index.html's parseTodos, presentation only, same tier as the
+# `  · Name: arg` shape below) — so its input goes out whole, never through
+# the [0:100] cut everything else gets. The plan is only ever a few short
+# lines; there is nothing here worth truncating.
 render_stream() {
 	jq -j --unbuffered '
 		if .type == "assistant" then
 			(.message.content[]? |
 				if .type == "text" then .text
+				elif .type == "tool_use" and .name == "TodoWrite" then
+					"\n  · TodoWrite: \(.input.todos // [] | tostring)\n"
 				elif .type == "tool_use" then
 					"\n  · \(.name): \((.input.command // .input.file_path // .input.pattern
 					                   // .input.description // "") | tostring | .[0:100])\n"

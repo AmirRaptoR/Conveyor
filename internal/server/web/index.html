@@ -432,6 +432,22 @@
   .tr.interrupted .verdict { color:var(--faint); font-style:italic; }
   .tr.interrupted::before { background:transparent; box-shadow:inset 0 0 0 1px var(--faint); }
 
+  /* The agent's own plan, kept current: the log says what happened, this says
+     what it thinks is left. Sticky, because a plan mid-flight is only useful
+     at its latest state — the history of how it got there is already in the
+     log, as a terse TodoWrite line per update. */
+  .todos {
+    flex:0 0 auto; padding:10px 18px; border-bottom:1px solid var(--rule);
+    font-size:11.5px; line-height:1.6;
+  }
+  .todo { display:flex; gap:8px; align-items:baseline; }
+  .todo .mark { flex:0 0 1.1em; text-align:center; }
+  .todo.completed { color:var(--faint); text-decoration:line-through; }
+  .todo.completed .mark { color:var(--ok); }
+  .todo.in_progress { color:var(--ink); font-weight:500; }
+  .todo.in_progress .mark { color:var(--run); }
+  .todo.pending .mark { color:var(--faint); }
+
   .log {
     margin:0; flex:1 1 auto; min-height:0; overflow:auto; padding:14px 18px;
     font-size:11.5px; line-height:1.7; color:var(--dim);
@@ -527,6 +543,7 @@
     <div class="report" id="report"></div>
     <div class="history" id="history" aria-live="polite"></div>
   </div>
+  <div class="todos" id="todos" hidden></div>
   <div class="log" id="log" aria-live="polite"></div>
 </aside>
 
@@ -907,6 +924,7 @@ async function inspect(id, title, stage) {
   $("#panel").classList.add("open"); $("#panel").setAttribute("aria-hidden", "false");
   $("#scrim").classList.add("open");
   setLogStatus("loading", "Loading…");
+  $("#todos").innerHTML = ""; $("#todos").hidden = true;
   $("#stop").innerHTML = stopNotice(id);
   const hand = $("#stop").querySelector(".hand");
   if (hand) hand.onclick = () => handBack(id, hand);
@@ -1173,6 +1191,11 @@ async function showRun(id) {
   if (stale()) return;
   const log = $("#log");
   log.innerHTML = "";
+  // Reset before replaying: a run with no TodoWrite call of its own should
+  // not keep showing whichever run was open before it. renderLine repopulates
+  // this as it walks the lines (and any buffered lines appendBuffered adds
+  // after), so it ends on that run's own latest state.
+  $("#todos").innerHTML = ""; $("#todos").hidden = true;
   for (const line of lines) log.appendChild(renderLine(line));
   logPending = false;
   appendBuffered(lines);
@@ -1218,6 +1241,19 @@ function renderLine(line) {
   const tool = text.match(/^\s*·\s*([A-Za-z_]+):\s?([\s\S]*)$/);
   if (tool) {
     el.classList.add("tool");
+    if (tool[1] === "TodoWrite") {
+      const list = parseTodos(tool[2]);
+      if (list) {
+        updateTodos(list);
+        const done = list.filter(t => t.status === "completed").length;
+        const active = list.find(t => t.status === "in_progress");
+        const gist = `${done}/${list.length} done` + (active ? ` · ${active.activeForm || active.content}` : "");
+        el.innerHTML = `<span class="tname">TodoWrite</span> <span class="targ">${esc(gist)}</span>`;
+        return el;
+      }
+      // Falls through to the generic rendering below on a shape this does
+      // not recognise — the sticky panel just misses this update.
+    }
     el.innerHTML = `<span class="tname">${esc(tool[1])}</span> <span class="targ">${esc(tool[2])}</span>`;
     return el;
   }
@@ -1242,6 +1278,33 @@ function inline(s) {
   return esc(s)
     .replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`)
     .replace(/\*\*([^*]+)\*\*/g, (_, b) => `<strong>${b}</strong>`);
+}
+
+// TodoWrite's arg is the plan itself, sent whole (see agents/claude/_stream),
+// not a path or a command truncated to a preview — so it is the one tool line
+// here worth parsing back into structure rather than just displaying. Defensive
+// by construction: any shape this does not recognise returns null and the
+// caller falls back to the plain tool-line rendering every other tool gets.
+function parseTodos(raw) {
+  let list;
+  try { list = JSON.parse(raw); } catch { return null; }
+  if (!Array.isArray(list)) return null;
+  if (!list.every(t => t && typeof t.content === "string" && typeof t.status === "string")) return null;
+  return list;
+}
+
+// The agent's own plan, kept current in the sticky panel above the log.
+// Presentation only, like everything else renderLine does — this reads
+// nothing back into $CONVEYOR_RESULT or the engine.
+function updateTodos(list) {
+  const box = $("#todos");
+  if (!list.length) { box.innerHTML = ""; box.hidden = true; return; }
+  box.innerHTML = list.map(t => {
+    const mark = t.status === "completed" ? "✔" : t.status === "in_progress" ? "▶" : "○";
+    const label = t.status === "in_progress" ? (t.activeForm || t.content) : t.content;
+    return `<div class="todo ${esc(t.status)}"><span class="mark">${mark}</span><span>${esc(label)}</span></div>`;
+  }).join("");
+  box.hidden = false;
 }
 
 function closePanel() {
