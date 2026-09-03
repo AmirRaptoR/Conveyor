@@ -159,6 +159,52 @@ type Resume struct {
 	Session string `json:"session,omitempty"`
 }
 
+// DoctorInput is the JSON piped to a doctor script's stdin: one marked item,
+// why it stopped, and its own run history. Its own shape, deliberately not
+// StageInput — whose From means "the previous stage" and would be a lie here,
+// since a doctor invocation follows no stage at all.
+type DoctorInput struct {
+	Item    *Item       `json:"item"`
+	Stage   string      `json:"stage"`
+	Blocked bool        `json:"blocked"`
+	Block   DoctorBlock `json:"block"`
+	// Runs is this item's own run history, newest first, capped at 20 — every
+	// kind, including earlier doctor runs. A directory retention has swept, or
+	// that the script cannot read, is the script's problem to tolerate.
+	Runs []DoctorRun `json:"runs"`
+}
+
+// DoctorBlock is why the item stopped, trimmed for a doctor script. Session is
+// deliberately absent — it is the agent's own handle on the conversation that
+// stopped, spent by the engine itself when it records an answer, and never
+// something a script reads or forwards.
+type DoctorBlock struct {
+	Kind   string    `json:"kind,omitempty"`
+	Reason string    `json:"reason"`
+	Stage  string    `json:"stage"`
+	RunID  string    `json:"runId,omitempty"`
+	At     time.Time `json:"at"`
+	Asked  bool      `json:"asked"`
+}
+
+// DoctorRun is one run of an item's history, trimmed for a doctor script.
+// Deliberately not Run: Run.Env and Run.Item would hand every source
+// parameter — tokens included — to a model, while Run.Dir is json:"-" so the
+// one field the script actually needs, the path to that run's own files, is
+// not even there. Adding Dir to Run is not the fix — RunMeta embeds Run and
+// would leak filesystem paths through the existing /api/runs.
+type DoctorRun struct {
+	ID         string    `json:"id"`
+	Kind       string    `json:"kind"`
+	Stage      string    `json:"stage,omitempty"` // Run.To — empty for a list run
+	Outcome    Outcome   `json:"outcome"`
+	ExitCode   int       `json:"exitCode"`
+	TimedOut   bool      `json:"timedOut"`
+	StartedAt  time.Time `json:"startedAt"`
+	FinishedAt time.Time `json:"finishedAt"`
+	Dir        string    `json:"dir"`
+}
+
 // ListInput is the JSON piped to a list script's stdin.
 type ListInput struct {
 	Source string         `json:"source"`
