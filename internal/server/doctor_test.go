@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -574,4 +575,110 @@ exit 10
 	if strings.Contains(string(b), "should-not-leak") {
 		t.Error("the block's session leaked onto the doctor's stdin")
 	}
+}
+
+// A doctor executable that loses its execute bit after load still produces a
+// failed row naming the error and leaves the item marked, exactly as a
+// deleted one does.
+func TestDoctorNotExecutableProducesAFailedRow(t *testing.T) {
+	cfg, r, dir := doctorBoard(t, "#!/bin/sh\nexit 0\n")
+	if err := os.Chmod(filepath.Join(dir, "doctor.sh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true}}
+	s.blocks["s1:1"] = Block{Kind: "limit", Reason: "quota", Stage: "working", RunID: "r0"}
+
+	doctorPost(t, s, `{"apply": true}`)
+	sw := waitSweepDone(t, s)
+	if sw.Results[0].Status != "failed" || sw.Results[0].Why == "" {
+		t.Fatalf("row = %+v, want a failed row naming the error", sw.Results[0])
+	}
+	s.mu.RLock()
+	it := s.state.Items[0]
+	s.mu.RUnlock()
+	if !it.Blocked {
+		t.Error("the item was touched even though its doctor could not even start")
+	}
+}
+
+// Cancelling the server's context mid-sweep leaves the rows it never reached
+// pending, still marks the sweep finished, and releases the guard.
+func TestDoctorCancellationLeavesRemainingRowsPending(t *testing.T) {
+	dir := t.TempDir()
+	started, release := filepath.Join(dir, "started"), filepath.Join(dir, "release")
+	cfg, r, _ := doctorBoard(t, `#!/bin/sh
+touch `+started+`
+while [ ! -f `+release+` ]; do sleep 0.01; done
+exit 10
+`)
+	s := New(cfg, r)
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx = ctx
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true},
+		{ID: "s1:2", Source: "s1", Stage: "working", Blocked: true},
+	}
+	s.blocks["s1:1"] = Block{Kind: "error", Reason: "boom", Stage: "working"}
+	s.blocks["s1:2"] = Block{Kind: "error", Reason: "boom", Stage: "working"}
+
+	doctorPost(t, s, "")
+	waitFor(t, "the first item's doctor to start", func() bool { _, err := os.Stat(started); return err == nil })
+	cancel()
+	os.WriteFile(release, nil, 0o644) // let the in-flight invocation actually finish
+
+	sw := waitSweepDone(t, s)
+	if sw.Results[1].Status != "pending" {
+		t.Errorf("second row = %+v, want pending — the sweep was cancelled before reaching it", sw.Results[1])
+	}
+	if sw.FinishedAt == nil {
+		t.Error("a cancelled sweep must still be marked finished")
+	}
+
+	// The guard was released: a fresh context lets a new sweep start.
+	s.ctx = t.Context()
+	w := doctorPost(t, s, "")
+	if w.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want 202 — the guard must be released after cancellation", w.Code)
+	}
+	waitSweepDone(t, s)
+}
+
+// The scheduler is a separate goroutine from the sweep and takes no lock the
+// sweep holds, so an unmarked item keeps advancing while a sweep is running.
+func TestDoctorSweepDoesNotBlockTheScheduler(t *testing.T) {
+	dir := t.TempDir()
+	release := filepath.Join(dir, "release")
+	cfg, r, _ := doctorBoard(t, `#!/bin/sh
+while [ ! -f `+release+` ]; do sleep 0.01; done
+exit 10
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := New(cfg, r)
+	s.ctx = ctx
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true}, // holds the sweep busy
+		{ID: "s1:2", Source: "s1", Stage: "backlog"},                // free to advance
+	}
+	s.blocks["s1:1"] = Block{Kind: "error", Reason: "boom", Stage: "working"}
+	go s.schedule(ctx)
+
+	doctorPost(t, s, "")
+	waitFor(t, "s1:2 to advance while the sweep is running", func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		for _, it := range s.state.Items {
+			if it.ID == "s1:2" {
+				return it.Stage == "done"
+			}
+		}
+		return false
+	})
+	if !doctorGet(t, s).Running {
+		t.Error("the scheduler outran the sweep instead of running beside it — this proves nothing")
+	}
+	os.WriteFile(release, nil, 0o644)
+	waitSweepDone(t, s)
 }
