@@ -26,7 +26,11 @@ SSE, run history, drag-to-reorder, drag out of the backlog to start an item now
 button, `Unblock all`, and a strip saying how each agent is doing. It advances items on its own — `-watch`
 is what makes it observe without touching anything. Discovery, scheduling and
 the tick button are three goroutines, deliberately: a 90-minute stage must not
-be able to stop every source being listed.
+be able to stop every source being listed. `POST /api/doctor` sweeps every
+marked item through its source's `doctor:` script, reading each one's own
+reason before deciding whether to retry it, resume it or leave it for a
+person — a third, more careful exception to "only a person clears a mark"
+(CONTRACTS §6). No board control drives it yet.
 
 `internal/store` holds the persisted manual input order — v1's only human
 control lever — and the data directory's owner lock.
