@@ -484,6 +484,85 @@ func TestRemovedRoutesAreNamed(t *testing.T) {
 
 // An agent is whatever a source's scripts name, never a list of its own: two
 // places to record the same fact is two places to get it wrong.
+// doctor is a reserved scripts: key that no stage names — resolved on its own
+// account, not by the per-stage loop.
+func TestDoctorScriptResolves(t *testing.T) {
+	dir, path := onboarded(t)
+	script(t, filepath.Join(dir, "agents", "claude", "doctor"))
+	body := stages + declared + `      doctor:
+        agent: claude
+`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	s := cfg.Sources[0]
+	if !s.OK() {
+		t.Fatalf("source should be healthy, got problems: %v", s.Problems)
+	}
+	if got := s.Paths["doctor"]; !strings.HasSuffix(got, "/agents/claude/doctor") {
+		t.Errorf("doctor = %q, want it under agents/claude", got)
+	}
+}
+
+// A doctor: naming an agent that does not exist is that source's problem, and
+// only that source's.
+func TestDoctorScriptBadAgentIsReported(t *testing.T) {
+	dir, path := onboarded(t)
+	// agents/claude/doctor is deliberately never created.
+	body := stages + declared + `      doctor:
+        agent: claude
+  - name: s2
+    provider: github
+    workdir: ./repo2
+    scripts:
+      refine:
+        agent: claude
+`
+	workdir(t, filepath.Join(dir, "repo2"))
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	s1 := cfg.Sources[0]
+	if s1.OK() {
+		t.Fatal("source with a broken doctor: reported healthy")
+	}
+	if !strings.Contains(strings.Join(s1.Problems, "; "), `"doctor"`) {
+		t.Errorf("problems = %v, want the doctor script named", s1.Problems)
+	}
+	if _, set := s1.Paths["doctor"]; set {
+		t.Error("doctor should not resolve when its agent script is missing")
+	}
+	s2 := cfg.Sources[1]
+	if !s2.OK() {
+		t.Errorf("a broken doctor: in one source dragged down another: %v", s2.Problems)
+	}
+}
+
+// No doctor: declared is not a problem — it loads clean, and that source's
+// marked items are simply left out of a sweep.
+func TestNoDoctorScriptLoadsClean(t *testing.T) {
+	_, path := onboarded(t)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	s := cfg.Sources[0]
+	if !s.OK() {
+		t.Fatalf("source should be healthy, got problems: %v", s.Problems)
+	}
+	if _, set := s.Paths["doctor"]; set {
+		t.Error("doctor should not be set when the source declares none")
+	}
+}
+
 func TestAgentsComeFromTheSourcesThatUseThem(t *testing.T) {
 	dir := t.TempDir()
 	for _, a := range []string{"claude", "codex"} {
