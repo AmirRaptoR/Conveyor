@@ -770,10 +770,15 @@ railTrackEl().addEventListener("keydown", e => {
 
 // Normalise a wheel notch across deltaMode 0 (pixels), 1 (lines), 2 (pages) to
 // a roughly comparable pixel distance, so one notch of a normal mouse wheel
-// moves the rail by a similar amount in each.
+// moves the rail by a similar amount in each. Page mode is rare — the few
+// devices that report it send one page (deltaY 1) per notch, and a "page" of
+// the rail is easily thousands of pixels wide, so scaling by the rail's own
+// width would move it by an entire screen for the same physical gesture that
+// moves a handful of lines under mode 1. 120px keeps it on the same order as
+// a mode-0 notch instead.
 function wheelPixels(e) {
   if (e.deltaMode === 1) return e.deltaY * 16;
-  if (e.deltaMode === 2) return e.deltaY * $("#line").clientWidth;
+  if (e.deltaMode === 2) return e.deltaY * 120;
   return e.deltaY;
 }
 
@@ -801,7 +806,14 @@ $("#railctl").addEventListener("wheel", railWheel, { passive: false });
 
 // Tracks a geometry change that fires no `resize` event at all: browser zoom,
 // a font loading late, or `--station` changing at the 640px media query.
-new ResizeObserver(updateRailCtl).observe($("#line"));
+// `.line` is `overflow-x:auto`, so its own box does not move when only its
+// content's width changes — a font finishing load after the first render
+// grows `#rail`'s scrollWidth without touching `.line`'s box at all, so both
+// are observed: `#rail` for content-width changes, `.line` for the container
+// itself (zoom, `--station`).
+const railResize = new ResizeObserver(updateRailCtl);
+railResize.observe($("#line"));
+railResize.observe($("#rail"));
 
 function station(st, items, active) {
   const live = active.some(a => a.stage === st.name);
@@ -1055,20 +1067,31 @@ function historyFailed(id, msg) {
   if (followRun === null) setLogStatus("idle", "");
 }
 
+// `openItemId === id` alone cannot tell apart the first open of an item from
+// a later re-open of the same item — opening A, then B, then A again leaves
+// two in-flight fetches that both satisfy that check, so the id equality
+// used to matter but is not enough on its own to make the second one "the
+// current one". `historyGen` is a call counter: only the fetch started by
+// the most recent loadHistory() for the current item is allowed to render.
+let historyGen = 0;
+
 async function loadHistory(id) {
+  const gen = ++historyGen;
+  const stale = () => openItemId !== id || gen !== historyGen;
   setHistoryStatus("loading", "Loading…");
   let runs;
   try {
     const res = await fetch(`/api/runs?item=${encodeURIComponent(id)}`);
-    // The panel may have moved on to another item while this was in flight.
-    if (openItemId !== id) return;
+    // The panel may have moved on to another item, or a newer call for this
+    // same item may already be in flight, while this was in flight.
+    if (stale()) return;
     if (!res.ok) { historyFailed(id, `Could not load run history (HTTP ${res.status}).`); return; }
     runs = await res.json();
   } catch {
-    if (openItemId !== id) return;
+    if (stale()) return;
     historyFailed(id, "Could not load run history."); return;
   }
-  if (openItemId !== id) return;
+  if (stale()) return;
   if (!Array.isArray(runs)) { historyFailed(id, "Could not load run history."); return; }
   $("#history").innerHTML = runs.length ? runs.map(r => `
     <button class="tr ${esc(r.outcome)}" data-run="${esc(r.id)}">
@@ -1117,6 +1140,12 @@ let logGen = 0, logPending = false, logBuffer = [];
 async function showRun(id) {
   followRun = id;
   const gen = ++logGen;
+  // `followRun === id` alone cannot tell apart the first click on a run from
+  // a later re-click on the same run — A, then B, then A again leaves two
+  // in-flight fetches that both satisfy that check. `gen` is what actually
+  // orders the calls: only the fetch started by the most recent showRun()
+  // is allowed to render or touch logPending/logBuffer.
+  const stale = () => followRun !== id || gen !== logGen;
   logPending = true;
   logBuffer = [];
   document.querySelectorAll("#history [data-run]").forEach(b => b.classList.toggle("sel", b.dataset.run === id));
@@ -1124,27 +1153,29 @@ async function showRun(id) {
   let lines;
   try {
     const res = await fetch(`/api/runs/${id}`);
-    // The reader moved to another run, or closed the panel, while this was
-    // in flight — nothing of this response belongs on screen any more.
-    if (followRun !== id) return;
+    // The reader moved to another run, closed the panel, or re-clicked this
+    // same run again while this was in flight — nothing of this response
+    // belongs on screen any more.
+    if (stale()) return;
     if (!res.ok) {
       setLogStatus("error", `Could not load this run (HTTP ${res.status}).`);
-      if (gen === logGen) logPending = false;
+      logPending = false;
       return;
     }
     const r = await res.json();
     lines = r.lines || [];
   } catch {
-    if (followRun !== id) return;
+    if (stale()) return;
     setLogStatus("error", "Could not load this run.");
-    if (gen === logGen) logPending = false;
+    logPending = false;
     return;
   }
-  if (followRun !== id) return;
+  if (stale()) return;
   const log = $("#log");
   log.innerHTML = "";
   for (const line of lines) log.appendChild(renderLine(line));
-  if (gen === logGen) { logPending = false; appendBuffered(lines); }
+  logPending = false;
+  appendBuffered(lines);
   if (!log.childElementCount) setLogStatus("empty", "No output.");
   else log.scrollTop = log.scrollHeight;
 }
