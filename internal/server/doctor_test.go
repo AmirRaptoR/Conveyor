@@ -427,8 +427,9 @@ func TestDoctorNonZeroExitsLeaveTheItemMarked(t *testing.T) {
 // live board, not the snapshot the sweep began with.
 func TestDoctorSkipsAtApplyIfAlreadyUnblocked(t *testing.T) {
 	dir := t.TempDir()
-	release := filepath.Join(dir, "release")
+	started, release := filepath.Join(dir, "started"), filepath.Join(dir, "release")
 	cfg, r, _ := doctorBoard(t, `#!/bin/sh
+touch `+started+`
 while [ ! -f `+release+` ]; do sleep 0.01; done
 exit 0
 `)
@@ -438,9 +439,10 @@ exit 0
 	s.blocks["s1:1"] = Block{Kind: "limit", Reason: "quota", Stage: "working", RunID: "r0"}
 
 	doctorPost(t, s, `{"apply": true}`)
-	waitFor(t, "the doctor to start", func() bool {
-		return len(doctorGet(t, s).Results) == 1
-	})
+	// Waiting for the script itself to have started, not merely for the sweep's
+	// row to exist — the row is created up front, before the block it names is
+	// even read, and racing that would test timing instead of the guard.
+	waitFor(t, "the doctor to start", func() bool { _, err := os.Stat(started); return err == nil })
 	// A person clears it by hand while the doctor is mid-run.
 	s.mu.Lock()
 	s.state.Items[0].Blocked = false
@@ -862,5 +864,111 @@ sources:
 				t.Errorf("deadline was %s out, want ~%s", got, tc.want)
 			}
 		})
+	}
+}
+
+// If Client.Move fails after an answer was recorded, the answer is taken
+// back — a caller cannot tell whether a failed unblock consumed it, and a
+// reply nobody's run will ever see must not be left waiting to be said into a
+// conversation that was never re-asked.
+func TestDoctorTakesBackTheAnswerIfMoveFails(t *testing.T) {
+	dir := t.TempDir()
+	writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\nexit 1\n") // always refuses
+	writeScript(t, filepath.Join(dir, "work.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "doctor.sh"), `#!/bin/sh
+cat > "$CONVEYOR_RESULT" <<'JSON'
+{"answer": "resumed with a fresh budget"}
+JSON
+exit 0
+`)
+	if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "conveyor.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`version: 1
+stages:
+  - name: backlog
+    onSuccess: working
+  - name: working
+    script: work
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: fake
+    workdir: ./repo
+    scripts:
+      work:
+        script: ./work.sh
+      doctor:
+        script: ./doctor.sh
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(cfg, runner.New(filepath.Join(dir, "runs")))
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true}}
+	s.blocks["s1:1"] = Block{Kind: "turns", Reason: "ran out of turns", Stage: "working", RunID: "r0", Session: "sess-1"}
+
+	doctorPost(t, s, `{"apply": true}`)
+	sw := waitSweepDone(t, s)
+	if sw.Results[0].Status != "failed" {
+		t.Fatalf("row = %+v, want failed — the move that clears the mark was refused", sw.Results[0])
+	}
+	if got := s.answers.Get("s1:1"); got != (model.Resume{}) {
+		t.Errorf("answer = %+v, want it taken back once the move failed", got)
+	}
+	// The item is still marked — move.sh refused to write "not blocked".
+	s.mu.RLock()
+	stillBlocked := s.blocks["s1:1"]
+	s.mu.RUnlock()
+	if stillBlocked.RunID != "r0" {
+		t.Errorf("block = %+v, want the original block untouched", stillBlocked)
+	}
+}
+
+// An item whose block has changed run id since it was diagnosed — a stage
+// re-marked it for a different reason while the doctor was mid-run — is
+// skipped at apply time, not cleared as though it were still the same stop.
+func TestDoctorSkipsAtApplyIfReMarkedUnderANewRun(t *testing.T) {
+	dir := t.TempDir()
+	started, release := filepath.Join(dir, "started"), filepath.Join(dir, "release")
+	cfg, r, _ := doctorBoard(t, `#!/bin/sh
+touch `+started+`
+while [ ! -f `+release+` ]; do sleep 0.01; done
+exit 0
+`)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true}}
+	s.blocks["s1:1"] = Block{Kind: "limit", Reason: "quota", Stage: "working", RunID: "r0"}
+
+	doctorPost(t, s, `{"apply": true}`)
+	// Waiting for the script itself to have started, not merely for the sweep's
+	// row to exist — the row is created up front, before the block it names is
+	// even read, and racing that would test timing instead of the guard.
+	waitFor(t, "the doctor to start", func() bool { _, err := os.Stat(started); return err == nil })
+	// The item is re-marked under a new run while the doctor is mid-flight —
+	// still blocked, but for a different stop than the one just diagnosed.
+	s.mu.Lock()
+	s.blocks["s1:1"] = Block{Kind: "error", Reason: "a fresh failure", Stage: "working", RunID: "r1"}
+	s.mu.Unlock()
+	os.WriteFile(release, nil, 0o644)
+
+	sw := waitSweepDone(t, s)
+	if sw.Results[0].Status != "skipped" {
+		t.Errorf("row = %+v, want skipped — the block it was diagnosed for is gone", sw.Results[0])
+	}
+	s.mu.RLock()
+	still := s.blocks["s1:1"]
+	s.mu.RUnlock()
+	if still.RunID != "r1" {
+		t.Errorf("block = %+v, the new mark must survive untouched", still)
 	}
 }

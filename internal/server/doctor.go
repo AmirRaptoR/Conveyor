@@ -107,15 +107,25 @@ func (s *Server) handleDoctorStart(w http.ResponseWriter, r *http.Request) {
 
 // handleDoctorGet returns the current or most recently finished sweep. Nil
 // until the first POST /api/doctor of this process's life.
+//
+// A copy, taken under the lock — the sweep it points at is still being
+// mutated row by row while it runs, and a caller reading the pointer's own
+// fields (Running, Results) after the lock is released would be reading them
+// out from under runDoctorSweep's next write.
 func (s *Server) handleDoctorGet(w http.ResponseWriter, r *http.Request) {
 	s.doctorMu.Lock()
 	sw := s.doctorSweep
+	var cp Sweep
+	if sw != nil {
+		cp = *sw
+		cp.Results = append([]SweepRow(nil), sw.Results...)
+	}
 	s.doctorMu.Unlock()
 	if sw == nil {
 		writeJSON(w, map[string]any{"results": []SweepRow{}})
 		return
 	}
-	writeJSON(w, sw)
+	writeJSON(w, cp)
 }
 
 // runDoctorSweep examines every row, one at a time — doctor invocations are
