@@ -412,7 +412,22 @@
     margin:0; flex:1 1 auto; min-height:0; overflow:auto; padding:14px 18px;
     font-size:11.5px; line-height:1.7; color:var(--dim);
   }
-  .log:empty::after { content:"No output."; color:var(--faint); }
+  /* Loading/empty/error read as one line of text, not as log content, so they
+     are their own element rather than the `:empty::after` trick — that trick
+     could not tell "nothing fetched yet" from "fetched and genuinely blank"
+     apart, which is exactly the distinction these states exist to draw. */
+  .log .status, .history .slot { color:var(--faint); }
+  .log .status.err, .history .slot.err {
+    color:var(--stop); border-color:color-mix(in srgb, var(--stop) 40%, var(--rule-soft));
+  }
+  /* An indeterminate bar: one fetch of unknown length has no progress to
+     report, so it sweeps rather than fills. */
+  .log .status.loading::before, .history .slot.loading::before {
+    content:""; display:block; height:2px; margin-bottom:8px;
+    background:linear-gradient(90deg, transparent, var(--run), transparent);
+    background-size:50% 100%; animation:loadbar 1.1s ease-in-out infinite;
+  }
+  @keyframes loadbar { 0%{background-position:-50% 0} 100%{background-position:150% 0} }
   .ln { white-space:pre-wrap; word-break:break-word; }
   .ln.blank { height:.55em; }
   /* stderr is where a script says something went wrong, and where the blocked
@@ -482,8 +497,8 @@
   </div>
   <div id="stop"></div>
   <div class="report" id="report"></div>
-  <div class="history" id="history"></div>
-  <div class="log" id="log"></div>
+  <div class="history" id="history" aria-live="polite"></div>
+  <div class="log" id="log" aria-live="polite"></div>
 </aside>
 
 <script>
@@ -730,11 +745,14 @@ const sourceColour = name => hueOf.get(name) || "var(--faint)";
 
 async function inspect(id, title, stage) {
   openItemId = id;
+  // No run is selected yet: an SSE line for whatever was open before this
+  // must not paint into a panel that has moved on to a different item.
+  followRun = null; logPending = false; logBuffer = [];
   $("#ptitle").textContent = title || id;
   $("#psub").textContent = `${id} · ${stage}`;
   $("#panel").classList.add("open"); $("#panel").setAttribute("aria-hidden", "false");
   $("#scrim").classList.add("open");
-  $("#log").innerHTML = "";
+  setLogStatus("loading", "Loading…");
   $("#stop").innerHTML = stopNotice(id);
   const hand = $("#stop").querySelector(".hand");
   if (hand) hand.onclick = () => handBack(id, hand);
@@ -883,8 +901,33 @@ function stopNotice(id) {
   </div>`;
 }
 
+function setHistoryStatus(kind, text) {
+  $("#history").innerHTML =
+    `<div class="slot${kind === "error" ? " err" : kind === "loading" ? " loading" : ""}">${esc(text)}</div>`;
+}
+
+// A failed history fetch leaves no run to select — the log would otherwise
+// sit on "Loading…" forever, an artifact with nothing left to resolve it.
+function historyFailed(id, msg) {
+  setHistoryStatus("error", msg);
+  if (followRun === null) setLogStatus("idle", "");
+}
+
 async function loadHistory(id) {
-  const runs = await (await fetch(`/api/runs?item=${encodeURIComponent(id)}`)).json();
+  setHistoryStatus("loading", "Loading…");
+  let runs;
+  try {
+    const res = await fetch(`/api/runs?item=${encodeURIComponent(id)}`);
+    // The panel may have moved on to another item while this was in flight.
+    if (openItemId !== id) return;
+    if (!res.ok) { historyFailed(id, `Could not load run history (HTTP ${res.status}).`); return; }
+    runs = await res.json();
+  } catch {
+    if (openItemId !== id) return;
+    historyFailed(id, "Could not load run history."); return;
+  }
+  if (openItemId !== id) return;
+  if (!Array.isArray(runs)) { historyFailed(id, "Could not load run history."); return; }
   $("#history").innerHTML = runs.length ? runs.map(r => `
     <button class="tr ${esc(r.outcome)}" data-run="${esc(r.id)}">
       <span class="when">${esc((r.startedAt || "").slice(11, 19))}</span>
@@ -893,8 +936,12 @@ async function loadHistory(id) {
       <span class="verdict">${esc(r.outcome)}</span>
     </button>`).join("")
     : `<div class="slot">No runs yet.</div>`;
-  document.querySelectorAll("[data-run]").forEach(b => b.onclick = () => showRun(b.dataset.run));
+  document.querySelectorAll("#history [data-run]").forEach(b => b.onclick = () => showRun(b.dataset.run));
   if (runs.length) showRun(runs[0].id);
+  // Never leave the log claiming "No output." for a run that was never
+  // selected — an item that genuinely has no history reads as exactly that
+  // in both regions.
+  else { followRun = null; setLogStatus("idle", "No runs yet."); }
 }
 
 // A run whose from and to are the same stage is not a move. For a stage script
@@ -912,14 +959,75 @@ function transition(r) {
   return `${from} <span class="arrow">&rarr;</span> ${to}`;
 }
 
+function setLogStatus(kind, text) {
+  const log = $("#log");
+  log.innerHTML = `<div class="status${kind === "error" ? " err" : kind === "loading" ? " loading" : ""}">${esc(text)}</div>`;
+}
+
+// SSE lines for the followed run that arrive while its own fetch is still in
+// flight cannot just be appended — the snapshot they will land after has not
+// rendered yet, and it may itself already carry the very same line. They are
+// buffered here and joined once the snapshot is in, in appendBuffered().
+// `logGen` scopes logPending/logBuffer to whichever showRun() call is current,
+// so a superseded call finishing late cannot clear a newer call's buffer.
+let logGen = 0, logPending = false, logBuffer = [];
+
 async function showRun(id) {
   followRun = id;
-  document.querySelectorAll("[data-run]").forEach(b => b.classList.toggle("sel", b.dataset.run === id));
-  const r = await (await fetch(`/api/runs/${id}`)).json();
+  const gen = ++logGen;
+  logPending = true;
+  logBuffer = [];
+  document.querySelectorAll("#history [data-run]").forEach(b => b.classList.toggle("sel", b.dataset.run === id));
+  setLogStatus("loading", "Loading…");
+  let lines;
+  try {
+    const res = await fetch(`/api/runs/${id}`);
+    // The reader moved to another run, or closed the panel, while this was
+    // in flight — nothing of this response belongs on screen any more.
+    if (followRun !== id) return;
+    if (!res.ok) {
+      setLogStatus("error", `Could not load this run (HTTP ${res.status}).`);
+      if (gen === logGen) logPending = false;
+      return;
+    }
+    const r = await res.json();
+    lines = r.lines || [];
+  } catch {
+    if (followRun !== id) return;
+    setLogStatus("error", "Could not load this run.");
+    if (gen === logGen) logPending = false;
+    return;
+  }
+  if (followRun !== id) return;
   const log = $("#log");
   log.innerHTML = "";
-  for (const line of r.lines || []) log.appendChild(renderLine(line));
-  log.scrollTop = log.scrollHeight;
+  for (const line of lines) log.appendChild(renderLine(line));
+  if (gen === logGen) { logPending = false; appendBuffered(lines); }
+  if (!log.childElementCount) setLogStatus("empty", "No output.");
+  else log.scrollTop = log.scrollHeight;
+}
+
+// Join the snapshot with whatever arrived over SSE while it was in flight.
+// `LogLine` carries no sequence number, so a buffered line can only be told
+// apart from one the snapshot already contains by comparing it, position by
+// position, against the snapshot's tail — dropping the longest run of
+// buffered lines that matches there and keeping the rest. A global
+// de-duplication would be wrong: agent output legitimately repeats identical
+// lines.
+function appendBuffered(snapshotLines) {
+  const log = $("#log");
+  const buf = logBuffer;
+  logBuffer = [];
+  const same = (a, b) => a && b && a.stream === b.stream && a.text === b.text && a.timestamp === b.timestamp;
+  let overlap = 0;
+  for (let m = Math.min(buf.length, snapshotLines.length); m > 0; m--) {
+    let match = true;
+    for (let i = 0; i < m; i++) {
+      if (!same(buf[i], snapshotLines[snapshotLines.length - m + i])) { match = false; break; }
+    }
+    if (match) { overlap = m; break; }
+  }
+  for (let i = overlap; i < buf.length; i++) log.appendChild(renderLine(buf[i]));
 }
 
 // An agent writes markdown and calls tools; showing that as one monospace blob
@@ -967,6 +1075,7 @@ function closePanel() {
   $("#panel").classList.remove("open"); $("#panel").setAttribute("aria-hidden", "true");
   $("#scrim").classList.remove("open");
   openItemId = null; followRun = null;
+  logPending = false; logBuffer = [];
 }
 $("#close").onclick = closePanel;
 $("#scrim").onclick = closePanel;
@@ -1146,12 +1255,14 @@ const es = new EventSource("/api/events");
 es.onmessage = ev => {
   const e = JSON.parse(ev.data);
   if (e.kind === "log") {
-    if (e.runId === followRun && e.line) {
-      const log = $("#log");
-      const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
-      log.appendChild(renderLine(e.line));
-      if (pinned) log.scrollTop = log.scrollHeight;
-    }
+    if (e.runId !== followRun || !e.line) return;
+    // The snapshot for this run has not rendered yet — buffer rather than
+    // append, or a line can land above lines the snapshot has not shown yet.
+    if (logPending) { logBuffer.push(e.line); return; }
+    const log = $("#log");
+    const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
+    log.appendChild(renderLine(e.line));
+    if (pinned) log.scrollTop = log.scrollHeight;
     return;
   }
   if (e.kind === "transition" && openItemId && e.transition?.item?.id === openItemId) loadHistory(openItemId);
