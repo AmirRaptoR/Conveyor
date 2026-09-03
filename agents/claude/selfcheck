@@ -100,4 +100,20 @@ else
 	echo "skip a write that fails is not the verdict either: no /dev/full"
 fi
 
+# 10. render_stream on a clean result: unchanged, just the blank line — no
+#     noise added to the common case.
+out=$(printf '%s\n' '{"type":"result","is_error":false,"subtype":"success","num_turns":6,"result":"done"}' | render_stream)
+chk "a clean result stays a blank line" "$out" ""
+
+# 11. render_stream on --max-turns being hit: this is the gap that sent people
+#     hunting through run history for what "exit 1" meant. error_max_turns
+#     carries no `result` text at all — the fix must not assume one.
+out=$(printf '%s\n' '{"type":"result","is_error":true,"subtype":"error_max_turns","num_turns":40}' | render_stream)
+chk "a max-turns stop is named in the log" "$out" $'\n[claude stopped: error_max_turns after 40 turn(s)]'
+
+# 12. render_stream on any other error subtype, with a result message: printed
+#     too, since it is the one hint of what actually went wrong.
+out=$(printf '%s\n' '{"type":"result","is_error":true,"subtype":"error_during_execution","result":"API overloaded"}' | render_stream)
+chk "an error with a message shows both" "$out" $'\n[claude stopped: error_during_execution] API overloaded'
+
 exit $fail

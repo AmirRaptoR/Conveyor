@@ -128,6 +128,15 @@ agent_asked() {
 }
 
 # render_stream reads the event stream on stdin and writes readable text.
+#
+# The result event is the one place the CLI says why a run ended, and until
+# now nothing here read it: `is_error` true and `is_error` false printed the
+# same blank line, so a clean finish and a run cut off by --max-turns (exit 1,
+# no assistant text at all — subtype "error_max_turns") were indistinguishable
+# in the log. A person reading a blocked item's history a day later had
+# nothing but "exit 1" to go on. This still prints nothing the engine parses
+# (CONTRACTS §2 — stdout stays logs), it just stops throwing the one useful
+# fact away.
 render_stream() {
 	jq -j --unbuffered '
 		if .type == "assistant" then
@@ -137,7 +146,14 @@ render_stream() {
 					"\n  · \(.name): \((.input.command // .input.file_path // .input.pattern
 					                   // .input.description // "") | tostring | .[0:100])\n"
 				else empty end)
-		elif .type == "result" then "\n"
+		elif .type == "result" then
+			if (.is_error // false) then
+				"\n[claude stopped: \(.subtype // "error")" +
+				(if .num_turns then " after \(.num_turns) turn(s)" else "" end) +
+				"]" +
+				(if .result then " \(.result)" else "" end) +
+				"\n"
+			else "\n" end
 		else empty end' 2>/dev/null
 }
 
