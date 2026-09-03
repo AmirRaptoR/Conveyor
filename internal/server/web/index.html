@@ -316,7 +316,6 @@
      Shown only for a terminal stage — everything else on the board is still
      moving, and the numbers here are only honest once the passage is done. */
   .report {
-    flex:0 0 auto; max-height:38vh; overflow-y:auto;
     padding:12px 18px; border-bottom:1px solid var(--rule);
     font-size:12px; line-height:1.65; color:var(--ink);
   }
@@ -379,8 +378,20 @@
   .ahead h2 { margin:0; font-size:13px; font-weight:500; line-height:1.5; }
   .ahead .sub { margin-top:5px; color:var(--faint); font-size:10.5px; letter-spacing:.07em; text-transform:uppercase; }
 
+  /* #stop, .report and .history read as one passage — a stop reason, then the
+     report, then the history that explains it — so they share one scroll
+     region rather than nesting three. `.log` stays its own: the tail-follow
+     behaviour reads `.log`'s own scrollTop/scrollHeight (see the SSE
+     handler), which only works if nothing above it also claims that scroll.
+     The cap is a percentage of `aside` (the wrapper this sits in), not of the
+     viewport, so it still means the same thing if the panel is ever resized
+     independently of the window — and it leaves `.log` a guaranteed share of
+     the panel's height rather than letting a long stop reason squeeze it to
+     nothing. */
+  .upper { flex:0 1 auto; max-height:55%; overflow-y:auto; min-height:0; }
+
   /* A run history is genuinely a sequence, so it is drawn as one. */
-  .history { flex:0 0 auto; max-height:30vh; overflow-y:auto; padding:12px 18px; border-bottom:1px solid var(--rule); }
+  .history { padding:12px 18px; border-bottom:1px solid var(--rule); }
   .tr {
     display:flex; align-items:center; gap:11px; width:100%; text-align:left;
     background:transparent; border:0; border-left:1px solid var(--rule);
@@ -495,9 +506,11 @@
     </div>
     <button class="ctl" id="close">Close</button>
   </div>
-  <div id="stop"></div>
-  <div class="report" id="report"></div>
-  <div class="history" id="history" aria-live="polite"></div>
+  <div class="upper" id="upper">
+    <div id="stop"></div>
+    <div class="report" id="report"></div>
+    <div class="history" id="history" aria-live="polite"></div>
+  </div>
   <div class="log" id="log" aria-live="polite"></div>
 </aside>
 
