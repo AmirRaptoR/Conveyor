@@ -312,6 +312,10 @@ func TestDoctorApplyExit0ClearsTheMark(t *testing.T) {
 	s.ctx = t.Context()
 	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true}}
 	s.blocks["s1:1"] = Block{Kind: "limit", Reason: "quota", Stage: "working", RunID: "r0"}
+	// A deferred stage may have left the item resting; handing it back is
+	// exactly the change a deferral was waiting to see (server.go's own
+	// unblock does this already — proven here for the path the sweep takes).
+	s.resting["s1:1"] = true
 
 	doctorPost(t, s, `{"apply": true}`)
 	sw := waitSweepDone(t, s)
@@ -321,12 +325,16 @@ func TestDoctorApplyExit0ClearsTheMark(t *testing.T) {
 	s.mu.RLock()
 	it, hasBlock := s.state.Items[0], s.blocks["s1:1"]
 	_, stillBlocked := s.blocks["s1:1"]
+	stillResting := s.resting["s1:1"]
 	s.mu.RUnlock()
 	if it.Blocked {
 		t.Error("item is still marked")
 	}
 	if stillBlocked {
 		t.Errorf("blocks entry survived: %+v", hasBlock)
+	}
+	if stillResting {
+		t.Error("resting entry survived a clear")
 	}
 	if s.answers.Get("s1:1") != (model.Resume{}) {
 		t.Error("no answer should have been recorded")
@@ -419,6 +427,69 @@ func TestDoctorNonZeroExitsLeaveTheItemMarked(t *testing.T) {
 				t.Error("an answer must not survive a non-clearing exit")
 			}
 		})
+	}
+}
+
+// A timeout is failed, exactly like any other non-clearing exit: the item
+// stays marked and no answer survives.
+func TestDoctorTimeoutLeavesTheItemMarked(t *testing.T) {
+	dir := t.TempDir()
+	writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "work.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "doctor.sh"), `#!/bin/sh
+echo '{"answer":"x"}' > "$CONVEYOR_RESULT"
+sleep 5
+exit 0
+`)
+	if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "conveyor.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`version: 1
+stages:
+  - name: backlog
+    onSuccess: working
+  - name: working
+    script: work
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: fake
+    workdir: ./repo
+    scripts:
+      work:
+        script: ./work.sh
+      doctor:
+        script: ./doctor.sh
+        timeout: 200ms
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(cfg, runner.New(filepath.Join(dir, "runs")))
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true}}
+	s.blocks["s1:1"] = Block{Kind: "error", Reason: "boom", Stage: "working", RunID: "r0"}
+
+	doctorPost(t, s, `{"apply": true}`)
+	sw := waitSweepDone(t, s)
+	if sw.Results[0].Status != "failed" || sw.Results[0].Outcome != "timeout" {
+		t.Fatalf("row = %+v, want a failed row with outcome timeout", sw.Results[0])
+	}
+	s.mu.RLock()
+	it := s.state.Items[0]
+	s.mu.RUnlock()
+	if !it.Blocked {
+		t.Error("item is no longer marked after a timeout")
+	}
+	if s.answers.Get("s1:1") != (model.Resume{}) {
+		t.Error("an answer must not survive a timeout")
 	}
 }
 
