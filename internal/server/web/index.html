@@ -99,8 +99,21 @@
   }
   .railbtn:hover:not(:disabled) { color:var(--ink); border-color:var(--faint); }
   .railbtn:disabled { opacity:.35; cursor:default; }
-  .railtrack { flex:1; height:3px; background:var(--rule-soft); position:relative; }
-  .railthumb { position:absolute; top:0; height:100%; background:var(--faint); }
+  /* The visible bar stays 3px — the interactive strip is taller, so the drag
+     and click targets are comfortable without changing the look. */
+  .railtrack {
+    flex:1; height:16px; position:relative; cursor:pointer; pointer-events:auto;
+    touch-action:none;
+  }
+  .railtrack::before {
+    content:""; position:absolute; left:0; right:0; top:50%; height:3px;
+    margin-top:-1.5px; background:var(--rule-soft); border-radius:2px;
+  }
+  .railthumb {
+    position:absolute; top:50%; height:3px; margin-top:-1.5px;
+    background:var(--faint); border-radius:2px; pointer-events:none;
+  }
+  .railtrack:focus-visible { outline:2px solid var(--run); outline-offset:2px; }
 
   .station { flex:0 0 var(--station); position:relative; z-index:1; padding-right:14px; }
   .station:last-child { padding-right:0; }
@@ -316,7 +329,6 @@
      Shown only for a terminal stage — everything else on the board is still
      moving, and the numbers here are only honest once the passage is done. */
   .report {
-    flex:0 0 auto; max-height:38vh; overflow-y:auto;
     padding:12px 18px; border-bottom:1px solid var(--rule);
     font-size:12px; line-height:1.65; color:var(--ink);
   }
@@ -379,8 +391,20 @@
   .ahead h2 { margin:0; font-size:13px; font-weight:500; line-height:1.5; }
   .ahead .sub { margin-top:5px; color:var(--faint); font-size:10.5px; letter-spacing:.07em; text-transform:uppercase; }
 
+  /* #stop, .report and .history read as one passage — a stop reason, then the
+     report, then the history that explains it — so they share one scroll
+     region rather than nesting three. `.log` stays its own: the tail-follow
+     behaviour reads `.log`'s own scrollTop/scrollHeight (see the SSE
+     handler), which only works if nothing above it also claims that scroll.
+     The cap is a percentage of `aside` (the wrapper this sits in), not of the
+     viewport, so it still means the same thing if the panel is ever resized
+     independently of the window — and it leaves `.log` a guaranteed share of
+     the panel's height rather than letting a long stop reason squeeze it to
+     nothing. */
+  .upper { flex:0 1 auto; max-height:55%; overflow-y:auto; min-height:0; }
+
   /* A run history is genuinely a sequence, so it is drawn as one. */
-  .history { flex:0 0 auto; max-height:30vh; overflow-y:auto; padding:12px 18px; border-bottom:1px solid var(--rule); }
+  .history { padding:12px 18px; border-bottom:1px solid var(--rule); }
   .tr {
     display:flex; align-items:center; gap:11px; width:100%; text-align:left;
     background:transparent; border:0; border-left:1px solid var(--rule);
@@ -412,7 +436,22 @@
     margin:0; flex:1 1 auto; min-height:0; overflow:auto; padding:14px 18px;
     font-size:11.5px; line-height:1.7; color:var(--dim);
   }
-  .log:empty::after { content:"No output."; color:var(--faint); }
+  /* Loading/empty/error read as one line of text, not as log content, so they
+     are their own element rather than the `:empty::after` trick — that trick
+     could not tell "nothing fetched yet" from "fetched and genuinely blank"
+     apart, which is exactly the distinction these states exist to draw. */
+  .log .status, .history .slot { color:var(--faint); }
+  .log .status.err, .history .slot.err {
+    color:var(--stop); border-color:color-mix(in srgb, var(--stop) 40%, var(--rule-soft));
+  }
+  /* An indeterminate bar: one fetch of unknown length has no progress to
+     report, so it sweeps rather than fills. */
+  .log .status.loading::before, .history .slot.loading::before {
+    content:""; display:block; height:2px; margin-bottom:8px;
+    background:linear-gradient(90deg, transparent, var(--run), transparent);
+    background-size:50% 100%; animation:loadbar 1.1s ease-in-out infinite;
+  }
+  @keyframes loadbar { 0%{background-position:-50% 0} 100%{background-position:150% 0} }
   .ln { white-space:pre-wrap; word-break:break-word; }
   .ln.blank { height:.55em; }
   /* stderr is where a script says something went wrong, and where the blocked
@@ -466,7 +505,10 @@
   <div class="line" id="line"><div class="rail" id="rail"></div></div>
   <div class="railctl" id="railctl" hidden>
     <button class="railbtn" id="rail-left" aria-label="Scroll the line left">‹</button>
-    <div class="railtrack"><div class="railthumb" id="rail-thumb"></div></div>
+    <div class="railtrack" id="rail-track" role="scrollbar" aria-orientation="horizontal"
+        aria-controls="line" tabindex="0" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+      <div class="railthumb" id="rail-thumb"></div>
+    </div>
     <button class="railbtn" id="rail-right" aria-label="Scroll the line right">›</button>
   </div>
 </div>
@@ -480,10 +522,12 @@
     </div>
     <button class="ctl" id="close">Close</button>
   </div>
-  <div id="stop"></div>
-  <div class="report" id="report"></div>
-  <div class="history" id="history"></div>
-  <div class="log" id="log"></div>
+  <div class="upper" id="upper">
+    <div id="stop"></div>
+    <div class="report" id="report"></div>
+    <div class="history" id="history" aria-live="polite"></div>
+  </div>
+  <div class="log" id="log" aria-live="polite"></div>
 </aside>
 
 <script>
@@ -621,8 +665,13 @@ function draw() {
 // pinned in the rail's top padding instead, so it is in view from the top of
 // the page. It lives outside `.line` so re-rendering `#rail` (every state
 // update) never touches it and never resets `.line`'s scrollLeft.
+function lineMax() {
+  const line = $("#line");
+  return Math.max(line.scrollWidth - line.clientWidth, 0);
+}
+
 function updateRailCtl() {
-  const line = $("#line"), ctl = $("#railctl");
+  const line = $("#line"), ctl = $("#railctl"), track = $("#rail-track");
   // .line is the scroll container — its own scrollWidth includes its padding,
   // which is what scrollLeft is measured against. #rail's scrollWidth is the
   // flex row alone and undercounts that padding, so max would be reached
@@ -630,21 +679,141 @@ function updateRailCtl() {
   const overflow = line.scrollWidth > line.clientWidth + 1;
   ctl.hidden = !overflow;
   if (!overflow) return;
-  const max = line.scrollWidth - line.clientWidth;
+  const max = lineMax();
   const ratio = Math.max(line.clientWidth / line.scrollWidth, 0.06);
   $("#rail-thumb").style.width = `${ratio * 100}%`;
   $("#rail-thumb").style.left = `${(line.scrollLeft / max) * (1 - ratio) * 100}%`;
   $("#rail-left").disabled = line.scrollLeft <= 0;
   $("#rail-right").disabled = line.scrollLeft >= max - 1;
+  track.setAttribute("aria-valuemax", String(Math.round(max)));
+  track.setAttribute("aria-valuenow", String(Math.round(line.scrollLeft)));
 }
 
 function scrollRail(dir) {
   const line = $("#line");
-  const max = line.scrollWidth - line.clientWidth;
+  const max = lineMax();
   const step = Math.max(line.clientWidth * 0.8, 120);
   line.scrollLeft = Math.min(Math.max(line.scrollLeft + dir * step, 0), max);
   updateRailCtl();
 }
+
+// --- rail drag/click/wheel/keyboard -----------------------------------------
+// The pinned control behaves like a real scrollbar: drag the thumb, click the
+// track to jump, wheel over it, arrow keys when it has focus. Geometry is
+// measured against `.line` (see updateRailCtl's comment above) so a drag
+// never falls short of the true end.
+function railGeometry() {
+  const track = $("#rail-track");
+  const trackRect = track.getBoundingClientRect();
+  const line = $("#line");
+  const ratio = Math.max(line.clientWidth / line.scrollWidth, 0.06);
+  const thumbW = ratio * trackRect.width;
+  return { trackRect, thumbW, travel: trackRect.width - thumbW, max: lineMax() };
+}
+
+function railScrollTo(t) {
+  const { max } = railGeometry();
+  $("#line").scrollLeft = Math.round(Math.min(Math.max(t, 0), 1) * max);
+  updateRailCtl();
+}
+
+let railDrag = null;
+function railTrackDown(e) {
+  if (e.button !== undefined && e.button !== 0) return;
+  const g = railGeometry();
+  const clickX = e.clientX - g.trackRect.left;
+  const thumbLeft = (g.max > 0 ? $("#line").scrollLeft / g.max : 0) * g.travel;
+  const onThumb = clickX >= thumbLeft && clickX <= thumbLeft + g.thumbW;
+  // Pointer travel maps to content travel by scrollableWidth / trackWidth
+  // (g.max / g.travel), not 1:1 — grabbing the thumb preserves the offset
+  // between the pointer and the thumb's own left edge, so it does not jump.
+  const grabOffset = onThumb ? clickX - thumbLeft : g.thumbW / 2;
+  railDrag = { pointerId: e.pointerId, grabOffset, travel: g.travel };
+  $("#rail-track").setPointerCapture?.(e.pointerId);
+  railScrollTo(g.travel > 0 ? (clickX - grabOffset) / g.travel : 0);
+  e.preventDefault();
+}
+function railTrackMove(e) {
+  if (!railDrag || e.pointerId !== railDrag.pointerId) return;
+  const g = railGeometry();
+  const x = e.clientX - g.trackRect.left - railDrag.grabOffset;
+  railScrollTo(g.travel > 0 ? x / g.travel : 0);
+}
+function railTrackUp(e) {
+  if (!railDrag || (e && e.pointerId !== undefined && e.pointerId !== railDrag.pointerId)) return;
+  railDrag = null;
+}
+const railTrackEl = () => $("#rail-track");
+railTrackEl().addEventListener("pointerdown", railTrackDown);
+railTrackEl().addEventListener("pointermove", railTrackMove);
+railTrackEl().addEventListener("pointerup", railTrackUp);
+railTrackEl().addEventListener("pointercancel", railTrackUp);
+railTrackEl().addEventListener("lostpointercapture", railTrackUp);
+// A drag keeps tracking the pointer past the track's own box — above, below,
+// or outside the window — because it is captured, not because it is still
+// inside the element; these two cover a mouseup while the OS still has the
+// button down but the tab lost focus (alt-tab mid-drag).
+addEventListener("blur", () => { railDrag = null; });
+addEventListener("visibilitychange", () => { if (document.hidden) railDrag = null; });
+
+railTrackEl().addEventListener("keydown", e => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+  e.preventDefault();
+  const line = $("#line"), max = lineMax();
+  const step = Math.max(line.clientWidth * 0.1, 24);
+  if (e.key === "ArrowLeft") line.scrollLeft = Math.max(line.scrollLeft - step, 0);
+  else if (e.key === "ArrowRight") line.scrollLeft = Math.min(line.scrollLeft + step, max);
+  else if (e.key === "Home") line.scrollLeft = 0;
+  else if (e.key === "End") line.scrollLeft = max;
+  updateRailCtl();
+});
+
+// Normalise a wheel notch across deltaMode 0 (pixels), 1 (lines), 2 (pages) to
+// a roughly comparable pixel distance, so one notch of a normal mouse wheel
+// moves the rail by a similar amount in each. Page mode is rare — the few
+// devices that report it send one page (deltaY 1) per notch, and a "page" of
+// the rail is easily thousands of pixels wide, so scaling by the rail's own
+// width would move it by an entire screen for the same physical gesture that
+// moves a handful of lines under mode 1. 120px keeps it on the same order as
+// a mode-0 notch instead.
+function wheelPixels(e) {
+  if (e.deltaMode === 1) return e.deltaY * 16;
+  if (e.deltaMode === 2) return e.deltaY * 120;
+  return e.deltaY;
+}
+
+// A plain vertical wheel over the rail (or the pinned control) scrolls it
+// horizontally while it has range left in that direction; at either end the
+// event is left alone so the page scrolls instead — the board never swallows
+// vertical scrolling at the ends of its range (#15). Only consumed when it
+// actually moves the rail, which is what makes that release work and is why
+// this cannot be a passive listener. Shift+wheel and a diagonal trackpad
+// gesture are left to the browser entirely, so the two never double-apply.
+function railWheel(e) {
+  if (e.shiftKey) return;
+  if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+  const line = $("#line"), max = lineMax();
+  if (max <= 0) return;
+  const px = wheelPixels(e);
+  if (px < 0 && line.scrollLeft <= 0) return;
+  if (px > 0 && line.scrollLeft >= max - 0.5) return;
+  e.preventDefault();
+  line.scrollLeft = Math.min(Math.max(line.scrollLeft + px, 0), max);
+  updateRailCtl();
+}
+$("#line").addEventListener("wheel", railWheel, { passive: false });
+$("#railctl").addEventListener("wheel", railWheel, { passive: false });
+
+// Tracks a geometry change that fires no `resize` event at all: browser zoom,
+// a font loading late, or `--station` changing at the 640px media query.
+// `.line` is `overflow-x:auto`, so its own box does not move when only its
+// content's width changes — a font finishing load after the first render
+// grows `#rail`'s scrollWidth without touching `.line`'s box at all, so both
+// are observed: `#rail` for content-width changes, `.line` for the container
+// itself (zoom, `--station`).
+const railResize = new ResizeObserver(updateRailCtl);
+railResize.observe($("#line"));
+railResize.observe($("#rail"));
 
 function station(st, items, active) {
   const live = active.some(a => a.stage === st.name);
@@ -730,11 +899,14 @@ const sourceColour = name => hueOf.get(name) || "var(--faint)";
 
 async function inspect(id, title, stage) {
   openItemId = id;
+  // No run is selected yet: an SSE line for whatever was open before this
+  // must not paint into a panel that has moved on to a different item.
+  followRun = null; logPending = false; logBuffer = [];
   $("#ptitle").textContent = title || id;
   $("#psub").textContent = `${id} · ${stage}`;
   $("#panel").classList.add("open"); $("#panel").setAttribute("aria-hidden", "false");
   $("#scrim").classList.add("open");
-  $("#log").innerHTML = "";
+  setLogStatus("loading", "Loading…");
   $("#stop").innerHTML = stopNotice(id);
   const hand = $("#stop").querySelector(".hand");
   if (hand) hand.onclick = () => handBack(id, hand);
@@ -883,8 +1055,44 @@ function stopNotice(id) {
   </div>`;
 }
 
+function setHistoryStatus(kind, text) {
+  $("#history").innerHTML =
+    `<div class="slot${kind === "error" ? " err" : kind === "loading" ? " loading" : ""}">${esc(text)}</div>`;
+}
+
+// A failed history fetch leaves no run to select — the log would otherwise
+// sit on "Loading…" forever, an artifact with nothing left to resolve it.
+function historyFailed(id, msg) {
+  setHistoryStatus("error", msg);
+  if (followRun === null) setLogStatus("idle", "");
+}
+
+// `openItemId === id` alone cannot tell apart the first open of an item from
+// a later re-open of the same item — opening A, then B, then A again leaves
+// two in-flight fetches that both satisfy that check, so the id equality
+// used to matter but is not enough on its own to make the second one "the
+// current one". `historyGen` is a call counter: only the fetch started by
+// the most recent loadHistory() for the current item is allowed to render.
+let historyGen = 0;
+
 async function loadHistory(id) {
-  const runs = await (await fetch(`/api/runs?item=${encodeURIComponent(id)}`)).json();
+  const gen = ++historyGen;
+  const stale = () => openItemId !== id || gen !== historyGen;
+  setHistoryStatus("loading", "Loading…");
+  let runs;
+  try {
+    const res = await fetch(`/api/runs?item=${encodeURIComponent(id)}`);
+    // The panel may have moved on to another item, or a newer call for this
+    // same item may already be in flight, while this was in flight.
+    if (stale()) return;
+    if (!res.ok) { historyFailed(id, `Could not load run history (HTTP ${res.status}).`); return; }
+    runs = await res.json();
+  } catch {
+    if (stale()) return;
+    historyFailed(id, "Could not load run history."); return;
+  }
+  if (stale()) return;
+  if (!Array.isArray(runs)) { historyFailed(id, "Could not load run history."); return; }
   $("#history").innerHTML = runs.length ? runs.map(r => `
     <button class="tr ${esc(r.outcome)}" data-run="${esc(r.id)}">
       <span class="when">${esc((r.startedAt || "").slice(11, 19))}</span>
@@ -893,8 +1101,12 @@ async function loadHistory(id) {
       <span class="verdict">${esc(r.outcome)}</span>
     </button>`).join("")
     : `<div class="slot">No runs yet.</div>`;
-  document.querySelectorAll("[data-run]").forEach(b => b.onclick = () => showRun(b.dataset.run));
+  document.querySelectorAll("#history [data-run]").forEach(b => b.onclick = () => showRun(b.dataset.run));
   if (runs.length) showRun(runs[0].id);
+  // Never leave the log claiming "No output." for a run that was never
+  // selected — an item that genuinely has no history reads as exactly that
+  // in both regions.
+  else { followRun = null; setLogStatus("idle", "No runs yet."); }
 }
 
 // A run whose from and to are the same stage is not a move. For a stage script
@@ -912,14 +1124,83 @@ function transition(r) {
   return `${from} <span class="arrow">&rarr;</span> ${to}`;
 }
 
+function setLogStatus(kind, text) {
+  const log = $("#log");
+  log.innerHTML = `<div class="status${kind === "error" ? " err" : kind === "loading" ? " loading" : ""}">${esc(text)}</div>`;
+}
+
+// SSE lines for the followed run that arrive while its own fetch is still in
+// flight cannot just be appended — the snapshot they will land after has not
+// rendered yet, and it may itself already carry the very same line. They are
+// buffered here and joined once the snapshot is in, in appendBuffered().
+// `logGen` scopes logPending/logBuffer to whichever showRun() call is current,
+// so a superseded call finishing late cannot clear a newer call's buffer.
+let logGen = 0, logPending = false, logBuffer = [];
+
 async function showRun(id) {
   followRun = id;
-  document.querySelectorAll("[data-run]").forEach(b => b.classList.toggle("sel", b.dataset.run === id));
-  const r = await (await fetch(`/api/runs/${id}`)).json();
+  const gen = ++logGen;
+  // `followRun === id` alone cannot tell apart the first click on a run from
+  // a later re-click on the same run — A, then B, then A again leaves two
+  // in-flight fetches that both satisfy that check. `gen` is what actually
+  // orders the calls: only the fetch started by the most recent showRun()
+  // is allowed to render or touch logPending/logBuffer.
+  const stale = () => followRun !== id || gen !== logGen;
+  logPending = true;
+  logBuffer = [];
+  document.querySelectorAll("#history [data-run]").forEach(b => b.classList.toggle("sel", b.dataset.run === id));
+  setLogStatus("loading", "Loading…");
+  let lines;
+  try {
+    const res = await fetch(`/api/runs/${id}`);
+    // The reader moved to another run, closed the panel, or re-clicked this
+    // same run again while this was in flight — nothing of this response
+    // belongs on screen any more.
+    if (stale()) return;
+    if (!res.ok) {
+      setLogStatus("error", `Could not load this run (HTTP ${res.status}).`);
+      logPending = false;
+      return;
+    }
+    const r = await res.json();
+    lines = r.lines || [];
+  } catch {
+    if (stale()) return;
+    setLogStatus("error", "Could not load this run.");
+    logPending = false;
+    return;
+  }
+  if (stale()) return;
   const log = $("#log");
   log.innerHTML = "";
-  for (const line of r.lines || []) log.appendChild(renderLine(line));
-  log.scrollTop = log.scrollHeight;
+  for (const line of lines) log.appendChild(renderLine(line));
+  logPending = false;
+  appendBuffered(lines);
+  if (!log.childElementCount) setLogStatus("empty", "No output.");
+  else log.scrollTop = log.scrollHeight;
+}
+
+// Join the snapshot with whatever arrived over SSE while it was in flight.
+// `LogLine` carries no sequence number, so a buffered line can only be told
+// apart from one the snapshot already contains by comparing it, position by
+// position, against the snapshot's tail — dropping the longest run of
+// buffered lines that matches there and keeping the rest. A global
+// de-duplication would be wrong: agent output legitimately repeats identical
+// lines.
+function appendBuffered(snapshotLines) {
+  const log = $("#log");
+  const buf = logBuffer;
+  logBuffer = [];
+  const same = (a, b) => a && b && a.stream === b.stream && a.text === b.text && a.timestamp === b.timestamp;
+  let overlap = 0;
+  for (let m = Math.min(buf.length, snapshotLines.length); m > 0; m--) {
+    let match = true;
+    for (let i = 0; i < m; i++) {
+      if (!same(buf[i], snapshotLines[snapshotLines.length - m + i])) { match = false; break; }
+    }
+    if (match) { overlap = m; break; }
+  }
+  for (let i = overlap; i < buf.length; i++) log.appendChild(renderLine(buf[i]));
 }
 
 // An agent writes markdown and calls tools; showing that as one monospace blob
@@ -967,6 +1248,7 @@ function closePanel() {
   $("#panel").classList.remove("open"); $("#panel").setAttribute("aria-hidden", "true");
   $("#scrim").classList.remove("open");
   openItemId = null; followRun = null;
+  logPending = false; logBuffer = [];
 }
 $("#close").onclick = closePanel;
 $("#scrim").onclick = closePanel;
@@ -1146,12 +1428,14 @@ const es = new EventSource("/api/events");
 es.onmessage = ev => {
   const e = JSON.parse(ev.data);
   if (e.kind === "log") {
-    if (e.runId === followRun && e.line) {
-      const log = $("#log");
-      const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
-      log.appendChild(renderLine(e.line));
-      if (pinned) log.scrollTop = log.scrollHeight;
-    }
+    if (e.runId !== followRun || !e.line) return;
+    // The snapshot for this run has not rendered yet — buffer rather than
+    // append, or a line can land above lines the snapshot has not shown yet.
+    if (logPending) { logBuffer.push(e.line); return; }
+    const log = $("#log");
+    const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
+    log.appendChild(renderLine(e.line));
+    if (pinned) log.scrollTop = log.scrollHeight;
     return;
   }
   if (e.kind === "transition" && openItemId && e.transition?.item?.id === openItemId) loadHistory(openItemId);
