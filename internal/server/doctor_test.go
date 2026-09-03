@@ -710,3 +710,157 @@ func TestDoctorRunsSurviveASweptDirectory(t *testing.T) {
 		t.Fatalf("runs = %+v, want the swept run still present with a readable dir", runs)
 	}
 }
+
+// scripts.doctor.params: reach the doctor script's environment, layered over
+// the source's env:, and reach no other script.
+func TestDoctorParamsLayerOverEnvAndReachNoOtherScript(t *testing.T) {
+	dir := t.TempDir()
+	writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "work.sh"), `#!/bin/sh
+if [ -n "$DOCTOR_PARAM" ]; then echo "DOCTOR_PARAM leaked into work: $DOCTOR_PARAM" > `+filepath.Join(dir, "leak")+`; fi
+exit 0
+`)
+	writeScript(t, filepath.Join(dir, "doctor.sh"), `#!/bin/sh
+cat > "$CONVEYOR_RESULT" <<JSON
+{"summary": "greeting=$GREETING param=$DOCTOR_PARAM"}
+JSON
+exit 10
+`)
+	if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "conveyor.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`version: 1
+stages:
+  - name: backlog
+    onSuccess: working
+  - name: working
+    script: work
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: fake
+    workdir: ./repo
+    env:
+      GREETING: hello
+    scripts:
+      work:
+        script: ./work.sh
+      doctor:
+        script: ./doctor.sh
+        params:
+          DOCTOR_PARAM: unique-value
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(cfg, runner.New(filepath.Join(dir, "runs")))
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true},
+		{ID: "s1:2", Source: "s1", Stage: "backlog"}, // runs work.sh, which must not see MODEL
+	}
+	s.blocks["s1:1"] = Block{Kind: "error", Reason: "boom", Stage: "working"}
+
+	doctorPost(t, s, "")
+	sw := waitSweepDone(t, s)
+	if sw.Results[0].Why != "greeting=hello param=unique-value" {
+		t.Fatalf("why = %q, want the source's env layered under the doctor's own params", sw.Results[0].Why)
+	}
+
+	// Drain the scheduler so work.sh actually runs, and prove MODEL never
+	// reached it.
+	go s.schedule(s.ctx)
+	waitFor(t, "s1:2 to run work.sh", func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		for _, it := range s.state.Items {
+			if it.ID == "s1:2" {
+				return it.Stage == "done"
+			}
+		}
+		return false
+	})
+	if _, err := os.Stat(filepath.Join(dir, "leak")); err == nil {
+		t.Error("scripts.doctor.params reached work.sh, which is not the doctor")
+	}
+}
+
+// scripts.doctor.timeout: sets the run's timeout and CONVEYOR_DEADLINE; unset,
+// the config's top-level timeout: is used.
+func TestDoctorTimeoutSetsTheDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name, timeoutLine string
+		want              time.Duration
+	}{
+		{"its own timeout", "        timeout: 2h\n", 2 * time.Hour},
+		{"the config default", "", 90 * time.Minute}, // conveyor.yaml's top-level timeout: below
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), "#!/bin/sh\nexit 0\n")
+			writeScript(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\nexit 0\n")
+			writeScript(t, filepath.Join(dir, "work.sh"), "#!/bin/sh\nexit 0\n")
+			writeScript(t, filepath.Join(dir, "doctor.sh"), `#!/bin/sh
+cat > "$CONVEYOR_RESULT" <<JSON
+{"summary": "$CONVEYOR_DEADLINE"}
+JSON
+exit 10
+`)
+			if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cfgPath := filepath.Join(dir, "conveyor.yaml")
+			body := `version: 1
+timeout: 90m
+stages:
+  - name: backlog
+    onSuccess: working
+  - name: working
+    script: work
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: fake
+    workdir: ./repo
+    scripts:
+      work:
+        script: ./work.sh
+      doctor:
+        script: ./doctor.sh
+` + tc.timeoutLine
+			if err := os.WriteFile(cfgPath, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(cfgPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := New(cfg, runner.New(filepath.Join(dir, "runs")))
+			s.ctx = t.Context()
+			s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true}}
+			s.blocks["s1:1"] = Block{Kind: "error", Reason: "boom", Stage: "working"}
+
+			before := time.Now()
+			doctorPost(t, s, "")
+			sw := waitSweepDone(t, s)
+			deadline, err := time.Parse(time.RFC3339, sw.Results[0].Why)
+			if err != nil {
+				t.Fatalf("CONVEYOR_DEADLINE = %q, want an RFC3339 instant: %v", sw.Results[0].Why, err)
+			}
+			got := deadline.Sub(before)
+			// Generous slack: the assertion is which timeout won, not exact timing.
+			if got < tc.want-time.Minute || got > tc.want+time.Minute {
+				t.Errorf("deadline was %s out, want ~%s", got, tc.want)
+			}
+		})
+	}
+}
