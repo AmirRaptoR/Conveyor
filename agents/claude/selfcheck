@@ -116,4 +116,36 @@ chk "a max-turns stop is named in the log" "$out" $'\n[claude stopped: error_max
 out=$(printf '%s\n' '{"type":"result","is_error":true,"subtype":"error_during_execution","result":"API overloaded"}' | render_stream)
 chk "an error with a message shows both" "$out" $'\n[claude stopped: error_during_execution] API overloaded'
 
+# 13. hit_max_turns reads what render_stream just wrote to $CLAUDE_SAID — a
+#     clean finish is not a turns stop, and neither is a quota refusal.
+printf '%s\n' '{"type":"result","is_error":true,"subtype":"error_max_turns","num_turns":40}' | render_stream >"$CLAUDE_SAID"
+chk "a max-turns result is recognised" "$(hit_max_turns && echo yes)" "yes"
+printf '%s\n' '{"type":"result","is_error":false,"subtype":"success"}' | render_stream >"$CLAUDE_SAID"
+chk "a clean finish is not a turns stop" "$(hit_max_turns && echo yes)" ""
+echo "Claude hit your usage limit" >"$CLAUDE_SAID"
+chk "a quota refusal is not a turns stop either" "$(hit_max_turns && echo yes)" ""
+
+# 14. record_session merges into an empty/missing $CONVEYOR_RESULT — the case
+#     agent_asked deliberately does not handle, because a turns stop has
+#     nothing else written yet.
+printf '%s\n' '{"type":"system","subtype":"init","model":"claude-sonnet-5"}' \
+	'{"type":"result","session_id":"sess-turns"}' >"$CLAUDE_RAW"
+export CONVEYOR_RESULT=$(mktemp)
+rm -f "$CONVEYOR_RESULT" # simulate: nothing written yet
+record_session
+chk "a session is recorded into a file that didn't exist" "$(jq -r .session "$CONVEYOR_RESULT")" "sess-turns"
+
+# 15. and it merges rather than clobbers when blocked runs after it — the
+# shape agents/claude/review and approve actually use.
+source "$(dirname "$0")/../_blocked"
+(blocked turns "hit the wall" >/dev/null 2>&1) || true
+chk "session survives blocked writing after it" "$(jq -r .session "$CONVEYOR_RESULT")" "sess-turns"
+chk "and blocked's own fields are there too"    "$(jq -r .kind "$CONVEYOR_RESULT")" "turns"
+
+# 16. no session in the stream: nothing is invented, same as claude_session.
+: > "$CLAUDE_RAW"
+: > "$CONVEYOR_RESULT"
+record_session
+chk "no session, nothing written" "$(cat "$CONVEYOR_RESULT")" ""
+
 exit $fail

@@ -131,6 +131,19 @@ if hit_limit; then
 Nothing is wrong with this item; it is waiting for the window to reset."
 fi
 
+# See agents/claude/review for the reasoning: a turn budget is a condition,
+# not a fault, and the implementation done up to the wall is worth resuming
+# into rather than losing to a cold restart.
+if hit_max_turns; then
+	record_session
+	blocked turns "the agent hit its ${MAX_TURNS:-200}-turn budget before \
+finishing the implementation. This is not a fault of the item. Answering this \
+mark with anything (e.g. \"continue\") resumes the same conversation with a \
+fresh turn budget instead of starting over; clearing the label alone starts a \
+new conversation, which resume_leftovers will still pick up from the tree but \
+without the conversation's own context."
+fi
+
 if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 	[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
 	agent_asked

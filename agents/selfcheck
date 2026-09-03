@@ -147,6 +147,22 @@ export CONVEYOR_RESULT="$tmp/blocked.json"
 rc=0; (RESUME_MAX_ATTEMPTS=1 resume_leftovers 70 >/dev/null 2>&1) || rc=$?
 chk "a loop stops the item"        "$rc" "20"
 chk "and it stops with kind worktree" "$(jq -r .kind "$CONVEYOR_RESULT")" "worktree"
+
+# 12b. blocked and asks merge onto what is already in $CONVEYOR_RESULT rather
+# than replacing it — the whole point being a field a caller wrote first (the
+# claude adapter's record_session is the one today) survives being blocked.
+echo '{"session": "sess-1"}' > "$CONVEYOR_RESULT"
+rc=0; (blocked turns "hit the wall" >/dev/null 2>&1) || rc=$?
+chk "blocked still exits 20"                "$rc" "20"
+chk "blocked merges onto an existing field" "$(jq -r .session "$CONVEYOR_RESULT")" "sess-1"
+chk "and adds its own"                      "$(jq -r .kind "$CONVEYOR_RESULT")" "turns"
+echo '{"session": "sess-2"}' > "$CONVEYOR_RESULT"
+rc=0; (asks decision "ship or not?" >/dev/null 2>&1) || rc=$?
+chk "asks merges the same way" "$(jq -r '[.session,.kind,.asked] | join(",")' "$CONVEYOR_RESULT")" "sess-2,decision,true"
+# and it still works from nothing, same as before either helper existed.
+rm -f "$CONVEYOR_RESULT"
+rc=0; (blocked worktree "dirty" >/dev/null 2>&1) || rc=$?
+chk "blocked still works with nothing written first" "$(jq -r .kind "$CONVEYOR_RESULT")" "worktree"
 : > "$CONVEYOR_RESULT"
 touch -d "30 days ago" file.txt new_test.txt
 rc=0; (RESUME_COLD_DAYS=14 resume_leftovers 70 >/dev/null 2>&1) || rc=$?

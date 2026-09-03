@@ -105,6 +105,47 @@ hit_limit() {
 	[[ -s "$CLAUDE_SAID" ]] && grep -qiE "hit your (session|usage|weekly) limit" "$CLAUDE_SAID"
 }
 
+# hit_max_turns reports whether the run stopped because it exhausted its
+# --max-turns budget rather than finishing or being denied for quota. Reads
+# the line render_stream just put in $CLAUDE_SAID for exactly this — a result
+# event with is_error and subtype "error_max_turns" — instead of re-parsing
+# the raw stream a second time.
+#
+# This is a condition, not a decision: the work done before the wall is real
+# (commits pushed, comments posted, tests run), and what stopped it was a
+# number in conveyor.yaml, not anything wrong with the item. Call
+# record_session first if the caller wants the conversation resumable —
+# hit_max_turns only answers "was this the reason", it writes nothing.
+hit_max_turns() {
+	[[ -s "$CLAUDE_SAID" ]] && grep -q '\[claude stopped: error_max_turns' "$CLAUDE_SAID"
+}
+
+# record_session merges {"session": "..."} into $CONVEYOR_RESULT, creating it
+# if a caller hits this before the agent has written anything of its own —
+# unlike agent_asked, which only ever adds to a file the model already wrote.
+# The two are siblings: agent_asked marks a question the model chose to ask;
+# this marks a run an adapter, not the model, decided is worth resuming, which
+# is exactly the turns case above — nothing in $CONVEYOR_RESULT yet, because
+# the run never got to write anything, only ran out of room to.
+#
+# A no-op if the stream never got a session (STREAM=0, or a run that died
+# before the first event) — same reasoning as claude_session itself: nothing
+# is a normal answer, not a blank line worth writing down.
+record_session() {
+	local sess tmp base
+	[[ -z "${CONVEYOR_RESULT:-}" ]] && return 0
+	sess=$(claude_session)
+	[[ -z "$sess" ]] && return 0
+	tmp=$(mktemp)
+	base='{}'
+	[[ -s "$CONVEYOR_RESULT" ]] && jq -e . "$CONVEYOR_RESULT" >/dev/null 2>&1 && base=$(cat "$CONVEYOR_RESULT")
+	if jq --arg s "$sess" '. + {session: $s}' <<<"$base" >"$tmp" 2>/dev/null; then
+		mv "$tmp" "$CONVEYOR_RESULT"
+	else
+		rm -f "$tmp"
+	fi
+}
+
 # agent_asked marks what the model wrote in $CONVEYOR_RESULT as a question, and
 # adds the conversation it can be answered in.
 #

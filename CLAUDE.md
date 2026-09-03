@@ -134,7 +134,7 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   spends a run to be asked it again. Condition is the default because it is the
   safe one to get wrong. The engine reads the flag, never the word beside it.
 - **A mark is one word and a paragraph.** The word (`decision`, `limit`,
-  `worktree`, `error`) is all a card shows and all a provider labels; the
+  `turns`, `worktree`, `error`) is all a card shows and all a provider labels; the
   paragraph is one click away in the panel. Scripts own the vocabulary — the
   engine never reads it, only checks it is short and unpunctuated, because it
   becomes a label on someone's tracker.

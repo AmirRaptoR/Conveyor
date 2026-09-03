@@ -123,6 +123,23 @@ if hit_limit; then
 Nothing is wrong with this item; it is waiting for the window to reset."
 fi
 
+# A turn budget is a number in conveyor.yaml, not a fact about this item. The
+# work up to the wall is real — commits pushed, comments posted, review rounds
+# already run — so this resumes rather than restarts: record_session before
+# blocked means the conversation, not just the reason, rides on the mark.
+# Answering with anything ("continue") hands it back into the same session
+# with a fresh turn budget, picking up from exactly where it stopped instead
+# of re-doing the investigation.
+if hit_max_turns; then
+	record_session
+	blocked turns "the agent hit its ${MAX_TURNS:-200}-turn budget before \
+finishing. This is not a fault of the item — the work done up to the wall \
+(pushed commits, posted comments, review rounds already run) is real. \
+Answering this mark with anything (e.g. \"continue\") resumes the same \
+conversation with a fresh turn budget instead of starting over; clearing the \
+label alone starts a new conversation from scratch."
+fi
+
 if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 	[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
 	agent_asked

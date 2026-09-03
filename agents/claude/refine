@@ -88,6 +88,14 @@ if hit_limit; then
 Nothing is wrong with this item; it is waiting for the window to reset."
 fi
 
+# See agents/claude/review for the reasoning.
+if hit_max_turns; then
+	record_session
+	blocked turns "the agent hit its ${MAX_TURNS:-40}-turn budget before \
+finishing the refinement. Answering this mark with anything (e.g. \"continue\") \
+resumes the same conversation with a fresh turn budget instead of starting over."
+fi
+
 # "Needs a human" cannot ride on the exit code: a CLI agent exits 0 whenever the
 # process ran, whatever it concluded. It comes back through the result file.
 if [[ -s "${CONVEYOR_RESULT:-}" ]] &&

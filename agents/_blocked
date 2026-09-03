@@ -9,6 +9,23 @@
 # in $CONVEYOR_RESULT, so the issue ended up wearing a mark with no comment
 # beside it and the board could say nothing about why it stopped.
 
+# _write_stop <jq args...> <filter> — the merge blocked and asks share: apply
+# filter to whatever is already in $CONVEYOR_RESULT (an empty object if there
+# is nothing, or nothing readable), so a field a caller wrote before stopping
+# survives being blocked.
+_write_stop() {
+	[[ -z "${CONVEYOR_RESULT:-}" ]] && return 0
+	local tmp base
+	tmp=$(mktemp)
+	base='{}'
+	[[ -s "$CONVEYOR_RESULT" ]] && jq -e . "$CONVEYOR_RESULT" >/dev/null 2>&1 && base=$(cat "$CONVEYOR_RESULT")
+	if jq "$@" <<<"$base" >"$tmp" 2>/dev/null; then
+		mv "$tmp" "$CONVEYOR_RESULT"
+	else
+		rm -f "$tmp"
+	fi
+}
+
 # blocked <kind> "<reason>" — record why a human is needed, then stop.
 #
 # Writes the convention every agent shares, so one is enough to teach: exit 20,
@@ -22,15 +39,21 @@
 #
 #   decision    a person must choose something before the work can be specified
 #   limit       the agent was out of quota; nothing is wrong with the item
+#   turns       the agent exhausted its turn budget before finishing; the work
+#               so far is real, not a fault, and a resumable session usually
+#               sits beside this kind (see agents/claude/_stream:record_session)
 #   worktree    the checkout is not in a state the work can start from
 #   no-output   the agent finished but produced nothing the provider can see
 #   input       the item itself is missing something (no criteria, no PR)
+#
+# Merges onto whatever is already in $CONVEYOR_RESULT rather than replacing it,
+# so a caller that wrote something first — record_session's {"session": "..."}
+# is the one case today — is not made to choose between "block" and "keep what
+# I already said". Nothing currently writes before calling blocked or asks
+# except that one caller, so this changes no existing behaviour.
 blocked() {
 	local kind=$1 reason=$2
-	if [[ -n "${CONVEYOR_RESULT:-}" ]]; then
-		jq -n --arg kind "$kind" --arg reason "$reason" \
-			'{blocked: true, kind: $kind, reason: $reason}' >"$CONVEYOR_RESULT"
-	fi
+	_write_stop --arg kind "$kind" --arg reason "$reason" '. + {blocked: true, kind: $kind, reason: $reason}'
 	echo "blocked ($kind): $reason" >&2
 	exit 20
 }
@@ -53,10 +76,8 @@ blocked() {
 # asks you the same thing again.
 asks() {
 	local kind=$1 question=$2
-	if [[ -n "${CONVEYOR_RESULT:-}" ]]; then
-		jq -n --arg kind "$kind" --arg reason "$question" \
-			'{blocked: true, kind: $kind, reason: $reason, asked: true}' >"$CONVEYOR_RESULT"
-	fi
+	_write_stop --arg kind "$kind" --arg reason "$question" \
+		'. + {blocked: true, kind: $kind, reason: $reason, asked: true}'
 	echo "asks ($kind): $question" >&2
 	exit 20
 }
