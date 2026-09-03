@@ -682,3 +682,31 @@ exit 10
 	os.WriteFile(release, nil, 0o644)
 	waitSweepDone(t, s)
 }
+
+// The runs handed to a doctor script are built from meta.json alone — never
+// log.txt, result.json or stdin.json — so a run whose other files retention
+// already swept still appears rather than breaking the invocation.
+func TestDoctorRunsSurviveASweptDirectory(t *testing.T) {
+	cfg, r, _ := doctorBoard(t, "#!/bin/sh\nexit 10\n")
+	s := New(cfg, r)
+	s.ctx = t.Context()
+
+	day := filepath.Join(r.Root, "2026-08-20", "090000.000-swpt")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(day, "meta.json"), []byte(
+		`{"id":"090000.000-swpt","source":"s1","itemId":"s1:1","kind":"stage",
+		  "to":"working","outcome":"blocked","exitCode":20,
+		  "startedAt":"2026-08-20T09:00:00Z","finishedAt":"2026-08-20T09:00:01Z"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// log.txt, result.json and stdin.json are deliberately never written —
+	// this is what a run looks like after retention has swept everything but
+	// the directory listing itself needs.
+
+	runs := s.doctorRuns("s1:1")
+	if len(runs) != 1 || runs[0].ID != "090000.000-swpt" || runs[0].Dir == "" {
+		t.Fatalf("runs = %+v, want the swept run still present with a readable dir", runs)
+	}
+}
