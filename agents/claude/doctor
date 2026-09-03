@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# The doctor: reads one marked item's block and its own run history, and
+# decides what should happen to it. Invoked by a sweep (`POST /api/doctor`),
+# never by the scheduler — this is not a stage in an item's lifecycle. See
+# docs/CONTRACTS.md §3 and §6 ("only a person clears a mark").
+#
+# Policy, by block.kind — CLAUDE.md's own vocabulary, and nothing else is
+# read from it: the engine never interprets kind, and neither does this rule
+# beyond a plain string match.
+#
+#   limit, worktree  a condition that may have passed. Exit 0, no comment.
+#   turns             resumable: exit 0 with an answer, so the item resumes
+#                      into the same conversation with a fresh turn budget
+#                      instead of hitting the identical wall cold.
+#   error             read the run that marked it, log first. A transient
+#                      cause (a network blip, a flaky test) exits 0, no
+#                      comment. A cause that would obviously reproduce (a
+#                      real defect, a missing tool, a config problem)
+#                      comments what needs fixing, then exits 10.
+#   decision          NEVER exit 0 — no amount of waiting produces an answer
+#                      only a person has. Investigates (the issue, the PR,
+#                      related issues, this item's run history) and comments
+#                      a recommendation for a person to act on, then exits 10.
+#   anything else      exit 10, no comment. Unknown is left alone.
+#
+# Config (source env: + this script's params:):
+#   REPO              owner/name — required, to comment
+#   MODEL, ALLOWED_TOOLS, MAX_TURNS, PERMISSION_MODE — passed to run_claude
+#
+# CONVEYOR_DRY_RUN=1 suppresses every comment; the verdict itself, and the
+# exit code that carries it, are unchanged — a dry run's row says accurately
+# what WOULD happen, never something milder.
+#
+# If the doctor's own agent invocation stops on a limit, a turn budget, or a
+# question of its own, that is "the doctor itself needs a person" (exit 20 —
+# see the endpoint's own table), and reuses the same blocked/asks convention
+# every other adapter shares. It says nothing about the item itself.
+set -euo pipefail
+
+source "$(dirname "$0")/_stream"
+source "$(dirname "$0")/../_blocked"
+
+: "${REPO:?REPO is required (set it in the source env: block)}"
+
+SENTINEL='<!-- conveyor:doctor -->'
+
+payload=$(cat)
+kind=$(jq -r '.block.kind // ""' <<<"$payload")
+reason=$(jq -r '.block.reason // ""' <<<"$payload")
+ref=$(jq -r '.item.ref' <<<"$payload")
+title=$(jq -r '.item.title' <<<"$payload")
+
+echo "diagnosing $CONVEYOR_SOURCE #$ref ($kind): $reason" >&2
+
+# already_commented — the whole of "did the doctor already say this?" lives in
+# whether the sentinel is in some comment already on the issue, the same
+# pattern agents/claude/approve uses for a reply it already gave. No store of
+# its own.
+already_commented() {
+	local out
+	out=$(gh issue view "$ref" --repo "$REPO" --json comments 2>/dev/null) || { echo false; return; }
+	if jq -e --arg s "$SENTINEL" '[.comments[] | select(.body | contains($s))] | length > 0' \
+		>/dev/null 2>&1 <<<"$out"; then
+		echo true
+	else
+		echo false
+	fi
+}
+
+# comment <body> — post once for this finding, never under a dry run. A
+# comment that fails to post is logged and does not change the exit code: the
+# verdict is the point, the comment is the explanation.
+comment() {
+	local body=$1
+	if [[ -n "${CONVEYOR_DRY_RUN:-}" ]]; then
+		echo "dry run: would comment on #$ref: $body" >&2
+		return 0
+	fi
+	if [[ "$(already_commented)" == "true" ]]; then
+		echo "already commented on #$ref for this finding; not posting again" >&2
+		return 0
+	fi
+	if ! gh issue comment "$ref" --repo "$REPO" --body "$body
+
+$SENTINEL" >/dev/null 2>&1; then
+		echo "could not comment on #$ref" >&2
+	fi
+}
+
+# investigate <prompt> — one model invocation, sharing the same stop
+# conventions every adapter does. Returns normally only when the model ran to
+# completion without asking for a person; the doctor's own stop is exit 20,
+# reported as "the doctor itself needs a person" and touching nothing on the
+# item.
+investigate() {
+	local full=$1 rc
+	set +e
+	MAX_TURNS="${MAX_TURNS:-20}" \
+		ALLOWED_TOOLS="${ALLOWED_TOOLS:-Read,Glob,Grep,Bash(gh:*)}" \
+		run_claude "$full"
+	rc=$?
+	set -e
+	record_model
+
+	if hit_limit; then
+		blocked limit "the doctor was out of quota and stopped before finishing its diagnosis of #$ref."
+	fi
+	if hit_max_turns; then
+		record_session
+		blocked turns "the doctor hit its ${MAX_TURNS:-20}-turn budget while diagnosing #$ref."
+	fi
+	if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
+		[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
+		agent_asked
+		echo "the doctor itself stopped: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
+		exit 20
+	fi
+	if [[ $rc -ne 0 ]]; then
+		echo "the doctor's own invocation exited $rc" >&2
+		exit 1
+	fi
+}
+
+case "$kind" in
+limit | worktree)
+	# Conditions already documented as bulk-clearable — see CONTRACTS.md §6.
+	echo "$kind may have passed; clearing it" >&2
+	exit 0
+	;;
+
+turns)
+	# A resumable condition: starting cold can hit the identical wall again.
+	echo "resumable; handing back a fresh turn budget" >&2
+	jq -n '{answer: "continue"}' >"$CONVEYOR_RESULT"
+	exit 0
+	;;
+
+error)
+	run_id=$(jq -r '.block.runId // ""' <<<"$payload")
+	log_dir=$(jq -r --arg id "$run_id" '[.runs[] | select(.id == $id)][0].dir // ""' <<<"$payload")
+	log_path=""
+	[[ -n "$log_dir" && -f "$log_dir/log.txt" ]] && log_path="$log_dir/log.txt"
+
+	prompt="Diagnose one failed pipeline run. This is a read-only investigation:
+do not edit anything, do not push, do not comment — only decide.
+
+Item #${ref} in ${REPO}: ${title}
+The run stopped with: ${reason}
+${log_path:+Its log is at ${log_path} — read it. [claude stopped: <subtype>] near
+the end names why the CLI itself ended, when that was the cause.}
+
+Decide whether the cause is plausibly TRANSIENT (a network blip, a flaky
+test, a tool that timed out for no reason tied to this change) or would
+OBVIOUSLY REPRODUCE on an identical retry (a real code defect, a missing
+tool, a config problem, a test that is deterministically wrong).
+
+Write your verdict to \$CONVEYOR_RESULT as JSON:
+{\"verdict\": \"transient\"} or
+{\"verdict\": \"reproducible\", \"summary\": \"<one paragraph: what needs fixing>\"}
+Write nothing else to that file."
+
+	: >"${CONVEYOR_RESULT:-/dev/null}"
+	investigate "$prompt"
+
+	verdict=$(jq -r '.verdict // ""' "${CONVEYOR_RESULT:-/dev/null}" 2>/dev/null || echo "")
+	if [[ "$verdict" == "transient" ]]; then
+		echo "looks transient; clearing it" >&2
+		# A clean, minimal record — never the item's own answer, which this
+		# branch has none of.
+		jq -n '{summary: "looked transient; retried"}' >"$CONVEYOR_RESULT"
+		exit 0
+	fi
+
+	# Reproducible, or the model gave no usable verdict — leaving it marked is
+	# the safe side to be wrong on: a bad retry burns a run into the same wall,
+	# a bad leave just waits one more sweep for a person to glance at it.
+	summary=$(jq -r '.summary // ""' "${CONVEYOR_RESULT:-/dev/null}" 2>/dev/null || echo "")
+	[[ -z "$summary" ]] && summary="could not determine whether this would reproduce; leaving it for a person to judge (original reason: ${reason})"
+	comment "**Doctor:** $summary"
+	jq -n --arg s "$summary" '{summary: $s}' >"$CONVEYOR_RESULT"
+	exit 10
+	;;
+
+decision)
+	# The one invariant that must not move: never exit 0 on a decision mark.
+	prompt="Investigate one item stopped on a decision only a person can make.
+This is a read-only investigation: do not edit anything, do not push, do not
+comment — only recommend. Read the issue, its pull request if one exists,
+related issues, and this item's own run history to understand the question.
+
+Item #${ref} in ${REPO}: ${title}
+It stopped asking: ${reason}
+
+Write your recommendation to \$CONVEYOR_RESULT as JSON:
+{\"summary\": \"<one paragraph: what you found, and what you recommend>\"}
+Write nothing else to that file. You are not deciding — a person still has
+to confirm or reject this before anything happens."
+
+	: >"${CONVEYOR_RESULT:-/dev/null}"
+	investigate "$prompt"
+
+	summary=$(jq -r '.summary // ""' "${CONVEYOR_RESULT:-/dev/null}" 2>/dev/null || echo "")
+	[[ -z "$summary" ]] && summary="the doctor could not form a recommendation; a person still needs to decide (original reason: ${reason})"
+	comment "**Doctor:** $summary"
+	jq -n --arg s "$summary" '{summary: $s}' >"$CONVEYOR_RESULT"
+	exit 10
+	;;
+
+*)
+	echo "unrecognised kind '$kind'; leaving it alone" >&2
+	exit 10
+	;;
+esac

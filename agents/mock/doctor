@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Mock doctor: a deterministic stand-in for agents/claude/doctor, so the sweep
+# — and this demo pipeline — are exercisable with no GitHub and no model.
+#
+# Driven entirely by the block already on its stdin (model.DoctorInput), the
+# same shape a real doctor reads: no extra control field, because the point is
+# to behave the way the real policy is supposed to, not to be puppeted.
+set -euo pipefail
+payload=$(cat)
+kind=$(jq -r '.block.kind // ""' <<<"$payload")
+reason=$(jq -r '.block.reason // ""' <<<"$payload")
+item=$(jq -r '.item.id' <<<"$payload")
+
+echo "diagnosing $item: $kind — $reason"
+
+case "$kind" in
+limit | worktree)
+	# Conditions that may have passed. Retry cold.
+	echo "  $kind may have passed; clearing it"
+	;;
+turns)
+	# Resumable: hand back an answer so the next run continues the same
+	# conversation with a fresh turn budget instead of starting cold into the
+	# identical wall.
+	echo "  resumable; handing back a fresh turn budget"
+	jq -n '{answer: "continue"}' >"$CONVEYOR_RESULT"
+	;;
+error)
+	if [[ "$reason" =~ (network|flaky|timeout|connection) ]]; then
+		echo "  looks transient; retrying"
+	else
+		echo "  looks like it would reproduce; leaving it marked" >&2
+		jq -n '{summary: "looks reproducible, not retrying: " + $r}' --arg r "$reason" >"$CONVEYOR_RESULT"
+		exit 10
+	fi
+	;;
+decision)
+	# Never auto-cleared. A real doctor investigates and comments a
+	# recommendation here; the mock has no issue tracker to comment on, so it
+	# only ever says so in the log.
+	echo "  a decision mark; never auto-clearing it" >&2
+	jq -n '{summary: "needs a person to decide; not auto-clearing"}' >"$CONVEYOR_RESULT"
+	exit 10
+	;;
+*)
+	echo "  unrecognised kind $kind; leaving it alone" >&2
+	exit 10
+	;;
+esac

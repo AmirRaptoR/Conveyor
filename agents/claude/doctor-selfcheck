@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Drives agents/claude/doctor against a stubbed `gh` and a stubbed `claude`,
+# and asserts the exit code, the mark it leaves, and whether it commented.
+# Touches no repository and runs no real model.
+#
+#   agents/claude/doctor-selfcheck
+#
+# The model path's own stop conventions — a limit, a turn budget, a question
+# of its own — are agents/claude/_stream's, already driven end to end by
+# agents/claude/selfcheck; this does not repeat them. What is checked here is
+# doctor's own policy: what each block.kind does, and what a model's verdict
+# (stubbed, never a real invocation) turns into.
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/bin" "$tmp/scene"
+export PATH="$tmp/bin:$PATH"
+
+# The claude stub: writes whatever verdict the scene staged into
+# $CONVEYOR_RESULT (standing in for the model doing its own investigation and
+# writing that file itself) and prints one clean stream-json result line.
+# CLAUDE_EXIT lets a scene force a non-zero exit.
+cat >"$tmp/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+scene="$SCENE"
+if [[ -f "$scene/claude_result" ]]; then
+	cp "$scene/claude_result" "$CONVEYOR_RESULT"
+fi
+echo '{"type":"result","is_error":false,"subtype":"success","num_turns":1}'
+exit "${CLAUDE_EXIT:-0}"
+STUB
+chmod +x "$tmp/bin/claude"
+
+# The gh stub: `issue view --json comments` answers out of a fixture the scene
+# writes (empty by default — no prior comment), and `issue comment` records
+# that it ran, so a test can tell whether a comment actually posted.
+cat >"$tmp/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+scene="$SCENE"
+case "$1 $2" in
+"issue view")
+	cat "$scene/comments" 2>/dev/null || echo '{"comments":[]}'
+	;;
+"issue comment")
+	echo "$*" >>"$scene/comments_posted"
+	;;
+*)
+	echo "stub gh: unhandled: $*" >&2
+	exit 97
+	;;
+esac
+STUB
+chmod +x "$tmp/bin/gh"
+
+scene() { rm -f "$tmp/scene"/*; }
+no_prior_comment() { echo '{"comments":[]}' >"$tmp/scene/comments"; }
+prior_comment() { echo '{"comments":[{"body":"already said this <!-- conveyor:doctor -->"}]}' >"$tmp/scene/comments"; }
+claude_says() { printf '%s' "$1" >"$tmp/scene/claude_result"; }
+
+# run <kind> <reason> [runId] [runs-json] — pipe a DoctorInput and report the
+# exit code.
+run() {
+	local kind=$1 reason=$2 run_id=${3:-r1} runs=${4:-[]}
+	: >"$CONVEYOR_RESULT"
+	local -a dry=()
+	[[ -n "${DRY:-}" ]] && dry=(CONVEYOR_DRY_RUN=1)
+	jq -n --arg kind "$kind" --arg reason "$reason" --arg runId "$run_id" --argjson runs "$runs" \
+		'{item:{id:"s1:7",ref:"7",title:"an item"},stage:"working",blocked:true,
+		  block:{kind:$kind,reason:$reason,stage:"working",runId:$runId,asked:false},
+		  runs:$runs}' |
+		env "${dry[@]}" SCENE="$tmp/scene" REPO=o/n CONVEYOR_SOURCE=s1 "$here/doctor" \
+			>/dev/null 2>&1
+	echo $?
+}
+export CONVEYOR_RESULT="$tmp/result.json"
+answer() { jq -r '.answer // "none"' "$CONVEYOR_RESULT" 2>/dev/null || echo none; }
+posted() { [[ -f "$tmp/scene/comments_posted" ]] && echo yes || echo no; }
+
+# --- limit, worktree: conditions, exit 0, no comment ------------------------
+for k in limit worktree; do
+	scene; no_prior_comment
+	chk "$k clears (exit 0)"      "$(run "$k" "boom")" "0"
+	chk "     and never comments" "$(posted)"           "no"
+done
+
+# --- turns: resumable, exit 0 with an answer --------------------------------
+scene; no_prior_comment
+chk "turns clears (exit 0)"        "$(run turns "ran out of turns")" "0"
+chk "     with a fresh-budget answer" "$(answer)" "continue"
+chk "     and never comments"      "$(posted)" "no"
+
+# --- error: a transient cause exits 0, no comment ---------------------------
+scene; no_prior_comment; claude_says '{"verdict":"transient"}'
+chk "error, transient verdict clears (exit 0)" "$(run error "flaky test")" "0"
+chk "     and never comments"                  "$(posted)" "no"
+
+# --- error: a reproducible cause leaves it marked, with a comment ----------
+scene; no_prior_comment; claude_says '{"verdict":"reproducible","summary":"the handler is missing a nil check"}'
+chk "error, reproducible verdict leaves it (exit 10)" "$(run error "panic: nil pointer")" "10"
+chk "     and comments what needs fixing"             "$(posted)" "yes"
+chk "     the mark is not cleared"                    "$(jq -r 'has("answer")' "$CONVEYOR_RESULT")" "false"
+
+# --- error: no usable verdict from the model defaults to the safe side -----
+scene; no_prior_comment; claude_says '{}'
+chk "error, no verdict leaves it (exit 10)" "$(run error "unclear")" "10"
+
+# --- decision: NEVER exit 0, always comments a recommendation --------------
+scene; no_prior_comment; claude_says '{"summary":"the issue needs a product call on X before this can proceed"}'
+chk "decision never clears (exit 10)"   "$(run decision "which approach?")" "10"
+chk "     and comments the recommendation" "$(posted)" "yes"
+chk "     and never writes an answer"   "$(jq -r 'has("answer")' "$CONVEYOR_RESULT")" "false"
+
+# A model that ran but wrote nothing usable still never clears a decision.
+scene; no_prior_comment; claude_says '{}'
+chk "decision with no model verdict still never clears (exit 10)" "$(run decision "which approach?")" "10"
+chk "     and still comments something"                           "$(posted)" "yes"
+
+# --- unrecognised kind: exit 10, no comment ---------------------------------
+scene; no_prior_comment
+chk "an unknown kind leaves it (exit 10)" "$(run made-up-kind "??")" "10"
+chk "     and never comments"             "$(posted)" "no"
+
+# --- dry run: the verdict is unchanged, but nothing is ever posted ---------
+scene; no_prior_comment; claude_says '{"summary":"needs a product call"}'
+chk "dry run still reaches the same verdict (exit 10)" "$(DRY=1 run decision "which approach?")" "10"
+chk "     but posts nothing"                            "$(posted)" "no"
+
+scene; no_prior_comment; claude_says '{"verdict":"reproducible","summary":"missing nil check"}'
+chk "dry run on a reproducible error still exits 10" "$(DRY=1 run error "panic")" "10"
+chk "     but posts nothing"                          "$(posted)" "no"
+
+# --- the same finding is never commented twice ------------------------------
+scene; prior_comment; claude_says '{"summary":"needs a product call"}'
+chk "a finding already commented still exits 10" "$(run decision "which approach?")" "10"
+chk "     but does not comment again"            "$(posted)" "no"
+
+# --- the run named by block.runId is the one whose log the doctor reads ----
+# (the stub does not read the log itself; this proves the run lookup does not
+# blow up when the id is present among several, and is silent when absent.)
+scene; no_prior_comment; claude_says '{"verdict":"transient"}'
+runs='[{"id":"other","kind":"stage","dir":"/nowhere"},{"id":"r9","kind":"stage","dir":"/also/nowhere"}]'
+chk "a runId present among several still runs cleanly" "$(run error "boom" "r9" "$runs")" "0"
+
+scene; no_prior_comment; claude_says '{"verdict":"transient"}'
+chk "a runId absent from runs still runs cleanly" "$(run error "boom" "missing" '[]')" "0"
+
+exit $fail

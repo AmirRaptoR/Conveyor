@@ -23,10 +23,18 @@ drains the mock pipeline in priority order and marks a blocked item in place.
 `conveyor serve` runs the pipeline and renders it: the board, live logs over
 SSE, run history, drag-to-reorder, drag out of the backlog to start an item now
 (`POST /api/items/{id}/start`), each mark's reason on its card with a hand-back
-button, `Unblock all`, and a strip saying how each agent is doing. It advances items on its own — `-watch`
+button, `Unblock all`, a `Diagnose` sweep, and a strip saying how each agent is
+doing. It advances items on its own — `-watch`
 is what makes it observe without touching anything. Discovery, scheduling and
 the tick button are three goroutines, deliberately: a 90-minute stage must not
-be able to stop every source being listed.
+be able to stop every source being listed. `Diagnose` (`POST /api/doctor`)
+sweeps every marked item through its source's `doctor:` script, reading each
+one's own reason before deciding whether to retry it, resume it or leave it
+for a person — a third, more careful exception to "only a person clears a
+mark" (CONTRACTS §6). Dry run by default; a person presses `Apply` once the
+sweep has shown what it would do. `agents/claude/doctor` and `agents/mock/doctor`
+are the shipped policies; a source declaring no `doctor:` just has its marked
+items skipped by a sweep.
 
 `internal/store` holds the persisted manual input order — v1's only human
 control lever — and the data directory's owner lock.

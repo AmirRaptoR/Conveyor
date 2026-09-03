@@ -248,6 +248,11 @@ type Server struct {
 	// polling guards discovery against itself: the ticker and the button both
 	// ask for it, and running every list script twice at once buys nothing.
 	polling atomic.Bool
+
+	// doctorMu guards doctorSweep, which the sweep's own goroutine mutates as
+	// each row settles and GET /api/doctor reads concurrently.
+	doctorMu    sync.Mutex
+	doctorSweep *Sweep
 }
 
 func New(cfg *config.Config, r *runner.Runner) *Server {
@@ -323,6 +328,8 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	mux.HandleFunc("POST /api/items/{id}/start", s.handleStart)
 	mux.HandleFunc("POST /api/items/{id}/unblock", s.handleUnblock)
 	mux.HandleFunc("POST /api/unblock", s.handleUnblockAll)
+	mux.HandleFunc("POST /api/doctor", s.handleDoctorStart)
+	mux.HandleFunc("GET /api/doctor", s.handleDoctorGet)
 
 	sub, err := fs.Sub(webFS, "web")
 	if err != nil {
@@ -1096,23 +1103,39 @@ func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent) // already where the caller wants it
 		return
 	}
-	// Recorded before the mark comes off, and with the session read out of the
-	// block while it still exists: clearing the mark forgets why the item
-	// stopped, and the conversation that asked is part of why.
-	if strings.TrimSpace(said.Answer) != "" {
-		s.mu.RLock()
-		sess := s.blocks[id].Session
-		s.mu.RUnlock()
-		if err := s.answers.Set(id, model.Resume{Answer: said.Answer, Session: sess}); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-	if err := s.unblock(s.ctx, item); err != nil {
+	if err := s.answerThenUnblock(s.ctx, item, said.Answer); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// answerThenUnblock records an answer against a marked item, if there is one,
+// and then clears its mark — the sequence handleUnblock performs for a person
+// typing into a card, and the doctor sweep performs for a script's verdict.
+//
+// The session comes out of the block while it still exists: clearing the mark
+// is what forgets why the item stopped, and the conversation that asked is
+// part of why. If the move that clears the mark then fails, the answer is
+// taken back — a failed unblock must not strand a reply nobody's run will ever
+// see, waiting to be said into a conversation that was never re-asked.
+func (s *Server) answerThenUnblock(ctx context.Context, item model.Item, answer string) error {
+	answer = strings.TrimSpace(answer)
+	if answer != "" {
+		s.mu.RLock()
+		sess := s.blocks[item.ID].Session
+		s.mu.RUnlock()
+		if err := s.answers.Set(item.ID, model.Resume{Answer: answer, Session: sess}); err != nil {
+			return err
+		}
+	}
+	if err := s.unblock(ctx, item); err != nil {
+		if answer != "" {
+			s.answers.Take(item.ID) // nothing consumed it; do not strand it
+		}
+		return err
+	}
+	return nil
 }
 
 // handleUnblockAll hands the whole board back at once, which is what an

@@ -155,6 +155,51 @@ tokens or money is the interesting number — all of that differs per agent and
 belongs to the script, which is why the engine holds no struct for it. An agent
 with no `status` script simply says nothing, which is not an error.
 
+**`doctor`** (optional, `scripts.doctor:` — a reserved source-script key no
+stage names) — triage one marked item, on demand, as part of a *sweep* the
+board starts across every marked item at once (`POST /api/doctor`). Not a
+stage in an item's lifecycle: it runs across items, and a source that declares
+none simply has its marked items skipped by a sweep. Receives
+
+```json
+{"item": …, "stage": "review", "blocked": true,
+ "block": {"kind": "turns", "reason": "…", "stage": "review",
+           "runId": "…", "at": "…", "asked": false},
+ "runs": [ {"id": "…", "kind": "stage", "stage": "review", "outcome": "blocked",
+            "exitCode": 20, "timedOut": false,
+            "startedAt": "…", "finishedAt": "…", "dir": "…"} ]}
+```
+
+`runs` is that item's own history, newest first and capped at 20, including
+earlier doctor runs — trimmed, deliberately not the shape a run is stored in:
+it never carries `env` or `item`, which would hand a model every source
+parameter, tokens included. `block` never carries the block's `session`. A
+`decision` mark is never something a doctor may clear — see below.
+
+| Exit | Means | The sweep does |
+| --- | --- | --- |
+| `0` | hand it back | clears the mark; if `$CONVEYOR_RESULT` has a non-empty string `answer`, records it first (with the block's own session) so the next run resumes into it |
+| `10` | leave it | nothing |
+| `20` | the doctor itself needs a person | nothing to the item |
+| other, or a timeout | the doctor failed on this item | nothing to the item; the sweep continues |
+
+Every invocation is recorded with `kind: "doctor"`, never `"stage"` —
+§6's run history reader for a mark's reason reads only `kind: "stage"`, so a
+doctor run that exits 20 is never mistaken for the run that marked the item.
+
+A block with `asked: true` is skipped before the script runs — the same
+`asked` guard every bulk clear already applies. Immediately before a `0` is
+applied, the item is re-checked against the live board, not the snapshot the
+sweep began with: unblocked, or re-marked under a new run id, since it was
+diagnosed, and the row is skipped rather than acted on twice.
+
+`CONVEYOR_DRY_RUN=1` reaches the script when the sweep is a dry run — the
+default invocation, given the blast radius of a script that can act across
+every onboarded repository at once. A dry run clears no mark and records no
+answer, whatever the script exits; what a doctor writes to the *provider*
+under it (a comment, say) is the script's own promise, exactly as it already
+is for `move`.
+
 ## 4. Transition order
 
 Moving an item from stage A to stage B is always, in this order:
@@ -369,8 +414,9 @@ is never cleared in bulk**, and is not counted towards a stall either: a board
 holding nothing but questions is stopped on purpose. Only answering it on its
 own card takes it off.
 
-**Only a person clears a mark**, with two exceptions, and both are the outside
-world coming back rather than a decision being made.
+**Only a person clears a mark**, with three exceptions. The first two are the
+outside world coming back rather than a decision being made; the third is the
+only one that reads the reason first.
 
 When *every* item is marked and the line cannot move at all, `retryStalled:`
 clears them on an interval and lets it try again. The guard is "everything" on
@@ -386,6 +432,16 @@ schedule the agent itself reports. Leaving those for someone to clear by hand is
 a night of the line standing still for a reason that expired at 3am. A
 `decision` mark is untouched, because no amount of waiting produces an answer
 only a person has.
+
+The third is a **doctor** script (§3) clearing a mark it examined itself, one
+item at a time, as part of a sweep a person started (`POST /api/doctor`). It
+differs from the first two in kind, not just in trigger: `retryStalled` and a
+quota's return clear a mark blind, on the strength of "the outside world may
+have changed"; a doctor reads the mark's kind and reason, and that item's own
+run history, before deciding. The one invariant that does not move for it
+either: a `decision` mark is never something a doctor may clear — the adapter
+holds that rule, checked by a selfcheck rather than by trust, because the
+engine itself still never reads the word beside the flag.
 
 ## 5a. Answering a stop
 

@@ -178,6 +178,10 @@ sources:
         agent: mock
         params:
           NOTE: "implementing"
+      doctor:
+        # A reserved key — no stage names it. POST /api/doctor sweeps every
+        # marked item through it. Try it: mark an item, then run the sweep.
+        agent: mock
 
   # A real source, for comparison — swap `agent: claude` for `agent: codex` and
   # only this repository changes:
@@ -239,6 +243,16 @@ sources:
   #         # smaller job than producing one.
   #         MODEL: claude-sonnet-5
   #         PROMPT: "/review $REF"
+  #     doctor:
+  #       # A reserved key — no stage names it. `POST /api/doctor` sweeps every
+  #       # item this repository has marked through it, one at a time, on
+  #       # demand: reads the mark's kind and reason and this item's own run
+  #       # history, and decides whether to retry it, resume it, or leave it
+  #       # for a person. A source declaring none simply has its marked items
+  #       # skipped by a sweep — this is not required to onboard a repository.
+  #       agent: claude
+  #       params:
+  #         MODEL: claude-sonnet-5
   #
   # Leaving MODEL unset is a choice too, and the one this repository ships:
   # every adapter then inherits whatever the operator's CLI is configured with,

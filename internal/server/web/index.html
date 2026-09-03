@@ -288,6 +288,25 @@
   .agent .facts { display:flex; gap:14px; flex-wrap:wrap; padding-top:6px; color:var(--faint); }
   .agent .facts b { color:var(--dim); font-weight:400; }
 
+  /* A doctor sweep: one row per marked item, updating in place as each one
+     settles. Never a count — a count cannot say which item was left, only
+     that some were. */
+  .doctor-sweep { border:1px solid var(--rule); border-radius:6px; padding:10px 12px;
+    margin:0 16px 10px; font-size:12px; }
+  .doctor-sweep .dhead { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
+  .doctor-sweep .dhead b { color:var(--ink); font-weight:400; letter-spacing:.02em; }
+  .doctor-sweep .dstate { color:var(--dim); }
+  .doctor-sweep .dapply { color:var(--run); }
+  .drow { display:flex; gap:10px; align-items:baseline; padding:2px 0; }
+  .drow .ditem { color:var(--dim); min-width:120px; }
+  .drow .dstatus { text-transform:uppercase; letter-spacing:.04em; font-size:10px; min-width:64px; }
+  .drow.pending .dstatus { color:var(--faint); }
+  .drow.skipped .dstatus { color:var(--faint); }
+  .drow.cleared .dstatus { color:var(--ok); }
+  .drow.left .dstatus { color:var(--run); }
+  .drow.failed .dstatus { color:var(--stop); }
+  .drow .dwhy { color:var(--dim); }
+
   /* What kind of stop it was, on the card. One word: the paragraph is in the
      panel, because a column of paragraphs cannot be read across. */
   .item .why {
@@ -510,6 +529,7 @@
   </span>
   <span class="grow"></span>
   <button class="ctl" id="unblock-all" hidden>Unblock all</button>
+  <button class="ctl" id="diagnose" hidden>Diagnose</button>
   <button class="ctl" id="refresh">Refresh</button>
   <button class="ctl primary" id="tick">Tick once</button>
 </div>
@@ -517,6 +537,7 @@
 <div id="agents"></div>
 <div id="sources"></div>
 <div id="faults"></div>
+<div id="doctor"></div>
 <div class="rail-wrap">
   <div class="line" id="line"><div class="rail" id="rail"></div></div>
   <div class="railctl" id="railctl" hidden>
@@ -568,6 +589,50 @@ async function load() {
 }
 
 function fault(msg) { $("#lamp").className = "lamp down"; $("#line1").textContent = msg; }
+
+// The doctor's own sweep, drawn separately from /api/state: it outlives any
+// one poll and has to keep showing rows settle while a sweep is running,
+// whether or not anything else on the board changed.
+let doctorSweep = null;
+async function loadDoctor() {
+  try { doctorSweep = await (await fetch("/api/doctor")).json(); } catch { return; }
+  drawDoctor();
+}
+
+function drawDoctor() {
+  const box = $("#doctor");
+  const sw = doctorSweep;
+  if (!sw || !(sw.results || []).length) { box.innerHTML = ""; return; }
+  // A dry run is never worded as a change: "would clear/leave", not "cleared",
+  // and the head says outright that nothing happened yet.
+  const verb = { cleared: sw.apply ? "cleared" : "would clear", left: sw.apply ? "left" : "would leave",
+    failed: "failed", skipped: "skipped", pending: "pending" };
+  box.innerHTML = `<div class="doctor-sweep">
+      <div class="dhead">
+        <b>Diagnose</b>
+        <span class="${sw.apply ? "dapply" : "dstate"}">${sw.apply ? "applying" : "dry run — nothing changed yet"}</span>
+        <span class="dstate">${sw.running ? "running…" : "finished"}</span>
+        ${(!sw.running && !sw.apply) ? `<button class="ctl" id="doctor-apply">Apply</button>` : ""}
+      </div>
+      ${sw.results.map(r => `<div class="drow ${esc(r.status)}">
+        <span class="ditem">${esc(r.item)}</span>
+        <span class="dstatus">${esc(verb[r.status] || r.status)}</span>
+        <span class="dwhy">${esc(r.why || "")}</span>
+      </div>`).join("")}
+    </div>`;
+  const applyBtn = $("#doctor-apply");
+  if (applyBtn) applyBtn.onclick = () => startDoctor(true);
+}
+
+async function startDoctor(apply) {
+  const res = await fetch("/api/doctor", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ apply }),
+  });
+  if (res.status === 409) { alert("A sweep is already running."); return; }
+  loadDoctor();
+}
 
 function draw() {
   if (!state) return;
@@ -631,6 +696,9 @@ function draw() {
   const all = $("#unblock-all");
   all.hidden = !marked;
   all.textContent = `Unblock all (${marked})`;
+  // Diagnose reads a reason before acting, so it is offered wherever a mark
+  // exists to read — the same condition as the blunter Unblock all.
+  $("#diagnose").hidden = !marked;
 
   // A key for the edge colours, and the list of what is enrolled: without it
   // the colours are decoration, because nothing says which repo is which.
@@ -1479,6 +1547,16 @@ $("#unblock-all").onclick = async e => {
   setTimeout(() => e.target.disabled = false, 2000);
 };
 
+$("#diagnose").onclick = () => {
+  // Dry run is the only thing a click starts — apply is a second, explicit
+  // press on the Apply button the result itself offers, never implied by this
+  // one. The blast radius is comments and clears across every marked item at
+  // once, and that is not a decision to make with one gesture.
+  const marked = (state?.items || []).filter(it => it.blocked).length;
+  if (!marked) { alert("Nothing is marked."); return; }
+  startDoctor(false);
+};
+
 $("#refresh").onclick = () => fetch("/api/refresh", { method:"POST" });
 $("#tick").onclick = async e => {
   e.target.disabled = true;
@@ -1503,10 +1581,12 @@ es.onmessage = ev => {
   }
   if (e.kind === "transition" && openItemId && e.transition?.item?.id === openItemId) loadHistory(openItemId);
   load();
+  loadDoctor();
 };
 es.onerror = () => fault("disconnected");
 
 load();
+loadDoctor();
 </script>
 </body>
 </html>

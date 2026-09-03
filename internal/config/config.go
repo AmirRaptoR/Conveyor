@@ -536,6 +536,22 @@ func (c *Config) resolveSources() {
 			}
 			s.Paths[st.Script] = path
 		}
+
+		// doctor is a reserved script key: no stage names it, and it is
+		// resolved here on its own account rather than by the loop above,
+		// which only resolves what a stage asks for. A source that declares
+		// none is not a problem — its marked items are simply skipped by a
+		// sweep — so only a declared-and-broken doctor: becomes a problem.
+		if spec, ok := s.Scripts["doctor"]; ok {
+			path, err := c.resolveScriptSpec("doctor", spec)
+			if err != nil {
+				note(`script "doctor": %v`, err)
+			} else if errs := checkScript(path, `script "doctor"`); len(errs) > 0 {
+				note("%s", strings.Join(errs, "; "))
+			} else {
+				s.Paths["doctor"] = path
+			}
+		}
 	}
 }
 
