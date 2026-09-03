@@ -178,6 +178,10 @@ sources:
         agent: mock
         params:
           NOTE: "implementing"
+      doctor:
+        # A reserved key — no stage names it. POST /api/doctor sweeps every
+        # marked item through it. Try it: mark an item, then run the sweep.
+        agent: mock
 
   # A real source, for comparison — swap `agent: claude` for `agent: codex` and
   # only this repository changes:
