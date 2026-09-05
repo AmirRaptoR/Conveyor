@@ -36,6 +36,18 @@ sweep has shown what it would do. `agents/claude/doctor` and `agents/mock/doctor
 are the shipped policies; a source declaring no `doctor:` just has its marked
 items skipped by a sweep.
 
+The board is an installable app (`web/manifest.webmanifest`, `web/sw.js`) and
+sends Web Push when an item asks a question or reaches a terminal stage —
+the two moments worth hearing about without watching. `internal/push` does
+RFC 8291/8292 on the standard library (`crypto/ecdh`, `crypto/hkdf`), proven
+against the RFC's own test vector; the VAPID key pair lives in
+`<data>/vapid.json` and subscriptions in `<data>/push.json`, both created on
+first use and never committed. No account anywhere: a device presses
+"Notify me" once (or installs the app, which asks on its own), and
+`POST /api/push/test` proves the path. **Push needs a secure origin**, so
+the live board is fronted by Caddy for TLS on the host — the app itself
+still binds loopback and keeps its own basic auth.
+
 `internal/store` holds the persisted manual input order — v1's only human
 control lever — and the data directory's owner lock.
 

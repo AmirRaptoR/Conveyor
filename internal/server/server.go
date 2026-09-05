@@ -7,11 +7,14 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,6 +27,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
+	"github.com/AmirRaptoR/Conveyor/internal/push"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 	"github.com/AmirRaptoR/Conveyor/internal/source"
 	"github.com/AmirRaptoR/Conveyor/internal/store"
@@ -257,6 +261,12 @@ type Server struct {
 	// each row settles and GET /api/doctor reads concurrently.
 	doctorMu    sync.Mutex
 	doctorSweep *Sweep
+
+	// Push notifications: the VAPID key pair the browser subscribes against
+	// and the subscriptions taken. Nil keys means the data dir refused the
+	// key file, and the board simply does not notify.
+	pushKeys *push.Keys
+	pushSubs *push.Store
 }
 
 func New(cfg *config.Config, r *runner.Runner) *Server {
@@ -270,6 +280,12 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 		tick:    make(chan struct{}, 1),
 		wake:    make(chan struct{}, 1),
 		ctx:     context.Background(),
+	}
+	s.pushSubs = push.OpenStore(filepath.Join(cfg.DataDir(), "push.json"))
+	if keys, err := push.LoadKeys(filepath.Join(cfg.DataDir(), "vapid.json")); err != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: push notifications off: %v\n", err)
+	} else {
+		s.pushKeys = keys
 	}
 	s.blocks = map[string]Block{}
 	s.paused = map[string]PauseView{}
@@ -334,7 +350,14 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	mux.HandleFunc("POST /api/unblock", s.handleUnblockAll)
 	mux.HandleFunc("POST /api/doctor", s.handleDoctorStart)
 	mux.HandleFunc("GET /api/doctor", s.handleDoctorGet)
+	mux.HandleFunc("GET /api/push/key", s.handlePushKey)
+	mux.HandleFunc("POST /api/push/subscribe", s.handlePushSubscribe)
+	mux.HandleFunc("POST /api/push/unsubscribe", s.handlePushUnsubscribe)
+	mux.HandleFunc("POST /api/push/test", s.handlePushTest)
 
+	// Go's table has no entry for the manifest extension and would serve it
+	// as text; Chrome wants the manifest type before it offers to install.
+	_ = mime.AddExtensionType(".webmanifest", "application/manifest+json")
 	sub, err := fs.Sub(webFS, "web")
 	if err != nil {
 		return err
@@ -877,8 +900,11 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// Written here rather than recovered later: this is the one moment the
 	// reason exists in full, and a run history sweep must not be what stands
 	// between an operator and why their board stopped.
+	asked := false
 	if tr.Blocked {
-		asked, session, questions := saidAt(tr.RunDir)
+		var session string
+		var questions json.RawMessage
+		asked, session, questions = saidAt(tr.RunDir)
 		s.blocks[tr.Item.ID] = Block{Kind: tr.Kind, Reason: tr.Reason, Stage: tr.Stage,
 			RunID: tr.RunID, At: time.Now(), Asked: asked, Session: session, Questions: questions}
 	} else {
@@ -895,6 +921,14 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 		delete(s.resting, tr.Item.ID)
 	}
 	s.mu.Unlock()
+
+	// The two moments a person wants to hear about without watching: a
+	// question only they can answer, and an item reaching the end of the line.
+	if asked {
+		s.notify("Needs you: "+tr.Item.Title, tr.Reason, tr.Item.ID)
+	} else if st, ok := s.cfg.Stage(tr.Item.Stage); ok && st.Terminal && tr.From != tr.Item.Stage {
+		s.notify("Shipped: "+tr.Item.Title, tr.Item.ID+" reached "+tr.Item.Stage, tr.Item.ID)
+	}
 
 	// A `limit` mark is account-level news, not a fact about this one item:
 	// every other item routed to the same agent is about to meet the same wall.
@@ -1724,4 +1758,86 @@ func Addr(a string) string {
 		return ":" + a
 	}
 	return a
+}
+
+// --- push notifications ---------------------------------------------------
+
+// notify sends one notification to every subscribed device, in the
+// background: a push service that is slow must not hold the scheduler. A
+// subscription the service says is gone is forgotten on the spot.
+func (s *Server) notify(title, body, itemID string) {
+	if s.pushKeys == nil || s.pushSubs.Len() == 0 {
+		return
+	}
+	if len(body) > 160 {
+		body = body[:157] + "…"
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"title": title, "body": body, "tag": itemID,
+		"url": "/#item=" + url.PathEscape(itemID),
+	})
+	for _, sub := range s.pushSubs.All() {
+		go func(sub push.Subscription) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			err := s.pushKeys.Send(ctx, sub, payload, "https://github.com/AmirRaptoR/Conveyor")
+			switch {
+			case errors.Is(err, push.Gone):
+				_ = s.pushSubs.Remove(sub.Endpoint)
+			case err != nil:
+				fmt.Fprintf(os.Stderr, "conveyor: push to %s: %v\n", sub.Endpoint, err)
+			}
+		}(sub)
+	}
+}
+
+func (s *Server) handlePushKey(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.pushKeys == nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{"key": "", "subscribed": 0})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"key": s.pushKeys.Public, "subscribed": s.pushSubs.Len()})
+}
+
+func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
+	var sub push.Subscription
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&sub); err != nil ||
+		!strings.HasPrefix(sub.Endpoint, "https://") || sub.Keys.P256dh == "" || sub.Keys.Auth == "" {
+		http.Error(w, "not a push subscription", http.StatusBadRequest)
+		return
+	}
+	if err := s.pushSubs.Add(sub); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
+	var v struct {
+		Endpoint string `json:"endpoint"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&v)
+	if v.Endpoint == "" {
+		http.Error(w, "no endpoint", http.StatusBadRequest)
+		return
+	}
+	_ = s.pushSubs.Remove(v.Endpoint)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// A test push, so a person can see the whole path work before waiting for a
+// real decision to come up.
+func (s *Server) handlePushTest(w http.ResponseWriter, r *http.Request) {
+	if s.pushKeys == nil {
+		http.Error(w, "push notifications are off (no key)", http.StatusServiceUnavailable)
+		return
+	}
+	if s.pushSubs.Len() == 0 {
+		http.Error(w, "no device is subscribed", http.StatusConflict)
+		return
+	}
+	s.notify("Conveyor", "Notifications are on. You will hear when something needs you or ships.", "")
+	w.WriteHeader(http.StatusNoContent)
 }
