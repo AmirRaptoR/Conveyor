@@ -73,10 +73,9 @@ func TestANoOpWaitsForTheNextListing(t *testing.T) {
 	lists, stageRuns := filepath.Join(dir, "lists"), filepath.Join(dir, "stageruns")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	s := New(cfg, r)
 	s.ctx = ctx
+	defer drain(t, s, cancel)
 	go s.poll(ctx)
 	go s.schedule(ctx)
 
@@ -102,10 +101,9 @@ func TestTheTickButtonClearsADeferral(t *testing.T) {
 	stageRuns := filepath.Join(dir, "stageruns")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	s := New(cfg, r)
 	s.ctx = ctx
+	defer drain(t, s, cancel)
 	s.refresh(ctx) // one listing, no poll ticker: nothing else will clear it
 	go s.schedule(ctx)
 	go s.button(ctx, true)
@@ -120,4 +118,15 @@ func TestTheTickButtonClearsADeferral(t *testing.T) {
 
 	s.tick <- struct{}{}
 	waitFor(t, "the button to run it again", func() bool { return countLines(stageRuns) > before })
+}
+
+// drain stops the server and waits for the runs it started to finish
+// writing. t.TempDir's cleanup runs right after the test returns, and a run
+// still filing its record into that directory made it "not empty" — a flake
+// that failed a deploy, since the release script runs this suite.
+func drain(t *testing.T, s *Server, cancel context.CancelFunc) {
+	t.Helper()
+	cancel()
+	waitFor(t, "runs to drain", func() bool { return len(s.activeList()) == 0 })
+	time.Sleep(150 * time.Millisecond) // the poll goroutine's own last listing
 }
