@@ -12,8 +12,15 @@
 # dependency_refs <body> — the issue numbers named on lines that declare a
 # dependency: "Depends on #12", "Blocked by: #12, #13", "- depends on #12".
 # Nothing else in the body is read; a "Related: #9" is not a dependency.
+#
+# A matching line is cut at its first mid-line sentence break (". ") before
+# numbers are pulled out of it, so a second clause on the same line — "Depends
+# on: ADR 9 (merged). Blocks: #12, #13 depend on this one" — does not donate
+# #12 and #13 to this issue's own dependency list just because the word
+# "depend" recurs later in the sentence describing who depends on *it*.
 dependency_refs() {
 	grep -iE '^[[:space:]*>-]*(depends on|blocked by|blocks on|requires|after)\b' <<<"$1" |
+		sed -E 's/\.[[:space:]].*$//' |
 		grep -oE '#[0-9]+' | tr -d '#' | sort -un
 }
 
