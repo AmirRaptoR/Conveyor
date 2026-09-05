@@ -674,9 +674,17 @@
   }
   .item:hover { border-color:var(--faint); }
   .item .title { font-size:13px; line-height:1.4; }
-  .item .foot { margin-top:8px; gap:8px; font-size:11.5px; letter-spacing:0; color:var(--dim); flex-wrap:nowrap; min-width:0; }
-  .item .foot > * { flex:none; }
+  /* The footer wraps rather than overflows: a long id ("caravan-v2:123")
+     beside a chip is wider than a column. The open-link sits in the card's
+     corner so it is never the thing that wraps onto a line of its own. */
+  .item { position:relative; }
+  .item .title { display:block; padding-right:18px; }
+  .item .foot { margin-top:8px; gap:6px 8px; font-size:11.5px; letter-spacing:0; color:var(--dim); flex-wrap:wrap; min-width:0; }
+  .item .foot > * { flex:none; max-width:100%; }
   .item .why { flex:0 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .item .src { white-space:nowrap; }
+  .item .open { position:absolute; top:7px; right:7px; margin:0; border:0; color:var(--faint); }
+  .item .open:hover { color:var(--ink); }
   .count .asks { color:var(--ask); }
   .src { color:var(--dim); }
   .src::before {
