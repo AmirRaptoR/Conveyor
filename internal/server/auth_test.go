@@ -19,10 +19,12 @@ func hashed(t *testing.T, pass string) string {
 	return h
 }
 
-// The wall, and that it has no door in it. Every route either reads the state
-// of the repositories or changes it, so there is no route that may answer
-// without credentials — a health endpoint nobody asked for would be the first
-// hole in a wall one line high.
+// The wall, and that it has one door in it: the app shell (manifest, icons,
+// worker script), which is static code a browser must fetch without
+// credentials before it offers to install. Every other route either reads
+// the state of the repositories or changes it, so nothing else may answer
+// without credentials — a health endpoint nobody asked for would be the
+// first hole in a wall one line high.
 func TestEveryRouteIsBehindTheSameWall(t *testing.T) {
 	cfg, r, _ := pipelineFor(t)
 	cfg.Auth = config.Auth{Users: map[string]string{"amir": hashed(t, "correct horse")}}
@@ -35,7 +37,23 @@ func TestEveryRouteIsBehindTheSameWall(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	for _, path := range []string{"/", "/api/state", "/api/events", "/api/runs", "/icon.svg"} {
+	// The door: GET only, these paths only.
+	for _, path := range []string{"/manifest.webmanifest", "/sw.js", "/icon.svg", "/icon-192.png"} {
+		reached = false
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != http.StatusOK || !reached {
+			t.Errorf("GET %s without credentials = %d, want 200: the app shell is public", path, w.Code)
+		}
+	}
+	reached = false
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/sw.js", nil))
+	if w.Code != http.StatusUnauthorized || reached {
+		t.Errorf("POST /sw.js without credentials = %d, want 401", w.Code)
+	}
+
+	for _, path := range []string{"/", "/api/state", "/api/events", "/api/runs", "/api/push/key", "/index.html"} {
 		reached = false
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, httptest.NewRequest("GET", path, nil))

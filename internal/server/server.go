@@ -1725,6 +1725,14 @@ func (s *Server) authed(next http.Handler) http.Handler {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The app's own shell is public: a browser fetches the manifest with
+		// no credentials and will not offer to install behind a 401, and the
+		// icons and worker script are static code that reveals nothing. The
+		// board, its state and every action stay behind the password.
+		if r.Method == http.MethodGet && publicAsset[r.URL.Path] {
+			next.ServeHTTP(w, r)
+			return
+		}
 		user, pass, ok := r.BasicAuth()
 		if !ok || !s.cfg.Auth.Check(user, pass) {
 			deny(w)
@@ -1732,6 +1740,11 @@ func (s *Server) authed(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+var publicAsset = map[string]bool{
+	"/manifest.webmanifest": true, "/sw.js": true,
+	"/icon.svg": true, "/icon-192.png": true, "/icon-512.png": true,
 }
 
 // loopback reports whether this listen address reaches only this machine.
