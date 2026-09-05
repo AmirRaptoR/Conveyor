@@ -201,6 +201,7 @@
     color:var(--faint); font-size:10.5px; letter-spacing:.04em;
   }
   .item .prio { font-variant-numeric:tabular-nums; }
+  .item .age { font-variant-numeric:tabular-nums; }
   /* Priority is loud in the badge, not on the edge: the edge says where the
      item is from, and that does not change. */
   .item.p0 .prio { color:var(--stop); font-weight:600; }
@@ -490,6 +491,7 @@
   .tr .when { flex:0 0 62px; color:var(--faint); font-variant-numeric:tabular-nums; }
   .tr .kind { flex:0 0 54px; color:var(--faint); letter-spacing:.08em; text-transform:uppercase; font-size:10px; }
   .tr .path { flex:1; }
+  .tr .dur { flex:0 0 44px; color:var(--faint); font-variant-numeric:tabular-nums; text-align:right; }
   .tr .arrow { color:var(--faint); }
   .tr .verdict { letter-spacing:.06em; font-size:10.5px; }
   .tr.success .verdict { color:var(--ok); }      .tr.success::before { background:var(--ok); }
@@ -809,9 +811,21 @@ let blocks = {};
 const clock = iso => { const d = new Date(iso);
   return isNaN(d) ? iso : d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}); };
 
+// The board is served to phones over the network, where a skewed device
+// clock is an everyday thing. Every other timestamp here is absolute, so a
+// skewed clock is merely a slightly wrong wall clock — but a duration is
+// computed against *now*, and is wrong by the whole skew. skew is how far
+// ahead the device is of the engine, taken from the Date header on every
+// /api/state response; nowMs() is the device's clock corrected by it.
+let skew = 0;
+const nowMs = () => Date.now() - skew;
+
 async function load() {
   try {
-    state = await (await fetch("/api/state")).json();
+    const res = await fetch("/api/state");
+    const served = Date.parse(res.headers.get("Date"));
+    if (!isNaN(served)) skew = Date.now() - served;
+    state = await res.json();
     draw();
   } catch { fault("disconnected"); }
 }
@@ -1182,12 +1196,54 @@ function tally(items) {
     held ? ` &middot; <span class="held">${held} stopped</span>` : ""}</span>`;
 }
 
+// Mirrors report.go's formatDuration exactly: at most two units, the
+// smaller dropped when it is zero. Never negative — clock skew or a
+// timestamp from the future reads as "<1s", not as a negative number.
+function formatDuration(ms) {
+  if (!(ms > 0)) return "<1s";
+  let s = Math.floor(ms / 1000);
+  if (s < 1) return "<1s";
+  const days = Math.floor(s / 86400); s -= days * 86400;
+  const hours = Math.floor(s / 3600); s -= hours * 3600;
+  const mins = Math.floor(s / 60); s -= mins * 60;
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+  if (mins > 0) return `${mins}m`;
+  return `${s}s`;
+}
+
+// A span carrying a start instant, ticked in place by tickDurations() — never
+// by draw(), so a second of drift cannot interrupt a drag, collapse an
+// expanded done column, or reset the rail's scroll position. `titleAttr` is
+// already escaped by the caller, since it is assembled from more than one
+// piece of free text.
+function durSpan(startMs, ago, titleAttr) {
+  if (!(startMs > 0) || isNaN(startMs)) return "";
+  const text = formatDuration(nowMs() - startMs) + (ago ? " ago" : "");
+  return `<span class="dur"${ago ? ' data-ago="1"' : ""} data-start="${startMs}"${
+    titleAttr ? ` title="${titleAttr}"` : ""}>${esc(text)}</span>`;
+}
+
+// How long an item has been in the stage it is in — the one duration a card
+// has room for. Nothing is drawn when there is no entry: a swept or
+// never-recorded arrival is "no chip", never a placeholder, a dash or a zero.
+function ageChip(it) {
+  const t = state.times && state.times[it.id];
+  if (!t) return "";
+  const startMs = new Date(t.enteredStage).getTime();
+  if (isNaN(startMs)) return "";
+  const terminal = !!stageBy(it.stage)?.terminal;
+  const title = `in ${esc(t.stage)} since ${esc(new Date(t.enteredStage).toLocaleString())}`;
+  return `<span class="age">${durSpan(startMs, terminal, title)}</span>`;
+}
+
 function card(it, active, place) {
   // Number, or nothing. `undefined !== null` is true, so a missing argument
   // used to render "NaN" in the rank badge rather than omitting it.
   const ranked = Number.isInteger(place);
   const hasPrio = it.priority !== null && it.priority !== undefined;
-  const working = active.some(a => a.itemId === it.id);
+  const inHand = active.find(a => a.itemId === it.id);
+  const working = !!inHand;
   const cls = ["item", hasPrio ? "p" + it.priority : "", working ? "working" : "",
                it.blocked ? "blocked " + tone(blocks[it.id]) : "", ranked ? "ranked" : ""].filter(Boolean).join(" ");
   return `<article class="${cls}" draggable="true" tabindex="0" role="button"
@@ -1195,10 +1251,11 @@ function card(it, active, place) {
       data-id="${esc(it.id)}" data-title="${esc(it.title)}" data-stage="${esc(it.stage)}">
     <span class="title">${esc(it.title)}</span>
     <span class="foot">
-      ${working ? `<span class="working-tag">working</span>` : ""}
+      ${working ? `<span class="working-tag">working ${durSpan(new Date(inHand.startedAt).getTime(), false)}</span>` : ""}
       ${it.blocked ? why(it) : ""}
       ${ranked && !working && !it.blocked ? `<span class="rank">${place + 1}</span>` : ""}
       ${hasPrio ? `<span class="prio">p${it.priority}</span>` : ""}
+      ${ageChip(it)}
       <span class="src">${esc(it.id)}</span>
       ${it.url ? `<a class="open" href="${esc(it.url)}" target="_blank" rel="noopener"
            title="Open on GitHub" aria-label="Open ${esc(it.id)} on GitHub">&#8599;</a>` : ""}
@@ -1558,6 +1615,7 @@ async function loadHistory(id) {
       <span class="when">${esc((r.startedAt || "").slice(11, 19))}</span>
       <span class="kind">${esc(r.kind)}</span>
       <span class="path">${transition(r)}</span>
+      ${runDuration(r)}
       <span class="verdict">${esc(r.outcome)}</span>
     </button>`).join("")
     : `<div class="slot">No runs yet.</div>`;
@@ -1582,6 +1640,14 @@ function transition(r) {
       : `<span class="arrow">&#8801;</span> confirmed ${to}`;
   }
   return `${from} <span class="arrow">&rarr;</span> ${to}`;
+}
+
+// A finished run's own cost, from durationNs; a still-running one has no
+// duration yet, so it counts up from its own startedAt instead, the same way
+// the working tag does.
+function runDuration(r) {
+  if (r.outcome === "running") return durSpan(new Date(r.startedAt).getTime(), false);
+  return `<span class="dur">${esc(formatDuration((r.durationNs || 0) / 1e6))}</span>`;
 }
 
 function setLogStatus(kind, text) {
@@ -2035,6 +2101,25 @@ es.onmessage = ev => {
   loadDoctor();
 };
 es.onerror = () => fault("disconnected");
+
+// Every displayed duration is a span carrying its own start instant, and this
+// is the only thing that ever changes its text — draw() rebuilds the whole
+// board from state, which a tick must never trigger: it would interrupt a
+// drag, collapse an expanded done column, or reset the rail's scroll
+// position, once a second, forever.
+function tickDurations() {
+  const n = nowMs();
+  document.querySelectorAll(".dur[data-start]").forEach(el => {
+    const start = Number(el.dataset.start);
+    if (!(start > 0)) return;
+    el.textContent = formatDuration(n - start) + (el.dataset.ago ? " ago" : "");
+  });
+}
+setInterval(() => { if (!document.hidden) tickDurations(); }, 1000);
+// A tab backgrounded for an hour and brought back must read correctly at
+// once, not resume ticking from whatever it last showed — so this runs
+// unconditionally, the one call that ignores document.hidden on purpose.
+addEventListener("visibilitychange", () => { if (!document.hidden) tickDurations(); });
 
 load();
 loadDoctor();
