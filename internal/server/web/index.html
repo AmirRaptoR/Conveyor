@@ -193,7 +193,9 @@
     border:1px solid var(--rule-soft); border-radius:2px; padding:0 4px;
   }
   .item.ranked .rank { color:var(--run); border-color:color-mix(in srgb, var(--run) 45%, var(--rule)); }
-  .item .title { font-size:12px; line-height:1.45; }
+  /* `anywhere`, not `break-all`: break only where an ordinary line would
+     overflow — a title with no spaces at all is the one case that needs it. */
+  .item .title { font-size:12px; line-height:1.45; overflow-wrap:anywhere; }
   .item .foot {
     margin-top:7px; display:flex; gap:9px; align-items:center; flex-wrap:wrap;
     color:var(--faint); font-size:10.5px; letter-spacing:.04em;
@@ -256,14 +258,16 @@
   }
   .count .held { color:var(--stop); }
 
-  /* Terminal stations sit after a gap, joined by a short spur. */
-  .terminus { flex:0 0 auto; padding-left:30px; position:relative; z-index:1; }
-  .terminus .plate { min-width:158px; }
-  .terminus .queue { margin-right:0; padding-right:0; border-top-color:var(--rule-soft); }
-  .terminus::before {
-    content:""; position:absolute; left:0; top:calc(14px + 52px); width:30px; height:1px;
-    background:var(--rule);
-  }
+  /* Terminal stations sit after a gap, joined by a short spur. A terminal
+     column takes a pipeline station's own basis and gutter, so its card is
+     the same width as any other column's no matter what is in it; the gap
+     moves into a margin, outside that basis, so nothing inside the box can
+     absorb it. `min-width:0` overrides the automatic minimum size a flex
+     item takes from its content — without it, a long title or stage name
+     could still force the column wider than its fixed basis. */
+  .terminus { flex:0 0 var(--station); margin-left:30px; padding-right:14px; min-width:0; position:relative; z-index:1; }
+  .terminus .plate { min-width:0; }
+  .terminus .queue { border-top-color:var(--rule-soft); }
   .terminus .plate { border-color:color-mix(in srgb, var(--ok) 45%, var(--rule)); }
   .terminus .name { color:var(--ok); }
 
@@ -644,7 +648,7 @@
   .railctl { display:none !important; }
   :root { --station:262px; }
   .station { padding-right:12px; }
-  .station::after, .terminus::before { display:none; }
+  .station::after { display:none; }
   .plate {
     position:sticky; top:0; z-index:2; height:auto; padding:10px 12px 9px;
     background:var(--panel); border:1px solid var(--rule); border-radius:10px 10px 0 0;
@@ -662,8 +666,11 @@
   }
   .station.live .queue { border-top-color:transparent; }
   .queue .slot { border:0; padding:22px 8px; text-align:center; color:var(--faint); font-size:12px; }
-  .terminus { padding-left:22px; }
-  .terminus .plate { min-width:var(--station); box-shadow:inset 0 2px 0 var(--ok); border-color:var(--rule); }
+  .terminus { margin-left:22px; padding-right:12px; }
+  /* `overflow:hidden` so a long stage name or a wide tally clips instead of
+     forcing the column wider — `min-width:0` alone stops the column growing,
+     but leaves the plate's own content free to paint past its edge. */
+  .terminus .plate { min-width:0; overflow:hidden; box-shadow:inset 0 2px 0 var(--ok); border-color:var(--rule); }
   .terminus .queue { border-top-color:transparent; }
   .terminus .name { color:var(--ink); }
   .more { border-radius:6px; padding:8px; }
