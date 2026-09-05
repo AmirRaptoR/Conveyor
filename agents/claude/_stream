@@ -26,9 +26,16 @@ trap 'rm -f "$CLAUDE_SAID" "$CLAUDE_RAW"' EXIT
 # claude_session prints the conversation's own id, or nothing. Nothing is a
 # normal answer: STREAM=0 produces no events, and an adapter that gets no
 # session simply cannot be resumed, which the engine already tolerates.
+# `|| true` is not decoration. Every event in the stream carries a session_id,
+# so on a real run jq is still writing thousands of lines when `head` takes its
+# one and closes the pipe. jq dies of SIGPIPE, `pipefail` makes the pipeline
+# 141, and an unguarded `sess=$(claude_session)` hands that to errexit, which
+# kills the adapter mid-branch. head already has the line by then, so the status
+# is the only thing worth discarding — and "nothing is a normal answer" above
+# means there is no input for which a non-zero status here would mean anything.
 claude_session() {
 	[[ -s "$CLAUDE_RAW" ]] || return 0
-	jq -r 'select(.session_id != null) | .session_id' "$CLAUDE_RAW" 2>/dev/null | head -1
+	jq -r 'select(.session_id != null) | .session_id' "$CLAUDE_RAW" 2>/dev/null | head -1 || true
 }
 
 # claude_model prints the model this run actually used, or nothing.
@@ -39,7 +46,10 @@ claude_session() {
 # same reason claude_session gives one: STREAM=0 produces no events.
 claude_model() {
 	[[ -s "$CLAUDE_RAW" ]] || return 0
-	jq -r 'select(.type == "system" and .subtype == "init") | .model' "$CLAUDE_RAW" 2>/dev/null | head -1
+	# Guarded for the same reason as claude_session, though this filter matches
+	# one event today and so rarely fills the pipe. A helper whose contract is
+	# "nothing is a normal answer" should not be one busy run away from 141.
+	jq -r 'select(.type == "system" and .subtype == "init") | .model' "$CLAUDE_RAW" 2>/dev/null | head -1 || true
 }
 
 # record_model writes that model to the log, on a line of its own.
