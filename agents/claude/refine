@@ -61,9 +61,7 @@ fi
 
 full="${full}
 
-If this cannot be done because it needs a decision only a human can make, change
-nothing and write {\"blocked\": true, \"reason\": \"<the decision needed>\"} to
-the file at ${CONVEYOR_RESULT}."
+$(decision_brief)"
 
 # A person may have answered the question this stage stopped on last time.
 full=$(resume_prompt "$payload" "$full")

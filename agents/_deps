@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Sourced by the agent adapters. Reads an item's declared dependencies so a
+# stage can refuse to start work that is sequenced behind something still
+# open — before the model runs, not after it has spent a run finding out.
+#
+# Nine of the seventeen "needs a decision" stops in one week were an agent
+# reading "Depends on #353" in the body and stopping because #353 was open.
+# That is not a decision; it is a condition with a known end, so it is a
+# `dependency` mark, and the doctor clears it once every number named is
+# closed (agents/claude/doctor).
+
+# dependency_refs <body> — the issue numbers named on lines that declare a
+# dependency: "Depends on #12", "Blocked by: #12, #13", "- depends on #12".
+# Nothing else in the body is read; a "Related: #9" is not a dependency.
+dependency_refs() {
+	grep -iE '^[[:space:]*>-]*(depends on|blocked by|blocks on|requires|after)\b' <<<"$1" |
+		grep -oE '#[0-9]+' | tr -d '#' | sort -un
+}
+
+# open_dependencies <body> — "#12 #13" for every named dependency that is
+# still open, or nothing. An issue that cannot be read is not counted: a
+# number from another repository or a typo must not hold an item forever.
+open_dependencies() {
+	local n out=""
+	for n in $(dependency_refs "$1"); do
+		if [[ "$(gh api "repos/$REPO/issues/$n" --jq .state 2>/dev/null)" == "open" ]]; then
+			out="${out:+$out }#$n"
+		fi
+	done
+	printf '%s' "$out"
+}

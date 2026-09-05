@@ -141,6 +141,29 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   stall — nobody answers a question by waiting, and handing it back unanswered
   spends a run to be asked it again. Condition is the default because it is the
   safe one to get wrong. The engine reads the flag, never the word beside it.
+- **A question carries its options.** `decision_brief` in `agents/_blocked` is
+  the paragraph every adapter appends: stop by writing `kind: decision`, a
+  one-sentence `reason`, and `questions` in the AskUserQuestion shape (the tool
+  itself is not available under `claude -p`; verified). The engine passes
+  `questions` through on the block unread; the board draws a modal that walks
+  them one at a time and posts the choices as the `answer`. The board shows a
+  stop in one of three tones — a question (violet, "needs you"), a condition
+  that passes on its own (grey: `limit`, `turns`, `unfinished`, `dependency`,
+  `worktree`), or a fault (red) — and lists every question in a strip under
+  the masthead. The tone is presentation: the engine still reads only `asked`.
+- **An item's pull request is found by closing reference, never by search.**
+  `agents/_pr` is the one lookup — "Closes #N" in the body, or the
+  `issue-N` branch `_worktree` names — used by implement, review and approve.
+  `gh pr list --search "$ref"` matched the number anywhere in any PR and handed
+  issue 188 the PR whose body said "depends on #188".
+- **An item sequenced behind an open issue is not started.** `agents/_deps`
+  reads "Depends on #N" / "Blocked by #N" lines from the body; implement stops
+  before the worktree with a `dependency` mark, a condition the doctor clears
+  once every named issue is closed. The agent is also told not to stop for an
+  open dependency itself — nine of one week's seventeen "decisions" were that.
+- **A merge conflict is work before it is a decision.** `approve` tries one
+  mechanical rebase in the worktree review left behind, pushed with a lease,
+  and only marks `conflict` when that does not apply cleanly.
 - **A mark is one word and a paragraph.** The word (`decision`, `limit`,
   `turns`, `worktree`, `error`) is all a card shows and all a provider labels; the
   paragraph is one click away in the panel. Scripts own the vocabulary — the
@@ -192,6 +215,11 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   the right-hand sides of `STAGE_LABELS` alone, which meant renaming a stage
   orphaned its old label forever: nothing took it off, and listing takes the
   first mapped label it finds, so an item landed in a stage nobody put it in.
+- **`list` asks for open and closed issues separately**, so a repository that
+  has finished more issues than `LIMIT` still lists its open work, and closed
+  ones are ordered by `closedAt` so the done column reads newest-finished first
+  (the engine keeps terminal items in listing order). The board draws ten and
+  offers the rest ten at a time.
 - **`list` reads closed issues it labelled, and only those.** A finished item is
   a closed issue — the pull request says `Closes #N` — so listing open ones
   alone left the last stages empty: an item did not arrive in `done`, it

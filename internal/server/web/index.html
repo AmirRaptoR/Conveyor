@@ -21,9 +21,11 @@
 
     --run:#e0a13a;         /* amber: working */
     --ok:#4caf72;          /* green: done */
-    --stop:#e05a4f;        /* red: needs a human */
+    --stop:#e05a4f;        /* red: a fault */
+    --ask:#9b87f5;         /* violet: a question only you can answer */
 
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, "Helvetica Neue", sans-serif;
     --station: 236px;
   }
   @media (prefers-color-scheme: light) {
@@ -38,9 +40,12 @@
   html, body { height:100%; }
   body {
     margin:0; background:var(--ground); color:var(--ink);
-    font:400 13px/1.5 var(--mono);
+    font:400 13.5px/1.5 var(--sans);
     -webkit-font-smoothing:antialiased;
   }
+  /* Prose in a sans; the instrument readouts — ids, counts, logs — stay mono. */
+  .mark, .readout, .count, .runs-label, .src, .prio, .rank, .log, .ln, .stop .meta,
+  .agent .who, .src-chip, .drow .dstatus, .why, .askstep { font-family:var(--mono); }
   :focus-visible { outline:2px solid var(--run); outline-offset:2px; }
 
   /* ---- masthead ---------------------------------------------------------- */
@@ -185,7 +190,7 @@
   .item.ranked .rank { color:var(--run); border-color:color-mix(in srgb, var(--run) 45%, var(--rule)); }
   .item .title { font-size:12px; line-height:1.45; }
   .item .foot {
-    margin-top:7px; display:flex; gap:9px; align-items:center;
+    margin-top:7px; display:flex; gap:9px; align-items:center; flex-wrap:wrap;
     color:var(--faint); font-size:10.5px; letter-spacing:.04em;
   }
   .item .prio { font-variant-numeric:tabular-nums; }
@@ -232,12 +237,17 @@
     background:color-mix(in srgb, var(--stop) 6%, var(--raised));
   }
   .item.blocked .title { color:var(--ink); }
-  .blocked-tag {
-    color:var(--stop); letter-spacing:.14em; text-transform:uppercase; font-size:9.5px;
+  /* Three tones of stop. A fault is red. A condition that will pass on its own
+     — quota, a turn budget, an open dependency — is grey: nothing for you to
+     do. A question is violet, and the only one of the three that is yours. */
+  .item.blocked.waiting {
+    border-color:var(--rule);
+    background:color-mix(in srgb, var(--dim) 7%, var(--raised));
   }
-  .blocked-tag::before {
-    content:""; display:inline-block; width:5px; height:5px;
-    background:var(--stop); margin-right:5px; vertical-align:middle;
+  .item.blocked.asks {
+    border-color:color-mix(in srgb, var(--ask) 65%, var(--rule));
+    background:color-mix(in srgb, var(--ask) 9%, var(--raised));
+    box-shadow:0 0 0 1px color-mix(in srgb, var(--ask) 35%, transparent);
   }
   .count .held { color:var(--stop); }
 
@@ -310,10 +320,37 @@
   /* What kind of stop it was, on the card. One word: the paragraph is in the
      panel, because a column of paragraphs cannot be read across. */
   .item .why {
-    color:var(--stop); letter-spacing:.1em; text-transform:lowercase; font-size:9.5px;
+    color:var(--stop); letter-spacing:.08em; text-transform:lowercase; font-size:9.5px;
     border:1px solid color-mix(in srgb, var(--stop) 35%, var(--rule));
-    border-radius:2px; padding:0 5px;
+    border-radius:999px; padding:1px 7px;
   }
+  .item .why.waiting { color:var(--dim); border-color:var(--rule); }
+  .item .why.asks {
+    color:var(--ask); border-color:color-mix(in srgb, var(--ask) 50%, var(--rule));
+    background:color-mix(in srgb, var(--ask) 12%, transparent); font-weight:600;
+  }
+  /* Everything waiting on you, in one strip under the masthead — the first
+     question the board answers, asked before the eye has to scan columns. */
+  .needs {
+    display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+    padding:9px 22px; border-bottom:1px solid var(--rule);
+    background:color-mix(in srgb, var(--ask) 9%, var(--panel)); font-size:12px;
+  }
+  .needs:empty { display:none; }
+  .needs .nlabel { color:var(--ask); font-weight:600; margin-right:6px; }
+  .needs .need {
+    font:inherit; font-size:12px; color:var(--ink); background:var(--raised);
+    border:1px solid color-mix(in srgb, var(--ask) 45%, var(--rule)); border-radius:999px;
+    padding:3px 12px; cursor:pointer; max-width:340px; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap;
+  }
+  .needs .need:hover { border-color:var(--ask); }
+  /* The done column shows the last ten; the rest come ten at a time. */
+  .more {
+    font:inherit; font-size:11px; color:var(--dim); background:none; cursor:pointer;
+    border:1px dashed var(--rule); padding:7px; width:100%;
+  }
+  .more:hover { color:var(--ink); border-color:var(--faint); }
 
   /* And the whole of it, in the panel, with the one control that answers it. */
   .stop {
@@ -326,6 +363,15 @@
   }
   .stop p { margin:0; color:var(--ink); font-size:12px; line-height:1.65; white-space:pre-wrap; }
   .stop .meta { margin-top:8px; color:var(--faint); font-size:10.5px; }
+  .stop.asks { border-left-color:var(--ask); }
+  .stop.asks h3 { color:var(--ask); }
+  .stop.waiting { border-left-color:var(--faint); }
+  .stop.waiting h3 { color:var(--dim); }
+  .stop .ask-btn {
+    display:inline-block; margin:12px 0 0; font:inherit; font-size:12px; font-weight:600;
+    color:#fff; background:var(--ask); border:0; border-radius:6px; padding:8px 16px; cursor:pointer;
+  }
+  .stop .ask-btn:hover { filter:brightness(1.1); }
   .stop .hand {
     margin-top:10px; color:var(--stop); cursor:pointer;
     border:1px solid color-mix(in srgb, var(--stop) 45%, var(--rule)); border-radius:2px;
@@ -335,7 +381,7 @@
   .stop .hand:hover { background:color-mix(in srgb, var(--stop) 14%, transparent); }
   .stop .answer {
     display:block; width:100%; box-sizing:border-box; margin-top:10px;
-    background:var(--bg); color:var(--ink); font:inherit; font-size:12px;
+    background:var(--ground); color:var(--ink); font:inherit; font-size:12px;
     line-height:1.6; border:1px solid var(--rule); border-radius:2px;
     padding:7px 9px; resize:vertical;
   }
@@ -381,11 +427,6 @@
   }
   .report strong { color:var(--ink); font-weight:600; }
   .report a { color:var(--run); }
-  .report .raw-md {
-    display:block; width:100%; box-sizing:border-box; margin-top:8px;
-    background:var(--bg); color:var(--ink); font:inherit; font-size:11px;
-    border:1px solid var(--rule); border-radius:2px; padding:6px 8px; resize:vertical;
-  }
 
   /* ---- faults ------------------------------------------------------------ */
   .faults { margin:0 22px; border-left:2px solid var(--stop); background:var(--panel); padding:12px 16px; }
@@ -509,6 +550,53 @@
   }
   .log strong { color:var(--ink); font-weight:600; }
 
+  /* ---- dialogs: the questions, and the final report ---------------------- */
+  dialog {
+    background:var(--panel); color:var(--ink); border:1px solid var(--rule); border-radius:10px;
+    padding:0; width:min(760px, 94vw); box-shadow:0 40px 90px -30px rgba(0,0,0,.7);
+  }
+  dialog::backdrop { background:rgba(0,0,0,.55); backdrop-filter:blur(2px); }
+  .askform { padding:20px 22px; display:flex; flex-direction:column; gap:14px; }
+  .askhead { display:flex; gap:12px; align-items:baseline; }
+  .askstep { color:var(--faint); font-size:11px; }
+  .askhdr { color:var(--ask); font-size:11px; letter-spacing:.14em; text-transform:uppercase; font-weight:600; }
+  .askq { margin:0; font-size:15px; line-height:1.55; white-space:pre-wrap; }
+  .askopts { display:flex; flex-direction:column; gap:7px; }
+  .askopt {
+    display:flex; gap:11px; align-items:flex-start; padding:10px 13px; cursor:pointer;
+    border:1px solid var(--rule); border-radius:8px; background:var(--raised);
+  }
+  .askopt:hover { border-color:var(--faint); }
+  .askopt:has(input:checked) { border-color:var(--ask); background:color-mix(in srgb, var(--ask) 10%, var(--raised)); }
+  .askopt input { margin:3px 0 0; accent-color:var(--ask); }
+  .askopt b { display:block; font-weight:600; }
+  .askopt small { display:block; color:var(--dim); font-size:12px; line-height:1.45; margin-top:2px; }
+  .askother {
+    width:100%; font:inherit; font-size:13px; background:var(--ground); color:var(--ink);
+    border:1px solid var(--rule); border-radius:8px; padding:9px 11px;
+  }
+  .askother:focus { outline:none; border-color:var(--ask); }
+  .askfoot { display:flex; gap:8px; align-items:center; }
+  .askfoot .send { color:#fff; background:var(--ask); border-color:transparent; }
+  .rhead {
+    display:flex; gap:8px; align-items:center; padding:12px 16px;
+    border-bottom:1px solid var(--rule); position:sticky; top:0; background:var(--panel);
+  }
+  .rhead b { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rbody { max-height:72vh; overflow:auto; padding:6px 22px 22px; border:0; }
+  .rbody.report { font-size:13px; }
+  @media print {
+    body.print-report { background:#fff; color:#000; }
+    body.print-report > :not(#reportdlg) { display:none !important; }
+    body.print-report #reportdlg {
+      position:static; display:block; border:0; box-shadow:none; width:auto;
+      background:#fff; color:#000;
+    }
+    body.print-report #reportdlg .rhead { display:none; }
+    body.print-report #reportdlg .rbody { max-height:none; overflow:visible; color:#000; }
+    body.print-report #reportdlg::backdrop { display:none; }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     *, *::before { animation:none !important; transition:none !important; }
   }
@@ -534,6 +622,7 @@
   <button class="ctl primary" id="tick">Tick once</button>
 </div>
 
+<div class="needs" id="needs"></div>
 <div id="agents"></div>
 <div id="sources"></div>
 <div id="faults"></div>
@@ -550,6 +639,8 @@
   </div>
 </div>
 
+<dialog id="ask"></dialog>
+<dialog id="reportdlg"></dialog>
 <div class="scrim" id="scrim"></div>
 <aside id="panel" aria-hidden="true">
   <div class="ahead">
@@ -693,6 +784,11 @@ function draw() {
   // Handing the whole board back is the answer to one situation — the thing
   // that stopped everything is fixed — so the control only exists then.
   const marked = items.filter(it => it.blocked).length;
+  const asking = items.filter(it => it.blocked && (blocks[it.id] || {}).asked);
+  $("#needs").innerHTML = !asking.length ? "" :
+    `<span class="nlabel">${asking.length} need${asking.length === 1 ? "s" : ""} your decision</span>` +
+    asking.map(it => `<button class="need" data-id="${esc(it.id)}" data-title="${esc(it.title)}"
+      data-stage="${esc(it.stage)}" title="${esc(it.title)}">${esc(it.title)}</button>`).join("");
   const all = $("#unblock-all");
   all.hidden = !marked;
   all.textContent = `Unblock all (${marked})`;
@@ -913,15 +1009,28 @@ function station(st, items, active) {
   </section>`;
 }
 
+// Ten at a time: a done column is a ledger, and the last ten entries are the
+// ones anyone reads. The rest are one press away. Per column, kept across
+// redraws so an SSE update does not fold the list back up mid-read.
+const shown = {};
 function terminus(st, items) {
+  const n = shown[st.name] || 10;
+  const left = items.length - n;
   return `<section class="terminus">
     <div class="plate">
       <div class="name">${esc(st.name)}${tally(items)}</div>
       <div class="runs-label">end of line</div>
     </div>
-    <div class="queue">${items.map(it => card(it, [], null)).join("")}</div>
+    <div class="queue">${items.slice(0, n).map(it => card(it, [], null)).join("")}${
+      left > 0 ? `<button class="more" data-stage="${esc(st.name)}">Show ${Math.min(10, left)} more · ${left} older</button>` : ""}</div>
   </section>`;
 }
+document.addEventListener("click", e => {
+  const more = e.target.closest(".more");
+  if (more) { shown[more.dataset.stage] = (shown[more.dataset.stage] || 10) + 10; draw(); return; }
+  const need = e.target.closest(".need");
+  if (need) inspect(need.dataset.id, need.dataset.title, need.dataset.stage);
+});
 
 // How many are here, and how many of those are not moving. Blocked is no longer
 // a column to look at, so the count is where a stage says it is holding
@@ -939,22 +1048,21 @@ function card(it, active, place) {
   const hasPrio = it.priority !== null && it.priority !== undefined;
   const working = active.some(a => a.itemId === it.id);
   const cls = ["item", hasPrio ? "p" + it.priority : "", working ? "working" : "",
-               it.blocked ? "blocked" : "", ranked ? "ranked" : ""].filter(Boolean).join(" ");
+               it.blocked ? "blocked " + tone(blocks[it.id]) : "", ranked ? "ranked" : ""].filter(Boolean).join(" ");
   return `<article class="${cls}" draggable="true" tabindex="0" role="button"
       style="--src:${sourceColour(it.source)}"
       data-id="${esc(it.id)}" data-title="${esc(it.title)}" data-stage="${esc(it.stage)}">
     <span class="title">${esc(it.title)}</span>
     <span class="foot">
       ${working ? `<span class="working-tag">working</span>` : ""}
-      ${it.blocked ? `<span class="blocked-tag">blocked</span>` : ""}
+      ${it.blocked ? why(it) : ""}
       ${ranked && !working && !it.blocked ? `<span class="rank">${place + 1}</span>` : ""}
-      <span class="prio">${hasPrio ? "p" + it.priority : "—"}</span>
+      ${hasPrio ? `<span class="prio">p${it.priority}</span>` : ""}
       <span class="src">${esc(it.id)}</span>
       ${it.url ? `<a class="open" href="${esc(it.url)}" target="_blank" rel="noopener"
            title="Open on GitHub" aria-label="Open ${esc(it.id)} on GitHub">&#8599;</a>` : ""}
     </span>
     ${refusals.has(it.id) ? `<span class="refused">${esc(refusals.get(it.id))}</span>` : ""}
-    ${it.blocked ? why(it) : ""}
   </article>`;
 }
 
@@ -965,7 +1073,24 @@ function card(it, active, place) {
 // here — the click is for the rest.
 function why(it) {
   const b = blocks[it.id] || {};
-  return `<span class="why" title="${esc(b.reason || "")}">${esc(b.kind || "blocked")}</span>`;
+  return `<span class="why ${tone(b)}">${b.asked ? "needs you · " : ""}${esc(b.kind || "blocked")}</span>`;
+}
+
+// Three tones, from the two facts the engine carries: a question is `asked`,
+// and these kinds are conditions that pass on their own (agents/_blocked's
+// vocabulary — presentation only, the engine never reads the word). Anything
+// else stopped because something went wrong.
+const WAITING = new Set(["limit", "turns", "unfinished", "dependency", "worktree"]);
+function tone(b) {
+  b = b || {};
+  return b.asked ? "asks" : WAITING.has(b.kind) ? "waiting" : "fault";
+}
+
+// The questions an agent left beside its reason, if they are the shape the
+// modal can walk; anything else is shown as the paragraph it always was.
+function questionsOf(b) {
+  const qs = b && b.questions;
+  return Array.isArray(qs) && qs.length && qs.every(q => q && typeof q === "object") ? qs : null;
 }
 
 // One hue per source, spread evenly around the wheel rather than hashed from
@@ -996,46 +1121,126 @@ async function inspect(id, title, stage) {
   $("#stop").innerHTML = stopNotice(id);
   const hand = $("#stop").querySelector(".hand");
   if (hand) hand.onclick = () => handBack(id, hand);
-  // Only a terminal stage has a passage worth summing up; anywhere else the
-  // item is still moving, and there is nothing to say no request for it.
-  $("#report").innerHTML = "";
-  if (stageBy(stage)?.terminal) loadReport(id);
+  const askBtn = $("#stop").querySelector(".ask-btn");
+  if (askBtn) askBtn.onclick = () => openAsk(id, title);
+  // The report is derived from run history, so it exists for every item;
+  // on one still moving it is the passage so far.
+  $("#report").innerHTML = `<div class="report-head"><button class="ctl rbtn">${
+    stageBy(stage)?.terminal ? "Final report" : "Report so far"}</button></div>`;
+  $("#report .rbtn").onclick = () => openReport(id, title);
   await loadHistory(id);
 }
 
-// The final report: derived fresh on every open, never cached, because it
-// thins as retention sweeps the runs it is built from.
-async function loadReport(id) {
+// The final report, in a modal: rendered, with the markdown one press away as
+// a copy, a file, or the browser's own print-to-PDF. Derived fresh on every
+// open, never cached, because it thins as retention sweeps the runs it is
+// built from.
+async function openReport(id, title) {
   let md;
   try {
     const res = await fetch(`/api/items/${encodeURIComponent(id)}/report`);
-    // The panel may have moved on while this was in flight — onto another
-    // item, or closed altogether (which clears openItemId). Either way this
-    // response belongs to nothing on screen any more.
-    if (openItemId !== id || !res.ok) return;
+    if (!res.ok) { refuse(id, (await res.text()).trim() || "no report"); return; }
     md = await res.text();
   } catch { return; }
-  if (openItemId !== id) return;
-  $("#report").innerHTML = `<div class="report-head"><button class="ctl copy-md">Copy markdown</button></div>
-    ${mdToHTML(md)}
-    <textarea class="raw-md" hidden readonly spellcheck="false">${esc(md)}</textarea>`;
-  const btn = $("#report .copy-md");
-  if (btn) btn.onclick = () => copyReport(md, btn);
+  const dlg = $("#reportdlg");
+  dlg.innerHTML = `<div class="rhead"><b>${esc(title || id)}</b><span class="grow"></span>
+      <button class="ctl" data-act="copy">Copy markdown</button>
+      <button class="ctl" data-act="md">Download .md</button>
+      <button class="ctl" data-act="print">Print / PDF</button>
+      <button class="ctl" data-act="close">Close</button></div>
+    <div class="report rbody">${mdToHTML(md)}</div>`;
+  dlg.onclick = async e => {
+    const act = e.target.dataset && e.target.dataset.act;
+    if (!act) { if (e.target === dlg) dlg.close(); return; }
+    if (act === "close") dlg.close();
+    if (act === "copy") {
+      try { await navigator.clipboard.writeText(md); e.target.textContent = "Copied"; }
+      catch { e.target.textContent = "Could not copy"; }
+      setTimeout(() => { e.target.textContent = "Copy markdown"; }, 1500);
+    }
+    if (act === "md") {
+      const url = URL.createObjectURL(new Blob([md], { type: "text/markdown" }));
+      const a = document.createElement("a");
+      a.href = url; a.download = `${id.replace(/[^\w.-]+/g, "-")}-report.md`; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+    if (act === "print") {
+      // Only the report prints: the class hides everything else, and the
+      // browser's own dialog offers "Save as PDF".
+      document.body.classList.add("print-report");
+      addEventListener("afterprint", () => document.body.classList.remove("print-report"), { once: true });
+      window.print();
+    }
+  };
+  dlg.showModal();
 }
 
-// Places the exact bytes the endpoint returned on the clipboard. Where the
-// Clipboard API is missing or refuses, the button says so and the raw
-// markdown — already in the DOM, just hidden — becomes selectable instead.
-async function copyReport(md, btn) {
-  try {
-    await navigator.clipboard.writeText(md);
-    btn.textContent = "Copied";
-    setTimeout(() => { btn.textContent = "Copy markdown"; }, 1500);
-  } catch {
-    btn.textContent = "Could not copy — select below";
-    const ta = document.querySelector("#report .raw-md");
-    if (ta) { ta.hidden = false; ta.focus(); ta.select(); }
-  }
+// The questions, one at a time, exactly as AskUserQuestion would have put
+// them to you: a header, the question, options with what each means, and a
+// line for anything else. The answers go back as one reply into the
+// conversation that asked, via the same endpoint the textarea uses.
+function openAsk(id, title) {
+  const qs = questionsOf(blocks[id]);
+  if (!qs) return;
+  const dlg = $("#ask");
+  const answers = [];
+  let i = 0;
+  const show = () => {
+    const q = qs[i], opts = Array.isArray(q.options) ? q.options : [];
+    const type = q.multiSelect ? "checkbox" : "radio";
+    dlg.innerHTML = `<form class="askform" method="dialog">
+      <div class="askhead">
+        <span class="askstep">${i + 1} / ${qs.length}</span>
+        <span class="askhdr">${esc(q.header || "")}</span>
+        <span class="grow"></span>
+        <span class="askstep">${esc(title || id)}</span>
+      </div>
+      <p class="askq">${esc(q.question || q.header || "")}</p>
+      <div class="askopts">${opts.map((o, j) => `<label class="askopt">
+          <input type="${type}" name="o" value="${j}">
+          <span><b>${esc(o.label || "")}</b>${o.description ? `<small>${esc(o.description)}</small>` : ""}</span>
+        </label>`).join("")}
+        <input class="askother" type="text" placeholder="${opts.length ? "Or say it in your own words" : "Your answer"}">
+      </div>
+      <div class="askfoot">
+        <button type="button" class="ctl" data-act="cancel">Cancel</button>
+        <span class="grow"></span>
+        ${i ? `<button type="button" class="ctl" data-act="back">Back</button>` : ""}
+        <button type="submit" class="ctl send">${i + 1 < qs.length ? "Next" : "Send answers"}</button>
+      </div></form>`;
+    const form = dlg.querySelector("form");
+    form.onclick = e => {
+      const act = e.target.dataset && e.target.dataset.act;
+      if (act === "cancel") dlg.close();
+      if (act === "back") { i--; show(); }
+    };
+    form.onsubmit = e => {
+      e.preventDefault();
+      const picked = [...form.querySelectorAll("input[name=o]:checked")].map(x => opts[+x.value].label);
+      const other = form.querySelector(".askother").value.trim();
+      if (!picked.length && !other) { form.querySelector(".askother").focus(); return; }
+      answers[i] = `${q.header || `Q${i + 1}`}: ${[...picked, other].filter(Boolean).join(" — ")}`;
+      if (++i < qs.length) { show(); return; }
+      dlg.close();
+      const box = document.querySelector("#stop .answer");
+      const note = box ? box.value.trim() : "";
+      sendAnswer(id, answers.join("\n") + (note ? `\n\n${note}` : ""));
+    };
+  };
+  show();
+  dlg.showModal();
+}
+
+async function sendAnswer(id, answer) {
+  const btn = document.querySelector("#stop .ask-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "Sending…"; }
+  const res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ answer }),
+  });
+  if (!res.ok) { refuse(id, (await res.text()).trim() || `could not answer ${id}`); return; }
+  $("#stop").innerHTML = "";
 }
 
 // A small markdown-to-elements reader for the one document this board
@@ -1127,17 +1332,22 @@ function stopNotice(id) {
   const b = blocks[id];
   if (!b) return "";
   const at = b.at ? new Date(b.at) : null;
-  return `<div class="stop">
-    <h3>${esc(b.kind || "blocked")}${b.stage ? ` in ${esc(b.stage)}` : ""}</h3>
+  const qs = questionsOf(b);
+  const t = tone(b);
+  return `<div class="stop ${t}">
+    <h3>${t === "asks" ? "needs you · " : t === "waiting" ? "waiting · " : ""}${esc(b.kind || "blocked")}${b.stage ? ` in ${esc(b.stage)}` : ""}</h3>
     <p>${esc(b.reason || "no reason was recorded")}</p>
     <div class="meta">
       ${at && !isNaN(at) ? `stopped ${esc(at.toLocaleString())}` : ""}
       ${b.runId ? ` &middot; run ${esc(b.runId)}` : ""}
     </div>
+    ${qs ? `<button class="ask-btn">Answer ${qs.length === 1 ? "the question" : `${qs.length} questions`}</button>` : ""}
     <textarea class="answer" rows="3" spellcheck="true"
-      placeholder="Reply, if it asked you something. The agent takes it up in the conversation that stopped — leave it empty to just hand the item back."></textarea>
+      placeholder="${qs ? "Anything to add beside the answers above, or reply here instead."
+                       : t === "asks" ? "Your answer. The agent takes it up in the conversation that stopped."
+                       : "Reply if there is something to say; leave it empty to just hand the item back."}"></textarea>
     <button class="hand"
-      title="Clear the mark; the item goes straight back into the line">Hand back</button>
+      title="Clear the mark; the item goes straight back into the line">${t === "asks" ? "Send reply" : "Hand back"}</button>
   </div>`;
 }
 

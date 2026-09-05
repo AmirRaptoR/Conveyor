@@ -160,12 +160,19 @@ agent_asked() {
 	sess=$(claude_session)
 	tmp=$(mktemp)
 	if jq --arg s "$sess" \
-		'. + {asked: true} + (if $s == "" then {} else {session: $s} end)' \
+		'. + {asked: true, kind: (.kind // "decision")} + (if $s == "" then {} else {session: $s} end)' \
 		"$CONVEYOR_RESULT" >"$tmp" 2>/dev/null; then
 		mv "$tmp" "$CONVEYOR_RESULT"
 	else
 		rm -f "$tmp"
 	fi
+}
+
+# last_said — the tail of what the model said, one line, for a reason that
+# would otherwise be "exited 1": the card then says what it was doing.
+last_said() {
+	[[ -s "${CLAUDE_SAID:-}" ]] || return 0
+	grep -v '^\s*$' "$CLAUDE_SAID" | tail -n 3 | tr -s '[:space:]' ' ' | cut -c1-300
 }
 
 # render_stream reads the event stream on stdin and writes readable text.

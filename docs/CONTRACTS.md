@@ -407,6 +407,10 @@ not passed: nobody answered it by waiting. A script that stopped on a question
 writes `"asked": true` beside its reason; everything else is a condition, which
 is the safe default, because a condition wrongly retried costs one run and a
 question wrongly cleared costs the run *and* asks you the same thing again.
+A question may also carry `"questions": [...]` — the AskUserQuestion shape
+(`header`, `question`, `options[{label, description}]`, `multiSelect`). The
+engine passes it through on the block untouched, like `session`; the board
+turns it into a modal and sends the choices back as the `answer`.
 
 The engine reads the flag and never the word beside it. Conditions are cleared
 in bulk — `Unblock all`, `retryStalled`, an agent's quota returning. **A question

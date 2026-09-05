@@ -28,7 +28,8 @@
 #   5. PR closed unmerged                    -> exit 20  (decision)
 #   6. hold on the PR (or the issue)         -> exit 20  (human-review)
 #   7. PR is a draft                         -> exit 10
-#   8. mergeable is CONFLICTING              -> exit 20  (conflict)
+#   8. mergeable is CONFLICTING              -> rebase once; exit 10 if it
+#                                                applied, else exit 20 (conflict)
 #   9. a check failed                        -> exit 20  (checks)
 #  10. a check is still running              -> exit 10
 #  11. an unresolved thread it has not answered -> address, test, push, reply,
@@ -186,6 +187,7 @@ fetch_details() {
 					isDraft
 					mergeable
 					headRefName
+					baseRefName
 					commits(last:1) {
 						nodes { commit { committedDate statusCheckRollup { state } } }
 					}
@@ -351,7 +353,7 @@ state of the branch, redoing whatever investigation already happened."
 		exit 20
 	fi
 	if [[ $rc -ne 0 ]]; then
-		blocked error "the agent exited $rc while addressing the review threads on #$pr."
+		blocked error "the agent exited $rc while addressing the review threads on #$pr. Last it said: $(last_said)"
 	fi
 
 	if [[ -n "$(git status --porcelain)" ]]; then
@@ -392,6 +394,27 @@ $SENTINEL"
 	exit 10
 }
 
+# try_rebase — one mechanical rebase of the PR branch onto its base, in the
+# item's own worktree. Returns non-zero, with the tree left as it was found,
+# when there is no worktree, the tree is dirty, or the rebase stops.
+try_rebase() {
+	local head_ref base_ref wt
+	head_ref=$(jq -r '.headRefName' <<<"$details")
+	base_ref=$(jq -r '.baseRefName // empty' <<<"$details")
+	wt="$(worktree_root)/${CONVEYOR_SOURCE}/${ref}"
+	[[ -n "$base_ref" && -d "$wt" ]] || return 1
+	git -C "$wt" rev-parse --git-dir >/dev/null 2>&1 || return 1
+	[[ -z "$(git -C "$wt" status --porcelain)" ]] || { echo "worktree $wt is dirty; not rebasing" >&2; return 1; }
+	[[ "$(git -C "$wt" branch --show-current)" == "$head_ref" ]] || return 1
+	git -C "$wt" fetch --quiet origin "$base_ref" "$head_ref" || return 1
+	git -C "$wt" reset --quiet --hard "origin/$head_ref" || return 1
+	if ! git -C "$wt" rebase --quiet "origin/$base_ref" >&2; then
+		git -C "$wt" rebase --abort 2>/dev/null || true
+		return 1
+	fi
+	git -C "$wt" push --quiet --force-with-lease origin "HEAD:$head_ref" >&2
+}
+
 # check_gates_once — gates 2 through 13. Exits directly (10 or 20) for any
 # outcome that is not "ready to merge right now"; returns normally only when
 # every gate has just passed. Called twice by the caller so gate 14's "refetch
@@ -423,7 +446,17 @@ check_gates_once() {
 	local mergeable
 	mergeable=$(jq -r '.mergeable' <<<"$details")
 	if [[ "$mergeable" == "CONFLICTING" ]]; then
-		blocked conflict "pull request #$pr has a merge conflict with its base branch."
+		# A conflict is work before it is a decision. Most are a base that moved
+		# under a branch review already left behind, and a rebase applies
+		# cleanly; only one that does not is worth a person. Tried on the
+		# worktree review left (never built here: a conflict on a PR nobody
+		# here opened is not this script's to rewrite), pushed with a lease so
+		# a branch someone touched meanwhile is refused rather than overwritten.
+		if try_rebase; then
+			echo "rebased #$pr onto $(jq -r .baseRefName <<<"$details"); waiting for GitHub to recompute" >&2
+			exit 10
+		fi
+		blocked conflict "pull request #$pr has a merge conflict with its base branch that a plain rebase did not resolve; it needs a hand."
 	fi
 	if [[ "$mergeable" != "MERGEABLE" ]]; then
 		echo "PR #$pr's mergeability is not yet known ($mergeable); waiting" >&2

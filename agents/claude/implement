@@ -17,6 +17,8 @@ source "$(dirname "$0")/../_blocked"
 source "$(dirname "$0")/../_worktree"
 source "$(dirname "$0")/../_resume"
 source "$(dirname "$0")/../_deadline"
+source "$(dirname "$0")/../_pr"
+source "$(dirname "$0")/../_deps"
 
 : "${PROMPT:?PROMPT is required (set it in this script params: block)}"
 
@@ -32,7 +34,15 @@ url=$(jq -r '.item.url // ""' <<<"$payload")
 rework=""
 head=""
 if [[ -n "${REPO:-}" ]]; then
-	existing=$(gh pr list --repo "$REPO" --state open --search "$ref" --json number --jq '.[0].number' 2>/dev/null)
+	# Before the worktree and long before the model: an item sequenced behind
+	# an open issue is not startable, and finding that out is not worth a run.
+	waiting=$(open_dependencies "$body")
+	if [[ -n "$waiting" ]]; then
+		blocked dependency "waits on $waiting, still open. Nothing is wrong with \
+this item; Diagnose clears it once they close."
+	fi
+
+	existing=$(open_pr "$ref")
 	if [[ -n "$existing" ]]; then
 		head=$(gh pr view "$existing" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null || true)
 		echo "PR #$existing exists — this is a rework pass"
@@ -99,9 +109,7 @@ now, main is checked out elsewhere, and changing branch under yourself is how
 one item's work lands on another item's branch. The branch you are on is the
 branch for this issue — commit to it and push it with \`git push -u origin HEAD\`.
 
-If this cannot be done because it needs a decision only a human can make, change
-nothing and write {\"blocked\": true, \"reason\": \"<the decision needed>\"} to
-the file at ${CONVEYOR_RESULT}."
+$(decision_brief)"
 
 # How long it has, and what to do if that is not enough. Last, because it is the
 # instruction that governs all the others.

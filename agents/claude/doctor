@@ -9,7 +9,9 @@
 # beyond a plain string match.
 #
 #   limit, worktree  a condition that may have passed. Exit 0, no comment.
-#   turns             resumable: exit 0 with an answer, so the item resumes
+#   dependency        re-read the issues the item names; exit 0 once every
+#                      one of them is closed, else exit 10, no comment.
+#   turns, unfinished resumable: exit 0 with an answer, so the item resumes
 #                      into the same conversation with a fresh turn budget
 #                      instead of hitting the identical wall cold.
 #   error             read the run that marked it, log first. A transient
@@ -39,6 +41,7 @@ set -euo pipefail
 
 source "$(dirname "$0")/_stream"
 source "$(dirname "$0")/../_blocked"
+source "$(dirname "$0")/../_deps"
 
 : "${REPO:?REPO is required (set it in the source env: block)}"
 
@@ -128,7 +131,17 @@ limit | worktree)
 	exit 0
 	;;
 
-turns)
+dependency)
+	waiting=$(open_dependencies "$(jq -r '.item.description // ""' <<<"$payload")")
+	if [[ -n "$waiting" ]]; then
+		echo "still waits on $waiting; leaving it" >&2
+		exit 10
+	fi
+	echo "every dependency is closed; clearing it" >&2
+	exit 0
+	;;
+
+turns | unfinished)
 	# A resumable condition: starting cold can hit the identical wall again.
 	echo "resumable; handing back a fresh turn budget" >&2
 	jq -n '{answer: "continue"}' >"$CONVEYOR_RESULT"

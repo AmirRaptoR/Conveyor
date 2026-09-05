@@ -49,6 +49,11 @@ case "$1 $2" in
 "issue comment")
 	echo "$*" >>"$scene/comments_posted"
 	;;
+"api "*)
+	# repos/o/n/issues/N --jq .state: the scene lists the numbers still open.
+	n=${2##*/}
+	if grep -qx "$n" "$scene/open_issues" 2>/dev/null; then echo open; else echo closed; fi
+	;;
 *)
 	echo "stub gh: unhandled: $*" >&2
 	exit 97
@@ -70,7 +75,8 @@ run() {
 	local -a dry=()
 	[[ -n "${DRY:-}" ]] && dry=(CONVEYOR_DRY_RUN=1)
 	jq -n --arg kind "$kind" --arg reason "$reason" --arg runId "$run_id" --argjson runs "$runs" \
-		'{item:{id:"s1:7",ref:"7",title:"an item"},stage:"working",blocked:true,
+		--arg desc "${DESC:-}" \
+		'{item:{id:"s1:7",ref:"7",title:"an item",description:$desc},stage:"working",blocked:true,
 		  block:{kind:$kind,reason:$reason,stage:"working",runId:$runId,asked:false},
 		  runs:$runs}' |
 		env "${dry[@]}" SCENE="$tmp/scene" REPO=o/n CONVEYOR_SOURCE=s1 "$here/doctor" \
@@ -88,10 +94,21 @@ for k in limit worktree; do
 	chk "     and never comments" "$(posted)"           "no"
 done
 
-# --- turns: resumable, exit 0 with an answer --------------------------------
-scene; no_prior_comment
-chk "turns clears (exit 0)"        "$(run turns "ran out of turns")" "0"
-chk "     with a fresh-budget answer" "$(answer)" "continue"
+# --- turns, unfinished: resumable, exit 0 with an answer --------------------
+for k in turns unfinished; do
+	scene; no_prior_comment
+	chk "$k clears (exit 0)"           "$(run "$k" "ran out of room")" "0"
+	chk "     with a fresh-budget answer" "$(answer)" "continue"
+	chk "     and never comments"      "$(posted)" "no"
+done
+
+# --- dependency: cleared only once every issue it names is closed -----------
+scene; no_prior_comment; printf '12\n' >"$tmp/scene/open_issues"
+chk "dependency still open is left (exit 10)" \
+	"$(DESC=$'Depends on #12, #13\nRelated: #99' run dependency "waits on #12")" "10"
+scene; no_prior_comment; : >"$tmp/scene/open_issues"
+chk "dependency all closed clears (exit 0)" \
+	"$(DESC=$'Depends on #12, #13' run dependency "waits on #12 #13")" "0"
 chk "     and never comments"      "$(posted)" "no"
 
 # --- error: a transient cause exits 0, no comment ---------------------------

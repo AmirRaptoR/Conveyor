@@ -120,6 +120,10 @@ type Block struct {
 	// back into the same conversation instead of starting one that has to
 	// rediscover the repository first. Recovered from run history like Reason.
 	Session string `json:"-"`
+	// Questions is the AskUserQuestion shape the agent wrote beside its
+	// reason, if it wrote one: what the board turns into a modal. Opaque
+	// here, like Session — the engine never reads inside it.
+	Questions json.RawMessage `json:"questions,omitempty"`
 }
 
 // AgentView is one agent's own report on itself.
@@ -717,15 +721,16 @@ func (s *Server) recallBlocks(items []model.Item) {
 			timeout = st.Timeout.D()
 		}
 		mark := pipeline.Marked(m.To, m.Run, data, timeout, 0)
-		asked, session := saidAt(m.Dir)
+		asked, session, questions := saidAt(m.Dir)
 		found[m.ItemID] = Block{
-			Kind:    mark.Kind,
-			Reason:  mark.Reason,
-			Stage:   m.To,
-			RunID:   m.ID,
-			At:      m.FinishedAt,
-			Asked:   asked,
-			Session: session,
+			Kind:      mark.Kind,
+			Reason:    mark.Reason,
+			Stage:     m.To,
+			RunID:     m.ID,
+			At:        m.FinishedAt,
+			Asked:     asked,
+			Session:   session,
+			Questions: questions,
 		}
 		delete(want, m.ItemID)
 		return len(want) > 0
@@ -873,9 +878,9 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// reason exists in full, and a run history sweep must not be what stands
 	// between an operator and why their board stopped.
 	if tr.Blocked {
-		asked, session := saidAt(tr.RunDir)
+		asked, session, questions := saidAt(tr.RunDir)
 		s.blocks[tr.Item.ID] = Block{Kind: tr.Kind, Reason: tr.Reason, Stage: tr.Stage,
-			RunID: tr.RunID, At: time.Now(), Asked: asked, Session: session}
+			RunID: tr.RunID, At: time.Now(), Asked: asked, Session: session, Questions: questions}
 	} else {
 		delete(s.blocks, tr.Item.ID)
 	}
@@ -1228,22 +1233,28 @@ func (s *Server) releaseLimited(ctx context.Context) int {
 // and a script that says nothing is a condition with no way back — all three
 // are correct. This is the same file the reason comes from, so a run pinned
 // against retention carries the whole stop, not half of it.
-func saidAt(dir string) (asked bool, session string) {
+func saidAt(dir string) (asked bool, session string, questions json.RawMessage) {
 	if dir == "" {
-		return false, ""
+		return false, "", nil
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "result.json"))
 	if err != nil {
-		return false, ""
+		return false, "", nil
 	}
 	var v struct {
-		Asked   bool   `json:"asked"`
-		Session string `json:"session"`
+		Asked     bool            `json:"asked"`
+		Session   string          `json:"session"`
+		Questions json.RawMessage `json:"questions"`
 	}
 	if json.Unmarshal(b, &v) != nil {
-		return false, ""
+		return false, "", nil
 	}
-	return v.Asked, v.Session
+	// Only an array is a list of questions; anything else is not passed on to
+	// a page that would try to walk it.
+	if len(v.Questions) == 0 || v.Questions[0] != '[' {
+		v.Questions = nil
+	}
+	return v.Asked, v.Session, v.Questions
 }
 
 // applyAgentStates turns what the agents said into what the scheduler does.

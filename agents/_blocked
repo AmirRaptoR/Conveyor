@@ -45,6 +45,14 @@ _write_stop() {
 #   worktree    the checkout is not in a state the work can start from
 #   no-output   the agent finished but produced nothing the provider can see
 #   input       the item itself is missing something (no criteria, no PR)
+#   dependency  the item names an issue that is still open; clears once it is
+#   unfinished  the run stopped itself at its deadline with work pushed and a
+#               conversation to resume into (agents/_deadline)
+#
+# A question can carry `questions`: the AskUserQuestion shape (header,
+# question, options[{label, description}], multiSelect), which the board turns
+# into a modal a person answers one at a time. The engine passes it through
+# unread, like `session`. See decision_brief below for the exact text.
 #
 # Merges onto whatever is already in $CONVEYOR_RESULT rather than replacing it,
 # so a caller that wrote something first — record_session's {"session": "..."}
@@ -74,6 +82,33 @@ blocked() {
 # Condition is the default because it is the safe one to get wrong: a condition
 # wrongly retried costs one run, a question wrongly cleared costs the run *and*
 # asks you the same thing again.
+# decision_brief — the paragraph every adapter appends to its prompt saying how
+# to stop for a person. One place, so the shape the board reads is the shape
+# every agent writes. The shape is AskUserQuestion's: the model already knows
+# it, the tool itself is not available in a headless run (verified: `claude -p`
+# does not expose it), and options are what turn "a paragraph in a comment"
+# into a button a person can press.
+decision_brief() {
+	cat <<-BRIEF
+	If this cannot be done because it needs a decision only a human can make,
+	change nothing and write this to the file at ${CONVEYOR_RESULT}:
+
+	  {"blocked": true, "kind": "decision",
+	   "reason": "<the decision needed, in one sentence>",
+	   "questions": [{"header": "<label, under 12 chars>",
+	                  "question": "<the full question, self-contained>",
+	                  "options": [{"label": "<1-5 words>", "description": "<what choosing it means>"}],
+	                  "multiSelect": false}]}
+
+	One entry per question, two to four options each, the one you would pick
+	listed first. This is the AskUserQuestion shape; that tool is not available
+	here, so the file is how you ask. A person answers on the board and the
+	reply reaches this same conversation. Do not stop for something you can
+	verify yourself, and do not stop because a dependency is open — say so in
+	one line and continue with what does not depend on it.
+	BRIEF
+}
+
 asks() {
 	local kind=$1 question=$2
 	_write_stop --arg kind "$kind" --arg reason "$question" \

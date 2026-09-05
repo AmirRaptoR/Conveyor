@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Sourced by the agent adapters. Finds an item's pull request the one way that
+# cannot pick up a stranger's: by closing reference.
+#
+# `gh pr list --search "$ref"` matches the number anywhere in any PR's text and
+# silently takes the first hit — issue #188 was handed #366, whose body said
+# "depends on #188", and the agent spent its run noticing. approve already
+# looks for "Closes #N"; this is the same filter for everyone else, with the
+# branch name as a second signal because agents/_worktree names every branch
+# issue-<ref> and a PR opened from it is that item's whatever its body says.
+
+# closing_prs <ref> [open|all] — JSON array of {number,state,headRefName,url}
+# for every PR that closes #ref, open first, newest first within each state.
+closing_prs() {
+	local ref=$1 state=${2:-open}
+	gh pr list --repo "$REPO" --state "$state" --limit 100 \
+		--json number,body,state,headRefName,url 2>/dev/null |
+		jq --arg ref "$ref" '[.[] | select(
+			((.body // "") | test("\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\b:?\\s*#" + $ref + "\\b"; "i"))
+			or .headRefName == ("issue-" + $ref))]
+			| sort_by(.state != "OPEN", -.number)' 2>/dev/null || echo '[]'
+}
+
+# open_pr <ref> — the number of the one open PR for #ref, or nothing.
+open_pr() {
+	closing_prs "$1" open | jq -r '.[0].number // empty'
+}

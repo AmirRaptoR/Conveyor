@@ -68,8 +68,17 @@ echo "listing issues in $REPO" >&2
 # no stage label yet is new work and lands in DEFAULT_STAGE; a *closed* one with
 # no stage label is finished, and letting the tag alone put it back on the board
 # would re-list it as new work on every poll.
-gh issue list --repo "$REPO" --state all --limit "${LIMIT:-200}" \
-	--json number,title,body,labels,url,assignees,state |
+# Two listings, not one with --state all: a repository that has finished more
+# issues than LIMIT would otherwise list only closed ones and lose the open
+# work. Closed issues come back newest-closed first — `gh` orders by creation
+# date, and the done column reads top-down as "what finished last".
+{
+	gh issue list --repo "$REPO" --state open --limit "${LIMIT:-200}" \
+		--json number,title,body,labels,url,assignees,state,closedAt
+	gh issue list --repo "$REPO" --state closed --limit "${CLOSED_LIMIT:-100}" \
+		--json number,title,body,labels,url,assignees,state,closedAt |
+		jq 'sort_by(.closedAt) | reverse'
+} | jq -s 'add' |
 	jq --arg source "$CONVEYOR_SOURCE" \
 		--arg default "$DEFAULT_STAGE" \
 		--arg blocked "$BLOCKED_LABEL" \
