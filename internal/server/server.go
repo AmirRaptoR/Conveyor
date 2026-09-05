@@ -1820,9 +1820,23 @@ func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not a push subscription", http.StatusBadRequest)
 		return
 	}
-	if err := s.pushSubs.Add(sub); err != nil {
+	fresh, err := s.pushSubs.Add(sub)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	// A new device hears back at once, so turning notifications on is its
+	// own proof; the page re-posts on every load and those stay silent.
+	if fresh && s.pushKeys != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			payload, _ := json.Marshal(map[string]string{"title": "Conveyor",
+				"body": "Notifications are on. You will hear when something needs you or ships.", "url": "/"})
+			if err := s.pushKeys.Send(ctx, sub, payload, "https://github.com/AmirRaptoR/Conveyor"); err != nil {
+				fmt.Fprintf(os.Stderr, "conveyor: hello push: %v\n", err)
+			}
+		}()
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

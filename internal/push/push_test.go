@@ -126,11 +126,13 @@ func TestStore(t *testing.T) {
 	st := OpenStore(path)
 	var a, b Subscription
 	a.Endpoint, b.Endpoint = "https://p/1", "https://p/2"
-	if err := st.Add(a); err != nil {
-		t.Fatal(err)
+	if fresh, err := st.Add(a); err != nil || !fresh {
+		t.Fatalf("first add: fresh=%v err=%v", fresh, err)
 	}
-	_ = st.Add(b)
-	_ = st.Add(a) // once
+	_, _ = st.Add(b)
+	if fresh, _ := st.Add(a); fresh { // once
+		t.Fatal("the same endpoint again is not a new subscription")
+	}
 	if OpenStore(path).Len() != 2 {
 		t.Fatalf("len %d", OpenStore(path).Len())
 	}

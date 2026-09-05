@@ -243,18 +243,19 @@ func OpenStore(path string) *Store {
 	return st
 }
 
-// Add records a subscription; the same endpoint twice is one subscription.
-func (st *Store) Add(s Subscription) error {
+// Add records a subscription and reports whether it is new; the same
+// endpoint twice is one subscription.
+func (st *Store) Add(s Subscription) (bool, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	for i := range st.subs {
 		if st.subs[i].Endpoint == s.Endpoint {
 			st.subs[i] = s
-			return st.save()
+			return false, st.save()
 		}
 	}
 	st.subs = append(st.subs, s)
-	return st.save()
+	return true, st.save()
 }
 
 func (st *Store) Remove(endpoint string) error {
