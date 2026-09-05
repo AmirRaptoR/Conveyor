@@ -585,16 +585,131 @@
   .rhead b { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .rbody { max-height:72vh; overflow:auto; padding:6px 22px 22px; border:0; }
   .rbody.report { font-size:13px; }
+  #printout { display:none; }
   @media print {
     body.print-report { background:#fff; color:#000; }
-    body.print-report > :not(#reportdlg) { display:none !important; }
-    body.print-report #reportdlg {
-      position:static; display:block; border:0; box-shadow:none; width:auto;
-      background:#fff; color:#000;
+    body.print-report > :not(#printout) { display:none !important; }
+    body.print-report #printout {
+      display:block; color:#000; background:#fff; padding:0; border:0;
+      font-size:12px; line-height:1.5;
     }
-    body.print-report #reportdlg .rhead { display:none; }
-    body.print-report #reportdlg .rbody { max-height:none; overflow:visible; color:#000; }
-    body.print-report #reportdlg::backdrop { display:none; }
+    body.print-report #printout .report { color:#000; background:#fff; border:0; padding:0; }
+    body.print-report #printout h1, body.print-report #printout h2,
+    body.print-report #printout th, body.print-report #printout code,
+    body.print-report #printout strong { color:#000; }
+    body.print-report #printout code { background:#eee; }
+    body.print-report #printout table { page-break-inside:auto; }
+    body.print-report #printout tr { page-break-inside:avoid; }
+    @page { margin:18mm; }
+  }
+  .rbody .slot { margin:14px 0; }
+
+  /* ---- the design pass ----------------------------------------------------
+     One voice. Sentence case everywhere, one sans family, mono only where the
+     content is a readout — an id, a log line, a code span. Colour is state
+     and nothing else: amber is working, violet is waiting on you, red is a
+     fault, green is finished. The page is the height of the window and the
+     line fills it, so the scrollbar is always where a scrollbar is. */
+  body { display:flex; flex-direction:column; height:100vh; font-size:13px; }
+  .mark, .readout, .count, .runs-label, .prio, .rank, .agent .who, .src-chip,
+  .drow .dstatus, .why { font-family:var(--sans); }
+  .src, .log, .ln, .stop .meta, .askstep, code { font-family:var(--mono); }
+
+  .masthead { align-items:center; gap:14px; padding:11px 22px; }
+  .mark { font-size:15px; font-weight:600; letter-spacing:0; text-transform:none; }
+  .readout { font-size:12.5px; letter-spacing:0; white-space:nowrap; align-items:center; }
+  .readout b { font-weight:600; }
+  .ctl {
+    font-size:12.5px; letter-spacing:0; text-transform:none; white-space:nowrap;
+    padding:6px 12px; border-radius:6px; color:var(--ink);
+    border-color:var(--rule); background:var(--raised);
+  }
+  .ctl:hover:not(:disabled) { border-color:var(--faint); background:var(--panel); }
+  .ctl.primary { background:var(--ink); color:var(--ground); border-color:transparent; font-weight:600; }
+  .ctl.primary:hover:not(:disabled) { background:var(--ink); opacity:.9; }
+
+  .needs, .agents, .sources { padding:8px 22px; font-size:12.5px; }
+  .agent .who { font-size:12.5px; letter-spacing:0; text-transform:none; font-weight:600; }
+  .agent .held { font-size:11.5px; border-radius:999px; padding:0 8px; }
+  .src-chip .swatch { width:8px; height:8px; border-radius:50%; }
+  .src-chip .n { color:var(--dim); }
+
+  .rail-wrap { flex:1; min-height:0; }
+  .line { height:100%; overflow:auto; padding:18px 22px 22px; }
+  .railctl { display:none !important; }
+  :root { --station:262px; }
+  .station { padding-right:12px; }
+  .station::after, .terminus::before { display:none; }
+  .plate {
+    position:sticky; top:0; z-index:2; height:auto; padding:10px 12px 9px;
+    background:var(--panel); border:1px solid var(--rule); border-radius:10px 10px 0 0;
+    box-shadow:none;
+  }
+  .station.live .plate, .station.live .plate { border-color:var(--rule); box-shadow:inset 0 2px 0 var(--run); }
+  .name { font-size:13px; font-weight:600; letter-spacing:0; text-transform:none; }
+  .count { font-size:11.5px; color:var(--dim); background:var(--raised); border-radius:999px; padding:0 8px; }
+  .count .held { color:var(--stop); }
+  .runs-label { font-size:11.5px; letter-spacing:0; margin-top:2px; }
+  .runs-label b { color:var(--dim); }
+  .queue {
+    margin:0; padding:8px; gap:6px; min-height:72px;
+    background:var(--panel); border:1px solid var(--rule); border-top:0; border-radius:0 0 10px 10px;
+  }
+  .station.live .queue { border-top-color:transparent; }
+  .queue .slot { border:0; padding:22px 8px; text-align:center; color:var(--faint); font-size:12px; }
+  .terminus { padding-left:22px; }
+  .terminus .plate { min-width:var(--station); box-shadow:inset 0 2px 0 var(--ok); border-color:var(--rule); }
+  .terminus .queue { border-top-color:transparent; }
+  .terminus .name { color:var(--ink); }
+  .more { border-radius:6px; padding:8px; }
+
+  .item {
+    border:1px solid var(--rule); border-left:1px solid var(--rule); border-radius:8px;
+    padding:10px 12px; background:var(--raised);
+  }
+  .item:hover { border-color:var(--faint); }
+  .item .title { font-size:13px; line-height:1.4; }
+  .item .foot { margin-top:8px; gap:8px; font-size:11.5px; letter-spacing:0; color:var(--dim); flex-wrap:nowrap; min-width:0; }
+  .item .foot > * { flex:none; }
+  .item .why { flex:0 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .count .asks { color:var(--ask); }
+  .src { color:var(--dim); }
+  .src::before {
+    content:""; display:inline-block; width:7px; height:7px; border-radius:50%;
+    background:var(--src, var(--faint)); margin-right:6px; vertical-align:0;
+  }
+  .rank { border-radius:999px; padding:0 7px; }
+  .open { border-radius:6px; padding:0 6px; }
+  .working-tag { font-size:11.5px; letter-spacing:0; text-transform:none; font-weight:600; }
+  .item .why { font-size:11.5px; letter-spacing:0; text-transform:none; padding:1px 9px; }
+  .item.blocked { border-color:color-mix(in srgb, var(--stop) 45%, var(--rule)); }
+  .item.blocked.waiting { border-color:var(--rule); }
+  .item.blocked.asks { box-shadow:none; }
+  .item .refused { font-size:11.5px; }
+
+  aside { width:min(760px, 96vw); }
+  .ahead { padding:14px 20px; align-items:center; }
+  .ahead h2 { font-size:15px; font-weight:600; line-height:1.4; }
+  .ahead .sub { font-size:12px; letter-spacing:0; text-transform:none; color:var(--dim); }
+  .stop { border-radius:8px; border-left-width:3px; margin:12px 20px 0; }
+  .stop h3 { font-size:12.5px; font-weight:600; letter-spacing:0; text-transform:none; }
+  .stop p { font-size:13px; }
+  .stop .hand { font-size:12px; letter-spacing:0; text-transform:none; border-radius:6px; padding:6px 12px; }
+  .stop .answer { border-radius:6px; font-size:13px; }
+  .stop.asks .hand { color:var(--ask); border-color:color-mix(in srgb, var(--ask) 45%, var(--rule)); }
+  .stop.asks .hand:hover { background:color-mix(in srgb, var(--ask) 14%, transparent); }
+  .stop.waiting .hand { color:var(--dim); border-color:var(--rule); }
+  .report-head { padding:10px 20px 0; }
+  .report { font-size:13px; }
+  .report h1 { font-size:15px; font-weight:600; }
+  .report h2 { font-size:13px; font-weight:600; letter-spacing:0; text-transform:none; margin-top:16px; }
+  .report th { letter-spacing:0; text-transform:none; }
+  .drow .dstatus { font-size:11.5px; letter-spacing:0; text-transform:none; }
+  .askhdr { font-size:12.5px; letter-spacing:0; text-transform:none; }
+  .doctor-sweep { margin:0 22px 10px; }
+  @media (max-width: 640px) {
+    body { height:auto; min-height:100vh; }
+    .line { height:auto; }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -641,6 +756,7 @@
 
 <dialog id="ask"></dialog>
 <dialog id="reportdlg"></dialog>
+<div id="printout" class="report"></div>
 <div class="scrim" id="scrim"></div>
 <aside id="panel" aria-hidden="true">
   <div class="ahead">
@@ -820,14 +936,14 @@ function draw() {
     </div>` : "";
 
   $("#lamp").className = "lamp " + (active.length || state.polling ? "busy" : "idle");
-  const when = state.updatedAt ? new Date(state.updatedAt).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"}) : "—";
+  const when = state.updatedAt ? new Date(state.updatedAt).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}) : "—";
   const held = marked;
   $("#line1").innerHTML = active.length === 1
     ? `<b>${esc(active[0].stage)}</b> running &middot; ${esc(active[0].itemId)}`
     : active.length
       ? `<b>${active.length}</b> running &middot; ${active.map(a => esc(a.stage)).join(", ")}`
-      : `<b>${items.length}</b> items &middot; ${(state.sources||[]).length} sources${
-          held ? ` &middot; <b>${held}</b> blocked` : ""} &middot; ${when}`;
+      : `<b>${items.length}</b> items${asking.length ? `, <b>${asking.length}</b> need${asking.length === 1 ? "s" : ""} you`
+          : held ? `, <b>${held}</b> stopped` : ""} &nbsp;·&nbsp; updated ${when}`;
 
   document.querySelectorAll(".item").forEach(el => {
     const open = () => { if (!justDragged) inspect(el.dataset.id, el.dataset.title, el.dataset.stage); };
@@ -1001,11 +1117,11 @@ function station(st, items, active) {
   return `<section class="station${live ? " live" : ""}">
     <div class="plate">
       <div class="name">${esc(st.name)}${tally(items)}</div>
-      <div class="runs-label">${st.script ? `runs <b>${esc(st.script)}</b>` : st.runs ? "runs inline" : "queue"}</div>
+      <div class="runs-label">${st.script ? `runs <b>${esc(st.script)}</b>` : st.runs ? "runs a script" : "waits"}</div>
     </div>
     <div class="queue" data-stage="${esc(st.name)}">${
       items.length ? items.map((it, i) => card(it, active, i)).join("")
-                   : `<div class="slot">empty</div>`}</div>
+                   : `<div class="slot">Nothing here</div>`}</div>
   </section>`;
 }
 
@@ -1019,7 +1135,7 @@ function terminus(st, items) {
   return `<section class="terminus">
     <div class="plate">
       <div class="name">${esc(st.name)}${tally(items)}</div>
-      <div class="runs-label">end of line</div>
+      <div class="runs-label">Finished</div>
     </div>
     <div class="queue">${items.slice(0, n).map(it => card(it, [], null)).join("")}${
       left > 0 ? `<button class="more" data-stage="${esc(st.name)}">Show ${Math.min(10, left)} more · ${left} older</button>` : ""}</div>
@@ -1036,9 +1152,11 @@ document.addEventListener("click", e => {
 // a column to look at, so the count is where a stage says it is holding
 // something a person has to deal with.
 function tally(items) {
-  const held = items.filter(it => it.blocked).length;
+  const asks = items.filter(it => it.blocked && (blocks[it.id] || {}).asked).length;
+  const held = items.filter(it => it.blocked).length - asks;
   return `<span class="count">${items.length}${
-    held ? ` &middot; <span class="held">${held} blocked</span>` : ""}</span>`;
+    asks ? ` &middot; <span class="asks">${asks} need${asks === 1 ? "s" : ""} you</span>` : ""}${
+    held ? ` &middot; <span class="held">${held} stopped</span>` : ""}</span>`;
 }
 
 function card(it, active, place) {
@@ -1125,9 +1243,9 @@ async function inspect(id, title, stage) {
   if (askBtn) askBtn.onclick = () => openAsk(id, title);
   // The report is derived from run history, so it exists for every item;
   // on one still moving it is the passage so far.
-  $("#report").innerHTML = `<div class="report-head"><button class="ctl rbtn">${
-    stageBy(stage)?.terminal ? "Final report" : "Report so far"}</button></div>`;
-  $("#report .rbtn").onclick = () => openReport(id, title);
+  const label = stageBy(stage)?.terminal ? "Final report" : "Report so far";
+  $("#report").innerHTML = `<div class="report-head"><button class="ctl rbtn" data-label="${label}">${label}</button></div>`;
+  $("#report .rbtn").onclick = e => openReport(id, title, e.target);
   await loadHistory(id);
 }
 
@@ -1135,20 +1253,36 @@ async function inspect(id, title, stage) {
 // a copy, a file, or the browser's own print-to-PDF. Derived fresh on every
 // open, never cached, because it thins as retention sweeps the runs it is
 // built from.
-async function openReport(id, title) {
+async function openReport(id, title, btn) {
+  // The dialog opens at once and says it is loading: the report is derived
+  // by walking run history, which on a busy board is seconds, and a button
+  // that does nothing for seconds gets pressed again.
+  const dlg = $("#reportdlg");
+  const head = (ready) => `<div class="rhead"><b>${esc(title || id)}</b><span class="grow"></span>
+      ${ready ? `<button class="ctl" data-act="copy">Copy markdown</button>
+      <button class="ctl" data-act="md">Download .md</button>
+      <button class="ctl" data-act="print">Print / PDF</button>` : ""}
+      <button class="ctl" data-act="close">Close</button></div>`;
+  dlg.innerHTML = `${head(false)}<div class="report rbody"><div class="slot loading">Building the report from run history…</div></div>`;
+  dlg.onclick = e => { if (e.target.dataset?.act === "close" || e.target === dlg) dlg.close(); };
+  if (!dlg.open) dlg.showModal();
+  if (btn) { btn.disabled = true; btn.textContent = "Loading…"; }
   let md;
   try {
     const res = await fetch(`/api/items/${encodeURIComponent(id)}/report`);
-    if (!res.ok) { refuse(id, (await res.text()).trim() || "no report"); return; }
+    if (!res.ok) {
+      dlg.querySelector(".rbody").innerHTML = `<div class="slot err">${esc((await res.text()).trim() || "no report")}</div>`;
+      return;
+    }
     md = await res.text();
-  } catch { return; }
-  const dlg = $("#reportdlg");
-  dlg.innerHTML = `<div class="rhead"><b>${esc(title || id)}</b><span class="grow"></span>
-      <button class="ctl" data-act="copy">Copy markdown</button>
-      <button class="ctl" data-act="md">Download .md</button>
-      <button class="ctl" data-act="print">Print / PDF</button>
-      <button class="ctl" data-act="close">Close</button></div>
-    <div class="report rbody">${mdToHTML(md)}</div>`;
+  } catch (err) {
+    dlg.querySelector(".rbody").innerHTML = `<div class="slot err">could not load the report: ${esc(String(err))}</div>`;
+    return;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = btn.dataset.label || "Report"; }
+  }
+  if (!dlg.open) return; // closed while it loaded
+  dlg.innerHTML = `${head(true)}<div class="report rbody">${mdToHTML(md)}</div>`;
   dlg.onclick = async e => {
     const act = e.target.dataset && e.target.dataset.act;
     if (!act) { if (e.target === dlg) dlg.close(); return; }
@@ -1165,10 +1299,17 @@ async function openReport(id, title) {
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
     if (act === "print") {
-      // Only the report prints: the class hides everything else, and the
-      // browser's own dialog offers "Save as PDF".
+      // Printed from a plain block in the page, never from the dialog: a
+      // modal is fixed to the viewport and clipped to it by the browser's
+      // own stylesheet, which prints as one page with a scrollbar. The class
+      // hides everything else, and the browser's dialog offers "Save as PDF".
+      const out = $("#printout");
+      out.innerHTML = mdToHTML(md);
       document.body.classList.add("print-report");
-      addEventListener("afterprint", () => document.body.classList.remove("print-report"), { once: true });
+      addEventListener("afterprint", () => {
+        document.body.classList.remove("print-report");
+        out.innerHTML = "";
+      }, { once: true });
       window.print();
     }
   };
