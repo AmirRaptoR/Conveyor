@@ -148,4 +148,43 @@ chk "and blocked's own fields are there too"    "$(jq -r .kind "$CONVEYOR_RESULT
 record_session
 chk "no session, nothing written" "$(cat "$CONVEYOR_RESULT")" ""
 
+# 17. a LONG stream — the case every check above was too small to reach.
+#
+# claude_session pipes jq into `head -1`, and every event carries a session_id,
+# so on a real run jq is still writing thousands of lines when head takes its
+# one and leaves. jq dies of SIGPIPE, `pipefail` makes the pipeline 141, and an
+# unguarded `sess=$(claude_session)` hands that status to `set -e`, which kills
+# the adapter where it stands.
+#
+# That is not a hypothetical: it is where every `error_max_turns` run went. The
+# turns branch is `record_session` and then `blocked turns`, so the adapter died
+# on the first line and the item was never marked — it was recorded as a plain
+# failure with exit 141, losing the session that makes a turn-wall stop
+# resumable. Fifteen review runs, ten implement, five approve and two refine.
+#
+# The size is the whole point of this case. Two events cannot reproduce it, and
+# case 14 above has exactly two.
+python3 -c "
+import json
+with open('$CLAUDE_RAW','w') as f:
+    f.write(json.dumps({'type':'system','subtype':'init','model':'claude-sonnet-5','session_id':'sess-long'})+'\n')
+    for i in range(20000):
+        f.write(json.dumps({'type':'assistant','session_id':'sess-long','n':i})+'\n')
+"
+chk "a long stream still yields the session" "$(claude_session)" "sess-long"
+chk "a long stream still yields the model"   "$(claude_model)" "claude-sonnet-5"
+
+# The status, not the value, is what killed the adapters — and it is the whole
+# contract these two carry: both document "nothing is a normal answer", so
+# neither has any business returning non-zero for any input at all. Asserted on
+# the helpers directly rather than through record_session, because errexit
+# inside a command substitution does not reliably reproduce what it does at the
+# top level of a script, which is where the adapters call it.
+chk "reading a long stream is not a failure" "$(claude_session >/dev/null; echo $?)" "0"
+chk "nor is reading the model"               "$(claude_model >/dev/null; echo $?)" "0"
+
+: > "$CONVEYOR_RESULT"
+record_session
+chk "record_session gets a session out of it" "$(jq -r .session "$CONVEYOR_RESULT")" "sess-long"
+
 exit $fail
