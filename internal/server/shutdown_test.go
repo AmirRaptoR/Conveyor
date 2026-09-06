@@ -97,6 +97,95 @@ sources:
 	return cfg, runner.New(filepath.Join(dir, "runs")), dir
 }
 
+// blockingListPipelineFor lays down a one-source pipeline whose list script
+// blocks until the test releases it, so discovery itself can be held
+// mid-flight — the counterpart to pipelineFor holding a stage.
+func blockingListPipelineFor(t *testing.T) (*config.Config, *runner.Runner, string) {
+	t.Helper()
+	dir := t.TempDir()
+	started := filepath.Join(dir, "list-started")
+	release := filepath.Join(dir, "list-release")
+
+	writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), `#!/bin/sh
+trap '' TERM
+touch `+started+`
+while [ ! -f `+release+` ]; do sleep 0.02; done
+echo "[]" > "$CONVEYOR_RESULT"
+`)
+	writeScript(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\nexit 0\n")
+	if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(dir, "conveyor.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`version: 1
+poll: 100ms
+stages:
+  - name: backlog
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: fake
+    workdir: ./repo
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg, runner.New(filepath.Join(dir, "runs")), dir
+}
+
+// Drain must wait for discovery, not just transitions: poll's own list run
+// writes under the data directory the same as a stage does, and a restart
+// racing it is exactly the half-written record the owner lock exists to
+// prevent.
+func TestDrainWaitsForDiscoveryNotJustTransitions(t *testing.T) {
+	cfg, r, dir := blockingListPipelineFor(t)
+	runsRoot := filepath.Join(dir, "runs")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(cfg, r)
+	s.drainGrace = 5 * time.Second
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- s.Run(ctx, "127.0.0.1:0", false) }()
+
+	waitFor(t, "the list script to start", func() bool {
+		_, err := os.Stat(filepath.Join(dir, "list-started"))
+		return err == nil
+	})
+
+	cancel()
+
+	select {
+	case err := <-runErr:
+		t.Fatalf("Run returned (err=%v) while the list run was still going", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "list-release"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run returned an error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return once the list run finished")
+	}
+
+	run := latestMeta(t, runsRoot)
+	if run.FinishedAt.IsZero() {
+		t.Error("the list run's meta.json has no finishedAt after Run returned")
+	}
+}
+
 // Shutdown must stop dispatch, cancel workers, wait for their completion and
 // only then let the caller release ownership — cmdServe's defer unlocks the
 // data directory the instant Run returns, so returning early hands a fresh
