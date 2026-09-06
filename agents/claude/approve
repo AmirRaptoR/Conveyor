@@ -482,6 +482,13 @@ post_conflict_marker() {
 	fi
 }
 
+# non_fast_forward <push-output> — a rejected push's own text, not just one
+# phrase of it: git says "(non-fast-forward)" for a diverged branch but
+# "(fetch first)" for one that is merely behind, and both are the same case
+# for criterion 24 (the branch moved since this worktree was reset to it).
+# Verified against this host's own git (2.53.0), which emits both.
+non_fast_forward() { grep -qiE 'non-fast-forward|fetch first|stale info' <<<"$1"; }
+
 # resolve_conflict — gate 8's model-run attempt. Reached only after try_rebase
 # has failed, CONFLICT_RESOLVE has not disabled it, the PR is not
 # cross-repository, its head is this pipeline's own issue-<ref> branch, and
@@ -544,7 +551,7 @@ resolve_conflict() {
 			clean_push_rc=$?
 			set -e
 			if [[ "$clean_push_rc" -ne 0 ]]; then
-				if grep -qi 'non-fast-forward' <<<"$clean_push_out"; then
+				if non_fast_forward "$clean_push_out"; then
 					blocked conflict "pushing the merge that resolved #$pr's conflict with $base_ref was rejected as non-fast-forward."
 				fi
 				echo "pushing the merge that resolved #$pr's conflict with $base_ref failed: $clean_push_out" >&2
@@ -663,7 +670,7 @@ continues the same merge rather than starting over."
 	push_rc=$?
 	set -e
 	if [[ "$push_rc" -ne 0 ]]; then
-		if grep -qi 'non-fast-forward' <<<"$push_out"; then
+		if non_fast_forward "$push_out"; then
 			blocked conflict "pushing the resolved conflict for #$pr to $head_ref was rejected as non-fast-forward."
 		fi
 		echo "pushing the resolved conflict for #$pr failed: $push_out" >&2
