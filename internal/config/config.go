@@ -66,6 +66,29 @@ type Concurrency struct {
 type Logs struct {
 	Retention Duration `yaml:"retention"`
 	SweepAt   string   `yaml:"sweepAt"`
+	// retentionSet is whether `retention:` appeared in the config at all. An
+	// omitted key and an explicit `retention: 0` decode to the same zero
+	// Duration, but they mean different things — one wants the default, the
+	// other is a load error — and only the raw node tells them apart.
+	retentionSet bool
+}
+
+// UnmarshalYAML decodes into an unexported-field-preserving alias so
+// retentionSet can be recorded from the raw node before that information is
+// lost to the zero value every other Duration field can't be told apart from.
+func (l *Logs) UnmarshalYAML(n *yaml.Node) error {
+	type plain Logs
+	var p plain
+	if err := n.Decode(&p); err != nil {
+		return err
+	}
+	*l = Logs(p)
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == "retention" {
+			l.retentionSet = true
+		}
+	}
+	return nil
 }
 
 type Stage struct {
@@ -200,6 +223,9 @@ type Duration time.Duration
 
 var dayRe = regexp.MustCompile(`^(\d+)d$`)
 
+// sweepAtRe is 24-hour HH:MM, the only form the daily retention sweep accepts.
+var sweepAtRe = regexp.MustCompile(`^([01]\d|2[0-3]):([0-5]\d)$`)
+
 func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 	s := strings.TrimSpace(n.Value)
 	if s == "" {
@@ -274,7 +300,7 @@ func (c *Config) applyDefaults() {
 	if c.Timeout == 0 {
 		c.Timeout = Duration(90 * time.Minute)
 	}
-	if c.Logs.Retention == 0 {
+	if !c.Logs.retentionSet && c.Logs.Retention == 0 {
 		c.Logs.Retention = Duration(30 * 24 * time.Hour)
 	}
 	if c.Logs.SweepAt == "" {
@@ -621,6 +647,12 @@ func (c *Config) Validate() []string {
 	}
 	if c.Concurrency.Global < 1 {
 		add("concurrency.global must be at least 1")
+	}
+	if c.Logs.Retention <= 0 {
+		add("logs.retention must be greater than zero, got %s", time.Duration(c.Logs.Retention))
+	}
+	if !sweepAtRe.MatchString(c.Logs.SweepAt) {
+		add("logs.sweepAt must be HH:MM (24-hour), got %q", c.Logs.SweepAt)
 	}
 
 	if len(c.Stages) < 2 {

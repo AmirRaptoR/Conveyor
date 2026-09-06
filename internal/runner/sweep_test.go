@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/AmirRaptoR/Conveyor/internal/model"
@@ -66,5 +67,34 @@ func TestSweepToleratesNoRunsYet(t *testing.T) {
 	n, err := SweepInterrupted(filepath.Join(t.TempDir(), "never-created"))
 	if err != nil || n != 0 {
 		t.Fatalf("sweep of a missing root = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
+// A meta.json the sweep cannot read (as opposed to one that simply is not
+// there) is worth reporting: silently skipping it once meant a run nobody
+// could explain, indistinguishable from one that behaved.
+func TestSweepReportsRatherThanSilentlySkipsUnreadableRuns(t *testing.T) {
+	root := t.TempDir()
+	killed := writeRun(t, root, "2026-08-28", "a", model.OutcomeRunning)
+	unreadable := writeRun(t, root, "2026-08-28", "b", model.OutcomeRunning)
+	if err := os.Chmod(filepath.Join(unreadable, "meta.json"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(unreadable, "meta.json"), 0o644) })
+
+	n, err := SweepInterrupted(root)
+	if err == nil {
+		t.Fatal("expected an error naming the unreadable meta.json")
+	}
+	if !strings.Contains(err.Error(), unreadable) && !strings.Contains(err.Error(), "meta.json") {
+		t.Errorf("error %v does not name the unreadable run", err)
+	}
+	// The one run it could read is still settled — one bad directory must not
+	// stop the rest of the sweep.
+	if n != 1 {
+		t.Errorf("swept %d runs, want 1 (the readable one)", n)
+	}
+	if got := outcomeOf(t, killed); got != model.OutcomeInterrupted {
+		t.Errorf("readable run = %q, want interrupted", got)
 	}
 }

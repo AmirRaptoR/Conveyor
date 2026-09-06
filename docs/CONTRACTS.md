@@ -403,10 +403,31 @@ logs:
   sweepAt: 04:00       # daily; also runs once on startup
 ```
 
-One exception, and it matters: **a run is pinned if it is the most recent failed
-or blocked run of an item that is still in a failed or blocked state.** Retention
-must never delete the evidence for the thing currently asking for attention.
-Pinned runs are reported in the sweep log so they cannot pile up unnoticed.
+Comparing days, not timestamps: a run directory whose day is strictly before
+the cutoff's UTC date is deleted, one on or after it is kept, and a whole
+expired day can be skipped without reading a single `meta.json` — conservative
+by up to 24 hours in the safe direction. The sweep runs once at startup and
+then daily at `sweepAt`, in the process's own local time zone, and never under
+`-watch`: a server that only observes must not delete anything either.
+
+Three exceptions, and they matter:
+
+- **A run whose `meta.json` outcome is still `running` is never deleted**,
+  regardless of age. Nothing this process started is alive to have finished
+  writing that record honestly, and a killed run is exactly the one someone
+  needs to read afterwards.
+- **The most recent failed, blocked or timeout run of an item that is still
+  marked is never deleted.** Retention must never delete the evidence for the
+  thing currently asking for attention.
+- **The most recent successful move that landed a currently-listed item in the
+  stage it currently occupies is never deleted.** Sweeping it would blank the
+  stage-age chip for an item still sitting right there.
+
+Both item-based pins are evaluated against the board's *current* items only —
+an expired run belonging to nothing on the board today is swept normally. A
+day directory left empty by the sweep is removed; one still holding a pinned
+run is not. Pinned runs are reported in the sweep log, named individually, so
+they cannot pile up unnoticed.
 
 ### Failure is a first-class state
 

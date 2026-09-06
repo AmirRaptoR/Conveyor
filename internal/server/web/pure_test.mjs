@@ -30,10 +30,10 @@ const region = html.slice(start, end);
 const sandbox = {};
 vm.createContext(sandbox);
 vm.runInContext(
-  region + "\nglobalThis.__pure = { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, controlsForMode, isHttpUrl };",
+  region + "\nglobalThis.__pure = { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, controlsForMode, isHttpUrl, staleThresholdMs, sourceDegraded };",
   sandbox,
 );
-const { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, controlsForMode, isHttpUrl } = sandbox.__pure;
+const { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, controlsForMode, isHttpUrl, staleThresholdMs, sourceDegraded } = sandbox.__pure;
 
 test("focusKeyOf: a card and its .open link are different keys", () => {
   assert.equal(focusKeyOf({ kind: "card", id: "issue-44", control: "card" }), "card:issue-44:card");
@@ -125,4 +125,60 @@ test("isHttpUrl: only http and https pass, case-insensitively", () => {
   assert.equal(isHttpUrl("data:text/html,<script>1</script>"), false);
   assert.equal(isHttpUrl(""), false);
   assert.equal(isHttpUrl(undefined), false);
+});
+
+// ---- staleThresholdMs -------------------------------------------------------
+
+test("staleThresholdMs: absent pollNs falls back to 10 minutes", () => {
+  assert.equal(staleThresholdMs(undefined), 10 * 60 * 1000);
+  assert.equal(staleThresholdMs(0), 10 * 60 * 1000);
+});
+
+test("staleThresholdMs: is 2x the configured poll interval", () => {
+  assert.equal(staleThresholdMs(5 * 60 * 1e9), 10 * 60 * 1000); // 5m poll -> 10m
+});
+
+test("staleThresholdMs: floored at 60s, so a fast test poll does not call every source stale between polls", () => {
+  assert.equal(staleThresholdMs(100 * 1e6), 60000); // 100ms poll, 2x would be 200ms
+});
+
+// ---- sourceDegraded ----------------------------------------------------------
+
+test("sourceDegraded: before the first refresh completes, nothing is degraded", () => {
+  assert.equal(sourceDegraded({ listError: "boom" }, 0, 0, 1_000_000), false);
+});
+
+test("sourceDegraded: a source with configuration problems is never degraded", () => {
+  assert.equal(sourceDegraded({ problems: ["bad workdir"], listError: "boom" }, 1000, 0, 1_000_000), false);
+});
+
+test("sourceDegraded: a non-empty listError is degraded", () => {
+  assert.equal(sourceDegraded({ listError: "exit 1" }, 1000, 0, 1_000_000), true);
+});
+
+test("sourceDegraded: never listed at all (no lastListedAt) is degraded", () => {
+  assert.equal(sourceDegraded({}, 1000, 0, 1_000_000), true);
+});
+
+test("sourceDegraded: listed well within the stale threshold is not degraded", () => {
+  const now = 1_000_000;
+  const s = { lastListedAt: new Date(now - 1000).toISOString() };
+  assert.equal(sourceDegraded(s, 1000, 0, now), false); // 1s old, 10m fallback threshold
+});
+
+test("sourceDegraded: exactly at the stale threshold's edge, older is degraded", () => {
+  const now = 1_000_000_000;
+  const pollNs = 100 * 1e6; // 100ms poll -> 60s floor
+  const justUnder = { lastListedAt: new Date(now - 59_000).toISOString() };
+  const justOver = { lastListedAt: new Date(now - 61_000).toISOString() };
+  assert.equal(sourceDegraded(justUnder, 1000, pollNs, now), false);
+  assert.equal(sourceDegraded(justOver, 1000, pollNs, now), true);
+});
+
+test("sourceDegraded: with pollNs absent, the 10-minute fallback applies", () => {
+  const now = 1_000_000_000;
+  const justUnder = { lastListedAt: new Date(now - 9 * 60 * 1000).toISOString() };
+  const justOver = { lastListedAt: new Date(now - 11 * 60 * 1000).toISOString() };
+  assert.equal(sourceDegraded(justUnder, 1000, 0, now), false);
+  assert.equal(sourceDegraded(justOver, 1000, 0, now), true);
 });
