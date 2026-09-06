@@ -235,6 +235,15 @@ test("handBack: a failure is reported inside the open panel, not only on the car
   assert.equal(panelFault.hidden, false);
 });
 
+test("handBack: a 2xx response clears the whole stop notice, .hand included", async () => {
+  const p = page(async () => ({ ok: true, status: 200, text: async () => "" }));
+  const btn = stopBtn("Hand back");
+  const stopEl = p.el("#stop");
+  stopEl.innerHTML = "<div>stop notice with .hand inside it</div>";
+  await p.sandbox.handBack("issue-9", btn);
+  assert.equal(stopEl.innerHTML, "", "the control is gone rather than merely re-enabled — a fresh redraw supplies the next one");
+});
+
 // ---- sendAnswer() — POST /api/items/{id}/unblock (question path) --------
 
 test("sendAnswer: a 500 restores the ask-btn's own prior label, whatever it was", async () => {
@@ -260,6 +269,14 @@ test("sendAnswer: a failure is reported inside the open panel too", async () => 
   await p.sandbox.sendAnswer("issue-9", "my answer");
   const panelFault = p.el("#stop .fault");
   assert.match(panelFault.textContent, /rejected/);
+});
+
+test("sendAnswer: a 2xx response clears the whole stop notice, .ask-btn included", async () => {
+  const p = page(async () => ({ ok: true, status: 200, text: async () => "" }));
+  const stopEl = p.el("#stop");
+  stopEl.innerHTML = "<div>stop notice with .ask-btn inside it</div>";
+  await p.sandbox.sendAnswer("issue-9", "my answer");
+  assert.equal(stopEl.innerHTML, "");
 });
 
 // ---- #unblock-all — POST /api/unblock ------------------------------------
@@ -297,6 +314,9 @@ test("#unblock-all: a 2xx response keeps the existing (timer-based) re-enable", 
   assert.equal(btn.disabled, true, "still disabled until the timer fires, as before");
   assert.equal(p.calls.timers.length, 1);
   assert.equal(p.calls.timers[0].ms, 2000);
+  p.calls.timers[0].fn(); // the timer itself is what re-enables it
+  assert.equal(btn.disabled, false);
+  assert.equal(btn.textContent, "Unblock all (1)");
 });
 
 // ---- #tick — POST /api/tick ------------------------------------------
@@ -321,6 +341,17 @@ test("#tick: the existing 409 message is preserved verbatim", async () => {
   const btn = p.el("#tick");
   await btn.onclick({ target: btn });
   assert.equal(p.el("#line1").textContent, "a tick is already in flight");
+});
+
+test("#tick: a 2xx response keeps the existing (timer-based) re-enable", async () => {
+  const p = page(async () => ({ ok: true, status: 200, text: async () => "" }));
+  const btn = p.el("#tick");
+  await btn.onclick({ target: btn });
+  assert.equal(btn.disabled, true, "still disabled until the timer fires, as before");
+  assert.equal(p.calls.timers.length, 1);
+  assert.equal(p.calls.timers[0].ms, 1500);
+  p.calls.timers[0].fn();
+  assert.equal(btn.disabled, false);
 });
 
 // ---- #refresh — POST /api/refresh ----------------------------------------
