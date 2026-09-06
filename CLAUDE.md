@@ -61,9 +61,6 @@ non-loopback address with no `auth.users` is refused**, because the board starts
 agent runs, reorders work and hands items back: reaching it is enough to drive
 every repository the config enrols.
 
-Not built yet: the log retention sweep (`logs.retention`, with the pinning rule
-in CONTRACTS §6). See `docs/DESIGN.md`.
-
 ## Invariants — do not break these
 
 - **stdout/stderr are logs and are never parsed.** Structured data comes back
