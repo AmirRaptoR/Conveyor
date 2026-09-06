@@ -102,7 +102,12 @@ finished transition wakes the scheduler, and the item that just exited 10 has
 not moved — it is still the best candidate in the stage it never left, so
 without this it is picked again immediately and the "try again later" it asked
 for arrives two seconds later, forever. A stage that deferred is skipped until
-the next listing lands; a person pressing the tick button clears that too.
+its source's next listing lands — specifically, a listing that *began* after
+the deferral was set; one already in flight when the deferral was set has not
+had the chance to answer it yet and leaves the item resting. A person pressing
+the tick button clears every deferral regardless of timing: that gesture means
+"look again now", and honouring one against it would answer a person with
+nothing.
 
 A blocked script may say why: `{"blocked": true, "reason": "…"}` in
 `$CONVEYOR_RESULT`. The engine passes the reason to `move`, and a provider that

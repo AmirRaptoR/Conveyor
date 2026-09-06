@@ -250,6 +250,20 @@ type Server struct {
 	// nothing about the item actually changed. Pruned when the item leaves
 	// the board, and cleared the moment a later transition for it succeeds.
 	transitionErrs map[string]TransitionError
+	// confirmedAt is when an item's entry in state.Items was last set by a
+	// completed transition (applyTransition), keyed by id. refresh compares
+	// this against sourceGen to decide whether a listing that began earlier
+	// may still be reporting that transition's pre-image (F03): a listing is
+	// trusted for an item only if it began after that item's last confirmed
+	// change, never by comparing content. Not bumped by a listing itself —
+	// only an engine transition counts, so a listing that merely repeats what
+	// is already known does not raise the bar against the next one.
+	confirmedAt map[string]time.Time
+	// sourceGen is the instant refresh stamped immediately before calling
+	// List for that source, keyed by source name — taken per source rather
+	// than once for the whole poll, so a slow source cannot make a fast
+	// source's fresh listing look stale in the same pass.
+	sourceGen map[string]time.Time
 	// paused is the agents the scheduler is holding work back from, by name.
 	//
 	// Not persisted, deliberately: it is a fact about the outside world right
@@ -301,7 +315,14 @@ type Server struct {
 	// So does the tick button: that gesture means "look again now", and
 	// honouring a deferral against it would answer a person with nothing.
 	resting map[string]bool
-	tick    chan struct{} // one buffered slot: ticks never queue up
+	// restingAt is when each resting[id] entry was set. refresh clears a
+	// deferral only when the item's source's listing this pass began after
+	// this instant — one set by a transition that completed after that
+	// listing began is not yet answered by it and must survive the clear.
+	// The tick button's own clear ignores this: "look again now" overrides
+	// every deferral regardless of when it was set.
+	restingAt map[string]time.Time
+	tick      chan struct{} // one buffered slot: ticks never queue up
 	// wake asks the scheduler to look again. One buffered slot, because the
 	// question is always the same one — what can move now — and a queue of it
 	// would be a queue of duplicates.
@@ -346,6 +367,9 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 	s.transitionErrs = map[string]TransitionError{}
 	s.paused = map[string]PauseView{}
 	s.resting = map[string]bool{}
+	s.restingAt = map[string]time.Time{}
+	s.confirmedAt = map[string]time.Time{}
+	s.sourceGen = map[string]time.Time{}
 	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
 
 	// Every log line reaches the browser as it is produced. This is the whole
@@ -561,6 +585,7 @@ func (s *Server) button(ctx context.Context, auto bool) {
 				// "Look again now", so nothing gets to say "not yet".
 				s.mu.Lock()
 				clear(s.resting)
+				clear(s.restingAt)
 				s.mu.Unlock()
 				s.wakeUp()
 				continue
@@ -637,14 +662,6 @@ func (s *Server) refresh(ctx context.Context) {
 	var items []model.Item
 	var warnings []string
 
-	// previous is what the board already knew, kept only so a failed listing
-	// below can fall back to it rather than deleting a source's items from
-	// the board on no information at all — the same bug F03 finds in the
-	// wholesale assignment, wearing a different hat.
-	s.mu.RLock()
-	previous := append([]model.Item(nil), s.state.Items...)
-	s.mu.RUnlock()
-
 	s.mu.Lock()
 	s.state.Polling = true
 	s.mu.Unlock()
@@ -658,6 +675,15 @@ func (s *Server) refresh(ctx context.Context) {
 		if !ok {
 			continue
 		}
+		// Stamped immediately before this source's own List call, not once
+		// for the whole refresh: a slow source earlier in the loop must not
+		// make this source's fresh listing look like it began before a
+		// transition that actually completed while the slow one was still
+		// running (F03).
+		genStart := time.Now()
+		s.mu.Lock()
+		s.sourceGen[src.Name] = genStart
+		s.mu.Unlock()
 		res, err := client.List(ctx)
 		if err != nil {
 			warnings = append(warnings, src.Name+": "+err.Error())
@@ -666,17 +692,13 @@ func (s *Server) refresh(ctx context.Context) {
 			// about it rather than have the wholesale assignment below wipe
 			// it off the board. A *successful* listing that genuinely omits
 			// an item still removes it — tombstones remain out of scope.
-			for _, it := range previous {
-				if it.Source == src.Name {
-					items = append(items, it)
-				}
-			}
+			items = append(items, s.mergeSourceListing(src.Name, genStart, nil, true)...)
 			continue
 		}
 		for _, w := range res.Warnings {
 			warnings = append(warnings, src.Name+": "+w.String())
 		}
-		items = append(items, res.Items...)
+		items = append(items, s.mergeSourceListing(src.Name, genStart, res.Items, false)...)
 	}
 	items = dedupeCrossSource(items, func(msg string) { warnings = append(warnings, msg) })
 
@@ -691,8 +713,27 @@ func (s *Server) refresh(ctx context.Context) {
 	s.state.UpdatedAt = time.Now()
 	s.state.Polling = false
 	// The listing every deferred stage was waiting for. Whatever it exited 10
-	// over has had a poll interval to change.
-	clear(s.resting)
+	// over has had a poll interval to change — but only for an item whose
+	// deferral was set *before* its source's own listing began (F03). One set
+	// by a transition that completed after that listing began is not yet
+	// answered by it: the listing may well have reported that transition's
+	// pre-image, and clearing the deferral would have the scheduler retry a
+	// stage the item is not actually resting in front of anymore, or retry an
+	// infrastructure failure the listing never had a chance to resolve.
+	srcOf := make(map[string]string, len(items))
+	for _, it := range items {
+		srcOf[it.ID] = it.Source
+	}
+	for id := range s.resting {
+		src, onBoard := srcOf[id]
+		gen, knownGen := s.sourceGen[src]
+		since, haveSince := s.restingAt[id]
+		if onBoard && knownGen && haveSince && since.After(gen) {
+			continue // the listing that just landed predates this deferral
+		}
+		delete(s.resting, id)
+		delete(s.restingAt, id)
+	}
 	// A mark cleared on the provider — a label removed by hand — takes its
 	// note with it. The provider is the authority on whether, always.
 	marked := map[string]bool{}
@@ -720,8 +761,87 @@ func (s *Server) refresh(ctx context.Context) {
 			delete(s.transitionErrs, id)
 		}
 	}
+	for id := range s.confirmedAt {
+		if !onBoard[id] {
+			delete(s.confirmedAt, id)
+		}
+	}
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
+}
+
+// mergeSourceListing reconciles one source's listing (fresh may be nil, for a
+// failed List) against the board's own live cache, so that a listing which
+// began before a transition completed cannot publish that transition's
+// pre-image (F03). genStart is when this source's List call began.
+//
+// The rule is by *when* the listing began, never by what it says: an item
+// reported differently by a listing that began after the transition
+// completed — a person moved it by hand — is trusted, even though its content
+// disagrees with the transition. Only a listing that began earlier is
+// refused, because it may be reporting what the provider looked like before
+// the transition wrote to it.
+func (s *Server) mergeSourceListing(src string, genStart time.Time, fresh []model.Item, failed bool) []model.Item {
+	s.mu.RLock()
+	cached := make(map[string]model.Item, len(s.state.Items))
+	for _, it := range s.state.Items {
+		if it.Source == src {
+			cached[it.ID] = it
+		}
+	}
+	s.mu.RUnlock()
+
+	if failed {
+		// No information about this source at all, not a signal that its
+		// work vanished: keep everything already known about it.
+		out := make([]model.Item, 0, len(cached))
+		for _, it := range cached {
+			out = append(out, it)
+		}
+		return out
+	}
+
+	out := make([]model.Item, 0, len(fresh)+len(cached))
+	seen := make(map[string]bool, len(fresh))
+	for _, it := range fresh {
+		seen[it.ID] = true
+		s.mu.RLock()
+		confirmedAt, haveConfirmed := s.confirmedAt[it.ID]
+		s.mu.RUnlock()
+		if haveConfirmed && confirmedAt.After(genStart) {
+			// A transition finished after this listing began: trust the
+			// cache, which already holds that transition's own outcome,
+			// over content this listing may have read beforehand.
+			if cur, ok := cached[it.ID]; ok {
+				out = append(out, cur)
+				continue
+			}
+		}
+		out = append(out, it)
+	}
+	// An item this source previously reported that the fresh listing does not
+	// (or could not, on a failed List) is normally gone — a successful
+	// listing that genuinely omits an item still removes it; tombstones stay
+	// out of scope. But its absence here is not new information when a
+	// transition for it is still running, or completed after this listing
+	// began: the listing did not include it because it was not done yet, not
+	// because the provider stopped reporting it.
+	for id, cur := range cached {
+		if seen[id] {
+			continue
+		}
+		if _, working := s.working.Load(id); working {
+			out = append(out, cur)
+			continue
+		}
+		s.mu.RLock()
+		confirmedAt, haveConfirmed := s.confirmedAt[id]
+		s.mu.RUnlock()
+		if haveConfirmed && confirmedAt.After(genStart) {
+			out = append(out, cur)
+		}
+	}
+	return out
 }
 
 // dedupeCrossSource enforces CONTRACTS.md §1's duplicate-id rule across the
@@ -1094,9 +1214,11 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 		// board keeps the reason past the next successful listing.
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "conveyor: %s: %v\n", item.ID, err)
+			now := time.Now()
 			s.mu.Lock()
-			s.transitionErrs[item.ID] = TransitionError{Reason: err.Error(), At: time.Now()}
+			s.transitionErrs[item.ID] = TransitionError{Reason: err.Error(), At: now}
 			s.resting[item.ID] = true
+			s.restingAt[item.ID] = now
 			s.mu.Unlock()
 		}
 		return
@@ -1138,6 +1260,11 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// reason exists in full, and a run history sweep must not be what stands
 	// between an operator and why their board stopped.
 	now := time.Now()
+	// This transition just wrote the authoritative cache entry for the item;
+	// a listing whose own List call for this source began before now may
+	// still be reporting whatever the provider looked like beforehand, and
+	// refresh must not let it overwrite this (F03).
+	s.confirmedAt[tr.Item.ID] = now
 	asked := false
 	if tr.Blocked {
 		var session string
@@ -1178,8 +1305,10 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// provider that is already failing.
 	if (tr.Outcome == model.OutcomeNoop && tr.From == tr.Stage) || (tr.Outcome == "" && tr.Err != nil) {
 		s.resting[tr.Item.ID] = true
+		s.restingAt[tr.Item.ID] = now
 	} else {
 		delete(s.resting, tr.Item.ID)
+		delete(s.restingAt, tr.Item.ID)
 	}
 	s.mu.Unlock()
 
@@ -1752,6 +1881,7 @@ func (s *Server) unblock(ctx context.Context, item model.Item) error {
 	// Handing an item back is an answer, and an answer is exactly the change a
 	// deferred stage was waiting to see.
 	delete(s.resting, item.ID)
+	delete(s.restingAt, item.ID)
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
 	s.wakeUp()
