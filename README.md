@@ -13,9 +13,10 @@ your repositories leaves the machine. A work item is whatever a script emits, so
 GitHub issues, Azure PBIs, Jira tickets or a text file are all just different
 `list` scripts.
 
-> **Status: early.** The engine runs end to end against mocks — config, runner,
-> sources and the transition table are working and tested. There is no web UI and
-> no GitHub source yet. See [docs/DESIGN.md](docs/DESIGN.md) for the build order.
+> **Status: working.** The engine runs end to end against mocks and against
+> real repositories — config, runner, sources and the transition table are
+> tested, `conveyor serve` renders the board, and `providers/github/` runs
+> against real issues. See [docs/DESIGN.md](docs/DESIGN.md) for what remains.
 
 ## How it works
 
