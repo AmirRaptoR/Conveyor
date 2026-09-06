@@ -12,6 +12,64 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 )
 
+// claimRefusal is why claimAndLaunch declined to start a transition.
+type claimRefusal int
+
+const (
+	claimAccepted claimRefusal = iota
+	claimItemBusy              // this item already has a transition in flight
+	claimSlotBusy              // the (source, stage) slot has none free
+	claimAgentPaused           // the stage's agent is over quota and overridePause is false
+)
+
+// claim is the only place s.working is populated. Every dispatch path — the
+// scheduler (launch), the tick button (advance) and a manual start
+// (handleStart) — calls this and nothing else stores into working, so "an
+// item has a transition in flight" is asserted in one place instead of three.
+//
+// The reservation is atomic: working.LoadOrStore either claims the item or
+// finds it already claimed, with no gap in which a second caller can read
+// "free" before the first writes "taken". The (source, stage) slot is taken
+// only after the item is reserved, and released again immediately if the slot
+// turns out to be full — a caller that gets back anything other than
+// claimAccepted has changed nothing: working and Locks are exactly as they
+// were found.
+//
+// overridePause is true only for the tick button: CLAUDE.md is explicit that
+// "the tick button still overrides" a paused agent, because under -watch it
+// is the only thing that moves anything. Every other caller is stopped by a
+// paused agent exactly as it is stopped by a busy slot.
+//
+// claim only reserves; it does not run anything. advance runs the transition
+// inline so it can refresh right afterwards (the button's contract under
+// -watch), while launch and handleStart hand it to a goroutine — both call
+// this same function first.
+func (s *Server) claim(item model.Item, target string, overridePause bool) claimRefusal {
+	if !overridePause && s.agentPaused(s.cfg.AgentFor(item.Source, target)) {
+		return claimAgentPaused
+	}
+	if _, already := s.working.LoadOrStore(item.ID, struct{}{}); already {
+		return claimItemBusy
+	}
+	if !s.eng.Locks().TryAcquire(item.Source, target) {
+		s.working.Delete(item.ID)
+		return claimSlotBusy
+	}
+	return claimAccepted
+}
+
+// claimAndLaunch reserves the item (via claim) and, once reserved, runs the
+// transition asynchronously — the shape every dispatch path except the tick
+// button wants.
+func (s *Server) claimAndLaunch(ctx context.Context, item model.Item, target string, overridePause bool) claimRefusal {
+	r := s.claim(item, target, overridePause)
+	if r == claimAccepted {
+		s.inFlight.Add(1)
+		go s.transition(ctx, item, target)
+	}
+	return r
+}
+
 // launch starts every transition the locks currently permit and returns how
 // many it started. Candidates whose source or target stage is already busy are
 // skipped rather than queued, so a slow stage never holds up a free one.
@@ -37,12 +95,16 @@ func (s *Server) launch(ctx context.Context) int {
 	// re-picking the same candidate and never terminates.
 	fullSrc := map[string]bool{}
 	fullStage := map[string]bool{}
+	// Items claimAndLaunch has already turned away this pass — a race with a
+	// manual start, not a full axis, so it excludes only this one candidate
+	// rather than every item sharing its source or stage.
+	busy := map[string]bool{}
 
 	for {
 		free := items[:0:0]
 		for _, it := range items {
 			target, ok := pipeline.Target(s.cfg, &it)
-			if !ok || fullSrc[it.Source] || fullStage[target] ||
+			if !ok || fullSrc[it.Source] || fullStage[target] || busy[it.ID] ||
 				s.eng.Locks().Busy(it.Source, target) {
 				continue
 			}
@@ -65,22 +127,20 @@ func (s *Server) launch(ctx context.Context) int {
 		if item == nil {
 			return n
 		}
-		// Claim before launching. Checking Busy and starting a goroutine leaves
-		// a gap in which the next pass sees the slot free and decides the same
-		// thing again; the duplicate then bails, having spent a launch. The
-		// locks are the authority on capacity — Busy above re-reads them every
-		// iteration, so the pass keeps filling slots until they are actually
-		// gone.
-		if !s.eng.Locks().TryAcquire(item.Source, target) {
+		// Claim before launching, atomically: claimAndLaunch reserves the item
+		// and the (source, stage) slot together and releases both if either is
+		// refused, so a concurrent manual start or scheduler pass can never
+		// double-launch this item.
+		switch s.claimAndLaunch(ctx, *item, target, false) {
+		case claimSlotBusy:
 			fullSrc[item.Source] = true
 			fullStage[target] = true
 			continue
+		case claimItemBusy, claimAgentPaused:
+			busy[item.ID] = true
+			continue
 		}
-		it, to := *item, target
-		s.working.Store(it.ID, struct{}{})
-		s.inFlight.Add(1)
 		n++
-		go s.transition(ctx, it, to)
 	}
 }
 
@@ -110,19 +170,49 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 	// bad agent invocation: the answer is kept and the session dropped, because
 	// a resume that did not work names a conversation worth abandoning.
 	resume := s.answers.Get(item.ID)
-	tr, _ := s.eng.Advance(ctx, item.Source, &item, target, resume)
-	if tr != nil {
-		switch tr.Outcome {
-		case model.OutcomeFailure, model.OutcomeTimeout:
-			if resume.Answer != "" && resume.Session != "" {
-				_ = s.answers.Set(item.ID, model.Resume{Answer: resume.Answer})
-			}
-		default:
-			s.answers.Take(item.ID)
+	tr, err := s.eng.Advance(ctx, item.Source, &item, target, resume)
+	if tr == nil {
+		// An unknown source or stage: a config problem, not a transient one,
+		// and nothing ran — there is nothing to mark, move or spend an answer
+		// on. Recorded and rested the same way an initial move failure is
+		// (below), so the scheduler does not retry it on every wake, and the
+		// board keeps the reason past the next successful listing.
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: %s: %v\n", item.ID, err)
+			now := time.Now()
+			s.mu.Lock()
+			s.transitionErrs[item.ID] = TransitionError{Reason: err.Error(), At: now}
+			s.resting[item.ID] = true
+			s.restingAt[item.ID] = now
+			s.mu.Unlock()
 		}
-		s.applyTransition(tr)
-		s.hub.publish(event{Kind: "transition", Transition: tr})
+		return
 	}
+	switch {
+	case tr.Outcome == "":
+		// Unset only when nothing ran at all — the initial provider move
+		// failed before any script had the chance to consume the answer. It
+		// must survive to be handed to whichever run actually receives it.
+	case tr.Outcome == model.OutcomeFailure || tr.Outcome == model.OutcomeTimeout:
+		if resume.Answer != "" && resume.Session != "" {
+			_ = s.answers.Set(item.ID, model.Resume{Answer: resume.Answer})
+		}
+	default:
+		spent, err := s.answers.Take(item.ID, resume)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: %s: could not record its answer as spent: %v\n", item.ID, err)
+		} else if spent && resume.Answer != "" {
+			// Only now — after the run named by tr has actually been handed
+			// the answer — does the board get to say who received it.
+			s.mu.Lock()
+			info := s.answerInfo[item.ID]
+			info.ConsumedBy = tr.RunID
+			s.answerInfo[item.ID] = info
+			s.mu.Unlock()
+		}
+	}
+	s.applyTransition(tr)
+	s.hub.publish(event{Kind: "transition", Transition: tr})
 }
 
 // applyTransition writes an item's new stage into the cache the moment it is
@@ -144,6 +234,11 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// reason exists in full, and a run history sweep must not be what stands
 	// between an operator and why their board stopped.
 	now := time.Now()
+	// This transition just wrote the authoritative cache entry for the item;
+	// a listing whose own List call for this source began before now may
+	// still be reporting whatever the provider looked like beforehand, and
+	// refresh must not let it overwrite this (F03).
+	s.confirmedAt[tr.Item.ID] = now
 	asked := false
 	if tr.Blocked {
 		var session string
@@ -161,15 +256,33 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	if tr.Item.Stage != tr.From {
 		s.times[tr.Item.ID] = ItemTime{Stage: tr.Item.Stage, EnteredStage: now, RunID: tr.RunID}
 	}
+	// tr.Err is set on an infrastructure failure — an initial provider move
+	// that failed before any script ran (tr.Outcome == "") is the one F04
+	// specifically calls out, since there is no run and no mark to show for
+	// it otherwise. Recorded the same way Blocks is: kept until a later
+	// transition for this item succeeds, so a listing wholesale-replacing
+	// State.Warnings does not erase the only trace of it.
+	if tr.Err != nil {
+		s.transitionErrs[tr.Item.ID] = TransitionError{Reason: tr.Err.Error(), At: now}
+	} else {
+		delete(s.transitionErrs, tr.Item.ID)
+	}
 	// A no-op in the stage the item was already in is the script saying it has
 	// nothing to do yet — a pull request still settling, a check still running.
 	// Nothing about the board will answer it differently one second later, so
 	// it waits for the listing. Any other outcome is progress, and progress
 	// ends the deferral: the item is somewhere new, or marked, or due a retry.
-	if tr.Outcome == model.OutcomeNoop && tr.From == tr.Stage {
+	//
+	// An initial provider move that failed gets the same deferral and for the
+	// same reason: nothing ran, nothing changed, and retrying it on every
+	// scheduler wake instead of waiting for the next listing would hammer a
+	// provider that is already failing.
+	if (tr.Outcome == model.OutcomeNoop && tr.From == tr.Stage) || (tr.Outcome == "" && tr.Err != nil) {
 		s.resting[tr.Item.ID] = true
+		s.restingAt[tr.Item.ID] = now
 	} else {
 		delete(s.resting, tr.Item.ID)
+		delete(s.restingAt, tr.Item.ID)
 	}
 	s.mu.Unlock()
 
@@ -210,11 +323,13 @@ func (s *Server) advance(ctx context.Context) bool {
 	if item == nil {
 		return false
 	}
-	if !s.eng.Locks().TryAcquire(item.Source, target) {
+	// overridePause: true. CLAUDE.md — "the tick button still overrides" — and
+	// under -watch this is the only thing that ever moves an item, so a paused
+	// agent must not be able to wedge the whole board shut.
+	if s.claim(*item, target, true) != claimAccepted {
 		return false
 	}
 	defer s.eng.Locks().Release(item.Source, target)
-	s.working.Store(item.ID, struct{}{})
 	defer s.working.Delete(item.ID)
 	// Counted the same way schedule's launches are, so a drain waiting on
 	// inFlight actually waits for this too — the only mover with -watch set,

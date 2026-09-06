@@ -36,6 +36,14 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	for id, t := range s.times {
 		st.Times[id] = t
 	}
+	st.TransitionErrors = make(map[string]TransitionError, len(s.transitionErrs))
+	for id, e := range s.transitionErrs {
+		st.TransitionErrors[id] = e
+	}
+	st.Answers = make(map[string]AnswerView, len(s.answerInfo))
+	for id, a := range s.answerInfo {
+		st.Answers[id] = a
+	}
 	s.mu.RUnlock()
 	writeJSON(w, st)
 }
@@ -140,15 +148,28 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "conveyor is shutting down", http.StatusServiceUnavailable)
 		return
 	}
-	// Claim before launching, exactly as the scheduler does: a check followed
-	// by a goroutine leaves a gap the next pass can decide the same thing in.
-	if !s.eng.Locks().TryAcquire(item.Source, target) {
+	// A manual start goes through the same atomic claim as every other
+	// dispatch path (claim), and overrides exactly one guard:
+	//   - overrides: resting — a deferral means "wait for the next listing",
+	//     and dragging a card out of the backlog is a person asking for that
+	//     listing right now, in spirit if not in fact.
+	//   - does not override: the item claim (claimItemBusy below), the
+	//     (source, stage) slot (claimSlotBusy), a paused agent
+	//     (claimAgentPaused — unlike the tick button, a manual start is not
+	//     the last resort under -watch and must meet the same wall every
+	//     other launch does), or pipeline.Target refusing above (a marked
+	//     item, or no next stage).
+	switch s.claimAndLaunch(s.ctx, item, target, false) {
+	case claimItemBusy:
+		http.Error(w, fmt.Sprintf("%s is already running in %s", id, target), http.StatusConflict)
+		return
+	case claimSlotBusy:
 		http.Error(w, s.whyBusy(item.Source, target), http.StatusConflict)
 		return
+	case claimAgentPaused:
+		http.Error(w, s.whyPaused(s.cfg.AgentFor(item.Source, target)), http.StatusConflict)
+		return
 	}
-	s.working.Store(item.ID, struct{}{})
-	s.inFlight.Add(1)
-	go s.transition(s.ctx, item, target)
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -208,19 +229,30 @@ func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
 // see, waiting to be said into a conversation that was never re-asked.
 func (s *Server) answerThenUnblock(ctx context.Context, item model.Item, answer string) error {
 	answer = strings.TrimSpace(answer)
+	var resume model.Resume
 	if answer != "" {
 		s.mu.RLock()
 		sess := s.blocks[item.ID].Session
 		s.mu.RUnlock()
-		if err := s.answers.Set(item.ID, model.Resume{Answer: answer, Session: sess}); err != nil {
+		resume = model.Resume{Answer: answer, Session: sess}
+		if err := s.answers.Set(item.ID, resume); err != nil {
 			return err
 		}
 	}
 	if err := s.unblock(ctx, item); err != nil {
 		if answer != "" {
-			s.answers.Take(item.ID) // nothing consumed it; do not strand it
+			// Nothing will consume it: the mark is still in place, so no run
+			// is about to be handed this reply. Roll back exactly the value
+			// just set — never an unconditional delete, in case a person
+			// somehow answered again in the gap.
+			_, _ = s.answers.Take(item.ID, resume)
 		}
 		return err
+	}
+	if answer != "" {
+		s.mu.Lock()
+		s.answerInfo[item.ID] = AnswerView{RecordedAt: time.Now()}
+		s.mu.Unlock()
 	}
 	return nil
 }
@@ -510,6 +542,7 @@ func (s *Server) unblock(ctx context.Context, item model.Item) error {
 	// Handing an item back is an answer, and an answer is exactly the change a
 	// deferred stage was waiting to see.
 	delete(s.resting, item.ID)
+	delete(s.restingAt, item.ID)
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
 	s.wakeUp()

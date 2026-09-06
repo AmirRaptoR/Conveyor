@@ -37,9 +37,21 @@ type State struct {
 	// transition lands an item somewhere new, recovered from run history for
 	// what this process did not do itself, pruned when the item leaves the
 	// board.
-	Times     map[string]ItemTime `json:"times,omitempty"`
-	UpdatedAt time.Time           `json:"updatedAt"`
-	Polling   bool                `json:"polling"`
+	Times map[string]ItemTime `json:"times,omitempty"`
+	// TransitionErrors is the last infrastructure failure a transition hit
+	// for an item, keyed by id — an initial provider move that failed, an
+	// unknown source or stage. Distinct from Blocks: nothing here is a
+	// decision for a person, only a fact the board must not lose behind the
+	// next successful listing the way State.Warnings would.
+	TransitionErrors map[string]TransitionError `json:"transitionErrors,omitempty"`
+	// Answers is, per item, whether a person's reply is held and when it was
+	// recorded, and — once a run has actually received it — that run's id.
+	// Never the reverse order: an answer is never shown consumed before a run
+	// has been given it. Pruned when the item leaves the board, the same
+	// lifetime rule Times uses.
+	Answers   map[string]AnswerView `json:"answers,omitempty"`
+	UpdatedAt time.Time             `json:"updatedAt"`
+	Polling   bool                  `json:"polling"`
 	// Agents is how each agent the sources call says it is doing — a usage
 	// limit, a quota, whatever its own status script chose to report. Empty
 	// when no agent provides one.
@@ -122,6 +134,27 @@ type ItemTime struct {
 	// CONTRACTS §6 pins against retention so the stage-age chip never goes
 	// blank out from under a currently-listed item.
 	RunID string `json:"-"`
+}
+
+// TransitionError is an infrastructure failure a transition hit for an item —
+// distinct from a mark: nothing here is a decision for a person, only a fact
+// that the last attempt did not get as far as running or moving anything, and
+// is due another one. Cleared the moment a later transition for the same item
+// succeeds.
+type TransitionError struct {
+	Reason string    `json:"reason"`
+	At     time.Time `json:"at"`
+}
+
+// AnswerView is what the board can say about a held reply without reading the
+// answer itself: when it was recorded, and — once a run has actually been
+// given it — which run that was.
+type AnswerView struct {
+	RecordedAt time.Time `json:"recordedAt"`
+	// ConsumedBy is the run id that received this answer, set only after
+	// store.Answers.Take has actually spent it — never before, and never
+	// merely because a run started.
+	ConsumedBy string `json:"consumedBy,omitempty"`
 }
 
 type StageView struct {
@@ -248,6 +281,34 @@ type Server struct {
 	// the durable record, this is only the index into them a board read
 	// cannot afford to rebuild.
 	times map[string]ItemTime
+	// transitionErrs is the last infrastructure error a transition hit for an
+	// item — an initial provider move that failed, an unknown source or
+	// stage — kept the same way blocks and times are: State.Warnings is
+	// replaced wholesale on every refresh, so a transition error recorded
+	// only there would vanish behind the next successful listing even though
+	// nothing about the item actually changed. Pruned when the item leaves
+	// the board, and cleared the moment a later transition for it succeeds.
+	transitionErrs map[string]TransitionError
+	// confirmedAt is when an item's entry in state.Items was last set by a
+	// completed transition (applyTransition), keyed by id. refresh compares
+	// this against sourceGen to decide whether a listing that began earlier
+	// may still be reporting that transition's pre-image (F03): a listing is
+	// trusted for an item only if it began after that item's last confirmed
+	// change, never by comparing content. Not bumped by a listing itself —
+	// only an engine transition counts, so a listing that merely repeats what
+	// is already known does not raise the bar against the next one.
+	confirmedAt map[string]time.Time
+	// sourceGen is the instant refresh stamped immediately before calling
+	// List for that source, keyed by source name — taken per source rather
+	// than once for the whole poll, so a slow source cannot make a fast
+	// source's fresh listing look stale in the same pass.
+	sourceGen map[string]time.Time
+	// answerInfo is, per item, when its currently-held or last-recorded
+	// answer was recorded, and the run id that consumed it once one has.
+	// Memory-only, like paused: it is a fact about this process's own
+	// handling of a reply, not something a restart can recover from run
+	// history or the answers file, which holds only the reply itself.
+	answerInfo map[string]AnswerView
 	// everSwept is whether the retention sweep has ever actually deleted a
 	// run. It is what tells a run ID that resolves to nothing apart from "it
 	// never existed" (404) from "it is gone because retention removed it"
@@ -294,8 +355,7 @@ type Server struct {
 	// collision worktrees exist to prevent — and whichever exited first had its
 	// outcome routed as though it were the other's.
 	working sync.Map // itemID -> struct{}, held for the life of a transition
-	// resting is the items a stage asked to be left alone until the next
-	// listing, by ID.
+	// resting is the items left alone until the next listing, by ID.
 	//
 	// Exit 10 means "leave the item where it is, try again next poll"
 	// (CONTRACTS §2). It was being answered with "try again now": a finished
@@ -307,11 +367,29 @@ type Server struct {
 	// breaker in schedule capped each burst and then let the next one start,
 	// which is why this looked like a warning rather than a fault.
 	//
-	// Every listing clears it wholesale, because a listing IS the next poll.
-	// So does the tick button: that gesture means "look again now", and
-	// honouring a deferral against it would answer a person with nothing.
+	// The same mechanism now also holds an item back after an infrastructure
+	// failure that ran nothing at all — an initial provider move that failed,
+	// or an unknown source or stage (F04): retrying those on every scheduler
+	// wake instead of waiting for the next listing would hammer an already-
+	// failing provider once per poll interval rather than once per listing.
+	//
+	// A listing clears an item's deferral — a listing IS the next poll — but
+	// only if that item's source's own listing *began* after the deferral was
+	// set (F03): one already in flight when the deferral was set has not had
+	// the chance to answer it yet, and clearing it early would have the
+	// scheduler retry a stage the item is not actually resting in front of.
+	// See restingAt. The tick button's own clear ignores all of this: that
+	// gesture means "look again now", and honouring a deferral against it
+	// would answer a person with nothing.
 	resting map[string]bool
-	tick    chan struct{} // one buffered slot: ticks never queue up
+	// restingAt is when each resting[id] entry was set. refresh clears a
+	// deferral only when the item's source's listing this pass began after
+	// this instant — one set by a transition that completed after that
+	// listing began is not yet answered by it and must survive the clear.
+	// The tick button's own clear ignores this: "look again now" overrides
+	// every deferral regardless of when it was set.
+	restingAt map[string]time.Time
+	tick      chan struct{} // one buffered slot: ticks never queue up
 	// wake asks the scheduler to look again. One buffered slot, because the
 	// question is always the same one — what can move now — and a queue of it
 	// would be a queue of duplicates.
@@ -359,8 +437,13 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 	}
 	s.blocks = map[string]Block{}
 	s.times = map[string]ItemTime{}
+	s.transitionErrs = map[string]TransitionError{}
 	s.paused = map[string]PauseView{}
 	s.resting = map[string]bool{}
+	s.restingAt = map[string]time.Time{}
+	s.confirmedAt = map[string]time.Time{}
+	s.sourceGen = map[string]time.Time{}
+	s.answerInfo = map[string]AnswerView{}
 	s.listedAt = map[string]time.Time{}
 	s.listErr = map[string]string{}
 	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg, nil, nil), PollNs: cfg.Poll.D()}
