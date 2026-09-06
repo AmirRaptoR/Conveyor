@@ -86,8 +86,9 @@ type State struct {
 }
 
 // PersistFault is one run whose own record-keeping failed — set from
-// runner.Result.Run.Error, which is what a failed meta.json write leaves
-// there instead of a record that looks like a clean success.
+// runner.Result.PersistErr, which is what a failed meta.json write or
+// log.txt append leaves there instead of a record that looks like a clean
+// success.
 type PersistFault struct {
 	RunID   string    `json:"runId"`
 	ItemID  string    `json:"itemId,omitempty"`
