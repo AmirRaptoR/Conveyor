@@ -1663,6 +1663,32 @@ function setLogStatus(kind, text) {
 // so a superseded call finishing late cannot clear a newer call's buffer.
 let logGen = 0, logPending = false, logBuffer = [];
 
+// A live run can emit far more than a browser should keep as DOM nodes.
+// MAX_LOG_LINES bounds how many stay rendered; the oldest are discarded as
+// new ones arrive, and a single marker node (never one per discard) says how
+// many. The full log is never lost — it is still on disk, and reloading this
+// run through the paged GET /api/runs/{id} API reaches it.
+const MAX_LOG_LINES = 5000;
+let logDiscarded = 0, logMarker = null;
+
+function trimLog(log) {
+  const floor = logMarker ? 1 : 0;
+  while (log.childElementCount > MAX_LOG_LINES + floor) {
+    const victim = log.children[logMarker ? 1 : 0];
+    if (!victim) break;
+    log.removeChild(victim);
+    logDiscarded++;
+  }
+  if (logDiscarded > 0) {
+    if (!logMarker) {
+      logMarker = document.createElement("div");
+      logMarker.className = "ln status";
+      log.insertBefore(logMarker, log.firstChild);
+    }
+    logMarker.textContent = `… ${logDiscarded} earlier line(s) dropped from view; reload this run to see them all …`;
+  }
+}
+
 async function showRun(id) {
   followRun = id;
   const gen = ++logGen;
@@ -1683,6 +1709,16 @@ async function showRun(id) {
     // same run again while this was in flight — nothing of this response
     // belongs on screen any more.
     if (stale()) return;
+    if (res.status === 410) {
+      // Genuinely honest but coarse (CONTRACTS §6): this cannot prove *this*
+      // run was swept rather than never existing, only that runs before the
+      // horizon are gone — never to be confused with the old 500-run lookup
+      // cutoff, which just meant "we didn't look far enough".
+      const body = await res.json().catch(() => ({}));
+      setLogStatus("error", `Removed by retention on ${body.horizon || "an earlier date"}.`);
+      logPending = false;
+      return;
+    }
     if (!res.ok) {
       setLogStatus("error", `Could not load this run (HTTP ${res.status}).`);
       logPending = false;
@@ -1699,12 +1735,15 @@ async function showRun(id) {
   if (stale()) return;
   const log = $("#log");
   log.innerHTML = "";
+  // A newly opened run starts its DOM cap fresh — the marker and count both
+  // belonged to whichever run was open before.
+  logDiscarded = 0; logMarker = null;
   // Reset before replaying: a run with no TodoWrite call of its own should
   // not keep showing whichever run was open before it. renderLine repopulates
   // this as it walks the lines (and any buffered lines appendBuffered adds
   // after), so it ends on that run's own latest state.
   $("#todos").innerHTML = ""; $("#todos").hidden = true;
-  for (const line of lines) log.appendChild(renderLine(line));
+  for (const line of lines) { log.appendChild(renderLine(line)); trimLog(log); }
   logPending = false;
   appendBuffered(lines);
   if (!log.childElementCount) setLogStatus("empty", "No output.");
@@ -1731,7 +1770,7 @@ function appendBuffered(snapshotLines) {
     }
     if (match) { overlap = m; break; }
   }
-  for (let i = overlap; i < buf.length; i++) log.appendChild(renderLine(buf[i]));
+  for (let i = overlap; i < buf.length; i++) { log.appendChild(renderLine(buf[i])); trimLog(log); }
 }
 
 // An agent writes markdown and calls tools; showing that as one monospace blob
@@ -2093,6 +2132,7 @@ es.onmessage = ev => {
     const log = $("#log");
     const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
     log.appendChild(renderLine(e.line));
+    trimLog(log);
     if (pinned) log.scrollTop = log.scrollHeight;
     return;
   }
