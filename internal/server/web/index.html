@@ -373,6 +373,12 @@
   }
   .stop p { margin:0; color:var(--ink); font-size:12px; line-height:1.65; white-space:pre-wrap; }
   .stop .meta { margin-top:8px; color:var(--faint); font-size:10.5px; }
+  /* A failed handBack/sendAnswer inside the open panel: refuse() alone draws
+     onto the board card, which #panel and #scrim occlude while it is open. */
+  .stop .fault {
+    margin-top:10px; padding:7px 9px; border:1px solid color-mix(in srgb, var(--stop) 40%, var(--rule-soft));
+    border-radius:2px; color:var(--stop); font-size:11.5px; line-height:1.5;
+  }
   .stop.asks { border-left-color:var(--ask); }
   .stop.asks h3 { color:var(--ask); }
   .stop.waiting { border-left-color:var(--faint); }
@@ -897,13 +903,18 @@ let skew = 0;
 const nowMs = () => Date.now() - skew;
 
 async function load() {
+  let res;
   try {
-    const res = await fetch("/api/state");
-    const served = Date.parse(res.headers.get("Date"));
-    if (!isNaN(served)) skew = Date.now() - served;
-    state = await res.json();
-    draw();
-  } catch { fault("disconnected"); }
+    res = await fetch("/api/state");
+  } catch { fault("disconnected"); return; }
+  // A 500 still answered the request — it is the server saying something is
+  // wrong, not the network failing to reach it, and the two must read
+  // differently or an operator chases a cable for a bug on the box.
+  if (!res.ok) { fault(`server error (HTTP ${res.status})`); return; }
+  const served = Date.parse(res.headers.get("Date"));
+  if (!isNaN(served)) skew = Date.now() - served;
+  state = await res.json();
+  draw();
 }
 
 function fault(msg) { $("#lamp").className = "lamp down"; $("#line1").textContent = msg; }
@@ -943,12 +954,16 @@ function drawDoctor() {
 }
 
 async function startDoctor(apply) {
-  const res = await fetch("/api/doctor", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ apply }),
-  });
+  let res;
+  try {
+    res = await fetch("/api/doctor", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apply }),
+    });
+  } catch { fault("could not start the sweep: disconnected"); return; }
   if (res.status === 409) { alert("A sweep is already running."); return; }
+  if (!res.ok) { fault((await res.text()).trim() || `could not start the sweep (HTTP ${res.status})`); return; }
   loadDoctor();
 }
 
@@ -1739,13 +1754,23 @@ function openAsk(id, title) {
 
 async function sendAnswer(id, answer) {
   const btn = document.querySelector("#stop .ask-btn");
+  const label = btn ? btn.textContent : "";
   if (btn) { btn.disabled = true; btn.textContent = "Sending…"; }
-  const res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ answer }),
-  });
-  if (!res.ok) { refuse(id, (await res.text()).trim() || `could not answer ${id}`); return; }
+  let res, msg;
+  try {
+    res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer }),
+    });
+  } catch { msg = `could not answer ${id}: disconnected`; }
+  if (res && !res.ok) msg = (await res.text()).trim() || `could not answer ${id}`;
+  if (msg) {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    refuse(id, msg);
+    panelFault(msg);
+    return;
+  }
   $("#stop").innerHTML = "";
 }
 
@@ -1847,6 +1872,7 @@ function stopNotice(id) {
       ${at && !isNaN(at) ? `stopped ${esc(at.toLocaleString())}` : ""}
       ${b.runId ? ` &middot; run ${esc(b.runId)}` : ""}
     </div>
+    <div class="fault" hidden></div>
     ${qs ? `<button class="ask-btn">Answer ${qs.length === 1 ? "the question" : `${qs.length} questions`}</button>` : ""}
     <textarea class="answer" rows="3" spellcheck="true" aria-label="Reply"
       placeholder="${qs ? "Anything to add beside the answers above, or reply here instead."
@@ -2157,11 +2183,14 @@ function refuse(id, why) {
 
 async function startItem(id, stage) {
   refusals.delete(id);
-  const res = await fetch(`/api/items/${encodeURIComponent(id)}/start`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ stage }),
-  });
+  let res;
+  try {
+    res = await fetch(`/api/items/${encodeURIComponent(id)}/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stage }),
+    });
+  } catch { refuse(id, `could not start ${id}`); return; }
   if (!res.ok) refuse(id, (await res.text()).trim() || `could not start ${id}`);
 }
 
@@ -2246,11 +2275,36 @@ async function saveOrder() {
     console.warn("refusing to save an empty order");
     return;
   }
-  await fetch("/api/order", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(ids),
-  });
+  let res;
+  try {
+    res = await fetch("/api/order", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(ids),
+    });
+  } catch {
+    // The drag already moved the card in the DOM (el.ondrop's insertBefore);
+    // a save that never reached the server has to be undone the same way a
+    // rejected one is — draw() is the rollback, state is still what the
+    // server last confirmed.
+    fault("could not save the new order: disconnected");
+    draw();
+    return;
+  }
+  if (!res.ok) {
+    fault(`could not save the new order: ${(await res.text()).trim() || `HTTP ${res.status}`}`);
+    draw();
+  }
+}
+
+// refuse() draws its message onto the board card, which #panel and #scrim
+// occlude while the panel is open — the one channel a panel-borne failure
+// needs beside it. The box is part of stopNotice()'s own markup (see the
+// `.fault` div there), so it survives exactly as long as the stop notice
+// that owns it: cleared by the next real redraw of #stop, never on a timer.
+function panelFault(msg) {
+  const box = document.querySelector("#stop .fault");
+  if (box) { box.textContent = msg; box.hidden = false; }
 }
 
 // Clearing a mark is a provider write, so the control says so while it lands:
@@ -2259,13 +2313,23 @@ async function saveOrder() {
 async function handBack(id, btn) {
   const box = document.querySelector("#stop .answer");
   const answer = box ? box.value.trim() : "";
+  const label = btn ? btn.textContent : "";
   if (btn) { btn.disabled = true; btn.textContent = answer ? "answering" : "handing back"; }
-  const res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ answer }),
-  });
-  if (!res.ok) { refuse(id, (await res.text()).trim() || `could not unblock ${id}`); return; }
+  let res, msg;
+  try {
+    res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer }),
+    });
+  } catch { msg = `could not unblock ${id}: disconnected`; }
+  if (res && !res.ok) msg = (await res.text()).trim() || `could not unblock ${id}`;
+  if (msg) {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    refuse(id, msg);
+    panelFault(msg);
+    return;
+  }
   // The panel was showing a stop that no longer exists.
   $("#stop").innerHTML = "";
 }
@@ -2284,10 +2348,23 @@ $("#unblock-all").onclick = async e => {
   }
   if (!confirm(`Clear the mark on ${n} item${n === 1 ? "" : "s"}? Each goes straight back into the line.`
     + (asking ? `\n\n${asking} waiting on an answer from you ${asking === 1 ? "is" : "are"} left alone.` : ""))) return;
-  e.target.disabled = true;
-  e.target.textContent = "handing back…";
-  await fetch("/api/unblock", { method:"POST" });
-  setTimeout(() => e.target.disabled = false, 2000);
+  const btn = e.target, label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "handing back…";
+  let res, msg;
+  try {
+    res = await fetch("/api/unblock", { method:"POST" });
+  } catch { msg = "could not clear marks: disconnected"; }
+  if (res && !res.ok) msg = (await res.text()).trim() || "could not clear marks";
+  if (msg) {
+    // A rejection never reaches the timer below, so the re-enable that
+    // matters here cannot depend on it — restored at once instead.
+    btn.disabled = false;
+    btn.textContent = label;
+    fault(msg);
+    return;
+  }
+  setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 2000);
 };
 
 $("#diagnose").onclick = () => {
@@ -2300,7 +2377,13 @@ $("#diagnose").onclick = () => {
   startDoctor(false);
 };
 
-$("#refresh").onclick = () => fetch("/api/refresh", { method:"POST" });
+$("#refresh").onclick = async () => {
+  let res;
+  try {
+    res = await fetch("/api/refresh", { method:"POST" });
+  } catch { fault("could not refresh: disconnected"); return; }
+  if (!res.ok) fault((await res.text()).trim() || `could not refresh (HTTP ${res.status})`);
+};
 
 // ---- the app on a device -------------------------------------------------
 // Installing is the browser's gesture; this only registers the worker that
@@ -2379,10 +2462,23 @@ function openFromHash() {
 }
 addEventListener("hashchange", openFromHash);
 $("#tick").onclick = async e => {
-  e.target.disabled = true;
-  const res = await fetch("/api/tick", { method:"POST" });
-  if (res.status === 409) $("#line1").textContent = "a tick is already in flight";
-  setTimeout(() => e.target.disabled = false, 1500);
+  const btn = e.target;
+  btn.disabled = true;
+  let res;
+  try {
+    res = await fetch("/api/tick", { method:"POST" });
+  } catch {
+    btn.disabled = false;
+    fault("could not tick: disconnected");
+    return;
+  }
+  if (res.status === 409) { $("#line1").textContent = "a tick is already in flight"; }
+  else if (!res.ok) {
+    btn.disabled = false;
+    fault((await res.text()).trim() || `could not tick (HTTP ${res.status})`);
+    return;
+  }
+  setTimeout(() => btn.disabled = false, 1500);
 };
 
 const es = new EventSource("/api/events");
