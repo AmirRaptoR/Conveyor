@@ -86,6 +86,14 @@ func (s *Server) launch(ctx context.Context) int {
 	for id := range s.resting {
 		resting[id] = true
 	}
+	// A source whose latest listing failed or timed out is showing its
+	// last-good items, not this poll's — stale state is for reading, never
+	// for acting on (CLAUDE.md), so nothing routed through it is dispatched
+	// until a listing confirms it again.
+	staleSrc := make(map[string]bool, len(s.listErr))
+	for name := range s.listErr {
+		staleSrc[name] = true
+	}
 	s.mu.RUnlock()
 	order := s.order.IDs()
 
@@ -107,6 +115,9 @@ func (s *Server) launch(ctx context.Context) int {
 			if !ok || fullSrc[it.Source] || fullStage[target] || busy[it.ID] ||
 				s.eng.Locks().Busy(it.Source, target) {
 				continue
+			}
+			if staleSrc[it.Source] {
+				continue // its items are its last-good listing, not this poll's
 			}
 			// Whose quota this would spend, and whether they have any. Checked
 			// here and not in Pick, because it is a fact about the world right

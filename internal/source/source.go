@@ -60,7 +60,11 @@ func (c *Client) List(ctx context.Context) (*ListResult, error) {
 		Workdir: c.cfg.Workdir(c.src),
 		Env:     c.src.ProviderEnv(),
 		Source:  c.src.Name,
-		Timeout: c.cfg.Timeout.D(),
+		// Discovery, not Timeout: a listing is a handful of API calls, not
+		// agent work, and must not be able to hold a slot for the 90-minute
+		// default meant for stages. A source that hangs past this is failed
+		// for this poll; the server keeps its last-good items, flagged stale.
+		Timeout: c.cfg.Discovery.D(),
 		Stdin: model.ListInput{
 			Source:         c.src.Name,
 			Stages:         c.cfg.StageNames(),

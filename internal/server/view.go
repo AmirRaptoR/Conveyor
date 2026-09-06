@@ -264,6 +264,13 @@ type SourceView struct {
 	// and then succeeded shows no error here, even though LastListedAt is
 	// what actually moved.
 	ListError string `json:"listError,omitempty"`
+	// Stale is this source's current items being its last good listing
+	// rather than this poll's — the latest attempt failed or timed out, so
+	// LastListedAt names when the items shown actually came from. Read-only:
+	// CLAUDE.md — "stale state is for reading, never for acting on" — the
+	// scheduler consults the same fact (Server.listErr) to refuse dispatching
+	// against a source it cannot currently confirm.
+	Stale bool `json:"stale,omitempty"`
 }
 
 type Server struct {
@@ -562,6 +569,7 @@ func sourceViews(c *config.Config, listedAt map[string]time.Time, listErr map[st
 			v.LastListedAt = t.UTC().Format(time.RFC3339)
 		}
 		v.ListError = listErr[s.Name]
+		v.Stale = v.ListError != ""
 		out[i] = v
 	}
 	return out
