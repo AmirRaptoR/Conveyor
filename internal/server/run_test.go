@@ -154,6 +154,75 @@ func TestRunLookupDistinguishesNeverExistedFromRetained(t *testing.T) {
 	}
 }
 
+// writeTestRunWithLog is writeTestRun plus a log.txt of n lines, for exercising
+// bounded retrieval.
+func writeTestRunWithLog(t *testing.T, root, day, id string, n int) string {
+	t.Helper()
+	dir := writeTestRun(t, root, day, id, model.Run{Source: "s1", Kind: "stage", Outcome: model.OutcomeSuccess})
+	var b strings.Builder
+	for i := 1; i <= n; i++ {
+		fmt.Fprintf(&b, "00:00:00.000 stdout line %d\n", i)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "log.txt"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// With no query parameters, a large log is still handed back bounded — the
+// last 2000 lines — with the true count reported alongside it.
+func TestRunLogDefaultsToLast2000LinesAndReportsTotal(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	writeTestRunWithLog(t, r.Root, "2026-08-01", "000000.000-big", 50000)
+
+	req := httptest.NewRequest("GET", "/api/runs/000000.000-big", nil)
+	req.SetPathValue("id", "000000.000-big")
+	w := httptest.NewRecorder()
+	s.handleRun(w, req)
+
+	var got RunMeta
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.TotalLines != 50000 {
+		t.Errorf("totalLines = %d, want 50000", got.TotalLines)
+	}
+	if len(got.Lines) != 2000 {
+		t.Fatalf("len(Lines) = %d, want 2000", len(got.Lines))
+	}
+	if got.Lines[0].Text != "line 48001" || got.Lines[1999].Text != "line 50000" {
+		t.Errorf("window = [%q .. %q], want [line 48001 .. line 50000]",
+			got.Lines[0].Text, got.Lines[1999].Text)
+	}
+}
+
+// tail and offset page through a log in units of lines.
+func TestRunLogAcceptsTailAndOffset(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	writeTestRunWithLog(t, r.Root, "2026-08-01", "000000.000-paged", 100)
+
+	req := httptest.NewRequest("GET", "/api/runs/000000.000-paged?tail=10&offset=5", nil)
+	req.SetPathValue("id", "000000.000-paged")
+	w := httptest.NewRecorder()
+	s.handleRun(w, req)
+
+	var got RunMeta
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Lines) != 10 {
+		t.Fatalf("len(Lines) = %d, want 10", len(got.Lines))
+	}
+	if got.Lines[0].Text != "line 6" || got.Lines[9].Text != "line 15" {
+		t.Errorf("window = [%q .. %q], want [line 6 .. line 15]", got.Lines[0].Text, got.Lines[9].Text)
+	}
+	if got.TotalLines != 100 {
+		t.Errorf("totalLines = %d, want 100", got.TotalLines)
+	}
+}
+
 // A symlink inside the run root pointing outside it must not be served, even
 // if its name matches a valid run ID.
 func TestRunLookupRefusesASymlinkEscape(t *testing.T) {

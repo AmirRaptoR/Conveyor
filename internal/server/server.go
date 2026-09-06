@@ -1613,7 +1613,12 @@ type RunMeta struct {
 	// Lines, not a blob: a log carries structure the writer already knew —
 	// which stream a line came from — and handing back one string throws it
 	// away, so a finished run could not be rendered the way a live one is.
-	Lines []runner.LogLine `json:"lines,omitempty"`
+	//
+	// Bounded: at most tail lines (2000 by default), from offset if given —
+	// see logWindow. TotalLines is the true count, so a caller can page to
+	// the rest instead of being handed a log's whole size in one response.
+	Lines      []runner.LogLine `json:"lines,omitempty"`
+	TotalLines int              `json:"totalLines"`
 }
 
 // handleRuns lists recent runs, newest first, optionally for one item.
@@ -1658,8 +1663,44 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b, _ := os.ReadFile(filepath.Join(run.Dir, "log.txt"))
-	run.Lines = parseLog(string(b))
+	all := parseLog(string(b))
+	run.TotalLines = len(all)
+	run.Lines = logWindow(all, r.URL.Query().Get("tail"), r.URL.Query().Get("offset"))
 	writeJSON(w, run)
+}
+
+// defaultTailLines is what GET /api/runs/{id} returns when the caller asks
+// for nothing in particular: a large log must not be handed over whole.
+const defaultTailLines = 2000
+
+// logWindow slices a bounded piece out of a run's full log, in units of
+// lines: tail with no offset is the last N lines (2000 if tail is absent or
+// invalid); an offset pages from that line index for up to tail lines.
+func logWindow(all []runner.LogLine, tailParam, offsetParam string) []runner.LogLine {
+	tail := defaultTailLines
+	if n, err := strconv.Atoi(tailParam); err == nil && n >= 0 {
+		tail = n
+	}
+	total := len(all)
+	if offsetParam == "" {
+		start := total - tail
+		if start < 0 {
+			start = 0
+		}
+		return all[start:]
+	}
+	offset, err := strconv.Atoi(offsetParam)
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	end := offset + tail
+	if end > total {
+		end = total
+	}
+	return all[offset:end]
 }
 
 // findRun resolves a run ID directly against the run root: the ID is the run
