@@ -178,6 +178,29 @@ func TestRunEnvIsRedactedOnDiskButNotInTheProcess(t *testing.T) {
 	}
 }
 
+// A run directory holds prompts, a person's typed answer and logs — all
+// meant for the operator running conveyor, nobody else on the box.
+func TestRunDirectoryAndFilesAreRestrictedToTheOwner(t *testing.T) {
+	res := run(t, `echo hi; echo '{"a":1}' > "$CONVEYOR_RESULT"`, time.Minute)
+
+	info, err := os.Stat(res.Run.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("run dir mode = %o, want 0700", perm)
+	}
+	for _, f := range []string{"meta.json", "stdin.json", "log.txt", "result.json"} {
+		fi, err := os.Stat(filepath.Join(res.Run.Dir, f))
+		if err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0o600 {
+			t.Errorf("%s mode = %o, want 0600", f, perm)
+		}
+	}
+}
+
 func TestMissingScriptIsAnErrorNotAnOutcome(t *testing.T) {
 	r := New(t.TempDir())
 	_, err := r.Run(context.Background(), Spec{

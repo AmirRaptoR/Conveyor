@@ -83,7 +83,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	started := time.Now()
 	runID := fmt.Sprintf("%s-%s", started.UTC().Format("150405.000"), randSuffix())
 	dir := filepath.Join(r.Root, started.UTC().Format("2006-01-02"), runID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0o700: a run directory holds prompts, a person's typed answer (stdin.json)
+	// and logs, all meant for the operator who runs conveyor and nobody else.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create run dir: %w", err)
 	}
 
@@ -116,7 +118,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		}
 		stdinJSON = b
 	}
-	if err := os.WriteFile(filepath.Join(dir, "stdin.json"), stdinJSON, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "stdin.json"), stdinJSON, 0o600); err != nil {
 		return nil, err
 	}
 
@@ -136,6 +138,14 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	deadline, _ := runCtx.Deadline()
 
 	resultPath := filepath.Join(dir, "result.json")
+	// Pre-created at 0o600 rather than left for the script's own `>` redirect
+	// to create: a shell redirection to an existing file opens it without
+	// re-applying a mode, so this is what keeps result.json — which can carry
+	// whatever the script decided was worth structuring — as restricted as
+	// everything else in the run directory once the script writes it.
+	if err := os.WriteFile(resultPath, nil, 0o600); err != nil {
+		return nil, err
+	}
 	env, envMap := buildEnv(spec, resultPath, deadline)
 	run.Env = envMap
 
@@ -155,7 +165,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	}
 
 	logPath := filepath.Join(dir, "log.txt")
-	logFile, err := os.Create(logPath)
+	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -264,7 +274,7 @@ func writeMeta(run *model.Run, dir string) {
 	toWrite := *run
 	toWrite.Env = redactEnv(run.Env)
 	b, _ := json.MarshalIndent(toWrite, "", "  ")
-	_ = os.WriteFile(filepath.Join(dir, "meta.json"), b, 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "meta.json"), b, 0o600)
 }
 
 // redactedValue stands in for any env value not worth ever writing to disk or
@@ -403,7 +413,7 @@ func SweepInterrupted(root string) (int, error) {
 			if err != nil {
 				continue
 			}
-			if os.WriteFile(meta, out, 0o644) == nil {
+			if os.WriteFile(meta, out, 0o600) == nil {
 				n++
 			}
 		}

@@ -319,6 +319,7 @@ type Server struct {
 }
 
 func New(cfg *config.Config, r *runner.Runner) *Server {
+	secureDataDir(cfg.DataDir())
 	s := &Server{
 		cfg:     cfg,
 		run:     r,
@@ -2021,6 +2022,27 @@ func (s *Server) authed(next http.Handler) http.Handler {
 var publicAsset = map[string]bool{
 	"/manifest.webmanifest": true, "/sw.js": true,
 	"/icon.svg": true, "/icon-192.png": true, "/icon-512.png": true,
+}
+
+// secureDataDir restricts the data directory to the owner alone: it holds
+// order.json, answers.json, push subscriptions, the VAPID key pair and every
+// run directory — prompts, a person's typed answer and logs among them.
+//
+// Best-effort and never fatal: a data directory another process or an older
+// build already created at a looser mode still gets tightened here, but a
+// filesystem that refuses the chmod (a network mount, a permission this
+// process does not have) must not stop conveyor from serving — a warning
+// naming the path is what a person can act on, a refusal to start is not.
+// Existing run directories underneath it are deliberately left alone; only
+// the root is touched, so this is one syscall, not a walk of run history.
+func secureDataDir(dir string) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: could not create data directory %s: %v\n", dir, err)
+		return
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: could not restrict %s to the owner alone: %v\n", dir, err)
+	}
 }
 
 // loopback reports whether this listen address reaches only this machine.
