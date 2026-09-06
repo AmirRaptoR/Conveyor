@@ -19,6 +19,16 @@
 # Worktrees live OUTSIDE the repository, deliberately: a directory inside it is
 # something an agent told to "commit everything" will eventually sweep into a
 # pull request.
+#
+# Reclaim is a positive allowlist, not "anything that looks clean". A path is
+# touched — created into, emptied, or removed — only when it is exactly
+# `<managed root>/<source>/<ref>` (symlinks resolved) AND carries the marker
+# `item_worktree` wrote into its git dir the one time it created it. The primary
+# checkout, a directory a person made, an external `git worktree`, a path
+# reached through a symlink escaping the managed root — none of that is ever
+# Conveyor's, no matter how clean or how old it is. A held branch is refused,
+# never reclaimed: Git allows a branch in exactly one worktree, and the only
+# safe response to "something else already has it" is to say so and stop.
 
 # worktree_root — where per-item checkouts go. Override with WORKTREES.
 worktree_root() { printf '%s' "${WORKTREES:-$HOME/codes/.worktrees}"; }
@@ -41,6 +51,89 @@ default_branch() {
 	printf 'main'
 }
 
+# _realpath <path> — the resolved, symlink-free absolute path, or failure if it
+# does not exist. Used for the ownership check: a symlink at the managed path
+# pointing outside it must never be treated as ours.
+_realpath() {
+	(cd -- "$1" 2>/dev/null && pwd -P)
+}
+
+# _managed_root — the managed root, resolved. Created if missing so a path
+# comparison against it never fails just because nothing has used it yet.
+_managed_root() {
+	mkdir -p -- "$(worktree_root)" 2>/dev/null || true
+	_realpath "$(worktree_root)"
+}
+
+# _worktree_gitdir <dir> — the absolute git dir for a worktree, which for a
+# linked worktree is its own private directory under the main repo's `.git`,
+# not part of the checked-out tree. Where the ownership marker and the lease
+# live, same as agents/_resume's attempt counter, so an agent told to "commit
+# everything" cannot sweep either into a pull request.
+_worktree_gitdir() {
+	git -C "$1" rev-parse --absolute-git-dir 2>/dev/null
+}
+
+# _worktree_owned <source> <ref> <dir> — true only when dir is exactly this
+# item's managed path (symlinks resolved) and carries the marker written when
+# item_worktree created it. Never inferred from a clean status, an age, or the
+# fact that something is sitting where an item's worktree would go.
+_worktree_owned() {
+	local source=$1 ref=$2 dir=$3 root want real gd
+	[[ -e "$dir" ]] || return 1
+	root=$(_managed_root) || return 1
+	want="$root/$source/$ref"
+	real=$(_realpath "$dir") || return 1
+	[[ "$real" == "$want" ]] || return 1
+	gd=$(_worktree_gitdir "$dir") || return 1
+	[[ -f "$gd/conveyor-owner" ]] || return 1
+	return 0
+}
+
+# _worktree_write_marker <source> <ref> <dir> — record that item_worktree made
+# this directory, so a later call can tell "ours" from "something else is
+# here" without asking anything but this file.
+_worktree_write_marker() {
+	local source=$1 ref=$2 dir=$3 gd
+	gd=$(_worktree_gitdir "$dir") || return 1
+	printf '%s\n%s\n' "$source" "$ref" >"$gd/conveyor-owner"
+}
+
+# _worktree_write_lease <dir> — record who is using this worktree right now:
+# the calling process's PID (unaffected by running inside `$(...)`: bash keeps
+# `$$` as the top-level script's PID, which is the PID the runner's process
+# group is built from) and the run's deadline, if the stage has one. Written on
+# every call, creation or reuse, so the lease always reflects whoever is
+# holding the worktree at this moment rather than whoever made it.
+_worktree_write_lease() {
+	local dir=$1 gd
+	gd=$(_worktree_gitdir "$dir") || return 1
+	printf '%s %s\n' "$$" "${CONVEYOR_DEADLINE:-}" >"$gd/conveyor-lease"
+}
+
+# _worktree_lease_live <dir> — true while the lease names a PID that is still
+# alive, or a deadline that has not passed yet. Neither age nor a clean status
+# says anything about whether an agent is still using a worktree; this does.
+# No lease at all (an old worktree from before leases existed, or one whose
+# owning run never got as far as writing one) is not live — the sweep's other
+# guards (dirty, unpushed, keep-ref) still apply.
+_worktree_lease_live() {
+	local dir=$1 gd f pid deadline epoch now
+	gd=$(_worktree_gitdir "$dir") || return 1
+	f="$gd/conveyor-lease"
+	[[ -f "$f" ]] || return 1
+	read -r pid deadline <"$f" || return 1
+	if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+		return 0
+	fi
+	if [[ -n "$deadline" ]]; then
+		epoch=$(date -u -d "$deadline" +%s 2>/dev/null) || epoch=""
+		now=$(date -u +%s)
+		[[ -n "$epoch" && "$epoch" -gt "$now" ]] && return 0
+	fi
+	return 1
+}
+
 # item_worktree <source> <ref> [existing-branch] — print the path to this item's
 # worktree, creating it if it is not there. Run from the source's checkout.
 #
@@ -54,7 +147,8 @@ default_branch() {
 # anything except its cause. These files run under bash, but they are sourced,
 # and whoever sources them next may not be.
 item_worktree() {
-	local source=$1 ref=$2 branch=${3:-} wt base
+	local source=$1 ref=$2 branch=${3:-} wt base held
+
 	wt="$(worktree_root)/${source}/${ref}"
 
 	# Records of worktrees whose directories are gone: cheap, and without it a
@@ -66,39 +160,42 @@ item_worktree() {
 	# next item instead of waiting for a sweeper nobody remembered to install.
 	sweep_worktrees "$source" "$ref"
 
-	if [[ -d "$wt" ]] && git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
-		printf '%s' "$wt"
-		return 0
+	if [[ -e "$wt" ]]; then
+		if _worktree_owned "$source" "$ref" "$wt" && git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+			_worktree_write_lease "$wt"
+			printf '%s' "$wt"
+			return 0
+		fi
+		# Something is at this exact path and it is not ours: a person's
+		# directory, a leftover from before ownership markers existed, anything.
+		# Not removed, not emptied, not handed to an agent as a workdir.
+		blocked worktree "$wt exists but was not created by Conveyor; refusing to touch it. \
+Move it aside or remove it by hand."
 	fi
 
 	# A branch can be checked out in exactly one worktree, and something else may
 	# already hold this one — an earlier run that made its own directory, a
-	# leftover under /tmp, a person looking at the pull request. Left alone this
-	# is a fatal from deep inside `git worktree add`, and the item is marked with
-	# a message about branches that explains nothing.
-	#
-	# If that other checkout is clean it is a copy of the remote and nothing is
-	# lost by taking the branch back. If it is dirty it holds work in progress on
-	# this very item, which is the thing we were about to recreate — so use it
-	# where it stands rather than destroy it and start again.
+	# leftover under /tmp, a person's primary checkout with the branch checked
+	# out for review. Left alone this is a fatal from deep inside
+	# `git worktree add`, and the item is marked with a message about branches
+	# that explains nothing — so it is resolved here, by refusing outright.
+	# Reclaiming it used to be tried instead: a *clean* holder was force-removed,
+	# and Git's own refusal to remove the primary checkout (which is always
+	# clean and always listed) is what turned that into deleting it. There is no
+	# clean-vs-dirty distinction that makes reclaiming someone else's checkout
+	# safe, so there is no reclaim: the branch is refused, whatever state its
+	# holder is in.
 	if [[ -n "$branch" ]]; then
-		local held
-		held=$(git worktree list --porcelain |
-			awk -v b="refs/heads/$branch" '''/^worktree /{p=$2} /^branch /{if ($2==b) print p}''' |
-			head -1)
+		held=$(git worktree list --porcelain | awk -v b="refs/heads/$branch" '
+			/^worktree / { p = $0; sub(/^worktree /, "", p); next }
+			/^branch /   { if ($0 == "branch " b) { print p; exit } }
+		')
 		if [[ -n "$held" && "$held" != "$wt" ]]; then
-			if [[ -n "$(git -C "$held" status --porcelain 2>/dev/null)" ]]; then
-				echo "branch $branch is checked out at $held with work in it; using that" >&2
-				printf '''%s''' "$held"
-				return 0
-			fi
-			echo "reclaiming branch $branch from a clean checkout at $held" >&2
-			git worktree remove --force "$held" 2>/dev/null || rm -rf "$held"
-			git worktree prune 2>/dev/null || true
+			blocked worktree "branch '$branch' is already checked out at $held, not this \
+item's worktree ($wt); refusing to touch another checkout to reclaim it."
 		fi
 	fi
 
-	rm -rf "$wt"
 	mkdir -p "$(dirname "$wt")" || return 1
 	git fetch --quiet origin --prune 2>/dev/null || true
 
@@ -108,13 +205,17 @@ item_worktree() {
 		git worktree add --quiet -B "$branch" "$wt" "origin/$branch" >&2 || return 1
 	else
 		base=$(default_branch)
-		git worktree add --quiet -B "${branch:-issue-$ref}" "$wt" "origin/$base" >&2 || return 1
+		# A space in $ref is fine in a directory name and not in a branch name;
+		# the synthesized branch is sanitized, the path stays literal.
+		git worktree add --quiet -B "${branch:-issue-${ref// /-}}" "$wt" "origin/$base" >&2 || return 1
 	fi
 
 	# Checked, not assumed. Printing a path that was never made sends the agent
 	# to `cd` into nothing, and the error it then reports is about whatever it
 	# tried next rather than about the checkout it never got.
 	[[ -d "$wt" ]] || return 1
+	_worktree_write_marker "$source" "$ref" "$wt"
+	_worktree_write_lease "$wt"
 	printf '%s' "$wt"
 }
 
@@ -127,17 +228,19 @@ item_worktree() {
 # somebody merges by hand — each leaves a full checkout behind, and a checkout is
 # not small: seven of them were 467MB here, one of them 287MB on its own.
 #
-# Three conditions, all required, because deleting a directory is the one action
+# Four conditions, all required, because deleting a directory is the one action
 # in this file that cannot be undone:
 #
+#   owned          exactly this source/ref's managed path, marked as ours. An
+#                  unowned path — a person's directory, a symlink escaping the
+#                  managed root — is refused, never swept.
+#   no live lease  no run currently holds it, by PID or by deadline. Recency of
+#                  the directory says nothing about this; the lease does.
 #   clean          nothing uncommitted. A dirty tree is somebody's work, or the
 #                  evidence from a run that died, and both outlive tidiness.
 #   nothing new    no commit that origin's default branch does not already have.
 #                  After a merge that is true by definition; before a push it is
 #                  emphatically not, which is what protects unpushed work.
-#   cold           untouched for longer than the longest stage. An item that
-#                  started ten minutes ago has an empty worktree that satisfies
-#                  both conditions above and is very much in use.
 sweep_worktrees() {
 	local source=$1 keep=${2:-} root base dir ref
 	root="$(worktree_root)/${source}"
@@ -145,12 +248,15 @@ sweep_worktrees() {
 	base="origin/$(default_branch)"
 
 	for dir in "$root"/*; do
-		[[ -d "$dir" ]] || continue
-		ref=$(basename "$dir")
+		[[ -e "$dir" ]] || continue
+		ref=$(basename -- "$dir")
 		[[ -n "$keep" && "$ref" == "$keep" ]] && continue
-		# 120 minutes: longer than the 90 the longest stage is allowed.
-		[[ -n "$(find "$dir" -maxdepth 0 -mmin -120)" ]] && continue
+		if ! _worktree_owned "$source" "$ref" "$dir"; then
+			echo "refusing to sweep unowned path $dir" >&2
+			continue
+		fi
 		git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || continue
+		_worktree_lease_live "$dir" && continue
 		[[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]] && continue
 		[[ "$(git -C "$dir" rev-list --count "$base"..HEAD 2>/dev/null || echo 1)" == "0" ]] || continue
 		echo "sweeping spent worktree $dir" >&2
@@ -162,9 +268,13 @@ sweep_worktrees() {
 # landed. Called after a merge: the branch is gone, so the directory is a copy of
 # nothing. Never called on a failure, where the tree is the evidence.
 drop_worktree() {
-	local wt
-	wt="$(worktree_root)/${1}/${2}"
-	[[ -d "$wt" ]] || return 0
+	local source=$1 ref=$2 wt
+	wt="$(worktree_root)/${source}/${ref}"
+	[[ -e "$wt" ]] || return 0
+	if ! _worktree_owned "$source" "$ref" "$wt"; then
+		echo "refusing to remove unowned path $wt" >&2
+		return 0
+	fi
 	git worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
 	git worktree prune 2>/dev/null || true
 }

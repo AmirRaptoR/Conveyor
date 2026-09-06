@@ -189,10 +189,17 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	go func() { defer wg.Done(); scan(stdout, "stdout", emit) }()
 	go func() { defer wg.Done(); scan(stderr, "stderr", emit) }()
 
-	// Kill the group on deadline, escalating TERM -> KILL so a script that
+	// The pgid is the leader's own PID, by construction of setPgid — captured
+	// now because Getpgid(pid) stops working once the leader is reaped, while
+	// this number keeps identifying the group for as long as any member of it
+	// is still alive.
+	pgid := cmd.Process.Pid
+
+	// Kill the group on cancellation, escalating TERM -> KILL so a script that
 	// ignores TERM cannot hold the source's lock forever. `done` stops the
 	// watcher when the process exits normally, so nothing is leaked.
-	killed := make(chan struct{})
+	killed := make(chan struct{})    // the deadline specifically expired
+	cancelled := make(chan struct{}) // runCtx ended some way, deadline or not
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -200,14 +207,15 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		case <-done:
 			return
 		case <-runCtx.Done():
+			close(cancelled)
 			if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 				close(killed)
 			}
-			killGroup(cmd, syscall.SIGTERM)
+			killGroup(pgid, syscall.SIGTERM)
 			select {
 			case <-done:
 			case <-time.After(gracePeriod):
-				killGroup(cmd, syscall.SIGKILL)
+				killGroup(pgid, syscall.SIGKILL)
 			}
 		}
 	}()
@@ -219,17 +227,51 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	select {
 	case <-killed:
 		timedOut = true
-		// A well-behaved parent traps TERM and exits at once, which closes
-		// `done` before the escalation goroutine can fire. Any child that
-		// ignored TERM would then survive, so sweep the group unconditionally.
-		killGroup(cmd, syscall.SIGKILL)
-		emit("engine", fmt.Sprintf("killed after %s (timeout)", spec.Timeout))
 	default:
+	}
+
+	wasCancelled := false
+	select {
+	case <-cancelled:
+		wasCancelled = true
+	default:
+	}
+
+	if wasCancelled {
+		// A well-behaved parent traps TERM and exits at once, which lets
+		// wg.Wait/cmd.Wait return — and `done` close — before the escalation
+		// goroutine's own grace timer ever fires. A descendant that ignored
+		// TERM and had already closed its stdout/stderr survives that: it
+		// holds no pipe the scanners are waiting on, so nothing here notices
+		// it is still running unless this sweeps the group unconditionally,
+		// on every cancellation and not only a timeout, and waits to see it
+		// actually gone rather than assuming SIGKILL landed.
+		killGroup(pgid, syscall.SIGKILL)
+		deadline := time.Now().Add(gracePeriod)
+		for groupAlive(pgid) && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if groupAlive(pgid) {
+			emit("engine", "process group survived SIGKILL past the grace period")
+		} else if timedOut {
+			emit("engine", fmt.Sprintf("killed after %s (timeout)", spec.Timeout))
+		}
 	}
 
 	run.ExitCode = exitCode(waitErr)
 	run.TimedOut = timedOut
-	run.Outcome = model.OutcomeFor(run.ExitCode, timedOut)
+	switch {
+	case timedOut:
+		run.Outcome = model.OutcomeTimeout
+	case wasCancelled:
+		// Cancelled without the deadline expiring: systemd, Ctrl-C, a server
+		// shutting down. The work may be real and unfinished, not a failure —
+		// see model.OutcomeInterrupted's own doc for why this is the same
+		// verdict a crash gets.
+		run.Outcome = model.OutcomeInterrupted
+	default:
+		run.Outcome = model.OutcomeFor(run.ExitCode, false)
+	}
 	r.finish(&run, dir, started)
 
 	res := &Result{Run: run, Log: lines}
