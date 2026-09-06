@@ -16,6 +16,13 @@
 #                     default and says so on stderr. 0 is valid, so the gate
 #                     can be exercised without waiting.
 #   PROMPT           what to tell the model when addressing review threads.
+#   CONFLICT_RESOLVE exactly "0" restores the old behaviour of marking every
+#                     conflict a plain rebase could not fix; any other value,
+#                     including unset (the default), lets gate 8 attempt one
+#                     model-run resolution first.
+#   CONFLICT_PROMPT  what to tell the model when resolving a merge conflict.
+#                     Unset uses a built-in default (see CONFLICT_PROMPT_DEFAULT
+#                     below), so no existing source needs to set this.
 #   ALLOWED_TOOLS, MODEL, MAX_TURNS, PERMISSION_MODE — passed to run_claude.
 #
 # The gate, in precedence order (numbers referenced throughout in comments and
@@ -28,8 +35,17 @@
 #   5. PR closed unmerged                    -> exit 20  (decision)
 #   6. hold on the PR (or the issue)         -> exit 20  (human-review)
 #   7. PR is a draft                         -> exit 10
-#   8. mergeable is CONFLICTING              -> rebase once; exit 10 if it
-#                                                applied, else exit 20 (conflict)
+#   8. mergeable is CONFLICTING, in sub-order:
+#        a. try_rebase                       -> exit 10 if it applied
+#        b. CONFLICT_RESOLVE == "0"          -> exit 20  (conflict)
+#        c. PR is cross-repository, or its head is not this item's own
+#           issue-<ref> branch               -> exit 20  (conflict)
+#        d. headRefOid/baseRefOid unknown    -> exit 10  (defer)
+#        e. the newest well-formed marker already names this exact
+#           head/base pair                   -> exit 20  (decision)
+#        f. otherwise: resolve (merge, model if it conflicts, verify, test,
+#           push, mark)                      -> exit 10 or exit 20 (conflict,
+#                                                worktree, limit, turns, error)
 #   9. a check failed                        -> exit 20  (checks)
 #  10. a check is still running              -> exit 10
 #  11. an unresolved thread it has not answered -> address, test, push, reply,
@@ -186,12 +202,15 @@ fetch_details() {
 				pullRequest(number:$number) {
 					isDraft
 					mergeable
+					isCrossRepository
 					headRefName
+					headRefOid
 					baseRefName
+					baseRefOid
 					commits(last:1) {
 						nodes { commit { committedDate statusCheckRollup { state } } }
 					}
-					comments(last:100) { nodes { createdAt } }
+					comments(last:100) { nodes { createdAt body } }
 					reviews(last:100) { nodes { submittedAt } }
 					reviewThreads(first:100) {
 						pageInfo { hasNextPage }
@@ -415,6 +434,254 @@ try_rebase() {
 	git -C "$wt" push --quiet --force-with-lease origin "HEAD:$head_ref" >&2
 }
 
+# CONFLICT_PROMPT_DEFAULT — used when the source's `params:` sets no
+# CONFLICT_PROMPT of its own, so upgrading this script requires no edit to any
+# existing `~/codes/conveyor.yaml`.
+CONFLICT_PROMPT_DEFAULT=$(cat <<'BRIEF'
+This pull request has a merge conflict with its base branch that a plain
+rebase could not resolve. Resolve each conflicted file so both sides' intent
+survives wherever the two changes do not actually collide — read the
+surrounding code and both commits before choosing, rather than picking one
+side blind.
+
+Edit the conflicted files in the working tree and nothing else: do not run
+`git commit`, `git push`, `git merge --abort`, or change branch. The script
+does all of that itself once the files are clean.
+
+If the two sides genuinely contradict each other, rather than merely both
+touching the same area, stop with a decision instead of picking a winner.
+BRIEF
+)
+
+# marker_pair — the "<headOid> <baseOid>" recorded by the newest well-formed
+# `<!-- conveyor:approve:conflict <headOid> <baseOid> -->` marker among the
+# PR's comments, or empty if none parses. Comments are returned oldest-first,
+# so the last match found, in order, is the newest one — and a marker that
+# does not parse into two 40-character hex OIDs is simply never a match, so it
+# is skipped rather than mistaken for one (criterion 8).
+marker_pair() {
+	jq -r '
+		[.comments.nodes[].body // ""]
+		| map([scan("<!-- conveyor:approve:conflict ([0-9a-fA-F]{40}) ([0-9a-fA-F]{40}) -->")])
+		| flatten(1)
+		| last
+		| if . == null then empty else .[0] + " " + .[1] end
+	' <<<"$details"
+}
+
+# post_conflict_marker <head-oid> <base-oid> — record a resolved-and-pushed
+# attempt so gate 8 never spends a second model run on the same conflict
+# (criteria 6, 7). Never routed through gh_do: a failure here is criterion 10's
+# case, exit 20 and never 10, because an unmarked successful attempt is
+# exactly the state that would re-run the model on the next poll.
+post_conflict_marker() {
+	local head_oid=$1 base_oid=$2 out
+	if ! out=$(gh pr comment "$pr" --repo "$REPO" \
+		--body "<!-- conveyor:approve:conflict $head_oid $base_oid -->" 2>&1); then
+		blocked conflict "resolved #$pr's merge conflict and pushed it, but recording the attempt failed ($out); the branch has moved even though this did not merge."
+	fi
+}
+
+# non_fast_forward <push-output> — a rejected push's own text, not just one
+# phrase of it: git says "(non-fast-forward)" for a diverged branch but
+# "(fetch first)" for one that is merely behind, and both are the same case
+# for criterion 24 (the branch moved since this worktree was reset to it).
+# Verified against this host's own git (2.53.0), which emits both.
+non_fast_forward() { grep -qiE 'non-fast-forward|fetch first|stale info' <<<"$1"; }
+
+# resolve_conflict — gate 8's model-run attempt. Reached only after try_rebase
+# has failed, CONFLICT_RESOLVE has not disabled it, the PR is not
+# cross-repository, its head is this pipeline's own issue-<ref> branch, and
+# this exact conflict (by head/base OID) has not already been attempted.
+# Exits 10 on a push it managed to record, or 20 naming what stopped it. Never
+# returns.
+resolve_conflict() {
+	local head_ref base_ref wt git_dir merging=0 base_oid conflicted=()
+	head_ref=$(jq -r '.headRefName' <<<"$details")
+	base_ref=$(jq -r '.baseRefName' <<<"$details")
+
+	wt=$(item_worktree "$CONVEYOR_SOURCE" "$ref" "$head_ref") ||
+		blocked worktree "could not prepare a worktree for #$ref on branch $head_ref to resolve its merge conflict."
+	cd "$wt"
+	git_dir=$(git rev-parse --git-dir)
+
+	if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+		# This script's own interrupted resolution, on this item's own branch,
+		# by construction — the same reasoning agents/_resume is built on
+		# (criterion 14). Continue into it rather than refusing.
+		merging=1
+		base_oid=$(git rev-parse MERGE_HEAD)
+		echo "resuming a conflict resolution already in progress in $wt" >&2
+	elif [[ -n "$(git status --porcelain)" ]]; then
+		blocked worktree "the worktree for #$ref at $wt has uncommitted changes and no merge in progress; not touching it to resolve a conflict."
+	fi
+
+	if [[ "$merging" -eq 0 ]]; then
+		# A worktree item_worktree hands back can be an existing checkout that
+		# was never refreshed (agents/_worktree:80-90); fetch and reset before
+		# merging so resolution never starts from a stale commit (criterion 15).
+		git fetch --quiet origin "$head_ref" "$base_ref" 2>&1 ||
+			blocked worktree "fetching origin/$head_ref and origin/$base_ref for #$ref failed."
+		git show-ref --verify --quiet "refs/remotes/origin/$head_ref" ||
+			blocked worktree "origin/$head_ref does not exist for #$ref."
+		git show-ref --verify --quiet "refs/remotes/origin/$base_ref" ||
+			blocked worktree "origin/$base_ref does not exist for #$ref."
+		git reset --quiet --hard "origin/$head_ref" ||
+			blocked worktree "resetting the worktree for #$ref to origin/$head_ref failed."
+		base_oid=$(git rev-parse "origin/$base_ref")
+
+		if git merge --quiet --no-edit "origin/$base_ref" >&2; then
+			# Merged cleanly: criterion 16, no model run at all. Captured exactly
+			# as the model-resolved path below captures it (criterion 23) — under
+			# this script's `set -e`, an unguarded run_tests would instead kill
+			# the whole run on a failing suite with its raw exit status and no
+			# result written at all.
+			local clean_test_rc=0
+			set +e
+			run_tests "$wt"
+			clean_test_rc=$?
+			set -e
+			if [[ "$clean_test_rc" -ne 0 ]]; then
+				blocked conflict "the test suite failed after merging $base_ref into #$pr's branch cleanly; nothing was pushed."
+			fi
+
+			local clean_push_out clean_push_rc=0
+			set +e
+			clean_push_out=$(git push origin "HEAD:$head_ref" 2>&1)
+			clean_push_rc=$?
+			set -e
+			if [[ "$clean_push_rc" -ne 0 ]]; then
+				if non_fast_forward "$clean_push_out"; then
+					blocked conflict "pushing the merge that resolved #$pr's conflict with $base_ref was rejected as non-fast-forward."
+				fi
+				echo "pushing the merge that resolved #$pr's conflict with $base_ref failed: $clean_push_out" >&2
+				exit 10
+			fi
+			post_conflict_marker "$(git rev-parse HEAD)" "$base_oid"
+			echo "merged $base_ref into $head_ref cleanly for #$pr; no model run" >&2
+			exit 10
+		fi
+		mapfile -t conflicted < <(git diff --name-only --diff-filter=U)
+	else
+		mapfile -t conflicted < <(git diff --name-only --diff-filter=U)
+	fi
+
+	if [[ "${#conflicted[@]}" -eq 0 ]]; then
+		blocked conflict "the merge into #$pr's branch $head_ref reports no conflicted files but is not resolved; needs a hand."
+	fi
+
+	local full rc
+	full="${CONFLICT_PROMPT:-$CONFLICT_PROMPT_DEFAULT}
+
+--- the item, as the pipeline sees it ---
+Item #${ref} in ${REPO}: ${title}
+Pull request #${pr}, branch ${head_ref}, merging in ${base_ref}
+--- end item ---
+
+The conflicted files are:
+$(printf '%s\n' "${conflicted[@]}")
+
+$(decision_brief)"
+
+	full=$(resume_prompt "$payload" "$full")
+
+	set +e
+	MAX_TURNS="${MAX_TURNS:-40}" \
+		ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep}" \
+		run_claude "$full"
+	rc=$?
+	set -e
+	record_model
+
+	if hit_limit; then
+		blocked limit "the agent was out of quota and stopped before resolving the merge conflict on #$pr. Nothing is wrong with this item; it is waiting for the window to reset."
+	fi
+	# Left in progress, not aborted: the merge itself is real work, and the next
+	# run of this script resumes into it exactly as agents/_resume resumes a
+	# dirty worktree (criterion 20).
+	if hit_max_turns; then
+		record_session
+		blocked turns "the agent hit its ${MAX_TURNS:-40}-turn budget while \
+resolving the merge conflict on #$pr, before finishing. The merge is left in \
+progress; answering this mark with anything (e.g. \"continue\") resumes the \
+same conversation with a fresh turn budget, and the next run of this script \
+continues the same merge rather than starting over."
+	fi
+	if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
+		[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
+		# The agent's own stop. Abort here, unlike the turns case above: a
+		# question can sit for days, and the tree it half-merged is not evidence
+		# anyone needs while waiting for an answer.
+		git merge --abort 2>/dev/null || true
+		agent_asked
+		echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
+		exit 20
+	fi
+	if [[ $rc -ne 0 ]]; then
+		blocked error "the agent exited $rc while resolving the merge conflict on #$pr. Last it said: $(last_said)"
+	fi
+
+	# Verify the tree itself before trusting it (criterion 19): the model can
+	# claim success without actually having removed every conflict marker.
+	# Checked on the working tree first, before staging — git add on a file
+	# that still reads "both modified" always clears its unmerged index
+	# entries regardless of what is in it, so a leftover marker line only
+	# ls-files --unmerged would ever miss it.
+	local f bad=()
+	for f in "${conflicted[@]}"; do
+		[[ -f "$f" ]] || continue
+		grep -qE '^(<<<<<<< |=======$|>>>>>>> )' "$f" && bad+=("$f")
+	done
+	if [[ "${#bad[@]}" -gt 0 ]]; then
+		blocked conflict "the agent finished but left conflict markers in: ${bad[*]}"
+	fi
+
+	git add -- "${conflicted[@]}"
+
+	# The staging above resolves every path this run knew to be conflicted;
+	# anything still unmerged afterwards is a path outside that set — the
+	# model touched a file that was not part of the original conflict, or
+	# introduced one of its own — and is worth a person's eyes before landing.
+	local unmerged
+	unmerged=$(git ls-files --unmerged)
+	if [[ -n "$unmerged" ]]; then
+		local paths
+		paths=$(awk '{print $4}' <<<"$unmerged" | sort -u | tr '\n' ' ')
+		blocked conflict "the agent finished but #$pr's merge still has unresolved paths: $paths"
+	fi
+
+	local commit_out
+	if ! commit_out=$(git commit --quiet -m "Merge origin/$base_ref into $head_ref to resolve conflicts for #$ref" 2>&1); then
+		blocked conflict "committing the resolved conflict for #$pr failed: $commit_out"
+	fi
+
+	local test_rc=0
+	set +e
+	run_tests "$wt"
+	test_rc=$?
+	set -e
+	if [[ "$test_rc" -ne 0 ]]; then
+		blocked conflict "the test suite failed after resolving #$pr's merge conflict; nothing was pushed."
+	fi
+
+	local push_out push_rc=0
+	set +e
+	push_out=$(git push origin "HEAD:$head_ref" 2>&1)
+	push_rc=$?
+	set -e
+	if [[ "$push_rc" -ne 0 ]]; then
+		if non_fast_forward "$push_out"; then
+			blocked conflict "pushing the resolved conflict for #$pr to $head_ref was rejected as non-fast-forward."
+		fi
+		echo "pushing the resolved conflict for #$pr failed: $push_out" >&2
+		exit 10
+	fi
+
+	post_conflict_marker "$(git rev-parse HEAD)" "$base_oid"
+	echo "resolved and pushed a fix for #$pr's merge conflict" >&2
+	exit 10
+}
+
 # check_gates_once — gates 2 through 13. Exits directly (10 or 20) for any
 # outcome that is not "ready to merge right now"; returns normally only when
 # every gate has just passed. Called twice by the caller so gate 14's "refetch
@@ -456,7 +723,48 @@ check_gates_once() {
 			echo "rebased #$pr onto $(jq -r .baseRefName <<<"$details"); waiting for GitHub to recompute" >&2
 			exit 10
 		fi
-		blocked conflict "pull request #$pr has a merge conflict with its base branch that a plain rebase did not resolve; it needs a hand."
+
+		# The off switch: exactly "0" restores today's behaviour of marking
+		# every conflict a plain rebase could not fix. Anything else, including
+		# unset, lets the model try once.
+		if [[ "${CONFLICT_RESOLVE:-}" == "0" ]]; then
+			blocked conflict "pull request #$pr has a merge conflict with its base branch that a plain rebase did not resolve; CONFLICT_RESOLVE=0 disables automatic resolution, so it needs a hand."
+		fi
+
+		# Only a branch this pipeline owns. A fork's PR can carry the
+		# issue-<ref> name too, so cross-repository is checked as well: without
+		# it, `git push origin HEAD:<headRefName>` would write to a same-named
+		# branch in the base repository that has nothing to do with this PR.
+		if [[ "$(jq -r '.isCrossRepository' <<<"$details")" == "true" ]]; then
+			blocked conflict "pull request #$pr has a merge conflict, but it is from a fork; its branch is not this pipeline's to rewrite."
+		fi
+		local conflict_head_ref
+		conflict_head_ref=$(jq -r '.headRefName' <<<"$details")
+		if [[ "$conflict_head_ref" != "issue-$ref" ]]; then
+			blocked conflict "pull request #$pr has a merge conflict, but its branch $conflict_head_ref is not this item's own issue-$ref branch; it is not this pipeline's to rewrite."
+		fi
+
+		# An incomplete view defers rather than acts, the same stance the
+		# review-thread paging guard takes above.
+		local head_oid base_oid
+		head_oid=$(jq -r '.headRefOid // empty' <<<"$details")
+		base_oid=$(jq -r '.baseRefOid // empty' <<<"$details")
+		if [[ -z "$head_oid" || -z "$base_oid" ]]; then
+			echo "PR #$pr's head or base commit is not yet known; deferring" >&2
+			exit 10
+		fi
+
+		# Bounded without state: if the newest well-formed marker already names
+		# this exact head/base pair, an attempt already ran against precisely
+		# this conflict and it is still reported conflicting — a person is
+		# needed, and running the model again would just repeat it.
+		local marker
+		marker=$(marker_pair)
+		if [[ -n "$marker" && "$marker" == "$head_oid $base_oid" ]]; then
+			asks decision "an earlier attempt already tried to resolve pull request #$pr's merge conflict at this same head and base commit, and it is still reported conflicting; it needs a hand."
+		fi
+
+		resolve_conflict # exits 10 or 20; never returns
 	fi
 	if [[ "$mergeable" != "MERGEABLE" ]]; then
 		echo "PR #$pr's mergeability is not yet known ($mergeable); waiting" >&2
