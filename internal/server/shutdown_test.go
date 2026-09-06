@@ -188,7 +188,7 @@ func TestDrainWaitsForAdvanceInWatchMode(t *testing.T) {
 	s.ctx = ctx
 	s.drainGrace = 5 * time.Second
 	s.refresh(ctx)
-	go s.button(ctx, false)
+	go s.button(ctx, ModeManual)
 
 	s.tick <- struct{}{}
 	waitFor(t, "the stage to start", func() bool {
@@ -228,7 +228,7 @@ func TestServerRunDoesNotReturnUntilDrained(t *testing.T) {
 	s.drainGrace = 5 * time.Second
 
 	runErr := make(chan error, 1)
-	go func() { runErr <- s.Run(ctx, "127.0.0.1:0", true) }()
+	go func() { runErr <- s.Run(ctx, "127.0.0.1:0", ModeAuto) }()
 
 	waitFor(t, "the stage to start", func() bool {
 		_, err := os.Stat(filepath.Join(dir, "started"))

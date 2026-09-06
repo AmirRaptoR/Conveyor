@@ -106,7 +106,7 @@ func TestTheTickButtonClearsADeferral(t *testing.T) {
 	defer drain(t, s, cancel)
 	s.refresh(ctx) // one listing, no poll ticker: nothing else will clear it
 	go s.schedule(ctx)
-	go s.button(ctx, true)
+	go s.button(ctx, ModeAuto)
 
 	waitFor(t, "the deferring stage to run once", func() bool { return countLines(stageRuns) >= 1 })
 	waitFor(t, "the item to be resting", func() bool {

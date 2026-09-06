@@ -61,6 +61,51 @@ func TestABadHashIsRefusedAtLoad(t *testing.T) {
 	}
 }
 
+// A malformed auth.origins entry is a load error naming the entry, exactly
+// like a malformed hash — the config is wrong either way, and a warning
+// nobody reads is not a control.
+func TestAMalformedOriginIsRefusedAtLoad(t *testing.T) {
+	cases := map[string]string{
+		"no scheme":        "board.example.com",
+		"unknown scheme":   "ftp://board.example.com",
+		"no host":          "https://",
+		"has a path":       "https://board.example.com/app",
+		"has a query":      "https://board.example.com?x=1",
+		"not a URL at all": "://://",
+	}
+	for name, bad := range cases {
+		problems := Auth{Origins: []string{bad}}.validate()
+		if len(problems) != 1 {
+			t.Errorf("%s (%q): %d problem(s), want 1", name, bad, len(problems))
+			continue
+		}
+		if !strings.Contains(problems[0], bad) {
+			t.Errorf("%s: %q does not name the bad entry", name, problems[0])
+		}
+	}
+
+	good := Auth{Origins: []string{"https://board.example.com", "http://localhost:9999"}}
+	if problems := good.validate(); len(problems) != 0 {
+		t.Errorf("well-formed origins rejected: %v", problems)
+	}
+	parsed, err := good.ParsedOrigins()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ParsedOrigin{
+		{Origin: "https://board.example.com", Host: "board.example.com"},
+		{Origin: "http://localhost:9999", Host: "localhost:9999"},
+	}
+	if len(parsed) != len(want) {
+		t.Fatalf("ParsedOrigins() = %v, want %v", parsed, want)
+	}
+	for i := range want {
+		if parsed[i] != want[i] {
+			t.Errorf("ParsedOrigins()[%d] = %+v, want %+v", i, parsed[i], want[i])
+		}
+	}
+}
+
 // The parameters live in the line, so raising the cost later leaves every hash
 // already written still verifiable.
 func TestAHashCarriesItsOwnParameters(t *testing.T) {

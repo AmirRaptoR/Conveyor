@@ -13,31 +13,69 @@ import (
 	"time"
 )
 
-// Run serves until ctx is done. auto drives the pipeline; without it the server
-// only ever reads.
-func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
+// Run serves until ctx is done. mode is what this process is willing to do to
+// the pipeline: auto drives it, manual only moves an item when the tick
+// button is pressed, and observe never runs a stage, a move or a doctor
+// script at all.
+func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 	// The board is a control plane: it starts agent runs, reorders work and
 	// hands marked items back. Reaching it is enough to drive every repository
 	// the config enrols, so an open one on a public interface is not a
 	// read-only inconvenience. This refuses rather than warns, because the
 	// mistake it prevents is silent and the fix is one command.
 	//
-	// Checked before anything below starts: the three loops read and write
-	// through ctx, not through this call's error return, so launching them
-	// ahead of a refusal left every one of them running regardless — on
-	// context.Background() if the caller never cancelled it, forever.
+	// Checked before anything below starts: nothing here has bound a listener
+	// or launched a goroutine yet, so a refusal here is the whole story — a
+	// serve that never listened and never listed anything.
 	if !s.cfg.Auth.Enabled() && !loopback(addr) {
 		return fmt.Errorf("refusing to serve %s with no auth: configure auth.users "+
 			"(run `conveyor passwd <name>` for a line to paste) or bind a loopback address", addr)
 	}
 
 	s.ctx = ctx
+	s.mode = mode
+	s.mu.Lock()
+	s.state.Mode = string(mode)
+	s.mu.Unlock()
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		s.listenHost = h
+	}
+
+	handler, err := s.handler()
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+		// No ReadTimeout and no WriteTimeout: either one cuts a live
+		// /api/events stream. ReadHeaderTimeout and MaxHeaderBytes bound only
+		// the part of a request that arrives before a handler — SSE or
+		// otherwise — ever starts running.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	// Bound before anything below starts: a serve that cannot bind must not
+	// have listed a source or launched a stage first.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	if s.listening != nil {
+		select {
+		case s.listening <- ln.Addr().String():
+		default:
+		}
+	}
+
 	// Three loops, and they are separate on purpose. Discovery must keep its
 	// interval while a 90-minute stage runs, so nothing that waits for work to
 	// finish may share a goroutine with it.
 	go s.poll(ctx)
-	go s.button(ctx, auto)
-	if auto {
+	go s.button(ctx, mode)
+	if mode.Runs() {
 		go s.schedule(ctx)
 		if d := s.cfg.RetryStalled.D(); d > 0 {
 			go s.stalled(ctx, d)
@@ -45,39 +83,16 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 		go s.sweep(ctx)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/state", s.handleState)
-	mux.HandleFunc("GET /api/events", s.handleEvents)
-	mux.HandleFunc("GET /api/runs", s.handleRuns)
-	mux.HandleFunc("GET /api/runs/{id}", s.handleRun)
-	mux.HandleFunc("GET /api/items/{id}/report", s.handleReport)
-	mux.HandleFunc("POST /api/refresh", s.handleRefresh)
-	mux.HandleFunc("POST /api/tick", s.handleTick)
-	mux.HandleFunc("PUT /api/order", s.handleOrder)
-	mux.HandleFunc("POST /api/items/{id}/start", s.handleStart)
-	mux.HandleFunc("POST /api/items/{id}/unblock", s.handleUnblock)
-	mux.HandleFunc("POST /api/unblock", s.handleUnblockAll)
-	mux.HandleFunc("POST /api/doctor", s.handleDoctorStart)
-	mux.HandleFunc("GET /api/doctor", s.handleDoctorGet)
-	mux.HandleFunc("GET /api/push/key", s.handlePushKey)
-	mux.HandleFunc("POST /api/push/subscribe", s.handlePushSubscribe)
-	mux.HandleFunc("POST /api/push/unsubscribe", s.handlePushUnsubscribe)
-	mux.HandleFunc("POST /api/push/test", s.handlePushTest)
-
-	static, err := webHandler()
-	if err != nil {
-		return err
-	}
-	mux.Handle("/", static)
-
-	srv := &http.Server{Addr: addr, Handler: s.authed(mux)}
 	go func() { <-ctx.Done(); _ = srv.Close() }()
-	mode := "running: items advance on their own"
-	if !auto {
-		mode = "watching only: -watch is set, nothing will advance"
+	banner := "running: items advance on their own"
+	switch mode {
+	case ModeManual:
+		banner = "manual: nothing advances on its own, the tick button does"
+	case ModeObserve:
+		banner = "observing only: nothing will ever advance, not even the tick button"
 	}
 	if s.cfg.Auth.Enabled() {
-		mode += "\n  basic auth on, " + strconv.Itoa(len(s.cfg.Auth.Users)) + " user(s)"
+		banner += "\n  basic auth on, " + strconv.Itoa(len(s.cfg.Auth.Users)) + " user(s)"
 	}
 	// ":8080" means every interface, so name a host you can actually open;
 	// "127.0.0.1:8090" already names one and must not have a second glued on.
@@ -85,8 +100,8 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	if strings.HasPrefix(addr, ":") {
 		shown = "localhost" + addr
 	}
-	fmt.Printf("conveyor: http://%s\n  %s\n", shown, mode)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	fmt.Printf("conveyor: http://%s\n  %s\n", shown, banner)
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	// The HTTP listener is down the moment ctx is cancelled, but a transition
@@ -96,6 +111,115 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	// restarted engine claim an item whose old run has not actually stopped.
 	s.drain()
 	return nil
+}
+
+// handler builds the whole route table and wraps it: host validation first
+// (cheapest), then cross-origin protection, then Basic Auth (the expensive
+// one) — so a cross-site or bad-Host flood never reaches a password
+// derivation. mutation routes additionally refuse in observe mode.
+func (s *Server) handler() (http.Handler, error) {
+	if s.cop == nil {
+		s.cop = http.NewCrossOriginProtection()
+	}
+	// Already validated at load (Auth.validate), so an error here would only
+	// mean a Config built without going through config.Load.
+	origins, err := s.cfg.Auth.ParsedOrigins()
+	if err != nil {
+		return nil, fmt.Errorf("auth.origins: %w", err)
+	}
+	for _, o := range origins {
+		if err := s.cop.AddTrustedOrigin(o.Origin); err != nil {
+			return nil, fmt.Errorf("auth.origins: %s: %w", o.Origin, err)
+		}
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/state", s.handleState)
+	mux.HandleFunc("GET /api/events", s.handleEvents)
+	mux.HandleFunc("GET /api/runs", s.handleRuns)
+	mux.HandleFunc("GET /api/runs/{id}", s.handleRun)
+	mux.HandleFunc("GET /api/items/{id}/report", s.handleReport)
+	mux.HandleFunc("POST /api/refresh", s.handleRefresh)
+	mux.HandleFunc("POST /api/tick", s.mutationGuard(s.handleTick))
+	mux.HandleFunc("PUT /api/order", s.handleOrder)
+	mux.HandleFunc("POST /api/items/{id}/start", s.mutationGuard(s.handleStart))
+	mux.HandleFunc("POST /api/items/{id}/unblock", s.mutationGuard(s.handleUnblock))
+	mux.HandleFunc("POST /api/unblock", s.mutationGuard(s.handleUnblockAll))
+	mux.HandleFunc("POST /api/doctor", s.mutationGuard(s.handleDoctorStart))
+	mux.HandleFunc("GET /api/doctor", s.handleDoctorGet)
+	mux.HandleFunc("GET /api/push/key", s.handlePushKey)
+	mux.HandleFunc("POST /api/push/subscribe", s.handlePushSubscribe)
+	mux.HandleFunc("POST /api/push/unsubscribe", s.handlePushUnsubscribe)
+	mux.HandleFunc("POST /api/push/test", s.handlePushTest)
+
+	static, err := webHandler()
+	if err != nil {
+		return nil, err
+	}
+	mux.Handle("/", static)
+
+	h := s.authed(mux)
+	if s.cop != nil {
+		h = s.cop.Handler(h)
+	}
+	return s.hostCheck(h), nil
+}
+
+// mutationGuard refuses a route in any mode that does not allow mutation —
+// today only observe. The page also hides the control that would have hit
+// this, but hiding a button is not a boundary: only a request that never
+// reaches its handler is.
+func (s *Server) mutationGuard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.mode.Mutates() {
+			http.Error(w, "observe mode: nothing here ever runs a stage, a move or a doctor script", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// hostCheck refuses a request whose Host is not one this board recognises —
+// not loopback, not the configured listen address, not an auth.origins entry
+// — so a DNS-rebinding page cannot reach a loopback-bound board just by
+// getting a browser to resolve some other name to 127.0.0.1. Checked first,
+// before cross-origin protection or Basic Auth: the cheapest rejection runs
+// first.
+func (s *Server) hostCheck(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.validHost(r.Host) {
+			http.Error(w, fmt.Sprintf(
+				"host %q is not recognized; add it to auth.origins", r.Host), http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) validHost(host string) bool {
+	h := host
+	if hh, _, err := net.SplitHostPort(host); err == nil {
+		h = hh
+	}
+	if h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(strings.Trim(h, "[]")); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	if s.listenHost != "" && h == s.listenHost {
+		return true
+	}
+	origins, err := s.cfg.Auth.ParsedOrigins()
+	if err != nil {
+		return false // malformed config; validate() already refuses this at load
+	}
+	for _, o := range origins {
+		if host == o.Host || h == o.Host {
+			return true
+		}
+	}
+	return false
 }
 
 // webHandler serves the embedded web/ directory: the board's markup, the
@@ -111,6 +235,27 @@ func webHandler() (http.Handler, error) {
 		return nil, err
 	}
 	return http.FileServer(http.FS(sub)), nil
+}
+
+// secureDataDir restricts the data directory to the owner alone: it holds
+// order.json, answers.json, push subscriptions, the VAPID key pair and every
+// run directory — prompts, a person's typed answer and logs among them.
+//
+// Best-effort and never fatal: a data directory another process or an older
+// build already created at a looser mode still gets tightened here, but a
+// filesystem that refuses the chmod (a network mount, a permission this
+// process does not have) must not stop conveyor from serving — a warning
+// naming the path is what a person can act on, a refusal to start is not.
+// Existing run directories underneath it are deliberately left alone; only
+// the root is touched, so this is one syscall, not a walk of run history.
+func secureDataDir(dir string) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: could not create data directory %s: %v\n", dir, err)
+		return
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: could not restrict %s to the owner alone: %v\n", dir, err)
+	}
 }
 
 // drainGrace bounds how long shutdown waits for in-flight transitions before
@@ -175,7 +320,7 @@ func (s *Server) authed(next http.Handler) http.Handler {
 			return
 		}
 		user, pass, ok := r.BasicAuth()
-		if !ok || !s.cfg.Auth.Check(user, pass) {
+		if !ok || !s.verify.verify(user, pass) {
 			deny(w)
 			return
 		}
