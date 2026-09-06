@@ -1,0 +1,19 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Pinned to go.mod's own `go` directive, so this can only drift by
+          # editing that file — never a version named twice.
+          go-version-file: go.mod
+      - run: ./check
