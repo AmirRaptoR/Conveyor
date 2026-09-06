@@ -40,6 +40,7 @@ case "$1 $2" in
 "api graphql") what=graphql ;;
 "api repos"*) what=timeline ;;
 "pr edit")   echo "unlabelled"; exit 0 ;;
+"pr comment") printf '%s\n' "$*" >>"$scene/comments_posted"; exit 0 ;;
 "pr merge")  echo "merged"; [[ -f "$scene/merge_fails" ]] && exit 1; touch "$scene/merged"; exit 0 ;;
 *)
 	case "$1" in
@@ -64,12 +65,33 @@ chmod +x "$tmp/bin/gh"
 # origin. Every path that stops before resolve_conflict never calls git at
 # all in this sandbox, since the worktree directory it would inspect never
 # exists here — so this stub changes nothing about them.
-cat >"$tmp/bin/git" <<'STUB'
+#
+# SELFCHECK_REAL_GIT lifts the refusal, and only the last section sets it:
+# resolve_conflict's own arithmetic — what a half-finished merge looks like and
+# what finishes it — is git's behaviour and cannot be asserted against a stub
+# that has none. The repository it then works in is built from nothing under
+# $tmp, with its own bare origin; this checkout is still never touched, which
+# is what the refusal is actually protecting.
+real_git=$(command -v git)
+cat >"$tmp/bin/git" <<STUB
 #!/usr/bin/env bash
-echo "stub git: refusing $*" >&2
+[[ -n "\${SELFCHECK_REAL_GIT:-}" ]] && exec $real_git "\$@"
+echo "stub git: refusing \$*" >&2
 exit 1
 STUB
 chmod +x "$tmp/bin/git"
+
+# claude refuses outright and leaves a receipt. Nothing in this file may run a
+# model, and the last section asserts a specific absence — that finishing a
+# merge somebody already resolved costs no model run — which needs the
+# difference between "did not run" and "ran and failed" to be visible.
+cat >"$tmp/bin/claude" <<STUB
+#!/usr/bin/env bash
+touch "$tmp/claude-ran"
+echo "stub claude: refusing to run a model" >&2
+exit 1
+STUB
+chmod +x "$tmp/bin/claude"
 
 # run <name> — run approve in the current scene and report its exit code.
 run() {
@@ -277,5 +299,96 @@ scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
 date -u +%Y-%m-%dT%H:%M:%SZ >"$tmp/scene/timeline"
 chk "a nonsense QUIET_SECONDS falls back to the default" "$(QUIET=soon run)" "10"
 chk "     and 0 is still a valid wait of none"           "$(QUIET=0 run)" "0"
+
+# --- 8f. a merge left resolved but uncommitted is finished, not marked -------
+#
+# The one place resolve_conflict is driven against real git, because what is
+# being asserted is a git state and nothing else: MERGE_HEAD set, no unmerged
+# paths, the resolution sitting in the index. That is what a run killed
+# mid-verification leaves — the `turns` stop is the usual way — and it used to
+# be marked `conflict` forever: the model was already out of the picture, so
+# the next poll found the same state and marked it again. midgame #106 sat
+# there for four hours over sixteen runs.
+#
+# Everything below is built from nothing under $tmp with its own bare origin.
+src="$tmp/src" origin="$tmp/origin.git" wt="$tmp/worktrees/s1/7"
+g() { "$real_git" "$@"; }
+
+g init --quiet --bare -b main "$origin"
+g init --quiet -b main "$src"
+g -C "$src" config user.email selfcheck@example.invalid
+g -C "$src" config user.name selfcheck
+g -C "$src" remote add origin "$origin"
+printf 'base\n' >"$src/f.txt"
+g -C "$src" add f.txt
+g -C "$src" commit --quiet -m base
+g -C "$src" push --quiet -u origin main
+g -C "$src" checkout --quiet -b issue-7
+branch_content='the branch'
+printf '%s\n' "$branch_content" >"$src/f.txt"
+g -C "$src" commit --quiet -am "branch edit"
+g -C "$src" push --quiet -u origin issue-7
+issue7_base=$(g -C "$src" rev-parse issue-7)
+g -C "$src" checkout --quiet main
+printf 'the base\n' >"$src/f.txt"
+g -C "$src" commit --quiet -am "base edit"
+g -C "$src" push --quiet origin main
+
+# half_merged <resolution> — put the item's worktree in the state a killed run
+# leaves: mid-merge, every conflict staged, nothing committed.
+#
+# The branch is wound back to where it was before any scene ran, here and on
+# the origin both. A scene that finishes its merge pushes it, and leaving that
+# in place would hand the next scene a branch with nothing left to merge —
+# which stops on the dirty worktree long before reaching what is being tested,
+# and passes or fails for the wrong reason.
+half_merged() {
+	g -C "$src" worktree remove --force "$wt" >/dev/null 2>&1
+	g -C "$src" branch --quiet -f issue-7 "$issue7_base"
+	g -C "$src" push --quiet --force origin issue-7
+	g -C "$src" worktree add --quiet --force "$wt" issue-7
+	g -C "$wt" merge --no-edit origin/main >/dev/null 2>&1
+	printf '%s\n' "$1" >"$wt/f.txt"
+	g -C "$wt" add f.txt
+}
+
+# The stubbed git refuses everything unless this is set, so it is passed to the
+# run and never exported: every scene above must stay unable to touch a repo.
+run_real() {
+	local rc
+	: >"$CONVEYOR_RESULT"
+	rm -f "$tmp/claude-ran"
+	echo '{"item":{"ref":"7","title":"an item"}}' |
+		(cd "$src" && SCENE="$tmp/scene" REPO=o/n PROMPT="fix it" CONVEYOR_SOURCE=s1 \
+			QUIET_SECONDS=0 SELFCHECK_REAL_GIT=1 "$here/approve" >/dev/null 2>&1)
+	rc=$?
+	echo "$rc"
+}
+merge_in_progress() { g -C "$wt" rev-parse -q --verify MERGE_HEAD >/dev/null && echo yes || echo no; }
+
+scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS '[]' issue-7 false
+half_merged "resolved by the run that died"
+chk "(8f) a merge with every conflict resolved is finished, not marked" "$(run_real)" "10"
+chk "     and no model ran"                   "$([[ -f "$tmp/claude-ran" ]] && echo ran || echo no)" "no"
+chk "     and the merge is committed"         "$(merge_in_progress)" "no"
+chk "     and the resolution is what landed"  "$(g -C "$wt" show HEAD:f.txt)" "resolved by the run that died"
+chk "     and the branch was pushed"          "$(g -C "$origin" rev-parse issue-7)" "$(g -C "$wt" rev-parse HEAD)"
+chk "     and the attempt was recorded"       "$([[ -s "$tmp/scene/comments_posted" ]] && echo posted || echo no)" "posted"
+
+# The narrow exception: $branch_content is byte-for-byte what HEAD already
+# holds, so this resolution takes the base's side of nothing and the merge
+# commit would change not one file. Finishing that silently would push a branch
+# whose own work had been thrown away, so it is still a person's.
+scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS '[]' issue-7 false
+half_merged "$branch_content"
+chk "(8f) a merge that resolves to no change at all still stops" "$(run_real)" "20"
+chk "     and the kind is conflict"           "$(kind)" "conflict"
+chk "     and no model ran"                   "$([[ -f "$tmp/claude-ran" ]] && echo ran || echo no)" "no"
+# The same scene is the only one where `status --porcelain` reads clean with a
+# merge in progress, so it is the only one that can prove gate 8a leaves it
+# alone. Before try_rebase looked for MERGE_HEAD it reset --hard over exactly
+# this, and the resolution was gone with nothing saying so.
+chk "(8a) a rebase never resets over a merge in progress" "$(merge_in_progress)" "yes"
+chk "     leaving the resolution where it was"            "$(cat "$wt/f.txt")" "$branch_content"
 
 exit $fail
