@@ -4,7 +4,7 @@
 // and a minimal, hand-rolled DOM. No dependency, no package.json, no
 // node_modules: run with
 //
-//   node --test internal/server/web/writes_test.mjs
+//   node --test internal/server/web/writes.test.mjs
 //
 // The script is pulled out of the live file (everything from the opening
 // <script> tag up to the EventSource wiring, which needs a real transport
