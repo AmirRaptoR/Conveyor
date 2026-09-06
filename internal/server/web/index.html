@@ -885,6 +885,12 @@ function controlsForMode(mode) {
   const enabled = mode !== "observe";
   return { tick: enabled, unblockAll: enabled, diagnose: enabled, handBack: enabled, dragStart: enabled };
 }
+
+// The same http(s)-only rule paraInline already applies to a report's own
+// `[text](url)` links (report.go's identityLine emits only that scheme), used
+// here for a card's provider link too: escaping markup is not validating a
+// scheme, and a `javascript:` URL from a provider is markup either way.
+function isHttpUrl(u) { return /^https?:\/\//i.test(u || ""); }
 // ---- end pure helpers -------------------------------------------------------
 
 let state = null, openItemId = null, openItemTitle = null, followRun = null;
@@ -1424,8 +1430,10 @@ function card(it, active, place) {
       ${hasPrio ? `<span class="prio">p${it.priority}</span>` : ""}
       ${ageChip(it)}
       <span class="src">${esc(it.id)}</span>
-      ${it.url ? `<a class="open" href="${esc(it.url)}" target="_blank" rel="noopener"
-           title="Open on GitHub" aria-label="Open ${esc(it.id)} on GitHub">&#8599;</a>` : ""}
+      ${it.url ? (isHttpUrl(it.url)
+           ? `<a class="open" href="${esc(it.url)}" target="_blank" rel="noopener"
+                title="Open on GitHub" aria-label="Open ${esc(it.id)} on GitHub">&#8599;</a>`
+           : `<span class="open" title="${esc(it.url)}">${esc(it.url)}</span>`) : ""}
     </span>
     ${refusals.has(it.id) ? `<span class="refused">${esc(refusals.get(it.id))}</span>` : ""}
   </article>`;

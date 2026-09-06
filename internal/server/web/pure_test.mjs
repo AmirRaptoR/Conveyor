@@ -30,10 +30,10 @@ const region = html.slice(start, end);
 const sandbox = {};
 vm.createContext(sandbox);
 vm.runInContext(
-  region + "\nglobalThis.__pure = { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, controlsForMode };",
+  region + "\nglobalThis.__pure = { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, controlsForMode, isHttpUrl };",
   sandbox,
 );
-const { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, controlsForMode } = sandbox.__pure;
+const { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, controlsForMode, isHttpUrl } = sandbox.__pure;
 
 test("focusKeyOf: a card and its .open link are different keys", () => {
   assert.equal(focusKeyOf({ kind: "card", id: "issue-44", control: "card" }), "card:issue-44:card");
@@ -116,4 +116,13 @@ test("controlsForMode: auto and manual both offer every control — only observe
     const got = controlsForMode(mode);
     for (const f of controlFields) assert.equal(got[f], true, `${f} in ${mode}`);
   }
+});
+
+test("isHttpUrl: only http and https pass, case-insensitively", () => {
+  assert.equal(isHttpUrl("https://github.com/x/y/issues/1"), true);
+  assert.equal(isHttpUrl("HTTP://example.com"), true);
+  assert.equal(isHttpUrl("javascript:alert(1)"), false);
+  assert.equal(isHttpUrl("data:text/html,<script>1</script>"), false);
+  assert.equal(isHttpUrl(""), false);
+  assert.equal(isHttpUrl(undefined), false);
 });
