@@ -1,0 +1,140 @@
+/* ---- sources ---------------------------------------------------------- */
+.sources {
+  display:flex; gap:16px; flex-wrap:wrap; align-items:center;
+  padding:10px 22px; border-bottom:1px solid var(--rule); background:var(--panel);
+  font-size:11px; color:var(--dim);
+}
+.src-chip { display:flex; align-items:center; gap:7px; }
+.src-chip .swatch { width:9px; height:2px; background:var(--src); }
+.src-chip .repo { color:var(--faint); }
+.src-chip .n { color:var(--ink); font-variant-numeric:tabular-nums; }
+.src-chip.broken .name { color:var(--stop); }
+.src-chip.broken .swatch { background:var(--stop); }
+/* Degraded: still enrolled and expected to be listing, but the last
+   attempt failed, never happened, or is older than the stale threshold —
+   distinct from .broken, which is a source not being listed by design. */
+.src-chip.degraded .name { color:var(--run); }
+.src-chip.degraded .swatch { background:var(--run); }
+.src-chip.degraded .n { color:var(--run); }
+.src-chip .never { color:var(--run); }
+
+/* The agents' own report on themselves. A strip above the sources, because
+   an agent over its usage limit stops every source at once, and that is the
+   first thing to know when a board has gone quiet. */
+.agents { display:flex; gap:20px; flex-wrap:wrap; align-items:center;
+  padding:9px 22px; border-bottom:1px solid var(--rule); background:var(--panel);
+  font-size:11px; color:var(--dim); }
+.agent { display:flex; align-items:baseline; gap:8px; }
+.agent .who { color:var(--ink); letter-spacing:.1em; text-transform:uppercase; font-size:9.5px; }
+.agent .say { color:var(--dim); }
+.agent.limited .who, .agent.limited .say { color:var(--stop); }
+.agent.paused .who { color:var(--stop); }
+/* The scheduler's own state, not the agent's report: said in the agent's
+   words but boxed, so "it says it is limited" and "we stopped dispatching"
+   are not read as one sentence. */
+.agent .held { color:var(--stop); border:1px solid var(--stop); border-radius:3px;
+  padding:0 5px; font-size:9.5px; letter-spacing:.04em; }
+.agent .resets { color:var(--faint); }
+.agent details { display:inline; }
+.agent summary { cursor:pointer; color:var(--faint); list-style:none; }
+.agent summary::-webkit-details-marker { display:none; }
+.agent .facts { display:flex; gap:14px; flex-wrap:wrap; padding-top:6px; color:var(--faint); }
+.agent .facts b { color:var(--dim); font-weight:400; }
+
+/* A doctor sweep: one row per marked item, updating in place as each one
+   settles. Never a count — a count cannot say which item was left, only
+   that some were. */
+.doctor-sweep { border:1px solid var(--rule); border-radius:6px; padding:10px 12px;
+  margin:0 16px 10px; font-size:12px; }
+.doctor-sweep .dhead { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
+.doctor-sweep .dhead b { color:var(--ink); font-weight:400; letter-spacing:.02em; }
+.doctor-sweep .dstate { color:var(--dim); }
+.doctor-sweep .dapply { color:var(--run); }
+.drow { display:flex; gap:10px; align-items:baseline; padding:2px 0; }
+.drow .ditem { color:var(--dim); min-width:120px; }
+.drow .dstatus { text-transform:uppercase; letter-spacing:.04em; font-size:10px; min-width:64px; }
+.drow.pending .dstatus { color:var(--faint); }
+.drow.skipped .dstatus { color:var(--faint); }
+.drow.cleared .dstatus { color:var(--ok); }
+.drow.left .dstatus { color:var(--run); }
+.drow.failed .dstatus { color:var(--stop); }
+.drow .dwhy { color:var(--dim); }
+
+/* What kind of stop it was, on the card. One word: the paragraph is in the
+   panel, because a column of paragraphs cannot be read across. */
+.item .why {
+  color:var(--stop); letter-spacing:.08em; text-transform:lowercase; font-size:9.5px;
+  border:1px solid color-mix(in srgb, var(--stop) 35%, var(--rule));
+  border-radius:999px; padding:1px 7px;
+}
+.item .why.waiting { color:var(--dim); border-color:var(--rule); }
+.item .why.asks {
+  color:var(--ask); border-color:color-mix(in srgb, var(--ask) 50%, var(--rule));
+  background:color-mix(in srgb, var(--ask) 12%, transparent); font-weight:600;
+}
+/* Everything waiting on you, in one strip under the masthead — the first
+   question the board answers, asked before the eye has to scan columns. */
+.needs {
+  display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+  padding:9px 22px; border-bottom:1px solid var(--rule);
+  background:color-mix(in srgb, var(--ask) 9%, var(--panel)); font-size:12px;
+}
+.needs:empty { display:none; }
+.needs .nlabel { color:var(--ask); font-weight:600; margin-right:6px; }
+.needs .need {
+  font:inherit; font-size:12px; color:var(--ink); background:var(--raised);
+  border:1px solid color-mix(in srgb, var(--ask) 45%, var(--rule)); border-radius:999px;
+  padding:3px 12px; cursor:pointer; max-width:340px; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap;
+}
+.needs .need:hover { border-color:var(--ask); }
+/* The done column shows the last ten; the rest come ten at a time. */
+.more {
+  font:inherit; font-size:11px; color:var(--dim); background:none; cursor:pointer;
+  border:1px dashed var(--rule); padding:7px; width:100%;
+}
+.more:hover { color:var(--ink); border-color:var(--faint); }
+
+/* And the whole of it, in the panel, with the one control that answers it. */
+.stop {
+  margin:0 0 14px; border-left:2px solid var(--stop);
+  background:var(--panel); padding:12px 16px;
+}
+.stop h3 {
+  margin:0 0 6px; font-size:10px; letter-spacing:.18em; text-transform:uppercase;
+  color:var(--stop); font-weight:500;
+}
+.stop p { margin:0; color:var(--ink); font-size:12px; line-height:1.65; white-space:pre-wrap; }
+.stop .meta { margin-top:8px; color:var(--faint); font-size:10.5px; }
+/* A failed handBack/sendAnswer inside the open panel: refuse() alone draws
+   onto the board card, which #panel and #scrim occlude while it is open. */
+.stop .fault {
+  margin-top:10px; padding:7px 9px; border:1px solid color-mix(in srgb, var(--stop) 40%, var(--rule-soft));
+  border-radius:2px; color:var(--stop); font-size:11.5px; line-height:1.5;
+}
+.stop.asks { border-left-color:var(--ask); }
+.stop.asks h3 { color:var(--ask); }
+.stop.waiting { border-left-color:var(--faint); }
+.stop.waiting h3 { color:var(--dim); }
+.stop .ask-btn {
+  display:inline-block; margin:12px 0 0; font:inherit; font-size:12px; font-weight:600;
+  color:#fff; background:var(--ask); border:0; border-radius:6px; padding:8px 16px; cursor:pointer;
+}
+.stop .ask-btn:hover { filter:brightness(1.1); }
+.stop .hand {
+  margin-top:10px; color:var(--stop); cursor:pointer;
+  border:1px solid color-mix(in srgb, var(--stop) 45%, var(--rule)); border-radius:2px;
+  padding:3px 10px; background:none; font:inherit; font-size:10px;
+  letter-spacing:.1em; text-transform:uppercase;
+}
+.stop .hand:hover { background:color-mix(in srgb, var(--stop) 14%, transparent); }
+.stop .answer {
+  display:block; width:100%; box-sizing:border-box; margin-top:10px;
+  background:var(--ground); color:var(--ink); font:inherit; font-size:12px;
+  line-height:1.6; border:1px solid var(--rule); border-radius:2px;
+  padding:7px 9px; resize:vertical;
+}
+.stop .answer:focus {
+  outline:none; border-color:color-mix(in srgb, var(--stop) 45%, var(--rule));
+}
+.stop .answer::placeholder { color:var(--faint); }

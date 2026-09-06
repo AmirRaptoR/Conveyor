@@ -1,0 +1,145 @@
+/* ---- the design pass ----------------------------------------------------
+   One voice. Sentence case everywhere, one sans family, mono only where the
+   content is a readout — an id, a log line, a code span. Colour is state
+   and nothing else: amber is working, violet is waiting on you, red is a
+   fault, green is finished. The page is the height of the window and the
+   line fills it, so the scrollbar is always where a scrollbar is. */
+body { display:flex; flex-direction:column; height:100vh; font-size:13px; }
+.mark, .readout, .count, .runs-label, .prio, .rank, .agent .who, .src-chip,
+.drow .dstatus, .why { font-family:var(--sans); }
+.src, .log, .ln, .stop .meta, .askstep, code { font-family:var(--mono); }
+
+.masthead { align-items:center; gap:14px; padding:11px 22px; }
+.mark { font-size:15px; font-weight:600; letter-spacing:0; text-transform:none; }
+.readout { font-size:12.5px; letter-spacing:0; white-space:nowrap; align-items:center; }
+.readout b { font-weight:600; }
+.ctl {
+  font-size:12.5px; letter-spacing:0; text-transform:none; white-space:nowrap;
+  padding:6px 12px; border-radius:6px; color:var(--ink);
+  border-color:var(--rule); background:var(--raised);
+}
+.ctl:hover:not(:disabled) { border-color:var(--faint); background:var(--panel); }
+.ctl.primary { background:var(--ink); color:var(--ground); border-color:transparent; font-weight:600; }
+.ctl.primary:hover:not(:disabled) { background:var(--ink); opacity:.9; }
+
+.needs, .agents, .sources { padding:8px 22px; font-size:12.5px; }
+.agent .who { font-size:12.5px; letter-spacing:0; text-transform:none; font-weight:600; }
+.agent .held { font-size:11.5px; border-radius:999px; padding:0 8px; }
+.src-chip .swatch { width:8px; height:8px; border-radius:50%; }
+.src-chip .n { color:var(--dim); }
+
+.rail-wrap { flex:1; min-height:0; }
+.line { height:100%; overflow:auto; padding:18px 22px 22px; }
+.railctl { display:none !important; }
+:root { --station:262px; }
+.station { padding-right:12px; }
+.station::after { display:none; }
+.plate {
+  position:sticky; top:0; z-index:2; height:auto; padding:10px 12px 9px;
+  background:var(--panel); border:1px solid var(--rule); border-radius:10px 10px 0 0;
+  box-shadow:none;
+}
+.station.live .plate, .station.live .plate { border-color:var(--rule); box-shadow:inset 0 2px 0 var(--run); }
+.name { font-size:13px; font-weight:600; letter-spacing:0; text-transform:none; }
+.count { font-size:11.5px; color:var(--dim); background:var(--raised); border-radius:999px; padding:0 8px; }
+.count .held { color:var(--stop); }
+.runs-label { font-size:11.5px; letter-spacing:0; margin-top:2px; }
+.runs-label b { color:var(--dim); }
+.queue {
+  margin:0; padding:8px; gap:6px; min-height:72px;
+  background:var(--panel); border:1px solid var(--rule); border-top:0; border-radius:0 0 10px 10px;
+}
+.station.live .queue { border-top-color:transparent; }
+.queue .slot { border:0; padding:22px 8px; text-align:center; color:var(--faint); font-size:12px; }
+.terminus { margin-left:22px; padding-right:12px; }
+/* `overflow:hidden` so a long stage name or a wide tally clips instead of
+   forcing the column wider — `min-width:0` alone stops the column growing,
+   but leaves the plate's own content free to paint past its edge. */
+.terminus .plate { min-width:0; overflow:hidden; box-shadow:inset 0 2px 0 var(--ok); border-color:var(--rule); }
+.terminus .queue { border-top-color:transparent; }
+.terminus .name { color:var(--ink); }
+.more { border-radius:6px; padding:8px; }
+
+.item {
+  border:1px solid var(--rule); border-left:1px solid var(--rule); border-radius:8px;
+  padding:10px 12px; background:var(--raised);
+}
+.item:hover { border-color:var(--faint); }
+.item .title { font-size:13px; line-height:1.4; }
+/* The footer wraps rather than overflows: a long id ("caravan-v2:123")
+   beside a chip is wider than a column. The open-link sits in the card's
+   corner so it is never the thing that wraps onto a line of its own. */
+.item { position:relative; }
+.item .title { display:block; padding-right:18px; }
+.item .foot { margin-top:8px; gap:6px 8px; font-size:11.5px; letter-spacing:0; color:var(--dim); flex-wrap:wrap; min-width:0; }
+.item .foot > * { flex:none; max-width:100%; }
+.item .why { flex:0 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.item .src { white-space:nowrap; }
+.item .open { position:absolute; top:7px; right:7px; margin:0; border:0; color:var(--faint); }
+.item .open:hover { color:var(--ink); }
+.count .asks { color:var(--ask); }
+.src { color:var(--dim); }
+.src::before {
+  content:""; display:inline-block; width:7px; height:7px; border-radius:50%;
+  background:var(--src, var(--faint)); margin-right:6px; vertical-align:0;
+}
+.rank { border-radius:999px; padding:0 7px; }
+.open { border-radius:6px; padding:0 6px; }
+.working-tag { font-size:11.5px; letter-spacing:0; text-transform:none; font-weight:600; }
+.item .why { font-size:11.5px; letter-spacing:0; text-transform:none; padding:1px 9px; }
+.item.blocked { border-color:color-mix(in srgb, var(--stop) 45%, var(--rule)); }
+.item.blocked.waiting { border-color:var(--rule); }
+.item.blocked.asks { box-shadow:none; }
+.item .refused { font-size:11.5px; }
+
+aside { width:min(760px, 96vw); }
+.ahead { padding:14px 20px; align-items:center; }
+.ahead h2 { font-size:15px; font-weight:600; line-height:1.4; }
+.ahead .sub { font-size:12px; letter-spacing:0; text-transform:none; color:var(--dim); }
+.stop { border-radius:8px; border-left-width:3px; margin:12px 20px 0; }
+.stop h3 { font-size:12.5px; font-weight:600; letter-spacing:0; text-transform:none; }
+.stop p { font-size:13px; }
+.stop .hand { font-size:12px; letter-spacing:0; text-transform:none; border-radius:6px; padding:6px 12px; }
+.stop .answer { border-radius:6px; font-size:13px; }
+.stop.asks .hand { color:var(--ask); border-color:color-mix(in srgb, var(--ask) 45%, var(--rule)); }
+.stop.asks .hand:hover { background:color-mix(in srgb, var(--ask) 14%, transparent); }
+.stop.waiting .hand { color:var(--dim); border-color:var(--rule); }
+.report-head { padding:10px 20px 0; }
+.report { font-size:13px; }
+.report h1 { font-size:15px; font-weight:600; }
+.report h2 { font-size:13px; font-weight:600; letter-spacing:0; text-transform:none; margin-top:16px; }
+.report th { letter-spacing:0; text-transform:none; }
+.drow .dstatus { font-size:11.5px; letter-spacing:0; text-transform:none; }
+.askhdr { font-size:12.5px; letter-spacing:0; text-transform:none; }
+.doctor-sweep { margin:0 22px 10px; }
+@media (max-width: 640px) {
+  body { height:auto; min-height:100vh; }
+  .line { height:auto; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before { animation:none !important; transition:none !important; }
+}
+@media (max-width: 640px) {
+  :root { --station: 200px; }
+  .masthead { flex-wrap:wrap; gap:10px; }
+}
+
+/* Offscreen but still read by assistive tech — unlike `display:none` or
+   `hidden`, which are removed from the accessibility tree entirely. */
+.sr-only {
+  position:absolute; width:1px; height:1px; margin:-1px; padding:0;
+  overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0;
+}
+
+/* Keyboard/touch parity for the two drag gestures (#44): reorder within a
+   queue, and start an item out of the first stage. Buttons, not a drag
+   surface, so a keyboard user reaches them by Tab and a touch user by a
+   tap — the detail panel already has the room a card does not (see the
+   issue's technical notes). Not gated behind a hover or pointer media
+   query, and never smaller than the 44x44 CSS px a touch target needs. */
+.pactions { display:flex; gap:8px; flex-wrap:wrap; padding:0 20px 14px; }
+.pactions .ctl {
+  min-width:44px; min-height:44px; display:inline-flex; align-items:center;
+  justify-content:center;
+}
