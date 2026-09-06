@@ -396,16 +396,12 @@ func cmdServe(args []string) error {
 	}
 	defer stop()
 
-	mode, err := server.ParseMode(*modeFlag)
+	mode, note, err := resolveMode(*modeFlag, isSet(c.fs, "mode"), *watch)
 	if err != nil {
 		return err
 	}
-	if *watch {
-		if isSet(c.fs, "mode") && mode != server.ModeObserve {
-			return fmt.Errorf("-watch and -mode=%s were both given; -watch always means observe", *modeFlag)
-		}
-		mode = server.ModeObserve
-		fmt.Fprintln(os.Stderr, "conveyor: -watch selects -mode=observe")
+	if note != "" {
+		fmt.Fprintln(os.Stderr, note)
 	}
 
 	release, err := own(cfg, r, mode.Settles())
@@ -414,6 +410,27 @@ func cmdServe(args []string) error {
 	}
 	defer release()
 	return server.New(cfg, r).Run(ctx, server.Addr(*addr), mode)
+}
+
+// resolveMode turns -mode and -watch into the single Mode Run needs.
+//
+// -watch is kept as an alias for -mode=observe, which is what its own help
+// text and CLAUDE.md have always promised; combined with an explicit -mode
+// that is not observe, it is a startup error naming both flags rather than
+// one silently winning. An unknown -mode value is a startup error listing the
+// three names it accepts.
+func resolveMode(modeStr string, modeSet, watch bool) (mode server.Mode, note string, err error) {
+	mode, err = server.ParseMode(modeStr)
+	if err != nil {
+		return "", "", err
+	}
+	if watch {
+		if modeSet && mode != server.ModeObserve {
+			return "", "", fmt.Errorf("-watch and -mode=%s were both given; -watch always means observe", modeStr)
+		}
+		return server.ModeObserve, "conveyor: -watch selects -mode=observe", nil
+	}
+	return mode, "", nil
 }
 
 // isSet reports whether name was actually passed on the command line, as
