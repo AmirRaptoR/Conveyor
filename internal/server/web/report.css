@@ -1,0 +1,37 @@
+/* ---- final report -------------------------------------------------------
+   Shown only for a terminal stage — everything else on the board is still
+   moving, and the numbers here are only honest once the passage is done. */
+.report {
+  padding:12px 18px; border-bottom:1px solid var(--rule);
+  font-size:12px; line-height:1.65; color:var(--ink);
+}
+.report:empty { display:none; padding:0; border:0; }
+.report-head { display:flex; justify-content:flex-end; margin-bottom:8px; }
+.report h1 { font-size:13px; margin:0 0 8px; font-weight:500; }
+.report h2 {
+  font-size:11px; letter-spacing:.12em; text-transform:uppercase;
+  color:var(--dim); margin:16px 0 8px; font-weight:500;
+}
+.report h3 { font-size:11px; color:var(--dim); margin:12px 0 6px; font-weight:500; }
+.report p { margin:0 0 8px; color:var(--dim); }
+.report table { width:100%; border-collapse:collapse; margin:0 0 10px; font-size:11.5px; }
+.report th, .report td {
+  text-align:left; padding:4px 10px 4px 0; border-bottom:1px solid var(--rule-soft);
+  color:var(--dim); vertical-align:top;
+}
+.report th {
+  color:var(--faint); font-weight:500; letter-spacing:.04em;
+  text-transform:uppercase; font-size:10px;
+}
+.report ul { margin:0 0 8px; padding-left:18px; }
+.report li { margin-bottom:6px; color:var(--dim); }
+.report blockquote {
+  margin:0 0 8px; padding-left:10px; border-left:2px solid var(--rule);
+  color:var(--dim); font-style:italic;
+}
+.report code {
+  background:color-mix(in srgb, var(--ink) 8%, transparent);
+  color:var(--ink); padding:0 3px; border-radius:2px; font-style:normal;
+}
+.report strong { color:var(--ink); font-weight:600; }
+.report a { color:var(--run); }

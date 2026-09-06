@@ -1,0 +1,41 @@
+/* An instrument panel for a production line. Graphite and steel throughout;
+   the only saturated colour in the interface is a signal, so state is the one
+   thing that can draw the eye. */
+:root {
+  --ground:#14181d;      /* painted machinery, not black */
+  --panel:#1a1f26;
+  --raised:#20262f;
+  --rule:#2b323c;
+  --rule-soft:#232932;
+  --ink:#dfe4ec;
+  --dim:#7d8798;
+  --faint:#535d6d;
+
+  --run:#e0a13a;         /* amber: working */
+  --ok:#4caf72;          /* green: done */
+  --stop:#e05a4f;        /* red: a fault */
+  --ask:#9b87f5;         /* violet: a question only you can answer */
+
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, "Helvetica Neue", sans-serif;
+  --station: 236px;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --ground:#eceef1; --panel:#f7f8fa; --raised:#fff;
+    --rule:#ccd2da; --rule-soft:#dee2e8;
+    --ink:#171c23; --dim:#5b6474; --faint:#8b94a3;
+  }
+}
+
+* { box-sizing:border-box; }
+html, body { height:100%; }
+body {
+  margin:0; background:var(--ground); color:var(--ink);
+  font:400 13.5px/1.5 var(--sans);
+  -webkit-font-smoothing:antialiased;
+}
+/* Prose in a sans; the instrument readouts — ids, counts, logs — stay mono. */
+.mark, .readout, .count, .runs-label, .src, .prio, .rank, .log, .ln, .stop .meta,
+.agent .who, .src-chip, .drow .dstatus, .why, .askstep { font-family:var(--mono); }
+:focus-visible { outline:2px solid var(--run); outline-offset:2px; }

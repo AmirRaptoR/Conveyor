@@ -1,0 +1,360 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"io/fs"
+	"mime"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Run serves until ctx is done. mode is what this process is willing to do to
+// the pipeline: auto drives it, manual only moves an item when the tick
+// button is pressed, and observe never runs a stage, a move or a doctor
+// script at all.
+func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
+	// The board is a control plane: it starts agent runs, reorders work and
+	// hands marked items back. Reaching it is enough to drive every repository
+	// the config enrols, so an open one on a public interface is not a
+	// read-only inconvenience. This refuses rather than warns, because the
+	// mistake it prevents is silent and the fix is one command.
+	//
+	// Checked before anything below starts: nothing here has bound a listener
+	// or launched a goroutine yet, so a refusal here is the whole story — a
+	// serve that never listened and never listed anything.
+	if !s.cfg.Auth.Enabled() && !loopback(addr) {
+		return fmt.Errorf("refusing to serve %s with no auth: configure auth.users "+
+			"(run `conveyor passwd <name>` for a line to paste) or bind a loopback address", addr)
+	}
+
+	s.ctx = ctx
+	s.mode = mode
+	s.mu.Lock()
+	s.state.Mode = string(mode)
+	s.mu.Unlock()
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		s.listenHost = h
+	}
+
+	handler, err := s.handler()
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+		// No ReadTimeout and no WriteTimeout: either one cuts a live
+		// /api/events stream. ReadHeaderTimeout and MaxHeaderBytes bound only
+		// the part of a request that arrives before a handler — SSE or
+		// otherwise — ever starts running.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	// Bound before anything below starts: a serve that cannot bind must not
+	// have listed a source or launched a stage first.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	if s.listening != nil {
+		select {
+		case s.listening <- ln.Addr().String():
+		default:
+		}
+	}
+
+	// Three loops, and they are separate on purpose. Discovery must keep its
+	// interval while a 90-minute stage runs, so nothing that waits for work to
+	// finish may share a goroutine with it.
+	go s.poll(ctx)
+	go s.button(ctx, mode)
+	if mode.Runs() {
+		go s.schedule(ctx)
+		if d := s.cfg.RetryStalled.D(); d > 0 {
+			go s.stalled(ctx, d)
+		}
+		go s.sweep(ctx)
+	}
+
+	go func() { <-ctx.Done(); _ = srv.Close() }()
+	banner := "running: items advance on their own"
+	switch mode {
+	case ModeManual:
+		banner = "manual: nothing advances on its own, the tick button does"
+	case ModeObserve:
+		banner = "observing only: nothing will ever advance, not even the tick button"
+	}
+	if s.cfg.Auth.Enabled() {
+		banner += "\n  basic auth on, " + strconv.Itoa(len(s.cfg.Auth.Users)) + " user(s)"
+	}
+	// ":8080" means every interface, so name a host you can actually open;
+	// "127.0.0.1:8090" already names one and must not have a second glued on.
+	shown := addr
+	if strings.HasPrefix(addr, ":") {
+		shown = "localhost" + addr
+	}
+	fmt.Printf("conveyor: http://%s\n  %s\n", shown, banner)
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	// The HTTP listener is down the moment ctx is cancelled, but a transition
+	// already launched keeps running — a stage script, an agent, a git push.
+	// cmdServe releases the data-directory lock in a defer right after Run
+	// returns, so returning here before that work is done would let a
+	// restarted engine claim an item whose old run has not actually stopped.
+	s.drain()
+	return nil
+}
+
+// handler builds the whole route table and wraps it: host validation first
+// (cheapest), then cross-origin protection, then Basic Auth (the expensive
+// one) — so a cross-site or bad-Host flood never reaches a password
+// derivation. mutation routes additionally refuse in observe mode.
+func (s *Server) handler() (http.Handler, error) {
+	if s.cop == nil {
+		s.cop = http.NewCrossOriginProtection()
+	}
+	// Already validated at load (Auth.validate), so an error here would only
+	// mean a Config built without going through config.Load.
+	origins, err := s.cfg.Auth.ParsedOrigins()
+	if err != nil {
+		return nil, fmt.Errorf("auth.origins: %w", err)
+	}
+	for _, o := range origins {
+		if err := s.cop.AddTrustedOrigin(o.Origin); err != nil {
+			return nil, fmt.Errorf("auth.origins: %s: %w", o.Origin, err)
+		}
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/state", s.handleState)
+	mux.HandleFunc("GET /api/events", s.handleEvents)
+	mux.HandleFunc("GET /api/runs", s.handleRuns)
+	mux.HandleFunc("GET /api/runs/{id}", s.handleRun)
+	mux.HandleFunc("GET /api/items/{id}/report", s.handleReport)
+	mux.HandleFunc("POST /api/refresh", s.handleRefresh)
+	mux.HandleFunc("POST /api/tick", s.mutationGuard(s.handleTick))
+	mux.HandleFunc("PUT /api/order", s.handleOrder)
+	mux.HandleFunc("POST /api/items/{id}/start", s.mutationGuard(s.handleStart))
+	mux.HandleFunc("POST /api/items/{id}/unblock", s.mutationGuard(s.handleUnblock))
+	mux.HandleFunc("POST /api/unblock", s.mutationGuard(s.handleUnblockAll))
+	mux.HandleFunc("POST /api/doctor", s.mutationGuard(s.handleDoctorStart))
+	mux.HandleFunc("GET /api/doctor", s.handleDoctorGet)
+	mux.HandleFunc("GET /api/push/key", s.handlePushKey)
+	mux.HandleFunc("POST /api/push/subscribe", s.handlePushSubscribe)
+	mux.HandleFunc("POST /api/push/unsubscribe", s.handlePushUnsubscribe)
+	mux.HandleFunc("POST /api/push/test", s.handlePushTest)
+
+	static, err := webHandler()
+	if err != nil {
+		return nil, err
+	}
+	mux.Handle("/", static)
+
+	h := s.authed(mux)
+	if s.cop != nil {
+		h = s.cop.Handler(h)
+	}
+	return s.hostCheck(h), nil
+}
+
+// mutationGuard refuses a route in any mode that does not allow mutation —
+// today only observe. The page also hides the control that would have hit
+// this, but hiding a button is not a boundary: only a request that never
+// reaches its handler is.
+func (s *Server) mutationGuard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.mode.Mutates() {
+			http.Error(w, "observe mode: nothing here ever runs a stage, a move or a doctor script", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// hostCheck refuses a request whose Host is not one this board recognises —
+// not loopback, not the configured listen address, not an auth.origins entry
+// — so a DNS-rebinding page cannot reach a loopback-bound board just by
+// getting a browser to resolve some other name to 127.0.0.1. Checked first,
+// before cross-origin protection or Basic Auth: the cheapest rejection runs
+// first.
+func (s *Server) hostCheck(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.validHost(r.Host) {
+			http.Error(w, fmt.Sprintf(
+				"host %q is not recognized; add it to auth.origins", r.Host), http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) validHost(host string) bool {
+	h := host
+	if hh, _, err := net.SplitHostPort(host); err == nil {
+		h = hh
+	}
+	if h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(strings.Trim(h, "[]")); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	if s.listenHost != "" && h == s.listenHost {
+		return true
+	}
+	origins, err := s.cfg.Auth.ParsedOrigins()
+	if err != nil {
+		return false // malformed config; validate() already refuses this at load
+	}
+	for _, o := range origins {
+		if host == o.Host || h == o.Host {
+			return true
+		}
+	}
+	return false
+}
+
+// webHandler serves the embedded web/ directory: the board's markup, the
+// stylesheets and the ES modules it links, and the app shell beside them. Its
+// own function rather than two lines inside Run so a test can drive exactly
+// what Run mounts instead of a second copy of it.
+func webHandler() (http.Handler, error) {
+	// Go's table has no entry for the manifest extension and would serve it
+	// as text; Chrome wants the manifest type before it offers to install.
+	_ = mime.AddExtensionType(".webmanifest", "application/manifest+json")
+	sub, err := fs.Sub(webFS, "web")
+	if err != nil {
+		return nil, err
+	}
+	return http.FileServer(http.FS(sub)), nil
+}
+
+// secureDataDir restricts the data directory to the owner alone: it holds
+// order.json, answers.json, push subscriptions, the VAPID key pair and every
+// run directory — prompts, a person's typed answer and logs among them.
+//
+// Best-effort and never fatal: a data directory another process or an older
+// build already created at a looser mode still gets tightened here, but a
+// filesystem that refuses the chmod (a network mount, a permission this
+// process does not have) must not stop conveyor from serving — a warning
+// naming the path is what a person can act on, a refusal to start is not.
+// Existing run directories underneath it are deliberately left alone; only
+// the root is touched, so this is one syscall, not a walk of run history.
+func secureDataDir(dir string) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: could not create data directory %s: %v\n", dir, err)
+		return
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: could not restrict %s to the owner alone: %v\n", dir, err)
+	}
+}
+
+// drainGrace bounds how long shutdown waits for in-flight transitions before
+// giving up and returning anyway. It must exceed the runner's own grace
+// period (30s): a script whose child ignores TERM is not reaped until the
+// runner's own SIGKILL lands, and draining any less than that would time out
+// on exactly the case it exists for.
+const drainGrace = 45 * time.Second
+
+// drain waits for every transition already claimed — schedule's launches,
+// handleStart, and the tick button's own advance — to finish, or gives up
+// after drainGrace and says what is still running rather than hanging
+// forever on a run that will not.
+func (s *Server) drain() {
+	deadline := time.Now().Add(s.drainGrace)
+	for s.inFlight.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := s.inFlight.Load(); n != 0 {
+		var running []string
+		for _, a := range s.activeList() {
+			running = append(running, a.ItemID)
+		}
+		fmt.Fprintf(os.Stderr, "conveyor: shutting down with %d transition(s) still running after %s: %s\n",
+			n, s.drainGrace, strings.Join(running, ", "))
+	}
+}
+
+// Addr normalises a listen address so `-addr 8080` works like `-addr :8080`.
+// authed puts basic auth in front of everything, or nothing in front of
+// anything. There is no per-route exemption on purpose: every route either
+// reads the state of the repositories or changes it, and a health endpoint
+// nobody asked for would be the first hole in a wall one line high.
+//
+// It replaces a reverse proxy that did the same job in a second process with a
+// second config file and a second password store. What the proxy added beyond
+// this — terminating the connection somewhere else — is not something a board
+// bound to one machine needed.
+func (s *Server) authed(next http.Handler) http.Handler {
+	if !s.cfg.Auth.Enabled() {
+		return next
+	}
+	realm := s.cfg.Auth.Realm
+	if realm == "" {
+		realm = "conveyor"
+	}
+	// A realm is quoted into a header, so a quote or newline in one would let a
+	// config file write the rest of the header. Not a threat here — the config
+	// is the operator's own — but a cheap thing to be right about.
+	realm = strings.NewReplacer(`"`, "", "\r", "", "\n", "").Replace(realm)
+	deny := func(w http.ResponseWriter) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`", charset="UTF-8"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The app's own shell is public: a browser fetches the manifest with
+		// no credentials and will not offer to install behind a 401, and the
+		// icons and worker script are static code that reveals nothing. The
+		// board, its state and every action stay behind the password.
+		if r.Method == http.MethodGet && publicAsset[r.URL.Path] {
+			next.ServeHTTP(w, r)
+			return
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || !s.verify.verify(user, pass) {
+			deny(w)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+var publicAsset = map[string]bool{
+	"/manifest.webmanifest": true, "/sw.js": true,
+	"/icon.svg": true, "/icon-192.png": true, "/icon-512.png": true,
+}
+
+// loopback reports whether this listen address reaches only this machine.
+//
+// A bare port (":8080") does not: it is every interface, which is the case
+// worth being strict about, because it is also the default.
+func loopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func Addr(a string) string {
+	if a == "" {
+		return ":8080"
+	}
+	if !strings.Contains(a, ":") {
+		return ":" + a
+	}
+	return a
+}
