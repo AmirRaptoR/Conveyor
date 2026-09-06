@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -255,9 +256,38 @@ func (r *Runner) finish(run *model.Run, dir string, started time.Time) {
 // ends. A run killed mid-flight — a timeout, a crash, an interrupted session —
 // otherwise leaves a zero-byte meta.json and no record of what it was doing,
 // which is exactly the run someone needs to read afterwards.
+//
+// What reaches disk (and so GET /api/runs) is redacted, never run.Env itself:
+// the caller's map is untouched, because nothing downstream of a finished run
+// reads it in-process — only the copy that gets serialized needs to differ.
 func writeMeta(run *model.Run, dir string) {
-	b, _ := json.MarshalIndent(run, "", "  ")
+	toWrite := *run
+	toWrite.Env = redactEnv(run.Env)
+	b, _ := json.MarshalIndent(toWrite, "", "  ")
 	_ = os.WriteFile(filepath.Join(dir, "meta.json"), b, 0o644)
+}
+
+// redactedValue stands in for any env value not worth ever writing to disk or
+// handing back over the API — a source's env:, provider.params: or
+// scripts.*.params:, which is exactly where a token lives (model.DoctorRun
+// exists for the same reason, one layer out). The CONVEYOR_ prefix is safe to
+// keep verbatim: it is paths, ids and a deadline, nothing the engine itself
+// did not already hand the script in the clear.
+const redactedValue = "«redacted»"
+
+func redactEnv(env map[string]string) map[string]string {
+	if env == nil {
+		return nil
+	}
+	out := make(map[string]string, len(env))
+	for k := range env {
+		if strings.HasPrefix(k, "CONVEYOR_") {
+			out[k] = env[k]
+		} else {
+			out[k] = redactedValue
+		}
+	}
+	return out
 }
 
 // scan reads lines without a length limit: an AI script can emit a single very

@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -123,6 +124,57 @@ func TestRunDirectoryIsSelfContained(t *testing.T) {
 	b, _ := os.ReadFile(filepath.Join(res.Run.Dir, "stdin.json"))
 	if !strings.Contains(string(b), "world") {
 		t.Error("stdin.json did not record the input")
+	}
+}
+
+// The script itself still sees the real value — cmd.Env is never touched by
+// redaction — but what reaches meta.json (and so GET /api/runs) replaces it,
+// keeping only the key: a source's env:/params: is exactly where a token
+// lives, and CONVEYOR_RESULT proves the process really did see it since the
+// script could not otherwise have written a result at all.
+func TestRunEnvIsRedactedOnDiskButNotInTheProcess(t *testing.T) {
+	r := New(t.TempDir())
+	res, err := r.Run(context.Background(), Spec{
+		Script:  script(t, `echo "{\"saw\":\"$SECRET_TOKEN\"}" > "$CONVEYOR_RESULT"`),
+		Kind:    "stage",
+		Workdir: t.TempDir(),
+		Timeout: time.Minute,
+		Source:  "test",
+		Env:     map[string]string{"SECRET_TOKEN": "swordfish"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(res.Data), "swordfish") {
+		t.Fatalf("the script did not see the real value: result.json = %s", res.Data)
+	}
+
+	b, err := os.ReadFile(filepath.Join(res.Run.Dir, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "swordfish") {
+		t.Error("meta.json still contains the secret value")
+	}
+	if !strings.Contains(string(b), "SECRET_TOKEN") {
+		t.Error("meta.json dropped the key entirely; it should keep the name and redact only the value")
+	}
+
+	var onDisk model.Run
+	if err := json.Unmarshal(b, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.Env["SECRET_TOKEN"] != redactedValue {
+		t.Errorf("meta.json's SECRET_TOKEN = %q, want the redaction marker", onDisk.Env["SECRET_TOKEN"])
+	}
+	if !strings.HasPrefix(onDisk.Env["CONVEYOR_SOURCE"], "test") {
+		t.Errorf("a CONVEYOR_ key was redacted: CONVEYOR_SOURCE = %q", onDisk.Env["CONVEYOR_SOURCE"])
+	}
+
+	// The in-process value is untouched too, not merely the file: the same
+	// map the caller can still see keeps the real secret.
+	if res.Run.Env["SECRET_TOKEN"] != "swordfish" {
+		t.Errorf("res.Run.Env was redacted in-process; want it unaffected, got %q", res.Run.Env["SECRET_TOKEN"])
 	}
 }
 
