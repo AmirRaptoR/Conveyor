@@ -9,9 +9,13 @@
 # failing check and an unresolved thread. A stub is the only way to exercise
 # them, and the same pattern providers/github/selfcheck.sh already uses.
 #
-# The model path (gate 11) is deliberately not driven here: it needs a worktree,
-# a remote and claude. What is checked is everything that decides *whether* to
-# get there.
+# The model path (gate 11, and gate 8's conflict-resolution path) is
+# deliberately not driven here: it needs a worktree, a remote and claude. What
+# is checked is everything that decides *whether* to get there — a stubbed
+# `git` that refuses every call stands in so that a scene which reaches
+# resolve_conflict fails fast on the worktree it cannot build, rather than
+# touching this repository. See agents/claude/approve's issue for what is left
+# for reading and for one manual smoke: criteria 10 and 12-24.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -53,30 +57,57 @@ cat "$scene/$what"
 STUB
 chmod +x "$tmp/bin/gh"
 
+# git is stubbed too, and refuses everything: a scene that reaches
+# resolve_conflict (gate 8's marker check found no matching earlier attempt)
+# must fail fast on the worktree it then cannot build, rather than running
+# `git fetch`/`git worktree add` for real against this repository's own
+# origin. Every path that stops before resolve_conflict never calls git at
+# all in this sandbox, since the worktree directory it would inspect never
+# exists here — so this stub changes nothing about them.
+cat >"$tmp/bin/git" <<'STUB'
+#!/usr/bin/env bash
+echo "stub git: refusing $*" >&2
+exit 1
+STUB
+chmod +x "$tmp/bin/git"
+
 # run <name> — run approve in the current scene and report its exit code.
 run() {
 	local rc
 	: >"$CONVEYOR_RESULT"
 	echo '{"item":{"ref":"7","title":"an item"}}' |
 		SCENE="$tmp/scene" REPO=o/n PROMPT="fix it" CONVEYOR_SOURCE=s1 \
-			QUIET_SECONDS="${QUIET:-0}" "$here/approve" >/dev/null 2>&1
+			QUIET_SECONDS="${QUIET:-0}" CONFLICT_RESOLVE="${CONFLICT_RESOLVE:-}" \
+			"$here/approve" >/dev/null 2>&1
 	rc=$?
 	echo "$rc"
 }
 kind() { jq -r '.kind // "none"' "$CONVEYOR_RESULT" 2>/dev/null || echo none; }
+asked() { jq -r '.asked // false' "$CONVEYOR_RESULT" 2>/dev/null || echo false; }
 export CONVEYOR_RESULT="$tmp/result.json"
 
 scene() { rm -f "$tmp/scene"/*; }
 pr() { printf '[{"number":%s,"body":"Closes #7","state":"%s","url":"u"}]' "$1" "$2" >"$tmp/scene/prlist"; }
 labels() { printf '%s' "${1:-[]}" >"$tmp/scene/labels_7"; printf '%s' "${2:-[]}" >"$tmp/scene/labels_9"; }
-# details <isDraft> <mergeable> <rollup> [threads-json]
+# details <isDraft> <mergeable> <rollup> [threads-json] [headRefName]
+#         [isCrossRepository] [headRefOid] [baseRefOid] [comments-json]
+#
+# headRefOid/baseRefOid default to two distinct, well-formed 40-character hex
+# strings, so a scene that says nothing about the marker looks like a PR gate
+# 8 has never attempted before.
 details() {
 	local rollup_field='null'
 	[[ -n "$3" ]] && rollup_field="{\"state\":\"$3\"}"
+	# Plain `-`, not `:-`: an explicitly empty oid (criterion 11's scene) must
+	# stay empty rather than being replaced by the default, which `:-` would do.
+	local head_ref="${5-issue-7}" cross="${6-false}" \
+		head_oid="${7-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+		base_oid="${8-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" comments="${9-[]}"
 	cat >"$tmp/scene/graphql" <<JSON
-{"isDraft":$1,"mergeable":"$2","headRefName":"issue-7",
+{"isDraft":$1,"mergeable":"$2","headRefName":"$head_ref","headRefOid":"$head_oid",
+ "baseRefName":"main","baseRefOid":"$base_oid","isCrossRepository":$cross,
  "commits":{"nodes":[{"commit":{"committedDate":"2020-01-01T00:00:00Z","statusCheckRollup":$rollup_field}}]},
- "comments":{"nodes":[]},"reviews":{"nodes":[]},
+ "comments":{"nodes":$comments},"reviews":{"nodes":[]},
  "reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":${4:-[]}}}
 JSON
 	# The stub does not run --jq, so fixtures are written in post-jq form. For
@@ -127,12 +158,54 @@ chk "a kind label alone is not a hold"        "$(run)" "0"
 scene; pr 9 OPEN; labels; details true MERGEABLE SUCCESS
 chk "(7) a draft waits"                       "$(run)" "10"
 
+# (1/2) try_rebase always fails here (no worktree in this sandbox), whatever
+# CONFLICT_RESOLVE is set to — so with it at "0" this is exactly today's old
+# behaviour, unconditionally.
 scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS
-chk "(8) a conflict stops"                    "$(run)" "20"
-chk "     and the kind is conflict"           "$(kind)" "conflict"
+chk "(1) a conflict stops with the off switch set" "$(CONFLICT_RESOLVE=0 run)" "20"
+chk "     and the kind is conflict"                "$(kind)" "conflict"
 
 scene; pr 9 OPEN; labels; details false UNKNOWN SUCCESS
 chk "mergeability not yet known waits"        "$(run)" "10"
+
+# --- 4/5. resolution only on a branch this pipeline owns --------------------
+# CONFLICT_RESOLVE is unset (the default) for all of these: resolution is
+# enabled, and each stops on ownership before ever reaching resolve_conflict.
+scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS '[]' issue-7 true
+chk "(4) a fork's conflict is not this pipeline's to rewrite" "$(run)" "20"
+chk "     and the kind is conflict"                           "$(kind)" "conflict"
+
+scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS '[]' patch-1
+chk "(5) a branch that is not issue-<ref> is not rewritten"  "$(run)" "20"
+chk "     and the kind is conflict"                           "$(kind)" "conflict"
+
+# --- 11. an incomplete view defers rather than acts -------------------------
+scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS '[]' issue-7 false '' ''
+chk "(11) a missing head/base OID defers"     "$(run)" "10"
+
+# --- 7/8/9. the bound: one attempt per head/base pair, via the newest marker
+matching='[{"createdAt":"2020-01-01T00:00:00Z","body":"<!-- conveyor:approve:conflict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb -->"}]'
+scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS '[]' issue-7 false \
+	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "$matching"
+chk "(7) the same conflict already attempted asks, and runs no model" "$(run)" "20"
+chk "     and the kind is decision"                                   "$(kind)" "decision"
+chk "     and it is a question, never bulk-cleared"                   "$(asked)" "true"
+
+malformed_then_valid='[{"createdAt":"2020-01-01T00:00:00Z","body":"<!-- conveyor:approve:conflict nothex nothex -->"},
+	{"createdAt":"2020-01-02T00:00:00Z","body":"<!-- conveyor:approve:conflict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb -->"}]'
+scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS '[]' issue-7 false \
+	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "$malformed_then_valid"
+chk "(8) a malformed marker is skipped, the well-formed one behind it wins" "$(run)" "20"
+chk "     and the kind is decision"                                        "$(kind)" "decision"
+
+# A different current head OID is a genuinely new conflict: it must not read
+# as the same attempt (must not ask decision). It cannot be driven further
+# than that here — a fresh attempt needs the worktree and remote gate 8's own
+# stubbed git refuses (see the header comment).
+scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS '[]' issue-7 false \
+	cccccccccccccccccccccccccccccccccccccccc bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "$matching"
+chk "(9) a different OID pair is a new conflict; it tries again"     "$(run)" "20"
+chk "     never read as the old attempt (a worktree failure trying the new one, not a decision)" "$(kind)" "worktree"
 
 # --- 9/10. the check rollup, mapped explicitly and totally ------------------
 for state in SUCCESS SKIPPED NEUTRAL; do
