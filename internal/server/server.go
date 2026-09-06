@@ -827,8 +827,14 @@ func (s *Server) recallBlocks(items []model.Item) {
 		}
 	}
 	// No matching move survives in retained history: an item onboarded
-	// straight into its stage, or one whose move was swept by retention.
-	// History that is not there is not invented — it simply gets no entry.
+	// straight into its stage, one whose move was swept by retention, or one
+	// whose stage changed some other way — a person relabelling it by hand.
+	// History that is not there is not invented, so a stale entry left over
+	// from before is dropped rather than kept naming a stage the item has
+	// since left: a wrong chip is worse than no chip.
+	for id := range wantTimes {
+		delete(s.times, id)
+	}
 	for id, t := range foundTimes {
 		s.times[id] = t
 	}

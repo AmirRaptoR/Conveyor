@@ -147,6 +147,23 @@ func TestNoTimeEntryWhenNoMoveSurvivesInHistory(t *testing.T) {
 	}
 }
 
+// A stale entry with no matching move surviving in history — the item's
+// stage changed some other way, by a person relabelling it or a move whose
+// run has been swept — is dropped, not left naming a stage the item has
+// since left. History that is not there is not invented, and a wrong chip is
+// worse than no chip.
+func TestStaleTimeEntryIsDroppedWhenNoMoveSurvivesInHistory(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.times["s1:1"] = ItemTime{Stage: "backlog", EnteredStage: time.Now().Add(-time.Hour)}
+
+	s.recallBlocks([]model.Item{{ID: "s1:1", Source: "s1", Stage: "working"}})
+
+	if got, ok := s.times["s1:1"]; ok {
+		t.Errorf("stale entry survived as %+v, want it dropped", got)
+	}
+}
+
 // An item that has left the board — done and rolled off, or no longer
 // listed — has its entry dropped on the next poll, the same pruning Blocks
 // gets.
