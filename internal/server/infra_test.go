@@ -155,3 +155,45 @@ func TestTransitionErrorsSurviveAListing(t *testing.T) {
 		t.Errorf("/api/state does not carry s1:1's transition error: %s", w.Body.String())
 	}
 }
+
+// F04: Advance returns a nil transition for an item whose source is not one
+// the engine knows about — a config problem, not a transient one. runOne
+// must not drop that error silently: it belongs on the board the same way
+// any other transition error does, and the claim and slot it took must come
+// back regardless.
+func TestUnknownSourceIsSurfacedAndReleasesItsClaim(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.ctx = context.Background()
+	// "ghost" names no configured source at all — the shape of an item whose
+	// source was removed from the config, or a stale id from elsewhere.
+	s.state.Items = []model.Item{{ID: "ghost:1", Ref: "1", Source: "ghost", Stage: "backlog"}}
+
+	n := s.launch(s.ctx)
+	if n != 1 {
+		t.Fatalf("launch dispatched %d transition(s), want 1", n)
+	}
+	waitFor(t, "the transition to finish", func() bool { return s.inFlight.Load() == 0 })
+
+	s.mu.RLock()
+	terr, hasErr := s.transitionErrs["ghost:1"]
+	resting := s.resting["ghost:1"]
+	s.mu.RUnlock()
+	if !hasErr || terr.Reason == "" {
+		t.Fatal("no transition error was recorded for an item naming an unknown source")
+	}
+	if !strings.Contains(terr.Reason, "ghost") {
+		t.Errorf("reason = %q, want it to name the unknown source", terr.Reason)
+	}
+	if !resting {
+		t.Error("the item was not deferred after an unknown-source error")
+	}
+
+	if _, working := s.working.Load("ghost:1"); working {
+		t.Error("working still holds the item after its claim should have been released")
+	}
+	bySrc, byStage, held, _, _, _ := s.eng.Locks().Snapshot()
+	if len(bySrc) != 0 || len(byStage) != 0 || held != 0 {
+		t.Errorf("locks not fully released: bySource=%v byStage=%v held=%d", bySrc, byStage, held)
+	}
+}
