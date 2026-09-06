@@ -46,6 +46,9 @@
 #        f. otherwise: resolve (merge, model if it conflicts, verify, test,
 #           push, mark)                      -> exit 10 or exit 20 (conflict,
 #                                                worktree, limit, turns, error)
+#           A merge already in progress with every conflict resolved is
+#           finished here with no model run: an earlier attempt did the work
+#           and died before committing it.
 #   9. a check failed                        -> exit 20  (checks)
 #  10. a check is still running              -> exit 10
 #  11. an unresolved thread it has not answered -> address, test, push, reply,
@@ -415,14 +418,26 @@ $SENTINEL"
 
 # try_rebase — one mechanical rebase of the PR branch onto its base, in the
 # item's own worktree. Returns non-zero, with the tree left as it was found,
-# when there is no worktree, the tree is dirty, or the rebase stops.
+# when there is no worktree, the tree is dirty, a merge or rebase is already in
+# progress, or the rebase stops.
 try_rebase() {
-	local head_ref base_ref wt
+	local head_ref base_ref wt gd
 	head_ref=$(jq -r '.headRefName' <<<"$details")
 	base_ref=$(jq -r '.baseRefName // empty' <<<"$details")
 	wt="$(worktree_root)/${CONVEYOR_SOURCE}/${ref}"
 	[[ -n "$base_ref" && -d "$wt" ]] || return 1
-	git -C "$wt" rev-parse --git-dir >/dev/null 2>&1 || return 1
+	gd=$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null) || return 1
+
+	# An operation already in progress belongs to gate 8f, and the dirty check
+	# below does not see it: a merge whose resolution is staged to exactly what
+	# HEAD already holds leaves `status --porcelain` empty. Falling through to
+	# the `reset --hard` two lines down would throw that resolution away —
+	# somebody's finished conflict work, discarded to attempt a rebase that the
+	# same conflict is about to stop anyway.
+	if [[ -e "$gd/MERGE_HEAD" || -d "$gd/rebase-merge" || -d "$gd/rebase-apply" ]]; then
+		echo "worktree $wt has a merge or rebase in progress; not rebasing" >&2
+		return 1
+	fi
 	[[ -z "$(git -C "$wt" status --porcelain)" ]] || { echo "worktree $wt is dirty; not rebasing" >&2; return 1; }
 	[[ "$(git -C "$wt" branch --show-current)" == "$head_ref" ]] || return 1
 	git -C "$wt" fetch --quiet origin "$base_ref" "$head_ref" || return 1
@@ -496,7 +511,7 @@ non_fast_forward() { grep -qiE 'non-fast-forward|fetch first|stale info' <<<"$1"
 # Exits 10 on a push it managed to record, or 20 naming what stopped it. Never
 # returns.
 resolve_conflict() {
-	local head_ref base_ref wt git_dir merging=0 base_oid conflicted=()
+	local head_ref base_ref wt git_dir merging=0 resolved=0 base_oid conflicted=()
 	head_ref=$(jq -r '.headRefName' <<<"$details")
 	base_ref=$(jq -r '.baseRefName' <<<"$details")
 
@@ -567,11 +582,38 @@ resolve_conflict() {
 	fi
 
 	if [[ "${#conflicted[@]}" -eq 0 ]]; then
-		blocked conflict "the merge into #$pr's branch $head_ref reports no conflicted files but is not resolved; needs a hand."
+		# A merge this script started, with every conflict already resolved and
+		# nothing left to commit it. Only the resume path can reach it: an
+		# earlier run resolved the files and died before committing — the
+		# `turns` stop below is how, since the verification a resolution ends
+		# with is the longest stretch in the run and the likeliest place to be
+		# cut. That state is one commit away from done, not a fault, but
+		# marking it made it permanent: the model was out of the picture, so
+		# nothing changed, so the next poll found the same state and marked it
+		# again. midgame #106 sat here for four hours over sixteen runs.
+		[[ "$merging" -eq 1 ]] ||
+			blocked conflict "the merge into #$pr's branch $head_ref reports no conflicted files but is not resolved; needs a hand."
+		resolved=1
+
+		# What to verify and stage, now that the unmerged set is empty by
+		# definition. `git diff HEAD` is everything the pending merge commit
+		# would change, staged and unstaged alike — wider than the conflicted
+		# set the model path uses, and deliberately so: a marker left in a file
+		# the dead run had already staged is still caught, and an edit it made
+		# but never staged still lands. Both are this item's own work on this
+		# item's own branch, the same reasoning the resume above rests on.
+		mapfile -t conflicted < <(git diff --name-only HEAD)
+		[[ "${#conflicted[@]}" -gt 0 ]] ||
+			blocked conflict "the merge in progress on #$pr's branch $head_ref has no conflicts left and changes nothing; needs a hand."
+		echo "the merge in $wt has no conflicts left; finishing it without a model run" >&2
 	fi
 
-	local full rc
-	full="${CONFLICT_PROMPT:-$CONFLICT_PROMPT_DEFAULT}
+	# Skipped entirely when the resume above found the work already done. There
+	# is nothing left to ask the model, and asking anyway would spend a run to
+	# be told so — the same waste the mark this replaces used to spend a poll on.
+	if [[ "$resolved" -eq 0 ]]; then
+		local full rc
+		full="${CONFLICT_PROMPT:-$CONFLICT_PROMPT_DEFAULT}
 
 --- the item, as the pipeline sees it ---
 Item #${ref} in ${REPO}: ${title}
@@ -583,42 +625,43 @@ $(printf '%s\n' "${conflicted[@]}")
 
 $(decision_brief)"
 
-	full=$(resume_prompt "$payload" "$full")
+		full=$(resume_prompt "$payload" "$full")
 
-	set +e
-	MAX_TURNS="${MAX_TURNS:-40}" \
-		ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep}" \
-		run_claude "$full"
-	rc=$?
-	set -e
-	record_model
+		set +e
+		MAX_TURNS="${MAX_TURNS:-40}" \
+			ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep}" \
+			run_claude "$full"
+		rc=$?
+		set -e
+		record_model
 
-	if hit_limit; then
-		blocked limit "the agent was out of quota and stopped before resolving the merge conflict on #$pr. Nothing is wrong with this item; it is waiting for the window to reset."
-	fi
-	# Left in progress, not aborted: the merge itself is real work, and the next
-	# run of this script resumes into it exactly as agents/_resume resumes a
-	# dirty worktree (criterion 20).
-	if hit_max_turns; then
-		record_session
-		blocked turns "the agent hit its ${MAX_TURNS:-40}-turn budget while \
+		if hit_limit; then
+			blocked limit "the agent was out of quota and stopped before resolving the merge conflict on #$pr. Nothing is wrong with this item; it is waiting for the window to reset."
+		fi
+		# Left in progress, not aborted: the merge itself is real work, and the
+		# next run of this script resumes into it exactly as agents/_resume
+		# resumes a dirty worktree (criterion 20).
+		if hit_max_turns; then
+			record_session
+			blocked turns "the agent hit its ${MAX_TURNS:-40}-turn budget while \
 resolving the merge conflict on #$pr, before finishing. The merge is left in \
 progress; answering this mark with anything (e.g. \"continue\") resumes the \
 same conversation with a fresh turn budget, and the next run of this script \
 continues the same merge rather than starting over."
-	fi
-	if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
-		[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
-		# The agent's own stop. Abort here, unlike the turns case above: a
-		# question can sit for days, and the tree it half-merged is not evidence
-		# anyone needs while waiting for an answer.
-		git merge --abort 2>/dev/null || true
-		agent_asked
-		echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
-		exit 20
-	fi
-	if [[ $rc -ne 0 ]]; then
-		blocked error "the agent exited $rc while resolving the merge conflict on #$pr. Last it said: $(last_said)"
+		fi
+		if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
+			[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
+			# The agent's own stop. Abort here, unlike the turns case above: a
+			# question can sit for days, and the tree it half-merged is not
+			# evidence anyone needs while waiting for an answer.
+			git merge --abort 2>/dev/null || true
+			agent_asked
+			echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
+			exit 20
+		fi
+		if [[ $rc -ne 0 ]]; then
+			blocked error "the agent exited $rc while resolving the merge conflict on #$pr. Last it said: $(last_said)"
+		fi
 	fi
 
 	# Verify the tree itself before trusting it (criterion 19): the model can

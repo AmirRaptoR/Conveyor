@@ -189,6 +189,18 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   the rebase fails and the attempt after it does too — verification, the test
   suite, the push, or recording the marker itself, same as the model actually
   disagreeing — or when the attempt is not this pipeline's to make.
+  **A merge already in progress is resumed, and one with no conflicts left is
+  simply finished** — committed, tested, pushed, marker recorded, no model run.
+  That state is what a run killed mid-verification leaves, and the `turns` stop
+  is the usual way to get there, so it is the common case and not a fault;
+  marking it made it permanent, because the model was already out of the
+  picture and every later poll found the same tree and marked it again. The one
+  thing still handed over is a resolution that changes nothing at all against
+  HEAD, which would push a branch whose own work had been discarded. The rebase
+  at the front of the gate therefore refuses on a merge or rebase in progress
+  and not merely on a dirty tree: a resolution staged to exactly what HEAD
+  holds leaves `git status --porcelain` empty, and the `reset --hard` that
+  rebase opens with would have thrown it away with nothing saying so.
 - **A mark is one word and a paragraph.** The word (`decision`, `limit`,
   `turns`, `worktree`, `error`) is all a card shows and all a provider labels; the
   paragraph is one click away in the panel. Scripts own the vocabulary — the
