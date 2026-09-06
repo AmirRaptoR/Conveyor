@@ -373,6 +373,12 @@
   }
   .stop p { margin:0; color:var(--ink); font-size:12px; line-height:1.65; white-space:pre-wrap; }
   .stop .meta { margin-top:8px; color:var(--faint); font-size:10.5px; }
+  /* A failed handBack/sendAnswer inside the open panel: refuse() alone draws
+     onto the board card, which #panel and #scrim occlude while it is open. */
+  .stop .fault {
+    margin-top:10px; padding:7px 9px; border:1px solid color-mix(in srgb, var(--stop) 40%, var(--rule-soft));
+    border-radius:2px; color:var(--stop); font-size:11.5px; line-height:1.5;
+  }
   .stop.asks { border-left-color:var(--ask); }
   .stop.asks h3 { color:var(--ask); }
   .stop.waiting { border-left-color:var(--faint); }
@@ -1852,6 +1858,7 @@ function stopNotice(id) {
       ${at && !isNaN(at) ? `stopped ${esc(at.toLocaleString())}` : ""}
       ${b.runId ? ` &middot; run ${esc(b.runId)}` : ""}
     </div>
+    <div class="fault" hidden></div>
     ${qs ? `<button class="ask-btn">Answer ${qs.length === 1 ? "the question" : `${qs.length} questions`}</button>` : ""}
     <textarea class="answer" rows="3" spellcheck="true" aria-label="Reply"
       placeholder="${qs ? "Anything to add beside the answers above, or reply here instead."
@@ -2276,19 +2283,39 @@ async function saveOrder() {
   }
 }
 
+// refuse() draws its message onto the board card, which #panel and #scrim
+// occlude while the panel is open — the one channel a panel-borne failure
+// needs beside it. The box is part of stopNotice()'s own markup (see the
+// `.fault` div there), so it survives exactly as long as the stop notice
+// that owns it: cleared by the next real redraw of #stop, never on a timer.
+function panelFault(msg) {
+  const box = document.querySelector("#stop .fault");
+  if (box) { box.textContent = msg; box.hidden = false; }
+}
+
 // Clearing a mark is a provider write, so the control says so while it lands:
 // a card that keeps its red for another second reads as a button that did
 // nothing, and the second press is the one that races.
 async function handBack(id, btn) {
   const box = document.querySelector("#stop .answer");
   const answer = box ? box.value.trim() : "";
+  const label = btn ? btn.textContent : "";
   if (btn) { btn.disabled = true; btn.textContent = answer ? "answering" : "handing back"; }
-  const res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ answer }),
-  });
-  if (!res.ok) { refuse(id, (await res.text()).trim() || `could not unblock ${id}`); return; }
+  let res, msg;
+  try {
+    res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer }),
+    });
+  } catch { msg = `could not unblock ${id}: disconnected`; }
+  if (res && !res.ok) msg = (await res.text()).trim() || `could not unblock ${id}`;
+  if (msg) {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    refuse(id, msg);
+    panelFault(msg);
+    return;
+  }
   // The panel was showing a stop that no longer exists.
   $("#stop").innerHTML = "";
 }
