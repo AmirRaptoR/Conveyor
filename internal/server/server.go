@@ -78,6 +78,22 @@ type State struct {
 	// Storage is what the run store currently holds and how far back
 	// retention still reaches.
 	Storage StorageView `json:"storage"`
+	// PersistFault is a run whose own record could not be trusted — a full
+	// disk during its meta.json write — kept until a later run persists
+	// cleanly. Unlike Warnings, refresh never rebuilds this: a disk-full
+	// fault must survive to the next poll, not vanish within one interval.
+	PersistFault *PersistFault `json:"persistFault,omitempty"`
+}
+
+// PersistFault is one run whose own record-keeping failed — set from
+// runner.Result.Run.Error, which is what a failed meta.json write leaves
+// there instead of a record that looks like a clean success.
+type PersistFault struct {
+	RunID   string    `json:"runId"`
+	ItemID  string    `json:"itemId,omitempty"`
+	Source  string    `json:"source,omitempty"`
+	Message string    `json:"message"`
+	At      time.Time `json:"at"`
 }
 
 // SlotsView is the concurrency state, as the scheduler sees it.
@@ -342,7 +358,39 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 		}
 		s.hub.publish(event{Kind: "log", RunID: runID, Line: &l})
 	}
+	// Every run this Runner executes — list, move, stage, doctor, status —
+	// reaches here, which is what lets one place notice a persistence fault
+	// without a check threaded through every call site that starts a run.
+	prevResult := r.OnResult
+	r.OnResult = func(res *runner.Result) {
+		if prevResult != nil {
+			prevResult(res)
+		}
+		s.notePersistFault(res)
+	}
 	return s
+}
+
+// notePersistFault sets or clears the board-visible sticky fault from one
+// run's outcome: a run whose meta.json write failed sets it (naming the run
+// that failed to record itself honestly); any other run persisting means the
+// disk is not, or is no longer, the problem, and clears it. It is intentional
+// that this is not scoped to one item or source — a full disk is a fact
+// about the run store, not about the run that happened to notice it first.
+func (s *Server) notePersistFault(res *runner.Result) {
+	if res == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.HasPrefix(res.Run.Error, "persist meta.json: ") {
+		s.state.PersistFault = &PersistFault{
+			RunID: res.Run.ID, ItemID: res.Run.ItemID, Source: res.Run.Source,
+			Message: res.Run.Error, At: time.Now(),
+		}
+	} else {
+		s.state.PersistFault = nil
+	}
 }
 
 func stageViews(c *config.Config) []StageView {

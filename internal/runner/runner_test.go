@@ -243,6 +243,24 @@ func TestOversizedLineIsCappedInMemoryNotOnDisk(t *testing.T) {
 	}
 }
 
+// OnResult reaches every run this Runner executes, which is what lets a
+// single subscriber notice an operational fault without threading a check
+// through every call site that starts one.
+func TestOnResultFiresForEveryRun(t *testing.T) {
+	r := New(t.TempDir())
+	var got *Result
+	r.OnResult = func(res *Result) { got = res }
+	res, err := r.Run(context.Background(), Spec{
+		Script: script(t, `exit 0`), Kind: "stage", Workdir: t.TempDir(), Source: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Run.ID != res.Run.ID {
+		t.Fatalf("OnResult did not fire with this run's result")
+	}
+}
+
 // meta.json is written to a temp file and renamed into place, so a run that
 // dies mid-write leaves the previous meta.json intact rather than truncated.
 func TestMetaJSONWriteIsAtomic(t *testing.T) {

@@ -86,6 +86,12 @@ type Runner struct {
 	// OnLog, if set, is called for every line as it is produced — this is what
 	// makes logs live in the UI. Called from a single goroutine, in order.
 	OnLog func(runID string, line LogLine)
+	// OnResult, if set, is called once for every run this Runner executes,
+	// after its final meta.json write (or failed attempt at one) — list,
+	// move, stage, doctor, status, all of it. It is what lets a single place
+	// notice a persistence fault (Result.Run.Error naming one) without
+	// threading a check through every call site that starts a run.
+	OnResult func(res *Result)
 }
 
 // gracePeriod is how long a script gets to exit after SIGTERM before SIGKILL.
@@ -226,7 +232,11 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		run.Outcome = model.OutcomeFailure
 		run.ExitCode = -1
 		r.finish(&run, started, persist)
-		return &Result{Run: run, Log: lines}, fmt.Errorf("start %s: %w", script, err)
+		res := &Result{Run: run, Log: lines}
+		if r.OnResult != nil {
+			r.OnResult(res)
+		}
+		return res, fmt.Errorf("start %s: %w", script, err)
 	}
 
 	var wg sync.WaitGroup
@@ -286,6 +296,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 			// producing data. It does not change the outcome.
 			emit("engine", "result.json is not valid JSON; ignoring")
 		}
+	}
+	if r.OnResult != nil {
+		r.OnResult(res)
 	}
 	return res, nil
 }
