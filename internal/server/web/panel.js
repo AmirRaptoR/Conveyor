@@ -1,5 +1,5 @@
 import { $, esc } from "./dom.js";
-import { nextQueueIndex } from "./pure.js";
+import { nextQueueIndex, controlsForMode } from "./pure.js";
 import { state, focusDescriptor, findFocusTarget } from "./shared.js";
 import { blocks, tone, questionsOf, formatDuration, durSpan } from "./board.js";
 import { queueOf, stageBy, startable, startItem, saveOrder, handBack } from "./drag.js";
@@ -136,6 +136,9 @@ function stopNotice(id) {
   const at = b.at ? new Date(b.at) : null;
   const qs = questionsOf(b);
   const t = tone(b);
+  // Answering is unblocking (CONTRACTS §6), which observe refuses at the
+  // route like every other mutation — so neither control is offered there.
+  const canHandBack = controlsForMode(state?.mode || "auto").handBack;
   return `<div class="stop ${t}">
     <h3>${t === "asks" ? "needs you · " : t === "waiting" ? "waiting · " : ""}${esc(b.kind || "blocked")}${b.stage ? ` in ${esc(b.stage)}` : ""}</h3>
     <p>${esc(b.reason || "no reason was recorded")}</p>
@@ -144,13 +147,13 @@ function stopNotice(id) {
       ${b.runId ? ` &middot; run ${esc(b.runId)}` : ""}
     </div>
     <div class="fault" hidden></div>
-    ${qs ? `<button class="ask-btn">Answer ${qs.length === 1 ? "the question" : `${qs.length} questions`}</button>` : ""}
-    <textarea class="answer" rows="3" spellcheck="true" aria-label="Reply"
+    ${canHandBack && qs ? `<button class="ask-btn">Answer ${qs.length === 1 ? "the question" : `${qs.length} questions`}</button>` : ""}
+    ${canHandBack ? `<textarea class="answer" rows="3" spellcheck="true" aria-label="Reply"
       placeholder="${qs ? "Anything to add beside the answers above, or reply here instead."
                        : t === "asks" ? "Your answer. The agent takes it up in the conversation that stopped."
                        : "Reply if there is something to say; leave it empty to just hand the item back."}"></textarea>
     <button class="hand"
-      title="Clear the mark; the item goes straight back into the line">${t === "asks" ? "Send reply" : "Hand back"}</button>
+      title="Clear the mark; the item goes straight back into the line">${t === "asks" ? "Send reply" : "Hand back"}</button>` : ""}
   </div>`;
 }
 

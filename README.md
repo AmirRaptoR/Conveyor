@@ -100,6 +100,24 @@ invalidating the lines already written. Auth is in the app rather than in a
 proxy in front of it because a proxy was a second server, a second config file
 and a second password store for one line of behaviour.
 
+Every state-changing route also validates the request's `Host` and rejects an
+unsafe cross-origin request (`net/http`'s `CrossOriginProtection`), so a
+foreign page cannot drive the board through an authenticated browser and a
+loopback board cannot be reached by a DNS-rebinding trick. `auth.origins` is
+the escape hatch for a proxy that does not forward `Host` as Caddy's default
+does — extra origins (scheme, host, optional port) allowed to drive the board:
+
+```yaml
+auth:
+  origins:
+    - "https://board.example.com"
+```
+
+Empty, the default, means same-origin only. A malformed entry is a load
+error, like every other `auth` problem. See docs/CONTRACTS.md's section on
+what a stage script's credentials actually reach — worktrees isolate
+checkouts, not credentials or host access.
+
 ## Configuration
 
 ```yaml
@@ -275,6 +293,12 @@ which a comment can change the outcome.
 It never sleeps: an item resting in a script stage has that script re-run every
 poll, so waiting is exit 10, not a blocked process holding a slot.
 
+This gate is a workflow control, not a security boundary: `approve` runs with
+the same repository credentials as `implement` and `review`, and an agent
+holding them could merge directly instead of waiting for it to pass. See
+docs/CONTRACTS.md's section on what a stage script's credentials actually
+reach.
+
 ## Writing a provider
 
 A provider is a folder under `providers/` holding one script per verb:
@@ -313,7 +337,9 @@ sources:
 ```
 
 Credentials are not part of this: the script inherits the ambient environment,
-so `gh`'s existing auth works and no token belongs in a committed config.
+so `gh`'s existing auth works and no token belongs in a committed config. See
+docs/CONTRACTS.md's section on what a stage script's credentials actually
+reach — a worktree isolates a checkout, not credentials or host access.
 
 `providers/github/selfcheck.sh` exercises both scripts against a stubbed `gh`
 and in dry-run, touching no network and no repository.

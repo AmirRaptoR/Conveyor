@@ -67,9 +67,18 @@ func (s *Server) handleTick(w http.ResponseWriter, r *http.Request) {
 // handleOrder replaces the manual input order. The whole list is sent, not a
 // move: two browsers reordering at once should end with one of the two
 // arrangements, not a merge of both.
+// orderBodyLimit bounds PUT /api/order — a JSON array of item ids, which for
+// any board this pipeline actually runs is a few kilobytes at most.
+const orderBodyLimit = 1 << 20
+
 func (s *Server) handleOrder(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, orderBodyLimit)
 	var ids []string
 	if err := json.NewDecoder(r.Body).Decode(&ids); err != nil {
+		if bodyTooLarge(err) {
+			http.Error(w, "order body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "expected a JSON array of item ids", http.StatusBadRequest)
 		return
 	}
@@ -96,13 +105,22 @@ func (s *Server) handleOrder(w http.ResponseWriter, r *http.Request) {
 // it. Dropping something and seeing nothing happen reads as a broken board;
 // "midgame is busy with midgame:49" reads as a reason to wait. The persisted
 // input order is still what decides who goes next when the slot frees.
+// startBodyLimit bounds POST /api/items/{id}/start — a JSON object with one
+// short string field.
+const startBodyLimit = 4 << 10
+
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var body struct {
 		Stage string `json:"stage"`
 	}
 	if r.ContentLength > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, startBodyLimit)
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if bodyTooLarge(err) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, `expected {"stage": "..."}`, http.StatusBadRequest)
 			return
 		}

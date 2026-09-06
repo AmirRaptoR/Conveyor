@@ -153,7 +153,7 @@ func TestDrainWaitsForDiscoveryNotJustTransitions(t *testing.T) {
 	s.drainGrace = 5 * time.Second
 
 	runErr := make(chan error, 1)
-	go func() { runErr <- s.Run(ctx, "127.0.0.1:0", false) }()
+	go func() { runErr <- s.Run(ctx, "127.0.0.1:0", ModeObserve) }()
 
 	waitFor(t, "the list script to start", func() bool {
 		_, err := os.Stat(filepath.Join(dir, "list-started"))
@@ -205,7 +205,7 @@ func TestNothingWritesAfterRunReturns(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := s.Run(ctx, ":0", false); err != nil {
+	if err := s.Run(ctx, ":0", ModeObserve); err != nil {
 		t.Fatalf("Run returned an error: %v", err)
 	}
 
@@ -312,7 +312,7 @@ func TestDrainWaitsForAdvanceInWatchMode(t *testing.T) {
 	s.ctx = ctx
 	s.drainGrace = 5 * time.Second
 	s.refresh(ctx)
-	go s.button(ctx, false)
+	go s.button(ctx, ModeManual)
 
 	s.tick <- struct{}{}
 	waitFor(t, "the stage to start", func() bool {
@@ -352,7 +352,7 @@ func TestServerRunDoesNotReturnUntilDrained(t *testing.T) {
 	s.drainGrace = 5 * time.Second
 
 	runErr := make(chan error, 1)
-	go func() { runErr <- s.Run(ctx, "127.0.0.1:0", true) }()
+	go func() { runErr <- s.Run(ctx, "127.0.0.1:0", ModeAuto) }()
 
 	waitFor(t, "the stage to start", func() bool {
 		_, err := os.Stat(filepath.Join(dir, "started"))
@@ -491,7 +491,7 @@ func TestErrorPathDrainsToo(t *testing.T) {
 	s := New(cfg, r)
 	s.drainGrace = 5 * time.Second
 
-	if err := s.Run(context.Background(), addr, false); err == nil {
+	if err := s.Run(context.Background(), addr, ModeObserve); err == nil {
 		t.Fatal("Run on an address already in use returned no error")
 	}
 

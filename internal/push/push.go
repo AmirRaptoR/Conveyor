@@ -25,11 +25,13 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -190,6 +192,58 @@ var Gone = errors.New("subscription gone")
 
 // Send delivers one payload to one subscription. sub is the VAPID contact
 // (a mailto: or https: URL) the push service may use to reach the operator.
+// allowPrivateDials is a test-only switch: internal/push's own tests talk to
+// httptest servers on 127.0.0.1, which the production rule below refuses.
+// Never set outside a test — every real web-push endpoint (Google, Mozilla,
+// Apple) is a public service, and a self-hosted one on a LAN is not a case
+// this repository has.
+var allowPrivateDials atomic.Bool
+
+// NonPublicIP reports whether ip must never be a push destination: loopback,
+// RFC 1918/RFC 4193 private (which covers IPv6 unique-local), or link-local.
+// Exported so the subscribe endpoint (server.go) can apply the same rule to
+// an endpoint whose host is already a literal IP, without duplicating it.
+func NonPublicIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
+// pushClient never follows a redirect — CheckRedirect returning
+// ErrUseLastResponse hands the 3xx straight back as the final response, which
+// Send below then reports as a plain failure — and never dials an address
+// that resolves to somewhere non-public, checked at the exact IP it is about
+// to connect to (dialing that IP directly, not the hostname a second time)
+// so the address actually connected to cannot differ from the one checked.
+var pushClient = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	Transport:     &http.Transport{DialContext: safeDialContext},
+}
+
+func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	dial := &net.Dialer{Timeout: 15 * time.Second}
+	if allowPrivateDials.Load() {
+		return dial.DialContext(ctx, network, addr)
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	for _, ip := range ips {
+		if NonPublicIP(ip) {
+			return nil, fmt.Errorf("push: refusing to dial non-public address %s", ip)
+		}
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("push: %s resolved to no address", host)
+	}
+	// The exact IP just checked, not the hostname again: a second lookup
+	// inside the dialer could resolve somewhere else entirely.
+	return dial.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
+}
+
 func (k *Keys) Send(ctx context.Context, s Subscription, payload []byte, contact string) error {
 	body, err := encrypt(s, payload)
 	if err != nil {
@@ -212,7 +266,7 @@ func (k *Keys) Send(ctx context.Context, s Subscription, payload []byte, contact
 	req.Header.Set("TTL", "86400")
 	req.Header.Set("Urgency", "high")
 	req.Header.Set("Authorization", "vapid t="+tok+", k="+k.Public)
-	res, err := http.DefaultClient.Do(req)
+	res, err := pushClient.Do(req)
 	if err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package push
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
@@ -13,11 +14,101 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func testSubscription(t *testing.T, endpoint string) Subscription {
+	t.Helper()
+	ua, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := make([]byte, 16)
+	rand.Read(auth)
+	var sub Subscription
+	sub.Endpoint = endpoint
+	sub.Keys.P256dh = b64.EncodeToString(ua.PublicKey().Bytes())
+	sub.Keys.Auth = b64.EncodeToString(auth)
+	return sub
+}
+
+// A real destination — every push service is one — is unaffected: Send
+// reaches an httptest server on 127.0.0.1 only because these tests opt into
+// allowPrivateDials, which nothing outside a test ever sets.
+func TestSendRefusesAPrivateDestinationByDefault(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	k, err := LoadKeys(filepath.Join(t.TempDir(), "vapid.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := testSubscription(t, srv.URL+"/abc")
+
+	if err := k.Send(context.Background(), sub, []byte("{}"), "mailto:a@b"); err == nil {
+		t.Fatal("Send to a loopback destination succeeded; want it refused")
+	}
+
+	allowPrivateDials.Store(true)
+	defer allowPrivateDials.Store(false)
+	if err := k.Send(context.Background(), sub, []byte("{}"), "mailto:a@b"); err != nil {
+		t.Fatalf("Send with allowPrivateDials set: %v", err)
+	}
+}
+
+// A push service answering with a redirect must not be followed — the whole
+// point of validating the destination is worthless if a 3xx can retarget the
+// request to somewhere else entirely after the check.
+func TestSendDoesNotFollowRedirects(t *testing.T) {
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the redirect target must never be reached")
+	}))
+	defer final.Close()
+	redirecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL, http.StatusFound)
+	}))
+	defer redirecting.Close()
+
+	allowPrivateDials.Store(true)
+	defer allowPrivateDials.Store(false)
+	k, err := LoadKeys(filepath.Join(t.TempDir(), "vapid.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := testSubscription(t, redirecting.URL+"/abc")
+	if err := k.Send(context.Background(), sub, []byte("{}"), "mailto:a@b"); err == nil {
+		t.Fatal("Send followed a redirect and reported success; want it reported as a failure")
+	}
+}
+
+func TestNonPublicIP(t *testing.T) {
+	for _, tc := range []struct {
+		ip   string
+		want bool
+	}{
+		{"127.0.0.1", true},
+		{"10.0.0.5", true},
+		{"172.16.0.5", true},
+		{"192.168.1.1", true},
+		{"169.254.1.1", true},
+		{"::1", true},
+		{"fc00::1", true}, // unique-local
+		{"8.8.8.8", false},
+		{"1.1.1.1", false},
+	} {
+		got := NonPublicIP(net.ParseIP(tc.ip))
+		if got != tc.want {
+			t.Errorf("NonPublicIP(%s) = %v, want %v", tc.ip, got, tc.want)
+		}
+	}
+}
 
 // The receiver's half of RFC 8291, written independently of encrypt so the
 // two have to agree on the key schedule rather than share it.

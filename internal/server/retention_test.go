@@ -248,7 +248,7 @@ func TestSweepDoesNotRunUnderWatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := New(cfg, r)
-	go s.Run(ctx, "127.0.0.1:0", false) // auto=false: -watch
+	go s.Run(ctx, "127.0.0.1:0", ModeObserve) // -watch
 	time.Sleep(150 * time.Millisecond)
 
 	if _, err := os.Stat(expired); err != nil {

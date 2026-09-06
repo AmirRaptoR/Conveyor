@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -62,6 +63,18 @@ func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		!strings.HasPrefix(sub.Endpoint, "https://") || sub.Keys.P256dh == "" || sub.Keys.Auth == "" {
 		http.Error(w, "not a push subscription", http.StatusBadRequest)
 		return
+	}
+	// Every real web-push endpoint is a public service (Google, Mozilla,
+	// Apple); an endpoint whose host is already a literal loopback, private,
+	// link-local or unique-local address can only be aimed at this machine or
+	// its own network by whoever is calling this route, never a real push
+	// service. Send's own dial-time check (internal/push) still guards a
+	// hostname that resolves somewhere non-public later.
+	if u, err := url.Parse(sub.Endpoint); err == nil {
+		if ip := net.ParseIP(strings.Trim(u.Hostname(), "[]")); ip != nil && push.NonPublicIP(ip) {
+			http.Error(w, "push endpoint host is not a public address", http.StatusBadRequest)
+			return
+		}
 	}
 	fresh, err := s.pushSubs.Add(sub)
 	if err != nil {
