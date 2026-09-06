@@ -217,6 +217,46 @@ func TestDrainWaitsForAdvanceInWatchMode(t *testing.T) {
 	}
 }
 
+// The end-to-end shape of the same guarantee: Server.Run itself, not just the
+// drain() call inside it, must not return while a transition it launched is
+// still running.
+func TestServerRunDoesNotReturnUntilDrained(t *testing.T) {
+	cfg, r, dir := resistantPipelineFor(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(cfg, r)
+	s.drainGrace = 5 * time.Second
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- s.Run(ctx, "127.0.0.1:0", true) }()
+
+	waitFor(t, "the stage to start", func() bool {
+		_, err := os.Stat(filepath.Join(dir, "started"))
+		return err == nil
+	})
+
+	cancel()
+
+	select {
+	case err := <-runErr:
+		t.Fatalf("Run returned (err=%v) while the transition was still running", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "release"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run returned an error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return once the transition finished")
+	}
+}
+
 // A drain that outlives its grace must return rather than hang forever on a
 // run that will not finish, and say what is still holding it up.
 func TestDrainGivesUpAfterItsGraceAndNamesWhatIsStillRunning(t *testing.T) {
