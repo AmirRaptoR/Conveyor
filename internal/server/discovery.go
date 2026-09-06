@@ -6,12 +6,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
+	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
+	"github.com/AmirRaptoR/Conveyor/internal/source"
 )
+
+// discoveryWorkers bounds how many sources are listed at once. Listing is I/O
+// against someone else's API, not CPU work, so this exists only so a config
+// enrolling many sources cannot open that many processes in the same
+// instant — it is not a per-source concurrency setting and does not belong
+// in Concurrency, which governs stage dispatch.
+const discoveryWorkers = 8
 
 // poll re-lists every source on the configured interval, and does nothing
 // else.
@@ -214,40 +224,76 @@ func (s *Server) refresh(ctx context.Context) {
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "polling"})
 
+	var active []config.Source
 	for _, src := range s.cfg.Sources {
-		if !src.OK() {
-			continue // its problems are already on the board
-		}
-		client, ok := s.eng.Client(src.Name)
-		if !ok {
+		if !src.OK() { // its problems are already on the board
 			continue
 		}
-		// Stamped immediately before this source's own List call, not once
-		// for the whole refresh: a slow source earlier in the loop must not
-		// make this source's fresh listing look like it began before a
-		// transition that actually completed while the slow one was still
-		// running (F03).
-		genStart := time.Now()
-		s.mu.Lock()
-		s.sourceGen[src.Name] = genStart
-		s.mu.Unlock()
-		res, err := client.List(ctx)
-		if err != nil {
-			warnings = append(warnings, src.Name+": "+err.Error())
-			failedNow[src.Name] = err.Error()
+		if _, ok := s.eng.Client(src.Name); ok {
+			active = append(active, src)
+		}
+	}
+
+	// Listed concurrently and bounded, so one source that hangs — up to its
+	// own Discovery timeout, independent of and much shorter than the
+	// 90-minute default meant for stage scripts — cannot delay any other
+	// source's listing. Outcomes are gathered into a slice indexed by this
+	// source's position in cfg.Sources, rather than appended as each
+	// completes, so the items assembled from it come out in configuration
+	// order no matter which source answers first: pipeline.Order is
+	// unaffected by discovery being concurrent, and dedupeCrossSource's
+	// first-in-order-wins rule stays meaningful.
+	outcomes := make([]struct {
+		genStart time.Time
+		res      *source.ListResult
+		err      error
+	}, len(active))
+	sem := make(chan struct{}, discoveryWorkers)
+	var wg sync.WaitGroup
+	for i, src := range active {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, src config.Source) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			client, _ := s.eng.Client(src.Name) // presence already checked above
+			// Stamped immediately before this source's own List call, not
+			// once for the whole refresh: a slow source must not make
+			// another source's fresh listing look like it began before a
+			// transition that actually completed while the slow one was
+			// still running (F03).
+			genStart := time.Now()
+			s.mu.Lock()
+			s.sourceGen[src.Name] = genStart
+			s.mu.Unlock()
+			res, err := client.List(ctx)
+			outcomes[i] = struct {
+				genStart time.Time
+				res      *source.ListResult
+				err      error
+			}{genStart, res, err}
+		}(i, src)
+	}
+	wg.Wait()
+
+	for i, src := range active {
+		o := outcomes[i]
+		if o.err != nil {
+			warnings = append(warnings, src.Name+": "+o.err.Error())
+			failedNow[src.Name] = o.err.Error()
 			// A failed listing is no information about this source, not a
 			// signal that its work vanished: keep what was already known
 			// about it rather than have the wholesale assignment below wipe
 			// it off the board. A *successful* listing that genuinely omits
 			// an item still removes it — tombstones remain out of scope.
-			items = append(items, s.mergeSourceListing(src.Name, genStart, nil, true)...)
+			items = append(items, s.mergeSourceListing(src.Name, o.genStart, nil, true)...)
 			continue
 		}
 		listedNow[src.Name] = time.Now()
-		for _, w := range res.Warnings {
+		for _, w := range o.res.Warnings {
 			warnings = append(warnings, src.Name+": "+w.String())
 		}
-		items = append(items, s.mergeSourceListing(src.Name, genStart, res.Items, false)...)
+		items = append(items, s.mergeSourceListing(src.Name, o.genStart, o.res.Items, false)...)
 	}
 	items = dedupeCrossSource(items, func(msg string) { warnings = append(warnings, msg) })
 
@@ -520,10 +566,14 @@ func (s *Server) askAgents(ctx context.Context) {
 func (s *Server) recallBlocks(items []model.Item) {
 	s.mu.RLock()
 	wantBlocks := map[string]bool{}
+	listedReason := map[string]string{}
 	for _, it := range items {
 		if it.Blocked {
 			if _, known := s.blocks[it.ID]; !known {
 				wantBlocks[it.ID] = true
+			}
+			if it.BlockReason != "" {
+				listedReason[it.ID] = it.BlockReason
 			}
 		}
 	}
@@ -587,9 +637,16 @@ func (s *Server) recallBlocks(items []model.Item) {
 			s.blocks[id] = b
 		}
 	}
-	// Marked, and no run to explain it: someone put the label on by hand.
+	// Marked, and no run to explain it: either someone put the label on by
+	// hand, or this poll's listing supplied its own reason (a closed issue
+	// found sitting in a non-terminal stage, say) — CONTRACTS.md §6. The
+	// listing's own words beat the generic fallback whenever it gave one.
 	for id := range wantBlocks {
 		if _, known := s.blocks[id]; !known {
+			if reason, ok := listedReason[id]; ok {
+				s.blocks[id] = Block{Kind: "by hand", Reason: reason}
+				continue
+			}
 			s.blocks[id] = Block{Kind: "by hand",
 				Reason: "marked outside the pipeline; there is no run to explain it"}
 		}

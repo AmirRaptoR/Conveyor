@@ -58,6 +58,12 @@ retryStalled: 1h      # when EVERY item is marked and nothing can move at all,
                       # waiting on a person, and clearing it just spends an agent
                       # run to be told the same thing. Unset means never.
 timeout: 90m          # default per-script timeout; stages may override
+discovery: 2m         # how long one source's list script may run before that
+                      # poll treats it as failed and falls back to its
+                      # last-good items, flagged stale. Independent of and
+                      # much shorter than timeout: a listing is a handful of
+                      # API calls, not agent work, and a hung source must not
+                      # be able to delay any other source's listing.
 
 logs:
   # Read and validated now, but not yet enforced: no sweep runs against these

@@ -36,12 +36,13 @@ cat >"$tmp/bin/gh" <<'STUB'
 scene="$SCENE"
 case "$1 $2" in
 "pr list")   what=prlist ;;
+"pr view")   what=prview ;;
 "issue view") what=labels_$3 ;;
-"api graphql") what=graphql ;;
+"api graphql") what=graphql; printf '%s\n' "$*" >>"$scene/graphql_calls" ;;
 "api repos"*) what=timeline ;;
 "pr edit")   echo "unlabelled"; exit 0 ;;
 "pr comment") printf '%s\n' "$*" >>"$scene/comments_posted"; exit 0 ;;
-"pr merge")  echo "merged"; [[ -f "$scene/merge_fails" ]] && exit 1; touch "$scene/merged"; exit 0 ;;
+"pr merge")  echo "merged"; touch "$scene/merge_called"; [[ -f "$scene/merge_fails" ]] && exit 1; touch "$scene/merged"; exit 0 ;;
 *)
 	case "$1" in
 	api) what=timeline ;;
@@ -113,6 +114,7 @@ pr() { printf '[{"number":%s,"body":"Closes #7","state":"%s","url":"u"}]' "$1" "
 labels() { printf '%s' "${1:-[]}" >"$tmp/scene/labels_7"; printf '%s' "${2:-[]}" >"$tmp/scene/labels_9"; }
 # details <isDraft> <mergeable> <rollup> [threads-json] [headRefName]
 #         [isCrossRepository] [headRefOid] [baseRefOid] [comments-json]
+#         [isInMergeQueue] [autoMergeRequest-json]
 #
 # headRefOid/baseRefOid default to two distinct, well-formed 40-character hex
 # strings, so a scene that says nothing about the marker looks like a PR gate
@@ -124,10 +126,12 @@ details() {
 	# stay empty rather than being replaced by the default, which `:-` would do.
 	local head_ref="${5-issue-7}" cross="${6-false}" \
 		head_oid="${7-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
-		base_oid="${8-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" comments="${9-[]}"
+		base_oid="${8-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" comments="${9-[]}" \
+		queue="${10:-false}" automerge="${11-null}"
 	cat >"$tmp/scene/graphql" <<JSON
 {"isDraft":$1,"mergeable":"$2","headRefName":"$head_ref","headRefOid":"$head_oid",
  "baseRefName":"main","baseRefOid":"$base_oid","isCrossRepository":$cross,
+ "isInMergeQueue":$queue,"autoMergeRequest":$automerge,
  "commits":{"nodes":[{"commit":{"committedDate":"2020-01-01T00:00:00Z","statusCheckRollup":$rollup_field}}]},
  "comments":{"nodes":$comments},"reviews":{"nodes":[]},
  "reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":${4:-[]}}}
@@ -135,6 +139,13 @@ JSON
 	# The stub does not run --jq, so fixtures are written in post-jq form. For
 	# the timeline that is a bare timestamp, or nothing.
 	: >"$tmp/scene/timeline"
+	# Default post-merge view: the merge gate 14 is about to attempt actually
+	# lands, at the exact head this call just inspected. F06's scenes below
+	# overwrite this to simulate a moved head, a queued/auto-merge outcome, or
+	# a merge genuinely refused.
+	cat >"$tmp/scene/prview" <<JSON
+{"state":"MERGED","headRefOid":"$head_oid","isInMergeQueue":false,"autoMergeRequest":null}
+JSON
 }
 
 # --- 1. a gh call that fails is a blip, not a verdict -----------------------
@@ -153,6 +164,26 @@ chk "     and the kind is input"             "$(kind)" "input"
 # A PR that merely mentions the issue is not a PR that closes it.
 scene; printf '[{"number":9,"body":"related to #7","state":"OPEN","url":"u"}]' >"$tmp/scene/prlist"
 chk "a mention is not a closing reference"   "$(run)" "20"
+
+# A closing keyword inside a fenced code block is a template's example, not a
+# live instruction — the same rule agents/_pr's pr_match_filter applies, since
+# discover_pr shares it.
+scene; printf '[{"number":9,"body":"```\\nCloses #7\\n```","state":"OPEN","url":"u"}]' >"$tmp/scene/prlist"
+chk "a fenced closing keyword does not match" "$(run)" "20"
+chk "     and the kind is input"              "$(kind)" "input"
+
+# A PR opened from this item's own issue-<ref> branch is a match even with no
+# closing keyword in its body at all — gate 4 (already merged) reaches it
+# with no other fixture needed, which is enough to prove discover_pr counted
+# it as a match at all.
+scene; printf '[{"number":9,"body":"no keyword here","state":"MERGED","headRefName":"issue-7","url":"u"}]' >"$tmp/scene/prlist"
+chk "the item's own branch name matches with no keyword" "$(run)" "0"
+
+# gh's own page cap: a full page with no match in it might be hiding one
+# behind, so this defers rather than reporting "no PR closes the issue".
+scene
+jq -n '[range(100) | {number: ., body: "unrelated", state: "OPEN", url: "u"}]' >"$tmp/scene/prlist"
+chk "a full page with no match defers, not none" "$(run)" "10"
 
 # --- 4/5. the PR is already finished ---------------------------------------
 scene; pr 9 MERGED
@@ -290,8 +321,66 @@ chk "(14) a settled PR merges"                "$(run)" "0"
 chk "     and gh pr merge actually ran"       "$([[ -f "$tmp/scene/merged" ]] && echo merged)" "merged"
 
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS; touch "$tmp/scene/merge_fails"
+# A genuine refusal changes nothing: the head gh reports afterwards is the
+# same one that was inspected, and the PR is still open. Only then is a
+# failed `gh pr merge` actually a fault rather than a moved head.
+cat >"$tmp/scene/prview" <<'JSON'
+{"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"autoMergeRequest":null}
+JSON
 chk "a refused merge stops, never reads as merged" "$(run)" "20"
 chk "     and the kind is merge"              "$(kind)" "merge"
+
+# --- F06: the merge is bound to the commit that passed the gates -----------
+#
+# gh pr merge carries --match-head-commit for the exact SHA the second
+# check_gates_once just inspected. A push landing in the gap between that
+# inspection and the merge call moves the head; this must defer and recheck,
+# never merge past it and never mark a fault.
+echo "F06: merge bound to the inspected commit"
+
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
+# The head moved after the inspection, and --match-head-commit refuses it —
+# gh reports a failure exactly as it would for any other rejected merge, and
+# only the follow-up read tells the two apart.
+cat >"$tmp/scene/prview" <<'JSON'
+{"state":"OPEN","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","isInMergeQueue":false,"autoMergeRequest":null}
+JSON
+touch "$tmp/scene/merge_fails"
+chk "(F06) a head that moved between the read and the merge defers" "$(run)" "10"
+chk "     never reads as merged"              "$([[ -f "$tmp/scene/merged" ]] && echo merged || echo no)" "no"
+
+# The same moved-head case, but gh happens to report success anyway (a race
+# where the mismatch was not caught server-side) — the follow-up read is what
+# actually decides this, not gh's exit code.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
+cat >"$tmp/scene/prview" <<'JSON'
+{"state":"OPEN","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","isInMergeQueue":false,"autoMergeRequest":null}
+JSON
+chk "(F06) a moved head defers even when gh reports success" "$(run)" "10"
+
+# Accepted but not yet merged: the repository requires a merge queue, so
+# `gh pr merge` enqueues it (or enables auto-merge) and returns 0. This must
+# not be reported done, and must not re-issue gh pr merge on the next poll.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
+cat >"$tmp/scene/prview" <<'JSON'
+{"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":true,"autoMergeRequest":null}
+JSON
+chk "(F06) an accepted-but-queued merge defers, not done" "$(run)" "10"
+chk "     it did call gh pr merge, but never observed it merged" \
+	"$([[ -f "$tmp/scene/merge_called" ]] && echo called || echo no)" "called"
+
+# On the next poll, the PR is still queued at the top of the gate — this must
+# defer without ever reaching (or re-issuing) gh pr merge again.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS '[]' issue-7 false '' '' '[]' true
+touch "$tmp/scene/merge_fails" # if merge were re-issued, it would fail loudly
+chk "(F06) a PR already queued at the top of a poll defers without re-merging" "$(run)" "10"
+chk "     gh pr merge was never reached"       "$([[ -f "$tmp/scene/merge_called" ]] && echo called || echo no)" "no"
+
+# ...and the same for auto-merge already enabled.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS '[]' issue-7 false '' '' '[]' false '{"enabledAt":"2020-01-01T00:00:00Z"}'
+touch "$tmp/scene/merge_fails"
+chk "(F06) auto-merge already enabled defers without re-merging" "$(run)" "10"
+chk "     gh pr merge was never reached"       "$([[ -f "$tmp/scene/merge_called" ]] && echo called || echo no)" "no"
 
 # --- QUIET_SECONDS parsing --------------------------------------------------
 # A fresh clock, so 600 is the thing being tested and not the 2020 commit date.
@@ -395,5 +484,80 @@ chk "     and no model ran"                   "$([[ -f "$tmp/claude-ran" ]] && e
 # this, and the resolution was gone with nothing saying so.
 chk "(8a) a rebase never resets over a merge in progress" "$(merge_in_progress)" "yes"
 chk "     leaving the resolution where it was"            "$(cat "$wt/f.txt")" "$branch_content"
+
+# --- gate 11: a thread is resolved only when the model actually disposed of
+# it, never on the strength of "some commit changed" alone -------------------
+#
+# Real git again, for the same reason as 8f: what is being asserted is which
+# threads got a reply-and-resolve mutation, and that is only visible against
+# a real commit. claude is restubbed here, last in the file, to actually
+# "address" the threads a scene names rather than refuse outright — it makes
+# one file edit and writes whatever $CONVEYOR_RESULT a scene asks for, which
+# is this harness standing in for the model reporting its own dispositions.
+reset_wt_clean() {
+	g -C "$src" worktree remove --force "$wt" >/dev/null 2>&1
+	g -C "$src" branch --quiet -f issue-7 "$issue7_base"
+	g -C "$src" push --quiet --force origin issue-7
+	g -C "$src" worktree add --quiet --force "$wt" issue-7
+	# item_worktree only reuses a path it recognizes as its own — see
+	# half_merged's identical line above for why this fixture writes the
+	# marker by hand rather than going through item_worktree itself.
+	printf 's1\n7\n' >"$(g -C "$wt" rev-parse --absolute-git-dir)/conveyor-owner"
+}
+cat >"$tmp/bin/claude" <<STUB
+#!/usr/bin/env bash
+touch "$tmp/claude-ran"
+[[ -f "\$SCENE/claude_edit" ]] && cat "\$SCENE/claude_edit" >>f.txt
+[[ -f "\$SCENE/claude_result" ]] && cat "\$SCENE/claude_result" >"\$CONVEYOR_RESULT"
+echo "stub claude: addressed threads"
+exit 0
+STUB
+chmod +x "$tmp/bin/claude"
+
+threads='[{"id":"T1","isResolved":false,"comments":{"nodes":[{"body":"please fix X"}]}},
+          {"id":"T2","isResolved":false,"comments":{"nodes":[{"body":"please fix Y"}]}}]'
+# Each disposed thread costs exactly two graphql calls (reply, then resolve),
+# both carrying -F id=<that thread>; an untouched thread never appears at all.
+touches_for() { grep -o "id=$1" "$tmp/scene/graphql_calls" 2>/dev/null | wc -l | tr -d ' '; }
+
+# All threads disposed: both are replied to and resolved, and the run defers.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
+printf 'edit for all\n' >"$tmp/scene/claude_edit"
+printf '{"dispositions":{"T1":"fixed X","T2":"fixed Y"}}' >"$tmp/scene/claude_result"
+reset_wt_clean
+chk "(11) all threads disposed defers"        "$(run_real)" "10"
+chk "     T1 is replied to and resolved"      "$(touches_for T1)" "2"
+chk "     T2 is replied to and resolved"      "$(touches_for T2)" "2"
+
+# A subset disposed: only the reported thread is replied to and resolved; the
+# other is left for gate 12 on a later poll.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
+printf 'edit for subset\n' >"$tmp/scene/claude_edit"
+printf '{"dispositions":{"T1":"fixed X"}}' >"$tmp/scene/claude_result"
+reset_wt_clean
+chk "(11) a subset disposed defers"           "$(run_real)" "10"
+chk "     T1 is replied to and resolved"      "$(touches_for T1)" "2"
+chk "     T2 is left alone"                   "$(touches_for T2)" "0"
+
+# None disposed: a commit still landed (the model touched something) but
+# reported no disposition at all — "the commit changed" is no longer enough
+# on its own, so nothing is resolved and nothing is replied to.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
+printf 'edit with no disposition\n' >"$tmp/scene/claude_edit"
+printf '{}' >"$tmp/scene/claude_result"
+reset_wt_clean
+chk "(11) none disposed still defers"         "$(run_real)" "10"
+chk "     T1 is left alone"                   "$(touches_for T1)" "0"
+chk "     T2 is left alone"                   "$(touches_for T2)" "0"
+
+# A disposition naming a thread id outside this run's unanswered set is
+# ignored, not acted on — it names a thread this run was never asked about.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
+printf 'edit for unknown id\n' >"$tmp/scene/claude_edit"
+printf '{"dispositions":{"T1":"fixed X","T99":"fixed something else"}}' >"$tmp/scene/claude_result"
+reset_wt_clean
+chk "(11) an unknown thread id is ignored"    "$(run_real)" "10"
+chk "     T1 is replied to and resolved"      "$(touches_for T1)" "2"
+chk "     the unknown id was never sent"      "$(touches_for T99)" "0"
 
 exit $fail

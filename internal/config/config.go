@@ -21,6 +21,15 @@ type Config struct {
 	Concurrency Concurrency `yaml:"concurrency"`
 	Poll        Duration    `yaml:"poll"`
 	Timeout     Duration    `yaml:"timeout"`
+	// Discovery bounds one source's list script independently of Timeout,
+	// which defaults to 90 minutes and exists for agent work. A listing is a
+	// handful of API calls, not a stage, and must not be able to hold a
+	// discovery slot that long: a source that hangs past Discovery is failed
+	// for this poll — its last-good items stay on the board, flagged stale —
+	// while every other source keeps listing. Unset defaults to a value much
+	// shorter than Timeout, so an existing config needs no change to get the
+	// guard.
+	Discovery Duration `yaml:"discovery"`
 	// RetryStalled is how often to clear every mark when *every* item is
 	// marked and the line cannot move at all. A total stall usually means the
 	// outside world broke — an agent over its usage limit, an expired
@@ -300,6 +309,9 @@ func (c *Config) applyDefaults() {
 	if c.Timeout == 0 {
 		c.Timeout = Duration(90 * time.Minute)
 	}
+	if c.Discovery == 0 {
+		c.Discovery = Duration(2 * time.Minute)
+	}
 	if !c.Logs.retentionSet && c.Logs.Retention == 0 {
 		c.Logs.Retention = Duration(30 * 24 * time.Hour)
 	}
@@ -346,6 +358,20 @@ func (c *Config) StageNames() []string {
 	out := make([]string, len(c.Stages))
 	for i, s := range c.Stages {
 		out[i] = s.Name
+	}
+	return out
+}
+
+// TerminalStageNames is which of those stages are terminal — CONTRACTS.md §1:
+// a list script tells a finished item from one that merely stopped in a
+// non-terminal stage by checking this, rather than keeping its own copy of
+// the stage graph in source env:.
+func (c *Config) TerminalStageNames() []string {
+	var out []string
+	for _, s := range c.Stages {
+		if s.Terminal {
+			out = append(out, s.Name)
+		}
 	}
 	return out
 }

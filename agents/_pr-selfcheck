@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Self-check for agents/_pr — the shared "find this item's pull request by
+# closing reference" rule every adapter and agents/claude/approve share.
+# Stubs `gh`, touches no network and no repository.
+#
+#   agents/_pr-selfcheck
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/_pr"
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/bin"
+export PATH="$tmp/bin:$PATH"
+export REPO="owner/repo"
+
+# The stub answers `gh pr list` from a fixture file the scene sets, and fails
+# the call outright when $tmp/scene/fail exists.
+scene() { rm -f "$tmp/list" "$tmp/fail"; }
+list() { printf '%s' "$1" >"$tmp/list"; }
+cat >"$tmp/bin/gh" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1 \$2" == "pr list" ]]; then
+	[[ -f "$tmp/fail" ]] && { echo "stub gh: pr list failed" >&2; exit 1; }
+	if [[ -f "$tmp/list" ]]; then cat "$tmp/list"; else echo "stub gh: no fixture for pr list" >&2; exit 98; fi
+	exit 0
+fi
+echo "stub gh: unhandled: \$*" >&2
+exit 97
+STUB
+chmod +x "$tmp/bin/gh"
+
+# --- Closes #N is matched, a mention alone is not ---------------------------
+scene; list '[{"number":9,"body":"Closes #7","state":"OPEN","headRefName":"patch-1","url":"u"}]'
+pr_lookup 7
+chk "Closes #N is matched"            "$PR_STATUS" "one"
+chk "  the number is right"           "$PR_NUMBER" "9"
+
+scene; list '[{"number":9,"body":"depends on #7","state":"OPEN","headRefName":"patch-1","url":"u"}]'
+pr_lookup 7
+chk "a mention in prose is not matched (depends on)" "$PR_STATUS" "none"
+
+scene; list '[{"number":9,"body":"see #7 for context","state":"OPEN","headRefName":"patch-1","url":"u"}]'
+pr_lookup 7
+chk "a mention in prose is not matched (see)" "$PR_STATUS" "none"
+
+scene; list '[{"number":9,"body":"```\nCloses #7\n```","state":"OPEN","headRefName":"patch-1","url":"u"}]'
+pr_lookup 7
+chk "a closing keyword inside a fenced code block is not matched" "$PR_STATUS" "none"
+
+# --- a branch renamed away from issue-N still matches by body ---------------
+scene; list '[{"number":9,"body":"Closes #7","state":"OPEN","headRefName":"a-renamed-branch","url":"u"}]'
+pr_lookup 7
+chk "a renamed branch still matches by body" "$PR_STATUS" "one"
+
+# --- the item's own issue-<ref> branch matches with no keyword at all -------
+scene; list '[{"number":9,"body":"no keyword here","state":"OPEN","headRefName":"issue-7","url":"u"}]'
+pr_lookup 7
+chk "the item's own branch matches with no keyword" "$PR_STATUS" "one"
+
+# --- #N in a different repository's issue is never seen, because the list is
+# already scoped to $REPO by `gh pr list --repo` --------------------------
+scene; list '[{"number":9,"body":"Closes other-org/other-repo#7","state":"OPEN","headRefName":"patch-1","url":"u"}]'
+pr_lookup 7
+chk "a cross-repository reference is not matched" "$PR_STATUS" "none"
+
+# --- two PRs closing the same ref: several, never picked between -----------
+scene; list '[{"number":9,"body":"Closes #7","state":"OPEN","headRefName":"a","url":"u"},
+              {"number":10,"body":"fixes #7","state":"OPEN","headRefName":"b","url":"u"}]'
+pr_lookup 7
+chk "two PRs closing the same ref is several" "$PR_STATUS" "several"
+
+# --- a failed gh call is unavailable, never none ----------------------------
+scene; touch "$tmp/fail"
+pr_lookup 7
+chk "a failed gh call is unavailable"        "$PR_STATUS" "unavailable"
+chk "  never read as none"                   "$([[ "$PR_STATUS" == "none" ]] && echo yes || echo no)" "no"
+
+# --- a non-JSON response is unavailable -------------------------------------
+scene; list 'not json'
+pr_lookup 7
+chk "a non-JSON response is unavailable"     "$PR_STATUS" "unavailable"
+
+# --- a full page (gh's own cap) with no match might be hiding one behind ---
+scene
+full=$(printf '{"number":%s,"body":"unrelated","state":"OPEN","headRefName":"x","url":"u"},' $(seq 1 100))
+list "[${full%,}]"
+pr_lookup 7
+chk "a full page with no match is unavailable, not none" "$PR_STATUS" "unavailable"
+
+# --- open_pr: the plain string form used by a caller with no need to tell
+# none/several/unavailable apart -------------------------------------------
+scene; list '[{"number":9,"body":"Closes #7","state":"OPEN","headRefName":"a","url":"u"}]'
+chk "open_pr returns the number on one match" "$(open_pr 7)" "9"
+scene; list '[]'
+chk "open_pr is empty on none"                "$(open_pr 7)" ""
+scene; touch "$tmp/fail"
+chk "open_pr is empty on unavailable too"     "$(open_pr 7)" ""
+
+if [[ $fail -eq 0 ]]; then echo "all checks passed"; else echo "SOME CHECKS FAILED"; fi
+exit $fail

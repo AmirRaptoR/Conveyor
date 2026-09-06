@@ -65,7 +65,10 @@ data='[
   "url":"https://example.test/17","assignees":[]},
  {"number":21,"title":"Tagged, then closed by hand","body":"","state":"CLOSED",
   "labels":[{"name":"conveyor"}],
-  "url":"https://example.test/21","assignees":[]}
+  "url":"https://example.test/21","assignees":[]},
+ {"number":27,"title":"Closed mid-flight","body":"","state":"CLOSED",
+  "labels":[{"name":"status:in-progress"}],
+  "url":"https://example.test/27","assignees":[],"closedAt":"2026-08-29T00:00:00Z"}
 ]'
 case "$*" in
 	*"--state open"*)   jq '[.[] | select(.state == "OPEN")]' <<<"$data" ;;
@@ -76,8 +79,12 @@ STUB
 chmod +x "$tmp/stub/gh"
 
 echo "list.sh"
-PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/out.json" \
-	./list.sh 2>/dev/null
+# "ready" is this fixture's one terminal stage — ref 15 (closed, mapped
+# "ready") is the "finished" case; ref 27 (closed, mapped "in-progress", which
+# is not terminal) is the "stopped mid-flight" case below.
+echo '{"terminalStages":["ready"]}' |
+	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/out.json" \
+		./list.sh 2>/dev/null
 
 check "maps a status label to its stage" \
 	"refining" "$(jq -r '.[0].stage' "$tmp/out.json")"
@@ -116,8 +123,9 @@ check "the old ignore label no longer keeps an issue off the board" \
 
 # The variable is gone, not merely defaulted: a config still setting it must not
 # quietly change what is listed.
-PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/named.json" \
-	IGNORE_LABELS="status:ready, hold" ./list.sh 2>/dev/null
+echo '{"terminalStages":["ready"]}' |
+	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/named.json" \
+		IGNORE_LABELS="status:ready, hold" ./list.sh 2>/dev/null
 check "IGNORE_LABELS is read by nothing" \
 	"$(jq -cS . "$tmp/out.json")" "$(jq -cS . "$tmp/named.json")"
 
@@ -129,6 +137,18 @@ check "a closed issue's item carries finishedAt from closedAt" \
 	"2026-08-30T12:00:00Z" "$(jq -r '.[] | select(.ref == "15") | .finishedAt' "$tmp/out.json")"
 check "an open issue's item carries an empty finishedAt" \
 	"" "$(jq -r '.[] | select(.ref == "7") | .finishedAt' "$tmp/out.json")"
+# --- F09: closed-issue routing depends on whether the mapped stage is terminal
+# "ready" is terminal here, so ref 15 above is unmarked and simply finished.
+check "closed + terminal stage is unmarked"    \
+	"false" "$(jq -r '.[] | select(.ref == "15") | .blocked' "$tmp/out.json")"
+# "in-progress" is not, so ref 27 stopped mid-flight: same stage, marked, with
+# a reason a person can read without opening the logs — not silently finished.
+check "closed + non-terminal stage keeps its stage" \
+	"in-progress" "$(jq -r '.[] | select(.ref == "27") | .stage' "$tmp/out.json")"
+check "     and is marked"                     \
+	"true" "$(jq -r '.[] | select(.ref == "27") | .blocked' "$tmp/out.json")"
+check "     with a human-readable reason"      \
+	"true" "$([[ -n "$(jq -r '.[] | select(.ref == "27") | .blockReason' "$tmp/out.json")" ]] && echo true)"
 check "a closed issue it never labelled is left in history" \
 	"" "$(jq -r '.[] | select(.ref == "17") | .ref' "$tmp/out.json")"
 # The onboarding tag opens the door; it does not reopen a closed issue. A stage
@@ -136,6 +156,38 @@ check "a closed issue it never labelled is left in history" \
 # issue wearing the tag would come back as new work every poll.
 check "the tag does not drag a closed issue back onto the board" \
 	"" "$(jq -r '.[] | select(.ref == "21") | .ref' "$tmp/out.json")"
+
+# --- F09: an enrolled open issue is found no matter how much unrelated open
+# work sits ahead of it ------------------------------------------------------
+#
+# Each enrolling label is its own server-side-filtered `gh` call, unioned —
+# never one `--state open --limit N` call truncated before enrolment is even
+# checked. The stub below plays out the old bug directly: the one unfiltered
+# call this test can still provoke (a caller with no --label at all) returns
+# 200 newer unrelated issues and never the enrolled one, which is only ever
+# visible through its own label's call.
+echo "discovery completeness"
+(
+	export STAGE_LABELS='refining=status:refining'
+	cat >"$tmp/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+*"--state open --label status:refining"*)
+	echo '[{"number":9001,"title":"The enrolled one","body":"","state":"OPEN","labels":[{"name":"status:refining"}],"url":"u","assignees":[]}]'
+	;;
+*"--state open --label"*) echo '[]' ;;
+*"--state closed"*)       echo '[]' ;;
+*"--state open"*)
+	jq -n '[range(200) | {number: (9500 - .), title: "unrelated", body: "", state: "OPEN", labels: [], url: "u", assignees: []}]'
+	;;
+*) echo "stub gh: unhandled: $*" >&2; exit 97 ;;
+esac
+STUB
+	echo '{}' | PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/deep.json" \
+		./list.sh 2>/dev/null
+	check "an enrolled issue behind 200 unrelated ones is still found" \
+		"9001" "$(jq -r '.[] | select(.stage == "refining") | .ref' "$tmp/deep.json")"
+) || fail=1
 
 # --- move.sh: stage -> label writes ----------------------------------------
 # move.sh asks GitHub for the issue's current labels, so the stub answers that.
@@ -267,8 +319,9 @@ case "$*" in
 	*)                  echo "$data" ;;
 esac
 STUB
-	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/ns.json" \
-		./list.sh 2>/dev/null
+	echo '{}' |
+		PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/ns.json" \
+			./list.sh 2>/dev/null
 	check "the mark defaults into the namespace" \
 		"true" "$(jq -r '.[] | select(.ref == "21") | .blocked' "$tmp/ns.json")"
 	# The tag is the namespace word without its separator, so renaming the
@@ -306,6 +359,60 @@ check "and the new one is added" \
 	"yes" "$(grep -q -- "--add-label conveyor:ready" <<<"$out" && echo yes || echo no)"
 check "a label outside the prefix is left alone" \
 	"no" "$(grep -q -- "--remove-label bug" <<<"$out" && echo yes || echo no)"
+
+# --- F10: ownership is starts-with, not substring ---------------------------
+#
+# grep -F "$LABEL_PREFIX" matches the namespace anywhere in the label, not just
+# at its start, so a repository's own "team-conveyor:keep" was swept into the
+# managed set and removed on the next move. This reproduces that and pins the
+# fix to a literal starts-with test.
+echo "label ownership (starts-with, not substring)"
+saved_labels=$STAGE_LABELS
+saved_prefix=${LABEL_PREFIX:-}
+
+export STAGE_LABELS='implementing=conveyor:implementing'
+export LABEL_PREFIX="conveyor:"
+export LABELS="team-conveyor:keep"
+check "a label merely containing the prefix is left alone" \
+	"" \
+	"$(echo '{"item":{"ref":"41"},"stage":"backlog"}' | dry)"
+
+export LABELS=$'team-conveyor:keep\nconveyor:implementing'
+check "a label actually starting with the prefix is still removed" \
+	"gh issue edit 41 --repo owner/repo --remove-label conveyor:implementing" \
+	"$(echo '{"item":{"ref":"41"},"stage":"backlog"}' | dry)"
+
+# A custom prefix with regex metacharacters must match only literally: '.'
+# does not stand for "any character" and '[x]' is not a character class.
+export STAGE_LABELS=""
+export LABEL_PREFIX='conv.yor[x]:'
+export LABELS=$'convXyor[x]:a\nconv.yor[x]:a'
+check "a regex-special prefix matches only literally" \
+	"gh issue edit 41 --repo owner/repo --remove-label conv.yor[x]:a" \
+	"$(echo '{"item":{"ref":"41"},"stage":"backlog"}' | dry)"
+
+export STAGE_LABELS=$saved_labels
+export LABEL_PREFIX=$saved_prefix
+
+# The mapping itself must be parsed as data: a stage name with '/', '.' or '['
+# used to be spliced into a sed pattern, where '.' and an unbalanced '[' are
+# regex metacharacters rather than literal text.
+echo "stage names as data (no sed interpolation)"
+saved_labels=$STAGE_LABELS
+export STAGE_LABELS='feat/review=status:feat-review
+a.b=status:dot
+c[d]=status:bracket'
+export LABELS=""
+check "a stage name containing / resolves" \
+	"gh issue edit 41 --repo owner/repo --add-label status:feat-review" \
+	"$(echo '{"item":{"ref":"41"},"stage":"feat/review"}' | dry)"
+check "a stage name containing . resolves literally" \
+	"gh issue edit 41 --repo owner/repo --add-label status:dot" \
+	"$(echo '{"item":{"ref":"41"},"stage":"a.b"}' | dry)"
+check "a stage name containing [ resolves" \
+	"gh issue edit 41 --repo owner/repo --add-label status:bracket" \
+	"$(echo '{"item":{"ref":"41"},"stage":"c[d]"}' | dry)"
+export STAGE_LABELS=$saved_labels
 
 [[ $fail -eq 0 ]] && echo "all checks passed" || echo "FAILURES"
 exit $fail

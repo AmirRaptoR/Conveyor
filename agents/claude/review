@@ -34,17 +34,27 @@ title=$(jq -r '.item.title' <<<"$payload")
 # reported. Checked here rather than trusted from the skill, because the skill
 # stopping politely would otherwise read as success and advance the item.
 if [[ -n "${REPO:-}" ]]; then
-	pr=$(open_pr "$ref")
-	if [[ -z "$pr" ]]; then
+	pr_lookup "$ref" open
+	case "$PR_STATUS" in
+	unavailable)
+		echo "could not tell whether an open pull request closes #$ref; deferring rather than reporting nothing landed" >&2
+		exit 10
+		;;
+	several)
+		blocked decision "more than one open pull request closes issue #$ref; resolve which one is correct before this can proceed."
+		;;
+	none)
 		blocked input "no open pull request closes #$ref, so there is nothing to \
 review. Either the implement stage did not land its work, or the PR was closed \
 by hand."
-	fi
+		;;
+	esac
+	pr=$PR_NUMBER
+	head=$PR_HEAD
 	echo "reviewing PR #$pr for $CONVEYOR_SOURCE #$ref — $title"
 	# The item's own worktree, on the pull request's branch. Review applies
 	# fixes and merges, both of which are writes: doing them in the repository a
 	# person works in is how a review lands on top of somebody's evening.
-	head=$(gh pr view "$pr" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null || true)
 	wt=$(item_worktree "$CONVEYOR_SOURCE" "$ref" "$head")
 	cd "$wt"
 	echo "  worktree: $wt  (branch $(git branch --show-current))"
@@ -166,9 +176,17 @@ fi
 # the merge is confirmed. Dropping it here would mean rebuilding it on the next
 # poll.
 if [[ $rc -eq 0 && -n "${REPO:-}" ]]; then
-	landed=$(closing_prs "$ref" all |
-		jq -r '[.[] | select(.state != "CLOSED")][0] | "\(.number) \(.state)"' 2>/dev/null)
-	if [[ -z "$landed" || "$landed" == "null null" ]]; then
+	pr_lookup "$ref" all
+	if [[ "$PR_STATUS" == "unavailable" ]]; then
+		echo "could not confirm the pull request for #$ref still exists after the review; deferring" >&2
+		exit 10
+	fi
+	active=$(jq '[.[] | select(.state != "CLOSED")]' <<<"$PR_MATCHES")
+	if [[ "$(jq 'length' <<<"$active")" -ge 2 ]]; then
+		blocked decision "more than one open or merged pull request now closes issue #$ref; resolve which one is correct before this can proceed."
+	fi
+	landed=$(jq -r '.[0] | if . == null then empty else "\(.number) \(.state)" end' <<<"$active")
+	if [[ -z "$landed" ]]; then
 		blocked no-output "the review finished but no open or merged pull request \
 references #$ref any more. A run cut short by a usage limit looks exactly like this."
 	fi

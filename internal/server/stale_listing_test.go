@@ -247,10 +247,14 @@ sources:
 	}
 }
 
-// F03: the staleness stamp is taken per source, immediately before that
-// source's own List call — not once for the whole refresh — so a slow
-// source earlier in the pass cannot make a fast source's own timestamp look
-// too early.
+// F03 + provider robustness: the staleness stamp is taken per source,
+// immediately before that source's own List call — not once for the whole
+// refresh, and not delayed by any other source's. Sources are listed
+// concurrently (provider robustness), so the test that once proved
+// "per-source, not global" by showing fast's stamp waited for slow's ~300ms
+// call now proves the opposite: fast's own stamp must NOT wait for slow's,
+// because each is taken independently, right before that source's own call,
+// on its own goroutine.
 func TestStaleListingGenerationIsStampedPerSource(t *testing.T) {
 	dir := t.TempDir()
 	writeScript(t, filepath.Join(dir, "providers", "slow", "list.sh"), "#!/bin/sh\nsleep 0.3\nexit 0\n")
@@ -294,11 +298,18 @@ sources:
 	if slowGen.Before(t0) {
 		t.Fatalf("slow's own generation was not stamped during this refresh")
 	}
-	if !fastGen.After(slowGen) {
-		t.Errorf("fast's generation (%v) was not stamped after slow's own List call returned (%v) — a global, once-per-refresh stamp would tie them together", fastGen, slowGen)
+	if fastGen.Before(t0) {
+		t.Fatalf("fast's own generation was not stamped during this refresh")
 	}
-	if fastGen.Sub(t0) < 250*time.Millisecond {
-		t.Errorf("fast's generation was stamped only %v after refresh started, want it stamped after slow's ~300ms List call, immediately before fast's own", fastGen.Sub(t0))
+	// Each is its own independent stamp, not a single value shared by the
+	// whole refresh: fast's must not have to wait out slow's ~300ms sleep,
+	// which a global, once-per-refresh stamp — or a sequential loop — would
+	// force.
+	if fastGen.Sub(t0) > 250*time.Millisecond {
+		t.Errorf("fast's generation was stamped %v after refresh started; it must not wait for slow's own ~300ms List call", fastGen.Sub(t0))
+	}
+	if slowGen.Sub(t0) > 250*time.Millisecond {
+		t.Errorf("slow's generation was stamped %v after refresh started; it must be stamped immediately before its own List call, not after", slowGen.Sub(t0))
 	}
 }
 

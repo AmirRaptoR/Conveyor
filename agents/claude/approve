@@ -55,7 +55,26 @@
 #      resolve -> exit 10
 #  12. an unresolved thread it already answered -> exit 20  (decision)
 #  13. now - base < QUIET_SECONDS            -> exit 10
-#  14. otherwise -> refetch 4-12, then merge -> exit 0
+#  14. otherwise -> refetch 4-12, then merge, bound to the exact commit that
+#      just passed every gate above:
+#        a. the PR is already queued to merge or already has auto-merge
+#           enabled (a queue/auto-merge this same script requested on an
+#           earlier poll, or one set by hand) -> exit 10, gh pr merge is not
+#           re-issued
+#        b. gh pr merge --match-head-commit <the second read's headRefOid>,
+#           then the PR is read once more, never trusted from gh's own exit
+#           code alone:
+#             - now MERGED                    -> exit 0 (drop worktree)
+#             - head has moved since the SHA just merged -> exit 10 (a moved
+#               head is new activity, not a fault; this covers both a
+#               --match-head-commit rejection and a push that landed in the
+#               gap regardless of what gh reported)
+#             - now queued or auto-merge-enabled -> exit 10, waiting for
+#               GitHub to actually finish it
+#             - gh reported failure and none of the above explains it -> exit
+#               20 (merge)
+#             - gh reported success but the PR is in none of the above states
+#               -> exit 10 (defer to the next poll rather than assume)
 #
 # Merge gates, all required: no hold, not a draft, no conflict, checks green,
 # no unresolved review threads, quiet for QUIET_SECONDS. Any activity resets
@@ -66,6 +85,7 @@ set -euo pipefail
 source "$(dirname "$0")/_stream"
 source "$(dirname "$0")/../_blocked"
 source "$(dirname "$0")/../_worktree"
+source "$(dirname "$0")/../_pr"
 
 : "${REPO:?REPO is required (set it in the source env: block)}"
 : "${PROMPT:?PROMPT is required (set it in this script params: block)}"
@@ -129,20 +149,29 @@ gh_do() {
 wearing() { jq -e --arg l "$1" 'any(.[]; . == $l)' >/dev/null 2>&1 <<<"$2"; }
 
 # The PR is found by closing reference, never by `gh pr list --search`, which
-# matches substrings anywhere in the PR and silently takes the first hit
-# (agents/claude/review:34 has this weakness today; this script must not copy
-# it). --state all so a PR that has already merged, or one abandoned in an
-# earlier round of rework, is still visible to the checks below.
+# matches substrings anywhere in the PR and silently takes the first hit.
+# --state all so a PR that has already merged, or one abandoned in an earlier
+# round of rework, is still visible to the checks below. The matching rule
+# itself — pr_match_filter, from agents/_pr — is the one every caller of
+# closing_prs shares too, so this script and _pr can never disagree about
+# what counts as "closes #ref".
 discover_pr() {
-	local all matches active n_all n_active
+	local all matches active n_all n_match n_active
 	all=$(gh_json pr list --repo "$REPO" --state all --limit 100 \
-		--json number,body,state,url)
-	matches=$(jq --arg ref "$ref" \
-		'[.[] | select(.body != null) | select(.body |
-			test("\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\b:?\\s*#" + $ref + "\\b"; "i"))]' \
-		<<<"$all")
-	n_all=$(jq 'length' <<<"$matches")
-	if [[ "$n_all" -eq 0 ]]; then
+		--json number,body,state,headRefName,url)
+	matches=$(pr_match_filter "$ref" <<<"$all")
+
+	n_all=$(jq 'length' <<<"$all")
+	n_match=$(jq 'length' <<<"$matches")
+	# gh's own page cap: a full page with no match in it might be hiding one
+	# behind, the same as agents/_pr's closing_prs — unavailable, not none,
+	# because reporting "no PR" here would mark the item for a person to
+	# reconcile work that may well already have a PR.
+	if [[ "$n_all" -ge 100 && "$n_match" -eq 0 ]]; then
+		echo "gh pr list for #$ref returned a full page with no match; it may be truncated" >&2
+		exit 10
+	fi
+	if [[ "$n_match" -eq 0 ]]; then
 		blocked input "no pull request closes issue #$ref, so there is nothing to approve."
 	fi
 
@@ -206,6 +235,8 @@ fetch_details() {
 					isDraft
 					mergeable
 					isCrossRepository
+					isInMergeQueue
+					autoMergeRequest { enabledAt }
 					headRefName
 					headRefOid
 					baseRefName
@@ -314,8 +345,16 @@ run_tests() {
 # unresolved thread the script has not already replied to, never one per
 # thread. Runs in the item's own worktree, on the PR's branch. Exits 10 on
 # success; it never merges in the run that pushed a fix.
+#
+# A changed commit is not proof every thread was addressed — only a
+# disposition the model itself reported, per thread id, in $CONVEYOR_RESULT
+# is. A thread it does not report on is left unresolved and unreplied here;
+# gate 12 picks it up as a question once the model has already had a poll to
+# answer it. Only threads named in this run's own unanswered set count — a
+# disposition for any other id is not something this run was asked about and
+# is ignored rather than acted on.
 address_threads() {
-	local threads=$1 head_ref before after thread_text full rc reply_body tid
+	local threads=$1 head_ref before after thread_text full rc tid
 	head_ref=$(jq -r '.headRefName' <<<"$details")
 
 	local wt
@@ -326,7 +365,7 @@ address_threads() {
 	echo "  worktree: $wt (branch $(git branch --show-current))" >&2
 
 	thread_text=$(jq -r '.[] |
-		"--- unresolved conversation ---\n" +
+		"--- unresolved conversation (thread id: " + .id + ") ---\n" +
 		([.comments.nodes[] | "> " + .body] | join("\n\n")) + "\n"' <<<"$threads")
 
 	full="${PROMPT}
@@ -340,6 +379,13 @@ Address every one of the unresolved conversations below on pull request #${pr}.
 For each, make the necessary change, or explain in your own commit message why
 none is needed. Commit and push your changes to the branch you are already on
 (${head_ref}) — do not open a new pull request, and do not change branch.
+
+For every thread you actually addressed, report a one-sentence disposition in
+\$CONVEYOR_RESULT under a \"dispositions\" object keyed by that thread's id,
+e.g. {\"dispositions\": {\"<thread id>\": \"renamed the variable and added a
+test\"}}. Only the thread ids listed below are yours to report on; a thread
+you do not report a disposition for is left open for a person to look at,
+even if you touched code near it.
 
 ${thread_text}"
 
@@ -387,32 +433,48 @@ state of the branch, redoing whatever investigation already happened."
 		blocked no-output "the agent finished but made no change to address the review threads on #$pr."
 	fi
 
+	# The dispositions the model actually reported, restricted to the thread
+	# ids this run named — a disposition is a non-empty string, and any id
+	# outside the unanswered set this run asked about is dropped here rather
+	# than resolving something never asked. "the commit changed" alone is not
+	# in this set at all, so it can no longer resolve anything by itself.
+	local dispositions known_ids disposed
+	known_ids=$(jq -c '[.[].id]' <<<"$threads")
+	if [[ -s "${CONVEYOR_RESULT:-}" ]]; then
+		dispositions=$(jq -c '.dispositions // {}' "$CONVEYOR_RESULT" 2>/dev/null) || dispositions='{}'
+	else
+		dispositions='{}'
+	fi
+	disposed=$(jq -c --argjson known "$known_ids" '
+		[to_entries[] | select((.value | type) == "string" and (.value | length) > 0)
+			| select(.key as $k | $known | index($k) != null)]' <<<"$dispositions")
+
 	run_tests "$wt"
 
 	if ! git push origin "HEAD:$head_ref" 2>&1; then
 		blocked error "pushing the fix for #$pr to $head_ref was rejected."
 	fi
 
-	# Reply to, and resolve, each thread just addressed — never the ones this
-	# run did not touch (gate 12 owns those).
-	while IFS= read -r tid; do
+	# Reply to, and resolve, only the threads just disposed — never the ones
+	# this run did not report on, which gate 12 owns once they have had a poll
+	# to be answered.
+	while IFS=$'\t' read -r tid disposition; do
 		[[ -z "$tid" ]] && continue
-		reply_body="Addressed in $(git rev-parse --short HEAD).
-
-$SENTINEL"
 		gh_do api graphql -f query='
 			mutation($id:ID!, $body:String!) {
 				addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $id, body: $body}) {
 					comment { id }
 				}
-			}' -F id="$tid" -F body="$reply_body" >/dev/null
+			}' -F id="$tid" -F body="${disposition}
+
+$SENTINEL" >/dev/null
 		gh_do api graphql -f query='
 			mutation($id:ID!) {
 				resolveReviewThread(input: {threadId: $id}) { thread { id } }
 			}' -F id="$tid" >/dev/null
-	done < <(jq -r '.[].id' <<<"$threads")
+	done < <(jq -r '.[] | [.key, .value] | @tsv' <<<"$disposed")
 
-	echo "pushed a fix for #$pr and resolved $(jq 'length' <<<"$threads") thread(s)" >&2
+	echo "pushed a fix for #$pr and resolved $(jq 'length' <<<"$disposed") of $(jq 'length' <<<"$threads") thread(s)" >&2
 	exit 10
 }
 
@@ -753,6 +815,20 @@ check_gates_once() {
 		exit 10
 	fi
 
+	# Gate 14a, reachable from any poll: a PR this same script enqueued (or one
+	# a person put in a queue or enabled auto-merge on by hand) is already
+	# accepted, and re-issuing `gh pr merge` here would either error on an
+	# already-queued PR or be redundant on one with auto-merge enabled. GitHub
+	# finishes it in its own time; this script only waits.
+	if [[ "$(jq -r '.isInMergeQueue' <<<"$details")" == "true" ]]; then
+		echo "PR #$pr is already queued to merge; waiting for GitHub to finish it" >&2
+		exit 10
+	fi
+	if jq -e '.autoMergeRequest != null' >/dev/null 2>&1 <<<"$details"; then
+		echo "PR #$pr already has auto-merge enabled; waiting for GitHub to finish it" >&2
+		exit 10
+	fi
+
 	local mergeable
 	mergeable=$(jq -r '.mergeable' <<<"$details")
 	if [[ "$mergeable" == "CONFLICTING" ]]; then
@@ -859,10 +935,56 @@ check_gates_once
 echo "re-checking immediately before merging, to close the window since the check above" >&2
 check_gates_once
 
-echo "merging PR #$pr" >&2
-merge_out=""
-if ! merge_out=$(gh pr merge "$pr" --repo "$REPO" --squash --delete-branch 2>&1); then
+# The exact commit the second check_gates_once just finished inspecting —
+# not an earlier read, and not re-fetched after: everything between here and
+# the merge call must be about this one SHA.
+head_oid=$(jq -r '.headRefOid' <<<"$details")
+if [[ -z "$head_oid" || "$head_oid" == "null" ]]; then
+	echo "PR #$pr's head commit is unexpectedly unknown right before merging; deferring" >&2
+	exit 10
+fi
+
+echo "merging PR #$pr at $head_oid" >&2
+merge_rc=0
+merge_out=$(gh pr merge "$pr" --repo "$REPO" --squash --delete-branch \
+	--match-head-commit "$head_oid" 2>&1) || merge_rc=$?
+
+# Never trusted from gh's exit code alone: `gh pr merge` returns 0 both for an
+# actual merge and for enqueuing (auto-merge enabled, or added to a required
+# merge queue — see `gh pr merge --help`), and a --match-head-commit
+# precondition failure is, from the exit code alone, indistinguishable from
+# any other rejected merge. One more read settles all of it.
+after=$(gh_json pr view "$pr" --repo "$REPO" \
+	--json state,headRefOid,isInMergeQueue,autoMergeRequest)
+after_state=$(jq -r '.state' <<<"$after")
+after_head=$(jq -r '.headRefOid' <<<"$after")
+
+if [[ "$after_state" == "MERGED" ]]; then
+	drop_worktree "$CONVEYOR_SOURCE" "$ref"
+	exit 0
+fi
+
+if [[ "$after_head" != "$head_oid" ]]; then
+	# The branch moved between the inspected read and this merge attempt — a
+	# --match-head-commit rejection reads this way, and so does any other push
+	# that landed in the gap regardless of what gh reported. New activity, not
+	# a fault: the quiet clock restarts on it next poll.
+	echo "PR #$pr's head moved from $head_oid to $after_head; deferring to recheck" >&2
+	exit 10
+fi
+
+if [[ "$(jq -r '.isInMergeQueue' <<<"$after")" == "true" ]] ||
+	jq -e '.autoMergeRequest != null' >/dev/null 2>&1 <<<"$after"; then
+	echo "PR #$pr is queued to merge (or has auto-merge enabled); waiting for GitHub to finish it" >&2
+	exit 10
+fi
+
+if [[ "$merge_rc" -ne 0 ]]; then
 	blocked merge "gh pr merge #$pr failed: $merge_out"
 fi
-drop_worktree "$CONVEYOR_SOURCE" "$ref"
-exit 0
+
+# gh reported success, the head has not moved, and the PR is neither merged
+# nor queued: an unexpected state. Deferring costs one more poll; treating it
+# as done without confirming it is the bug this gate exists to close.
+echo "gh pr merge #$pr reported success but the PR is not yet observed merged; deferring" >&2
+exit 10
