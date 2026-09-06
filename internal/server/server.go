@@ -832,11 +832,22 @@ func (s *Server) recallBlocks(items []model.Item) {
 	// History that is not there is not invented, so a stale entry left over
 	// from before is dropped rather than kept naming a stage the item has
 	// since left: a wrong chip is worse than no chip.
+	//
+	// Both loops check the entry as it stands now, not as it stood when the
+	// scan above started: walkRuns runs unlocked, and a transition landing on
+	// this same item while it ran already wrote the correct entry through
+	// applyTransition. A scan that started before that write must not undo it
+	// on the strength of what it saw before the write happened — the same
+	// race the found-block merge above is already guarded against.
 	for id := range wantTimes {
-		delete(s.times, id)
+		if t, known := s.times[id]; !known || t.Stage != stageOf[id] {
+			delete(s.times, id)
+		}
 	}
 	for id, t := range foundTimes {
-		s.times[id] = t
+		if cur, known := s.times[id]; !known || cur.Stage != stageOf[id] {
+			s.times[id] = t
+		}
 	}
 	s.mu.Unlock()
 }
