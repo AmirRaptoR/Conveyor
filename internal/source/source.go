@@ -61,7 +61,11 @@ func (c *Client) List(ctx context.Context) (*ListResult, error) {
 		Env:     c.src.ProviderEnv(),
 		Source:  c.src.Name,
 		Timeout: c.cfg.Timeout.D(),
-		Stdin:   model.ListInput{Source: c.src.Name, Stages: c.cfg.StageNames()},
+		Stdin: model.ListInput{
+			Source:         c.src.Name,
+			Stages:         c.cfg.StageNames(),
+			TerminalStages: c.cfg.TerminalStageNames(),
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("source %q: list: %w", c.src.Name, err)

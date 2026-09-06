@@ -40,6 +40,14 @@ type Item struct {
 	// stage it stopped in, and the work resumes there instead of restarting.
 	Blocked bool `json:"blocked,omitempty"`
 
+	// BlockReason is a listing-supplied reason for Blocked, read only when no
+	// run in history produced one — a mark this pipeline did not itself make
+	// (a closed issue found sitting in a non-terminal stage) has no run to
+	// recover a reason from, and without this the card can say only that it
+	// is blocked, not why. A run's own recorded reason always wins; see
+	// CONTRACTS.md §6 and internal/server's recallBlocks.
+	BlockReason string `json:"blockReason,omitempty"`
+
 	// Raw is provider passthrough: opaque to the engine, handed back to
 	// scripts untouched.
 	Raw map[string]any `json:"raw,omitempty"`
@@ -211,7 +219,11 @@ type DoctorRun struct {
 
 // ListInput is the JSON piped to a list script's stdin.
 type ListInput struct {
-	Source string         `json:"source"`
-	Stages []string       `json:"stages"`
-	Config map[string]any `json:"config,omitempty"`
+	Source string   `json:"source"`
+	Stages []string `json:"stages"`
+	// TerminalStages is which of Stages are terminal, so a list script can
+	// tell a finished item from one that merely stopped without keeping its
+	// own copy of the stage graph in source env:. See CONTRACTS.md §1.
+	TerminalStages []string       `json:"terminalStages,omitempty"`
+	Config         map[string]any `json:"config,omitempty"`
 }

@@ -324,6 +324,20 @@ func (c *Config) StageNames() []string {
 	return out
 }
 
+// TerminalStageNames is which of those stages are terminal — CONTRACTS.md §1:
+// a list script tells a finished item from one that merely stopped in a
+// non-terminal stage by checking this, rather than keeping its own copy of
+// the stage graph in source env:.
+func (c *Config) TerminalStageNames() []string {
+	var out []string
+	for _, s := range c.Stages {
+		if s.Terminal {
+			out = append(out, s.Name)
+		}
+	}
+	return out
+}
+
 // ResolveScript turns a config-relative script path into an absolute one.
 func (c *Config) ResolveScript(p string) string {
 	if p == "" || filepath.IsAbs(p) {

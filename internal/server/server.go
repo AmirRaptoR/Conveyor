@@ -757,10 +757,14 @@ func (s *Server) askAgents(ctx context.Context) {
 func (s *Server) recallBlocks(items []model.Item) {
 	s.mu.RLock()
 	wantBlocks := map[string]bool{}
+	listedReason := map[string]string{}
 	for _, it := range items {
 		if it.Blocked {
 			if _, known := s.blocks[it.ID]; !known {
 				wantBlocks[it.ID] = true
+			}
+			if it.BlockReason != "" {
+				listedReason[it.ID] = it.BlockReason
 			}
 		}
 	}
@@ -824,9 +828,16 @@ func (s *Server) recallBlocks(items []model.Item) {
 			s.blocks[id] = b
 		}
 	}
-	// Marked, and no run to explain it: someone put the label on by hand.
+	// Marked, and no run to explain it: either someone put the label on by
+	// hand, or this poll's listing supplied its own reason (a closed issue
+	// found sitting in a non-terminal stage, say) — CONTRACTS.md §6. The
+	// listing's own words beat the generic fallback whenever it gave one.
 	for id := range wantBlocks {
 		if _, known := s.blocks[id]; !known {
+			if reason, ok := listedReason[id]; ok {
+				s.blocks[id] = Block{Kind: "by hand", Reason: reason}
+				continue
+			}
 			s.blocks[id] = Block{Kind: "by hand",
 				Reason: "marked outside the pipeline; there is no run to explain it"}
 		}

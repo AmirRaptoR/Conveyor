@@ -65,7 +65,10 @@ data='[
   "url":"https://example.test/17","assignees":[]},
  {"number":21,"title":"Tagged, then closed by hand","body":"","state":"CLOSED",
   "labels":[{"name":"conveyor"}],
-  "url":"https://example.test/21","assignees":[]}
+  "url":"https://example.test/21","assignees":[]},
+ {"number":27,"title":"Closed mid-flight","body":"","state":"CLOSED",
+  "labels":[{"name":"status:in-progress"}],
+  "url":"https://example.test/27","assignees":[],"closedAt":"2026-08-29T00:00:00Z"}
 ]'
 case "$*" in
 	*"--state open"*)   jq '[.[] | select(.state == "OPEN")]' <<<"$data" ;;
@@ -76,8 +79,12 @@ STUB
 chmod +x "$tmp/stub/gh"
 
 echo "list.sh"
-PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/out.json" \
-	./list.sh 2>/dev/null
+# "ready" is this fixture's one terminal stage — ref 15 (closed, mapped
+# "ready") is the "finished" case; ref 27 (closed, mapped "in-progress", which
+# is not terminal) is the "stopped mid-flight" case below.
+echo '{"terminalStages":["ready"]}' |
+	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/out.json" \
+		./list.sh 2>/dev/null
 
 check "maps a status label to its stage" \
 	"refining" "$(jq -r '.[0].stage' "$tmp/out.json")"
@@ -116,8 +123,9 @@ check "the old ignore label no longer keeps an issue off the board" \
 
 # The variable is gone, not merely defaulted: a config still setting it must not
 # quietly change what is listed.
-PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/named.json" \
-	IGNORE_LABELS="status:ready, hold" ./list.sh 2>/dev/null
+echo '{"terminalStages":["ready"]}' |
+	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/named.json" \
+		IGNORE_LABELS="status:ready, hold" ./list.sh 2>/dev/null
 check "IGNORE_LABELS is read by nothing" \
 	"$(jq -cS . "$tmp/out.json")" "$(jq -cS . "$tmp/named.json")"
 
@@ -129,6 +137,18 @@ check "a closed issue's item carries finishedAt from closedAt" \
 	"2026-08-30T12:00:00Z" "$(jq -r '.[] | select(.ref == "15") | .finishedAt' "$tmp/out.json")"
 check "an open issue's item carries an empty finishedAt" \
 	"" "$(jq -r '.[] | select(.ref == "7") | .finishedAt' "$tmp/out.json")"
+# --- F09: closed-issue routing depends on whether the mapped stage is terminal
+# "ready" is terminal here, so ref 15 above is unmarked and simply finished.
+check "closed + terminal stage is unmarked"    \
+	"false" "$(jq -r '.[] | select(.ref == "15") | .blocked' "$tmp/out.json")"
+# "in-progress" is not, so ref 27 stopped mid-flight: same stage, marked, with
+# a reason a person can read without opening the logs — not silently finished.
+check "closed + non-terminal stage keeps its stage" \
+	"in-progress" "$(jq -r '.[] | select(.ref == "27") | .stage' "$tmp/out.json")"
+check "     and is marked"                     \
+	"true" "$(jq -r '.[] | select(.ref == "27") | .blocked' "$tmp/out.json")"
+check "     with a human-readable reason"      \
+	"true" "$([[ -n "$(jq -r '.[] | select(.ref == "27") | .blockReason' "$tmp/out.json")" ]] && echo true)"
 check "a closed issue it never labelled is left in history" \
 	"" "$(jq -r '.[] | select(.ref == "17") | .ref' "$tmp/out.json")"
 # The onboarding tag opens the door; it does not reopen a closed issue. A stage
@@ -136,6 +156,38 @@ check "a closed issue it never labelled is left in history" \
 # issue wearing the tag would come back as new work every poll.
 check "the tag does not drag a closed issue back onto the board" \
 	"" "$(jq -r '.[] | select(.ref == "21") | .ref' "$tmp/out.json")"
+
+# --- F09: an enrolled open issue is found no matter how much unrelated open
+# work sits ahead of it ------------------------------------------------------
+#
+# Each enrolling label is its own server-side-filtered `gh` call, unioned —
+# never one `--state open --limit N` call truncated before enrolment is even
+# checked. The stub below plays out the old bug directly: the one unfiltered
+# call this test can still provoke (a caller with no --label at all) returns
+# 200 newer unrelated issues and never the enrolled one, which is only ever
+# visible through its own label's call.
+echo "discovery completeness"
+(
+	export STAGE_LABELS='refining=status:refining'
+	cat >"$tmp/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+*"--state open --label status:refining"*)
+	echo '[{"number":9001,"title":"The enrolled one","body":"","state":"OPEN","labels":[{"name":"status:refining"}],"url":"u","assignees":[]}]'
+	;;
+*"--state open --label"*) echo '[]' ;;
+*"--state closed"*)       echo '[]' ;;
+*"--state open"*)
+	jq -n '[range(200) | {number: (9500 - .), title: "unrelated", body: "", state: "OPEN", labels: [], url: "u", assignees: []}]'
+	;;
+*) echo "stub gh: unhandled: $*" >&2; exit 97 ;;
+esac
+STUB
+	echo '{}' | PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/deep.json" \
+		./list.sh 2>/dev/null
+	check "an enrolled issue behind 200 unrelated ones is still found" \
+		"9001" "$(jq -r '.[] | select(.stage == "refining") | .ref' "$tmp/deep.json")"
+) || fail=1
 
 # --- move.sh: stage -> label writes ----------------------------------------
 # move.sh asks GitHub for the issue's current labels, so the stub answers that.
@@ -267,8 +319,9 @@ case "$*" in
 	*)                  echo "$data" ;;
 esac
 STUB
-	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/ns.json" \
-		./list.sh 2>/dev/null
+	echo '{}' |
+		PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/ns.json" \
+			./list.sh 2>/dev/null
 	check "the mark defaults into the namespace" \
 		"true" "$(jq -r '.[] | select(.ref == "21") | .blocked' "$tmp/ns.json")"
 	# The tag is the namespace word without its separator, so renaming the

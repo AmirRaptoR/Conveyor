@@ -275,6 +275,45 @@ func TestAHandPlacedMarkSaysSo(t *testing.T) {
 	}
 }
 
+// A mark with no run behind it, but a reason the listing itself supplied (a
+// closed issue found sitting in a non-terminal stage, say), shows that reason
+// on the card instead of the generic "no history explains this" filler —
+// CONTRACTS.md §6.
+func TestAListingSuppliedReasonIsShownWithNoRunToExplainIt(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.recallBlocks([]model.Item{{ID: "s1:9", Source: "s1", Stage: "working", Blocked: true,
+		BlockReason: "closed while still in a non-terminal stage; a person should reconcile it"}})
+	if got := s.blocks["s1:9"].Reason; got != "closed while still in a non-terminal stage; a person should reconcile it" {
+		t.Errorf("reason = %q, want the listing's own reason", got)
+	}
+}
+
+// A recovered run-history reason always wins over a listing-supplied one — a
+// listing's reason exists only to cover the gap where no run explains the
+// mark at all.
+func TestARunHistoryReasonBeatsAListingSuppliedOne(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	day := filepath.Join(r.Root, "2026-08-28", "120000.000-bbbb")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"id":"120000.000-bbbb","source":"s1","itemId":"s1:1","kind":"stage",
+	          "to":"working","outcome":"blocked","exitCode":20}`
+	if err := os.WriteFile(filepath.Join(day, "meta.json"), []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(day, "result.json"), []byte(`{"blocked":true,"reason":"the checkout is dirty"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.recallBlocks([]model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true,
+		BlockReason: "a listing-supplied reason that should be ignored"}})
+	if got := s.blocks["s1:1"].Reason; got != "the checkout is dirty" {
+		t.Errorf("reason = %q, want the run's own reason to win", got)
+	}
+}
+
 // The stall retry is guarded on "everything", not "something": while one item
 // can still move, a mark is a decision, and clearing it spends an agent run to
 // be told the same thing again.
