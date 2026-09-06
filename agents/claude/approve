@@ -345,8 +345,16 @@ run_tests() {
 # unresolved thread the script has not already replied to, never one per
 # thread. Runs in the item's own worktree, on the PR's branch. Exits 10 on
 # success; it never merges in the run that pushed a fix.
+#
+# A changed commit is not proof every thread was addressed — only a
+# disposition the model itself reported, per thread id, in $CONVEYOR_RESULT
+# is. A thread it does not report on is left unresolved and unreplied here;
+# gate 12 picks it up as a question once the model has already had a poll to
+# answer it. Only threads named in this run's own unanswered set count — a
+# disposition for any other id is not something this run was asked about and
+# is ignored rather than acted on.
 address_threads() {
-	local threads=$1 head_ref before after thread_text full rc reply_body tid
+	local threads=$1 head_ref before after thread_text full rc tid
 	head_ref=$(jq -r '.headRefName' <<<"$details")
 
 	local wt
@@ -357,7 +365,7 @@ address_threads() {
 	echo "  worktree: $wt (branch $(git branch --show-current))" >&2
 
 	thread_text=$(jq -r '.[] |
-		"--- unresolved conversation ---\n" +
+		"--- unresolved conversation (thread id: " + .id + ") ---\n" +
 		([.comments.nodes[] | "> " + .body] | join("\n\n")) + "\n"' <<<"$threads")
 
 	full="${PROMPT}
@@ -371,6 +379,13 @@ Address every one of the unresolved conversations below on pull request #${pr}.
 For each, make the necessary change, or explain in your own commit message why
 none is needed. Commit and push your changes to the branch you are already on
 (${head_ref}) — do not open a new pull request, and do not change branch.
+
+For every thread you actually addressed, report a one-sentence disposition in
+\$CONVEYOR_RESULT under a \"dispositions\" object keyed by that thread's id,
+e.g. {\"dispositions\": {\"<thread id>\": \"renamed the variable and added a
+test\"}}. Only the thread ids listed below are yours to report on; a thread
+you do not report a disposition for is left open for a person to look at,
+even if you touched code near it.
 
 ${thread_text}"
 
@@ -418,32 +433,48 @@ state of the branch, redoing whatever investigation already happened."
 		blocked no-output "the agent finished but made no change to address the review threads on #$pr."
 	fi
 
+	# The dispositions the model actually reported, restricted to the thread
+	# ids this run named — a disposition is a non-empty string, and any id
+	# outside the unanswered set this run asked about is dropped here rather
+	# than resolving something never asked. "the commit changed" alone is not
+	# in this set at all, so it can no longer resolve anything by itself.
+	local dispositions known_ids disposed
+	known_ids=$(jq -c '[.[].id]' <<<"$threads")
+	if [[ -s "${CONVEYOR_RESULT:-}" ]]; then
+		dispositions=$(jq -c '.dispositions // {}' "$CONVEYOR_RESULT" 2>/dev/null) || dispositions='{}'
+	else
+		dispositions='{}'
+	fi
+	disposed=$(jq -c --argjson known "$known_ids" '
+		[to_entries[] | select((.value | type) == "string" and (.value | length) > 0)
+			| select(.key as $k | $known | index($k) != null)]' <<<"$dispositions")
+
 	run_tests "$wt"
 
 	if ! git push origin "HEAD:$head_ref" 2>&1; then
 		blocked error "pushing the fix for #$pr to $head_ref was rejected."
 	fi
 
-	# Reply to, and resolve, each thread just addressed — never the ones this
-	# run did not touch (gate 12 owns those).
-	while IFS= read -r tid; do
+	# Reply to, and resolve, only the threads just disposed — never the ones
+	# this run did not report on, which gate 12 owns once they have had a poll
+	# to be answered.
+	while IFS=$'\t' read -r tid disposition; do
 		[[ -z "$tid" ]] && continue
-		reply_body="Addressed in $(git rev-parse --short HEAD).
-
-$SENTINEL"
 		gh_do api graphql -f query='
 			mutation($id:ID!, $body:String!) {
 				addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $id, body: $body}) {
 					comment { id }
 				}
-			}' -F id="$tid" -F body="$reply_body" >/dev/null
+			}' -F id="$tid" -F body="${disposition}
+
+$SENTINEL" >/dev/null
 		gh_do api graphql -f query='
 			mutation($id:ID!) {
 				resolveReviewThread(input: {threadId: $id}) { thread { id } }
 			}' -F id="$tid" >/dev/null
-	done < <(jq -r '.[].id' <<<"$threads")
+	done < <(jq -r '.[] | [.key, .value] | @tsv' <<<"$disposed")
 
-	echo "pushed a fix for #$pr and resolved $(jq 'length' <<<"$threads") thread(s)" >&2
+	echo "pushed a fix for #$pr and resolved $(jq 'length' <<<"$disposed") of $(jq 'length' <<<"$threads") thread(s)" >&2
 	exit 10
 }
 

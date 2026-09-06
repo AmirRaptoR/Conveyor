@@ -38,7 +38,7 @@ case "$1 $2" in
 "pr list")   what=prlist ;;
 "pr view")   what=prview ;;
 "issue view") what=labels_$3 ;;
-"api graphql") what=graphql ;;
+"api graphql") what=graphql; printf '%s\n' "$*" >>"$scene/graphql_calls" ;;
 "api repos"*) what=timeline ;;
 "pr edit")   echo "unlabelled"; exit 0 ;;
 "pr comment") printf '%s\n' "$*" >>"$scene/comments_posted"; exit 0 ;;
@@ -479,5 +479,76 @@ chk "     and no model ran"                   "$([[ -f "$tmp/claude-ran" ]] && e
 # this, and the resolution was gone with nothing saying so.
 chk "(8a) a rebase never resets over a merge in progress" "$(merge_in_progress)" "yes"
 chk "     leaving the resolution where it was"            "$(cat "$wt/f.txt")" "$branch_content"
+
+# --- gate 11: a thread is resolved only when the model actually disposed of
+# it, never on the strength of "some commit changed" alone -------------------
+#
+# Real git again, for the same reason as 8f: what is being asserted is which
+# threads got a reply-and-resolve mutation, and that is only visible against
+# a real commit. claude is restubbed here, last in the file, to actually
+# "address" the threads a scene names rather than refuse outright — it makes
+# one file edit and writes whatever $CONVEYOR_RESULT a scene asks for, which
+# is this harness standing in for the model reporting its own dispositions.
+reset_wt_clean() {
+	g -C "$src" worktree remove --force "$wt" >/dev/null 2>&1
+	g -C "$src" branch --quiet -f issue-7 "$issue7_base"
+	g -C "$src" push --quiet --force origin issue-7
+	g -C "$src" worktree add --quiet --force "$wt" issue-7
+}
+cat >"$tmp/bin/claude" <<STUB
+#!/usr/bin/env bash
+touch "$tmp/claude-ran"
+[[ -f "\$SCENE/claude_edit" ]] && cat "\$SCENE/claude_edit" >>f.txt
+[[ -f "\$SCENE/claude_result" ]] && cat "\$SCENE/claude_result" >"\$CONVEYOR_RESULT"
+echo "stub claude: addressed threads"
+exit 0
+STUB
+chmod +x "$tmp/bin/claude"
+
+threads='[{"id":"T1","isResolved":false,"comments":{"nodes":[{"body":"please fix X"}]}},
+          {"id":"T2","isResolved":false,"comments":{"nodes":[{"body":"please fix Y"}]}}]'
+# Each disposed thread costs exactly two graphql calls (reply, then resolve),
+# both carrying -F id=<that thread>; an untouched thread never appears at all.
+touches_for() { grep -o "id=$1" "$tmp/scene/graphql_calls" 2>/dev/null | wc -l | tr -d ' '; }
+
+# All threads disposed: both are replied to and resolved, and the run defers.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
+printf 'edit for all\n' >"$tmp/scene/claude_edit"
+printf '{"dispositions":{"T1":"fixed X","T2":"fixed Y"}}' >"$tmp/scene/claude_result"
+reset_wt_clean
+chk "(11) all threads disposed defers"        "$(run_real)" "10"
+chk "     T1 is replied to and resolved"      "$(touches_for T1)" "2"
+chk "     T2 is replied to and resolved"      "$(touches_for T2)" "2"
+
+# A subset disposed: only the reported thread is replied to and resolved; the
+# other is left for gate 12 on a later poll.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
+printf 'edit for subset\n' >"$tmp/scene/claude_edit"
+printf '{"dispositions":{"T1":"fixed X"}}' >"$tmp/scene/claude_result"
+reset_wt_clean
+chk "(11) a subset disposed defers"           "$(run_real)" "10"
+chk "     T1 is replied to and resolved"      "$(touches_for T1)" "2"
+chk "     T2 is left alone"                   "$(touches_for T2)" "0"
+
+# None disposed: a commit still landed (the model touched something) but
+# reported no disposition at all — "the commit changed" is no longer enough
+# on its own, so nothing is resolved and nothing is replied to.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
+printf 'edit with no disposition\n' >"$tmp/scene/claude_edit"
+printf '{}' >"$tmp/scene/claude_result"
+reset_wt_clean
+chk "(11) none disposed still defers"         "$(run_real)" "10"
+chk "     T1 is left alone"                   "$(touches_for T1)" "0"
+chk "     T2 is left alone"                   "$(touches_for T2)" "0"
+
+# A disposition naming a thread id outside this run's unanswered set is
+# ignored, not acted on — it names a thread this run was never asked about.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
+printf 'edit for unknown id\n' >"$tmp/scene/claude_edit"
+printf '{"dispositions":{"T1":"fixed X","T99":"fixed something else"}}' >"$tmp/scene/claude_result"
+reset_wt_clean
+chk "(11) an unknown thread id is ignored"    "$(run_real)" "10"
+chk "     T1 is replied to and resolved"      "$(touches_for T1)" "2"
+chk "     the unknown id was never sent"      "$(touches_for T99)" "0"
 
 exit $fail
