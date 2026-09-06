@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -32,6 +33,55 @@ type Auth struct {
 	// config file is a password in every backup and every `cat` of that file,
 	// and a warning nobody reads is not a control.
 	Users map[string]string `yaml:"users"`
+	// Origins is every extra origin (scheme + host + optional port, exactly as
+	// a browser's Origin header writes it — "https://board.example.com") that
+	// may drive the board beyond loopback and the listen address itself.
+	// Empty is the default and means same-origin only. Each entry is registered
+	// with CrossOriginProtection.AddTrustedOrigin and its host is accepted as a
+	// Host header value, because a proxy that rewrites Host (unlike Caddy's
+	// default forwarding) is exactly the case this key exists for. A malformed
+	// entry is a load error, like every other auth problem.
+	Origins []string `yaml:"origins"`
+}
+
+// ParsedOrigin is one auth.origins entry, split into the exact string
+// CrossOriginProtection wants and the host[:port] a request's Host header is
+// compared against.
+type ParsedOrigin struct {
+	Origin string // "https://board.example.com", as a browser's Origin header writes it
+	Host   string // "board.example.com", what a Host header carries
+}
+
+// ParsedOrigins parses every configured origin. Called after validate has
+// already rejected anything malformed, so an error here is only reachable
+// from a caller that skipped validation.
+func (a Auth) ParsedOrigins() ([]ParsedOrigin, error) {
+	out := make([]ParsedOrigin, 0, len(a.Origins))
+	for _, o := range a.Origins {
+		u, host, err := parseOrigin(o)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ParsedOrigin{Origin: u, Host: host})
+	}
+	return out, nil
+}
+
+func parseOrigin(o string) (origin, host string, err error) {
+	u, err := url.Parse(o)
+	if err != nil {
+		return "", "", fmt.Errorf("%q is not a URL: %w", o, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", "", fmt.Errorf("%q must start with http:// or https://", o)
+	}
+	if u.Host == "" {
+		return "", "", fmt.Errorf("%q has no host", o)
+	}
+	if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
+		return "", "", fmt.Errorf("%q must be scheme, host and optional port only — no path, query or fragment", o)
+	}
+	return u.Scheme + "://" + u.Host, u.Host, nil
 }
 
 // Enabled reports whether anything has to authenticate.
@@ -134,6 +184,11 @@ func (a Auth) validate() []string {
 			problems = append(problems, fmt.Sprintf(
 				"auth: user %q: %v. Run `conveyor passwd %s` and paste what it prints — "+
 					"a plaintext password here would be a password in every backup of this file", user, err, user))
+		}
+	}
+	for _, o := range a.Origins {
+		if _, _, err := parseOrigin(o); err != nil {
+			problems = append(problems, fmt.Sprintf("auth.origins: %v", err))
 		}
 	}
 	return problems
