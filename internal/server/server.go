@@ -632,6 +632,14 @@ func (s *Server) refresh(ctx context.Context) {
 	var items []model.Item
 	var warnings []string
 
+	// previous is what the board already knew, kept only so a failed listing
+	// below can fall back to it rather than deleting a source's items from
+	// the board on no information at all — the same bug F03 finds in the
+	// wholesale assignment, wearing a different hat.
+	s.mu.RLock()
+	previous := append([]model.Item(nil), s.state.Items...)
+	s.mu.RUnlock()
+
 	s.mu.Lock()
 	s.state.Polling = true
 	s.mu.Unlock()
@@ -648,6 +656,16 @@ func (s *Server) refresh(ctx context.Context) {
 		res, err := client.List(ctx)
 		if err != nil {
 			warnings = append(warnings, src.Name+": "+err.Error())
+			// A failed listing is no information about this source, not a
+			// signal that its work vanished: keep what was already known
+			// about it rather than have the wholesale assignment below wipe
+			// it off the board. A *successful* listing that genuinely omits
+			// an item still removes it — tombstones remain out of scope.
+			for _, it := range previous {
+				if it.Source == src.Name {
+					items = append(items, it)
+				}
+			}
 			continue
 		}
 		for _, w := range res.Warnings {
