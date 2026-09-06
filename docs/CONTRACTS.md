@@ -35,6 +35,10 @@ arrive in this shape.
   "assignee": null,
   "createdAt": "2026-08-20T10:00:00Z",
   "updatedAt": "2026-08-27T11:00:00Z",
+  "finishedAt": "2026-08-30T09:00:00Z", // when the source considers this item
+                                // finished. Provider-supplied and optional;
+                                // empty when the source does not say. Only
+                                // meaningful in a terminal stage — see §4a.
   "raw": {}                     // provider passthrough. Opaque to the engine,
                                 // handed back to scripts untouched.
 }
@@ -238,7 +242,11 @@ decisive first:
    stage it is heading into. Further along wins
 3. recovery — a stage that runs a script, found holding an item, is an
    unfinished job and is re-run
-4. the manual input order, then `priority`, then the source's own listing order
+4. within one stage: the manual input order, then `priority`, then the
+   source's own listing order — except a **terminal** stage, which is not
+   scheduled at all and orders instead by `finishedAt` descending (falling
+   back to listing order when it is empty or unparseable), so the done column
+   reads newest-finished first and merges every source into one ledger
 
 Rung 2 is the point of the whole thing: finish an item before starting another.
 Every half-finished item holds a worktree, a branch and an open pull request
@@ -258,7 +266,11 @@ nothing is left stranded wearing a status it is not in.
 
 Rung 4 therefore decides *within* one stage. That is where a human lever
 belongs — it is a choice about what to start next, and dragging a backlog card
-cannot jump the queue past work already in flight.
+cannot jump the queue past work already in flight. A terminal stage never
+reaches rung 4 through `Pick` — rung 1 already excludes it from scheduling —
+but `Order` still has to place it somewhere, and a finish time is the only
+honest answer: the manual order and `priority` are levers over what runs
+next, and a finished item does not run again.
 
 ## 4a2. A source may cost more than the stage assumes
 
