@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -188,6 +189,87 @@ func TestEventsStreamSurvivesCrossSiteAndStaysOpen(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the handler did not return after its context was cancelled")
+	}
+}
+
+// The handler-chain check above proves the cross-origin rule; this proves
+// the other half of the same criterion against a real listening
+// http.Server — the only thing that can actually enforce a Read/WriteTimeout
+// — held open past 30s and still receiving an event at the end of it. Those
+// timeouts are deliberately never set (server.go's Run), because either one
+// would cut exactly this stream.
+func TestEventsStreamOverRealListenerStaysOpenPast30Seconds(t *testing.T) {
+	cfg, r, _, _, _, _ := modePipeline(t)
+	s := New(cfg, r)
+	s.listening = make(chan string, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx, "127.0.0.1:0", ModeAuto)
+	addr := <-s.listening
+
+	client := &http.Client{}
+	req, _ := http.NewRequest("GET", "http://"+addr+"/api/events", nil)
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("GET /api/events with Sec-Fetch-Site: cross-site was refused")
+	}
+
+	// Publish once now and once past the 30s mark: read must succeed both
+	// times off the same, still-open connection, proving nothing cut it in
+	// between.
+	s.hub.publish(event{Kind: "state"})
+	if !readUntilContains(t, resp.Body, `"kind":"state"`, 5*time.Second) {
+		t.Fatal("never received the first event")
+	}
+
+	start := time.Now()
+	for time.Since(start) < 31*time.Second {
+		time.Sleep(time.Second)
+	}
+	s.hub.publish(event{Kind: "polling"})
+	if !readUntilContains(t, resp.Body, `"kind":"polling"`, 5*time.Second) {
+		t.Fatal("the stream had closed by 31s — a timeout cut it")
+	}
+}
+
+// readUntilContains reads from body until want appears or timeout passes,
+// reporting whether it was seen.
+func readUntilContains(t *testing.T, body io.Reader, want string, timeout time.Duration) bool {
+	t.Helper()
+	type result struct {
+		ok bool
+	}
+	done := make(chan result, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		var acc strings.Builder
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			n, err := body.Read(buf)
+			if n > 0 {
+				acc.Write(buf[:n])
+				if strings.Contains(acc.String(), want) {
+					done <- result{true}
+					return
+				}
+			}
+			if err != nil {
+				done <- result{false}
+				return
+			}
+		}
+		done <- result{false}
+	}()
+	select {
+	case r := <-done:
+		return r.ok
+	case <-time.After(timeout + time.Second):
+		return false
 	}
 }
 
