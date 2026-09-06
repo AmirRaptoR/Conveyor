@@ -17,12 +17,32 @@ func TestPersistenceFailureRaisesABoardVisibleFault(t *testing.T) {
 	s.notePersistFault(&runner.Result{Run: model.Run{
 		ID: "000000.000-x", ItemID: "s1:1", Source: "s1",
 		Error: "persist meta.json: write /data/runs/.../meta.json: no space left on device",
-	}})
+	}, PersistErr: "persist meta.json: write /data/runs/.../meta.json: no space left on device"})
 	if s.state.PersistFault == nil {
 		t.Fatal("PersistFault is nil, want it set")
 	}
 	if s.state.PersistFault.RunID != "000000.000-x" {
 		t.Errorf("RunID = %q, want 000000.000-x", s.state.PersistFault.RunID)
+	}
+}
+
+// A run whose process failed to start occupies Run.Error with that failure
+// first — the same run's log.txt append can still fail on the same full
+// disk, and that must not be masked just because Run.Error was already
+// taken. notePersistFault reads the dedicated PersistErr field for exactly
+// this reason.
+func TestPersistenceFailureIsNotMaskedByAnEarlierUnrelatedError(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.notePersistFault(&runner.Result{Run: model.Run{
+		ID: "000000.000-z", ItemID: "s1:1", Source: "s1",
+		Error: "fork/exec /path/to/script: permission denied",
+	}, PersistErr: "append log.txt: write /data/runs/.../log.txt: no space left on device"})
+	if s.state.PersistFault == nil {
+		t.Fatal("PersistFault is nil, want it set even though Run.Error names an unrelated failure")
+	}
+	if s.state.PersistFault.RunID != "000000.000-z" {
+		t.Errorf("RunID = %q, want 000000.000-z", s.state.PersistFault.RunID)
 	}
 }
 
@@ -35,7 +55,7 @@ func TestLogAppendFailureRaisesABoardVisibleFaultToo(t *testing.T) {
 	s.notePersistFault(&runner.Result{Run: model.Run{
 		ID: "000000.000-y", ItemID: "s1:1", Source: "s1",
 		Error: "append log.txt: write /data/runs/.../log.txt: no space left on device",
-	}})
+	}, PersistErr: "append log.txt: write /data/runs/.../log.txt: no space left on device"})
 	if s.state.PersistFault == nil {
 		t.Fatal("PersistFault is nil for a log.txt append failure, want it set")
 	}
@@ -52,7 +72,7 @@ func TestLogAppendFailureRaisesABoardVisibleFaultToo(t *testing.T) {
 func TestPersistenceFaultSurvivesARefresh(t *testing.T) {
 	cfg, r := boardFor(t)
 	s := New(cfg, r)
-	s.notePersistFault(&runner.Result{Run: model.Run{ID: "x", Error: "persist meta.json: enospc"}})
+	s.notePersistFault(&runner.Result{Run: model.Run{ID: "x", Error: "persist meta.json: enospc"}, PersistErr: "persist meta.json: enospc"})
 	if s.state.PersistFault == nil {
 		t.Fatal("setup: fault not recorded")
 	}
@@ -76,7 +96,7 @@ func TestPersistenceFaultSurvivesARefresh(t *testing.T) {
 func TestPersistenceFaultClearsOnALaterSuccessfulPersist(t *testing.T) {
 	cfg, r := boardFor(t)
 	s := New(cfg, r)
-	s.notePersistFault(&runner.Result{Run: model.Run{ID: "x", Error: "persist meta.json: enospc"}})
+	s.notePersistFault(&runner.Result{Run: model.Run{ID: "x", Error: "persist meta.json: enospc"}, PersistErr: "persist meta.json: enospc"})
 	s.notePersistFault(&runner.Result{Run: model.Run{ID: "y", Outcome: model.OutcomeSuccess}})
 	if s.state.PersistFault != nil {
 		t.Errorf("PersistFault = %+v, want cleared by a later clean persist", s.state.PersistFault)

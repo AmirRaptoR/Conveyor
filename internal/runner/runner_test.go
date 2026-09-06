@@ -310,6 +310,9 @@ func TestPersistenceFailureIsReportedNotSilentlyDropped(t *testing.T) {
 	if res.Run.Error == "" {
 		t.Error("Run.Error is empty, want the persistence failure named")
 	}
+	if res.PersistErr == "" {
+		t.Error("PersistErr is empty, want the persistence failure named there too")
+	}
 	foundEngineLine := false
 	for _, l := range res.Log {
 		if l.Stream == "engine" && strings.Contains(l.Text, "meta.json") {

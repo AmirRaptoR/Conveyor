@@ -378,17 +378,23 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 // it. It is intentional that this is not scoped to one item or source — a
 // full disk is a fact about the run store, not about the run that happened to
 // notice it first.
+//
+// This reads res.PersistErr, not res.Run.Error: Run.Error keeps only the
+// first failure a run hit, so a run whose process failed to start *and*
+// whose log.txt append failed on the same full disk would carry the start
+// failure there, and a prefix check against it would miss the persistence
+// failure entirely — masking the fault instead of raising it, and silently
+// clearing a real one already on the board.
 func (s *Server) notePersistFault(res *runner.Result) {
 	if res == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if strings.HasPrefix(res.Run.Error, "persist meta.json: ") ||
-		strings.HasPrefix(res.Run.Error, "append log.txt: ") {
+	if res.PersistErr != "" {
 		s.state.PersistFault = &PersistFault{
 			RunID: res.Run.ID, ItemID: res.Run.ItemID, Source: res.Run.Source,
-			Message: res.Run.Error, At: time.Now(),
+			Message: res.PersistErr, At: time.Now(),
 		}
 	} else {
 		s.state.PersistFault = nil

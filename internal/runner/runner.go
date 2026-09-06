@@ -65,6 +65,12 @@ type Result struct {
 	// package's own tests do); log.txt on disk is always the complete,
 	// untruncated record. See CONTRACTS §6.
 	Log []LogLine
+	// PersistErr names a failure to write meta.json or append log.txt, set
+	// independently of Run.Error. Run.Error keeps only the first failure a
+	// run hit — a process that fails to start sets it before persist() ever
+	// runs — so a simultaneous persistence failure could occupy no field a
+	// caller could reliably detect it from. This is that field.
+	PersistErr string
 }
 
 // maxLogLines bounds the in-memory copy of a run's log kept alongside the
@@ -163,6 +169,13 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	// wrong at all. A failed append to log.txt gets the same treatment; it
 	// cannot be logged through the same broken file, so it goes to the
 	// process's own stderr instead.
+	//
+	// persistErr is recorded separately from run.Error: run.Error keeps only
+	// the first failure a run hit (a process that fails to start sets it
+	// before persist() ever runs), so a persistence failure landing behind an
+	// earlier one would occupy no field a caller could detect it from.
+	// persistErr always carries it, whatever else went wrong first.
+	var persistErr string
 	persist := func() {
 		mu.Lock()
 		lwErr := logWriteErr
@@ -172,12 +185,18 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 			if run.Error == "" {
 				run.Error = msg
 			}
+			if persistErr == "" {
+				persistErr = msg
+			}
 			fmt.Fprintln(os.Stderr, "conveyor: "+msg)
 		}
 		if err := writeMeta(&run, dir); err != nil {
 			msg := fmt.Sprintf("persist meta.json: %v", err)
 			if run.Error == "" {
 				run.Error = msg
+			}
+			if persistErr == "" {
+				persistErr = msg
 			}
 			emit("engine", msg)
 		}
@@ -248,7 +267,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		run.Outcome = model.OutcomeFailure
 		run.ExitCode = -1
 		r.finish(&run, started, persist)
-		res := &Result{Run: run, Log: lines}
+		res := &Result{Run: run, Log: lines, PersistErr: persistErr}
 		if r.OnResult != nil {
 			r.OnResult(res)
 		}
@@ -303,7 +322,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	run.Outcome = model.OutcomeFor(run.ExitCode, timedOut)
 	r.finish(&run, started, persist)
 
-	res := &Result{Run: run, Log: lines}
+	res := &Result{Run: run, Log: lines, PersistErr: persistErr}
 	if b, err := os.ReadFile(resultPath); err == nil && len(b) > 0 {
 		if json.Valid(b) {
 			res.Data = json.RawMessage(b)
