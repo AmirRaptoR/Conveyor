@@ -17,6 +17,17 @@ import (
 // the pipeline: auto drives it, manual only moves an item when the tick
 // button is pressed, and observe never runs a stage, a move or a doctor
 // script at all.
+//
+// The guarantee it makes: when Run returns, nothing it started is still
+// writing under the data directory. cmdServe releases the owner lock in a
+// defer the instant Run returns, so that guarantee is the whole reason a
+// restarted engine never takes the lock out from under a run its predecessor
+// left going — a run directory half-created, a label half-written, an
+// order.json mid-write. It holds on every return path, including a refusal
+// that never started anything and a listen error that leaves the caller with
+// no reason of its own to cancel ctx: Run derives its own cancellable context
+// here and cancels it before it returns, rather than only reacting to the
+// caller's.
 func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 	// The board is a control plane: it starts agent runs, reorders work and
 	// hands marked items back. Reaching it is enough to drive every repository
@@ -32,7 +43,16 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 			"(run `conveyor passwd <name>` for a line to paste) or bind a loopback address", addr)
 	}
 
-	s.ctx = ctx
+	// Run's own lifetime, derived rather than reused: cancelling it is what
+	// stops every loop and handler-spawned goroutine on every return path
+	// below, whether or not the caller's ctx was ever cancelled. drain() runs
+	// after cancel(), never before — defer unwinds last-registered-first, so
+	// the loops are already unwinding by the time drain starts waiting on
+	// them.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer s.drain()
+	defer cancel()
+	s.ctx = runCtx
 	s.mode = mode
 	s.mu.Lock()
 	s.state.Mode = string(mode)
@@ -47,7 +67,7 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 	}
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: handler,
+		Handler: s.tracked(handler),
 		// No ReadTimeout and no WriteTimeout: either one cuts a live
 		// /api/events stream. ReadHeaderTimeout and MaxHeaderBytes bound only
 		// the part of a request that arrives before a handler — SSE or
@@ -58,7 +78,10 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 	}
 
 	// Bound before anything below starts: a serve that cannot bind must not
-	// have listed a source or launched a stage first.
+	// have listed a source or launched a stage first. The deferred cancel()
+	// and drain() above still run on a bind failure: it must stop the guard
+	// check having succeeded from leaving anything behind, though nothing has
+	// been spawned yet at this point either.
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -72,18 +95,19 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 
 	// Three loops, and they are separate on purpose. Discovery must keep its
 	// interval while a 90-minute stage runs, so nothing that waits for work to
-	// finish may share a goroutine with it.
-	go s.poll(ctx)
-	go s.button(ctx, mode)
+	// finish may share a goroutine with it. Each goes through spawn so drain
+	// waits for it to actually exit, not just for ctx to be cancelled.
+	s.spawn(func() { s.poll(runCtx) })
+	s.spawn(func() { s.button(runCtx, mode) })
 	if mode.Runs() {
-		go s.schedule(ctx)
+		s.spawn(func() { s.schedule(runCtx) })
 		if d := s.cfg.RetryStalled.D(); d > 0 {
-			go s.stalled(ctx, d)
+			s.spawn(func() { s.stalled(runCtx, d) })
 		}
-		go s.sweep(ctx)
+		s.spawn(func() { s.sweep(runCtx) })
 	}
 
-	go func() { <-ctx.Done(); _ = srv.Close() }()
+	go func() { <-runCtx.Done(); _ = srv.Close() }()
 	banner := "running: items advance on their own"
 	switch mode {
 	case ModeManual:
@@ -102,14 +126,18 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 	}
 	fmt.Printf("conveyor: http://%s\n  %s\n", shown, banner)
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		// The deferred cancel() and drain() above still run on this path: a
+		// bind failure must stop the loops just launched, not leave them on
+		// the caller's ctx with nothing telling it to cancel.
 		return err
 	}
-	// The HTTP listener is down the moment ctx is cancelled, but a transition
-	// already launched keeps running — a stage script, an agent, a git push.
-	// cmdServe releases the data-directory lock in a defer right after Run
-	// returns, so returning here before that work is done would let a
-	// restarted engine claim an item whose old run has not actually stopped.
-	s.drain()
+	// The HTTP listener is down the moment runCtx is cancelled, but a
+	// transition already launched keeps running — a stage script, an agent, a
+	// git push — and so does discovery, a doctor sweep, a push send, any
+	// request still writing order.json or answers.json. The deferred cancel()
+	// stops every loop above; the deferred drain() is what actually waits for
+	// all of that, transitions and everything else, before Run hands back
+	// control to cmdServe's defer that releases the data-directory lock.
 	return nil
 }
 
@@ -266,22 +294,77 @@ func secureDataDir(dir string) {
 const drainGrace = 45 * time.Second
 
 // drain waits for every transition already claimed — schedule's launches,
-// handleStart, and the tick button's own advance — to finish, or gives up
-// after drainGrace and says what is still running rather than hanging
-// forever on a run that will not.
+// handleStart, and the tick button's own advance — and every other goroutine
+// Run started that still has work outstanding — the loops themselves, a
+// background refresh or doctor sweep, a push send, a request still writing to
+// the data directory — to finish, or gives up after drainGrace and says what
+// is still running rather than hanging forever on a run that will not.
+//
+// This is what makes "Run has returned" mean "the owner lock is safe to
+// release": cmdServe's defer does that the instant Run returns, so nothing
+// counted here may still be writing under the data directory once drain does.
 func (s *Server) drain() {
 	deadline := time.Now().Add(s.drainGrace)
-	for s.inFlight.Load() != 0 && time.Now().Before(deadline) {
+	for (s.inFlight.Load() != 0 || s.shutdownWork.Load() != 0) && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if n := s.inFlight.Load(); n != 0 {
+	n, other := s.inFlight.Load(), s.shutdownWork.Load()
+	switch {
+	case n == 0 && other == 0:
+		return
+	case n == 0:
+		// Nothing this counter can name — a loop still unwinding, a push send,
+		// a request mid-write. "still running: " followed by an empty list
+		// would claim a transition that does not exist; say only the count.
+		fmt.Fprintf(os.Stderr, "conveyor: shutting down with %d task(s) still running after %s\n",
+			other, s.drainGrace)
+	case other == 0:
 		var running []string
 		for _, a := range s.activeList() {
 			running = append(running, a.ItemID)
 		}
 		fmt.Fprintf(os.Stderr, "conveyor: shutting down with %d transition(s) still running after %s: %s\n",
 			n, s.drainGrace, strings.Join(running, ", "))
+	default:
+		// Named, because inFlight is exactly the transitions activeList can
+		// name. other has no item to name, so it is folded into the count
+		// rather than pretended into the list.
+		var running []string
+		for _, a := range s.activeList() {
+			running = append(running, a.ItemID)
+		}
+		fmt.Fprintf(os.Stderr, "conveyor: shutting down with %d transition(s) and %d other task(s) still running after %s: %s\n",
+			n, other, s.drainGrace, strings.Join(running, ", "))
 	}
+}
+
+// spawn runs f in its own goroutine, counted in shutdownWork until it
+// returns. Every goroutine Run starts directly (a loop) or a handler spawns
+// that runs a script or writes under the data directory (a background
+// refresh, a doctor sweep, unblockAll, a push send) goes through this, so
+// drain actually waits for it instead of only for a transition.
+func (s *Server) spawn(f func()) {
+	s.shutdownWork.Add(1)
+	go func() {
+		defer s.shutdownWork.Add(-1)
+		f()
+	}()
+}
+
+// tracked counts a request as outstanding shutdown work for as long as its
+// handler is running — the same idiom as webHandler and authed, so a test can
+// drive it directly. A request that decides to write, order.json,
+// answers.json, push.json, does so synchronously inside its handler; counting
+// the handler's own lifetime is what closes the gap between that write
+// starting and drain knowing to wait for it, and closes the same gap in
+// handleStart between its ctx.Err() check and claiming a slot: the request is
+// already counted before either runs.
+func (s *Server) tracked(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.shutdownWork.Add(1)
+		defer s.shutdownWork.Add(-1)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Addr normalises a listen address so `-addr 8080` works like `-addr :8080`.
