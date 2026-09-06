@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -106,7 +108,7 @@ func TestTheTickButtonClearsADeferral(t *testing.T) {
 	defer drain(t, s, cancel)
 	s.refresh(ctx) // one listing, no poll ticker: nothing else will clear it
 	go s.schedule(ctx)
-	go s.button(ctx, true)
+	go s.button(ctx, ModeAuto)
 
 	waitFor(t, "the deferring stage to run once", func() bool { return countLines(stageRuns) >= 1 })
 	waitFor(t, "the item to be resting", func() bool {
@@ -118,6 +120,47 @@ func TestTheTickButtonClearsADeferral(t *testing.T) {
 
 	s.tick <- struct{}{}
 	waitFor(t, "the button to run it again", func() bool { return countLines(stageRuns) > before })
+}
+
+// F02: the guard a manual start overrides is resting, and only resting — a
+// drop out of the backlog is a person asking for another look right now, in
+// spirit if not in fact (CLAUDE.md). A plain scheduler wake, by contrast,
+// must go on respecting the deferral.
+func TestStartOverridesResting(t *testing.T) {
+	cfg, r, dir := deferringPipeline(t)
+	stageRuns := filepath.Join(dir, "stageruns")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(cfg, r)
+	s.ctx = ctx
+	defer drain(t, s, cancel)
+	s.refresh(ctx) // one listing, no poll ticker: nothing else will clear it
+	go s.schedule(ctx)
+
+	waitFor(t, "the deferring stage to run once", func() bool { return countLines(stageRuns) >= 1 })
+	waitFor(t, "the item to be resting", func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return s.resting["s1:1"]
+	})
+	before := countLines(stageRuns)
+
+	// A plain wake must not retry a resting item.
+	s.wakeUp()
+	time.Sleep(200 * time.Millisecond)
+	if got := countLines(stageRuns); got != before {
+		t.Fatalf("stage ran %d time(s) after a plain wake, want %d — resting must hold against it", got, before)
+	}
+
+	// A manual start does override it.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/items/s1:1/start", nil)
+	req.SetPathValue("id", "s1:1")
+	s.handleStart(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d (%s), want 202 — a manual start must override resting", w.Code, w.Body.String())
+	}
+	waitFor(t, "the manually started run to happen", func() bool { return countLines(stageRuns) > before })
 }
 
 // drain stops the server and waits for the runs it started to finish

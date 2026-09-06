@@ -99,7 +99,7 @@ func (s *Server) handleDoctorStart(w http.ResponseWriter, r *http.Request) {
 	s.doctorSweep = sw
 	s.doctorMu.Unlock()
 
-	go s.runDoctorSweep(s.ctx, sw)
+	s.spawn(func() { s.runDoctorSweep(s.ctx, sw) })
 
 	w.WriteHeader(http.StatusAccepted)
 	writeJSON(w, map[string]string{"sweep": sw.ID})

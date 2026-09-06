@@ -42,6 +42,8 @@ func main() {
 		err = cmdTick(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "probe":
+		err = cmdProbe(os.Args[2:])
 	case "passwd":
 		err = cmdPasswd(os.Args[2:])
 	case "-h", "--help", "help":
@@ -65,8 +67,18 @@ func usage() {
   list      [-source NAME]              run list scripts, print items
   run       -source N -item ID -stage S move one item into a stage and run it
   tick      [-source NAME] [-n N]       one scheduling pass: pick and advance
-  serve     [-addr :8080] [-watch]      run the pipeline; board, live logs,
-                                        run history. -watch observes only
+  serve     [-addr :8080] [-mode M]     run the pipeline; board, live logs,
+            [-watch]                    run history. -mode is auto (default),
+                                        manual (tick button only) or observe
+                                        (nothing ever advances). -watch is an
+                                        alias for -mode=observe
+  probe     [-addr ADDR] [-wait D]      post-deploy check: request the board
+            [-origin URL]... [-notify] through every auth.origins entry (and
+                                        any -origin), retrying up to -wait;
+                                        exits non-zero if any is unreachable.
+                                        Run after a deploy's restart, never
+                                        by the deploy script itself — see
+                                        README
   passwd    <name>                      hash a password for the config's
                                         auth.users block
   
@@ -139,8 +151,12 @@ func own(cfg *config.Config, r *runner.Runner, settle bool) (func(), error) {
 		return nil, err
 	}
 	if settle {
-		if n, err := runner.SweepInterrupted(r.Root); err == nil && n > 0 {
+		n, err := runner.SweepInterrupted(r.Root)
+		if n > 0 {
 			fmt.Fprintf(os.Stderr, "conveyor: marked %d interrupted run(s) from a previous process\n", n)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: interrupted-run sweep had errors: %v\n", err)
 		}
 	}
 	return func() { _ = lock.Release() }, nil
@@ -381,20 +397,65 @@ func outcomeErr(o model.Outcome) error {
 func cmdServe(args []string) error {
 	c := newFlags("serve")
 	addr := c.fs.String("addr", ":8080", "listen address")
+	modeFlag := c.fs.String("mode", "auto", "auto | manual | observe")
 	// A pipeline that needs a button pressed is not a pipeline. Serving runs it;
-	// -watch is for looking at a board without touching the repositories.
-	watch := c.fs.Bool("watch", false, "observe only: never advance an item")
+	// -watch is for looking at a board without touching the repositories. Kept
+	// as an alias for -mode=observe, which is what its own help text and
+	// CLAUDE.md have always promised.
+	watch := c.fs.Bool("watch", false, "observe only: never advance an item (alias for -mode=observe)")
 	cfg, r, ctx, stop, err := c.load(args)
 	if err != nil {
 		return err
 	}
 	defer stop()
-	release, err := own(cfg, r, !*watch)
+
+	mode, note, err := resolveMode(*modeFlag, isSet(c.fs, "mode"), *watch)
+	if err != nil {
+		return err
+	}
+	if note != "" {
+		fmt.Fprintln(os.Stderr, note)
+	}
+
+	release, err := own(cfg, r, mode.Settles())
 	if err != nil {
 		return err
 	}
 	defer release()
-	return server.New(cfg, r).Run(ctx, server.Addr(*addr), !*watch)
+	return server.New(cfg, r).Run(ctx, server.Addr(*addr), mode)
+}
+
+// resolveMode turns -mode and -watch into the single Mode Run needs.
+//
+// -watch is kept as an alias for -mode=observe, which is what its own help
+// text and CLAUDE.md have always promised; combined with an explicit -mode
+// that is not observe, it is a startup error naming both flags rather than
+// one silently winning. An unknown -mode value is a startup error listing the
+// three names it accepts.
+func resolveMode(modeStr string, modeSet, watch bool) (mode server.Mode, note string, err error) {
+	mode, err = server.ParseMode(modeStr)
+	if err != nil {
+		return "", "", err
+	}
+	if watch {
+		if modeSet && mode != server.ModeObserve {
+			return "", "", fmt.Errorf("-watch and -mode=%s were both given; -watch always means observe", modeStr)
+		}
+		return server.ModeObserve, "conveyor: -watch selects -mode=observe", nil
+	}
+	return mode, "", nil
+}
+
+// isSet reports whether name was actually passed on the command line, as
+// opposed to holding its default.
+func isSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 // cmdPasswd mints one line for the config's auth.users block.

@@ -53,7 +53,23 @@ func TestEveryRouteIsBehindTheSameWall(t *testing.T) {
 		t.Errorf("POST /sw.js without credentials = %d, want 401", w.Code)
 	}
 
-	for _, path := range []string{"/", "/api/state", "/api/events", "/api/runs", "/api/push/key", "/index.html"} {
+	// Everything else, the board's own code included. The stylesheets and the
+	// ES modules index.html loads *are* the board — its rendering, its
+	// actions, the endpoints it calls — so they stay behind the password
+	// beside it; publicAsset gains no entry for them. Derived from the page
+	// rather than listed, so a stylesheet or module added later is covered
+	// here without editing this test (see pageAssets).
+	behindTheWall := append([]string{"/", "/api/state", "/api/events", "/api/runs", "/api/push/key", "/index.html"},
+		pageAssets(t)...)
+	for _, path := range behindTheWall {
+		if publicAsset[path] {
+			// The app shell (manifest, icons, worker) is public by design and
+			// asserted above. The board's own code must never join it.
+			if strings.HasSuffix(path, ".css") || (strings.HasSuffix(path, ".js") && path != "/sw.js") {
+				t.Errorf("%s is on the unauthenticated allowlist: the board's own code stays behind the password", path)
+			}
+			continue
+		}
 		reached = false
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
@@ -114,7 +130,7 @@ func TestServingOpenOffLoopbackIsRefused(t *testing.T) {
 	s := New(cfg, r)
 
 	for _, addr := range []string{":7788", "0.0.0.0:7788", "[::]:7788", "192.168.1.10:7788"} {
-		err := s.Run(context.Background(), addr, false)
+		err := s.Run(context.Background(), addr, ModeManual)
 		if err == nil || !strings.Contains(err.Error(), "refusing to serve") {
 			t.Errorf("Run(%q) with no auth = %v, want a refusal", addr, err)
 		}
@@ -129,7 +145,10 @@ func TestServingOpenOffLoopbackIsRefused(t *testing.T) {
 	cfg.Auth = config.Auth{Users: map[string]string{"amir": hashed(t, "s")}}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := s.Run(ctx, ":0", false); err != nil && strings.Contains(err.Error(), "refusing to serve") {
+	if err := s.Run(ctx, ":0", ModeManual); err != nil && strings.Contains(err.Error(), "refusing to serve") {
 		t.Errorf("a configured board was still refused: %v", err)
 	}
+	// Run's poll goroutine lists once before it ever checks ctx.Done; let that
+	// finish before TempDir's cleanup, or its write races the RemoveAll.
+	waitFor(t, "the stray poll from an already-cancelled Run to finish", func() bool { return !s.polling.Load() })
 }

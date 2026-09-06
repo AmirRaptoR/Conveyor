@@ -1,0 +1,53 @@
+/* ---- dialogs: the questions, and the final report ---------------------- */
+dialog {
+  background:var(--panel); color:var(--ink); border:1px solid var(--rule); border-radius:10px;
+  padding:0; width:min(760px, 94vw); box-shadow:0 40px 90px -30px rgba(0,0,0,.7);
+}
+dialog::backdrop { background:rgba(0,0,0,.55); backdrop-filter:blur(2px); }
+.askform { padding:20px 22px; display:flex; flex-direction:column; gap:14px; }
+.askhead { display:flex; gap:12px; align-items:baseline; }
+.askstep { color:var(--faint); font-size:11px; }
+.askhdr { color:var(--ask); font-size:11px; letter-spacing:.14em; text-transform:uppercase; font-weight:600; }
+.askq { margin:0; font-size:15px; line-height:1.55; white-space:pre-wrap; }
+.askopts { display:flex; flex-direction:column; gap:7px; }
+.askopt {
+  display:flex; gap:11px; align-items:flex-start; padding:10px 13px; cursor:pointer;
+  border:1px solid var(--rule); border-radius:8px; background:var(--raised);
+}
+.askopt:hover { border-color:var(--faint); }
+.askopt:has(input:checked) { border-color:var(--ask); background:color-mix(in srgb, var(--ask) 10%, var(--raised)); }
+.askopt input { margin:3px 0 0; accent-color:var(--ask); }
+.askopt b { display:block; font-weight:600; }
+.askopt small { display:block; color:var(--dim); font-size:12px; line-height:1.45; margin-top:2px; }
+.askother {
+  width:100%; font:inherit; font-size:13px; background:var(--ground); color:var(--ink);
+  border:1px solid var(--rule); border-radius:8px; padding:9px 11px;
+}
+.askother:focus { outline:none; border-color:var(--ask); }
+.askfoot { display:flex; gap:8px; align-items:center; }
+.askfoot .send { color:#fff; background:var(--ask); border-color:transparent; }
+.rhead {
+  display:flex; gap:8px; align-items:center; padding:12px 16px;
+  border-bottom:1px solid var(--rule); position:sticky; top:0; background:var(--panel);
+}
+.rhead b { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rbody { max-height:72vh; overflow:auto; padding:6px 22px 22px; border:0; }
+.rbody.report { font-size:13px; }
+#printout { display:none; }
+@media print {
+  body.print-report { background:#fff; color:#000; }
+  body.print-report > :not(#printout) { display:none !important; }
+  body.print-report #printout {
+    display:block; color:#000; background:#fff; padding:0; border:0;
+    font-size:12px; line-height:1.5;
+  }
+  body.print-report #printout .report { color:#000; background:#fff; border:0; padding:0; }
+  body.print-report #printout h1, body.print-report #printout h2,
+  body.print-report #printout th, body.print-report #printout code,
+  body.print-report #printout strong { color:#000; }
+  body.print-report #printout code { background:#eee; }
+  body.print-report #printout table { page-break-inside:auto; }
+  body.print-report #printout tr { page-break-inside:avoid; }
+  @page { margin:18mm; }
+}
+.rbody .slot { margin:14px 0; }

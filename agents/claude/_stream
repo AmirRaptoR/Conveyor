@@ -111,8 +111,28 @@ ${default}"
 
 # hit_limit reports whether the account was out of quota. Claude Code says so in
 # the transcript and exits cleanly, so nothing else can tell you.
+#
+# Anchored to the start of a line, because the transcript is not only the CLI
+# talking — it is also the model talking, and the model quotes. Searching the
+# whole text for the phrase read this, in a refine that had finished its work
+# and was explaining why a *different* tool could not run:
+#
+#   **Codex did not run.** ... (`ERROR: You've hit your usage limit... try
+#   again at Sep 8th`)
+#
+# and marked the item out of quota, which paused every claude stage on the
+# board behind a limit that was not ours and not now. The CLI's own refusal is
+# always a line of its own and always the last thing it says —
+#
+#   You've hit your session limit · resets 8:30pm (UTC)
+#
+# — so requiring it to begin a line costs nothing real and is not something
+# prose does. `You.{0,2}ve` spans both the plain and the typographic
+# apostrophe without depending on the locale to make a bracket expression
+# match a multibyte character.
 hit_limit() {
-	[[ -s "$CLAUDE_SAID" ]] && grep -qiE "hit your (session|usage|weekly) limit" "$CLAUDE_SAID"
+	[[ -s "$CLAUDE_SAID" ]] &&
+		grep -qiE "^[[:space:]]*You.{0,2}ve hit your (session|usage|weekly) limit" "$CLAUDE_SAID"
 }
 
 # hit_max_turns reports whether the run stopped because it exhausted its

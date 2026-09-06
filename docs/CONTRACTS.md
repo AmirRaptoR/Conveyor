@@ -52,7 +52,11 @@ arrive in this shape.
 Rules the engine enforces:
 
 - Unknown `stage` → the item is rejected and logged, not silently dropped.
-- Duplicate `id` within one poll → first wins, the collision is logged.
+- Missing `ref` → the item is rejected and logged, the same as a missing `id`.
+- Duplicate `id` within one poll → first wins, the collision is logged. This is
+  enforced across every source's listing, not merely within one source's own —
+  the engine keys `working`, marks, timers and the manual order by the bare id,
+  and two sources cannot be trusted not to collide.
 - An item that disappears from a source is marked gone, not deleted, so its run
   history survives.
 - A marked item is never picked. That is the whole mechanism by which a stage
@@ -103,7 +107,12 @@ finished transition wakes the scheduler, and the item that just exited 10 has
 not moved — it is still the best candidate in the stage it never left, so
 without this it is picked again immediately and the "try again later" it asked
 for arrives two seconds later, forever. A stage that deferred is skipped until
-the next listing lands; a person pressing the tick button clears that too.
+its source's next listing lands — specifically, a listing that *began* after
+the deferral was set; one already in flight when the deferral was set has not
+had the chance to answer it yet and leaves the item resting. A person pressing
+the tick button clears every deferral regardless of timing: that gesture means
+"look again now", and honouring one against it would answer a person with
+nothing.
 
 A blocked script may say why: `{"blocked": true, "reason": "…"}` in
 `$CONVEYOR_RESULT`. The engine passes the reason to `move`, and a provider that
@@ -352,6 +361,32 @@ It is still not unbounded. Scripts that run in the source's own checkout — a
 A stage script may spawn as many subagents as it likes internally — that is
 invisible to the engine.
 
+### What a stage script's credentials actually reach
+
+Three facts worth being explicit about, because a worktree is easy to
+over-read as a security boundary when it is only a filesystem one:
+
+- **A stage script runs as the conveyor user, with that user's whole ambient
+  environment and credentials** — the same `gh` auth, the same SSH keys, the
+  same cloud credentials any other process that user runs would have. The
+  engine adds nothing to that and takes nothing away from it.
+- **A worktree isolates a checkout, not credentials, network or host access.**
+  It is what lets two items in one repository run at once without one agent's
+  uncommitted work colliding with another's, and nothing more. It does not stop
+  a script from reading another repository, calling an external API, or acting
+  outside the worktree entirely.
+- **The `approve` gate (§"Merging is a gate, not a judgement" in README.md) is
+  a workflow control, not an enforced boundary.** It waits for checks, review
+  threads and a quiet PR before merging — but an agent running with the same
+  credentials `approve` itself uses could merge directly, or push to any other
+  branch it can reach, without going through the gate at all. What stops that
+  from happening is the prompt an adapter writes and the model that reads it,
+  not a permission the engine withholds.
+
+None of this is a defect to fix here: it is what "the extension is the
+scripts" (see the top of this document) means in practice, and a reader
+relying on worktrees or the approve gate as a sandbox should not.
+
 ## 6. Runs and logs
 
 Every script invocation is a **run**, and every run is a self-contained directory.
@@ -382,10 +417,31 @@ logs:
   sweepAt: 04:00       # daily; also runs once on startup
 ```
 
-One exception, and it matters: **a run is pinned if it is the most recent failed
-or blocked run of an item that is still in a failed or blocked state.** Retention
-must never delete the evidence for the thing currently asking for attention.
-Pinned runs are reported in the sweep log so they cannot pile up unnoticed.
+Comparing days, not timestamps: a run directory whose day is strictly before
+the cutoff's UTC date is deleted, one on or after it is kept, and a whole
+expired day can be skipped without reading a single `meta.json` — conservative
+by up to 24 hours in the safe direction. The sweep runs once at startup and
+then daily at `sweepAt`, in the process's own local time zone, and never under
+`-watch`: a server that only observes must not delete anything either.
+
+Three exceptions, and they matter:
+
+- **A run whose `meta.json` outcome is still `running` is never deleted**,
+  regardless of age. Nothing this process started is alive to have finished
+  writing that record honestly, and a killed run is exactly the one someone
+  needs to read afterwards.
+- **The most recent failed, blocked or timeout run of an item that is still
+  marked is never deleted.** Retention must never delete the evidence for the
+  thing currently asking for attention.
+- **The most recent successful move that landed a currently-listed item in the
+  stage it currently occupies is never deleted.** Sweeping it would blank the
+  stage-age chip for an item still sitting right there.
+
+Both item-based pins are evaluated against the board's *current* items only —
+an expired run belonging to nothing on the board today is swept normally. A
+day directory left empty by the sweep is removed; one still holding a pinned
+run is not. Pinned runs are reported in the sweep log, named individually, so
+they cannot pile up unnoticed.
 
 ### Failure is a first-class state
 

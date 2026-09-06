@@ -29,6 +29,14 @@ version: 1
 #   realm: conveyor
 #   users:
 #     amir: "pbkdf2-sha256$600000$<salt>$<key>"
+#   # origins: extra origins (scheme + host + optional port, exactly as a
+#   # browser's Origin header writes it) allowed to drive the board beyond
+#   # loopback and the listen address itself. Empty is the default: same-origin
+#   # only. Needed behind a proxy that rewrites Host — Caddy's default
+#   # forwarding does not, so the common deployment in this repo needs nothing
+#   # here.
+#   origins:
+#     - "https://board.example.com"
 
 concurrency:
   perSource: 1        # items in flight per this source. Safe above 1 too: an

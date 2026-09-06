@@ -23,13 +23,59 @@ func boardHTML(t *testing.T) string {
 	return string(b)
 }
 
+// boardSource is index.html plus every module the page loads, concatenated —
+// for the markup checks whose subject is a template string in a module rather
+// than an element written in the page.
+func boardSource(t *testing.T) string {
+	t.Helper()
+	parts := []string{boardHTML(t)}
+	entries, err := webFS.ReadDir("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".js") || strings.HasSuffix(e.Name(), ".test.js") {
+			continue
+		}
+		b, err := webFS.ReadFile("web/" + e.Name())
+		if err != nil {
+			t.Fatalf("reading web/%s from the embedded FS: %v", e.Name(), err)
+		}
+		parts = append(parts, string(b))
+	}
+	return strings.Join(parts, "\n")
+}
+
+// styleBlock is the board's whole stylesheet, as a browser sees it: every
+// sheet index.html links, concatenated in the order the <link> tags appear.
+// The single <style> block this used to read was split into one file per
+// section of the design, and cascade order is what makes the trailing
+// override layers (the design pass, the @media blocks) work — so the order
+// here is the page's own, taken from the page, never a list kept beside it.
 func styleBlock(t *testing.T, html string) string {
 	t.Helper()
-	m := regexp.MustCompile(`(?s)<style>(.*?)</style>`).FindStringSubmatch(html)
-	if m == nil {
-		t.Fatal("no <style> block found in index.html")
+	if regexp.MustCompile(`(?s)<style[^>]*>.*?</style>`).MatchString(html) {
+		t.Fatal("index.html carries an inline style element again; the design lives in .css files")
 	}
-	return m[1]
+	var sheets []string
+	for _, tag := range regexp.MustCompile(`<link\b[^>]*>`).FindAllString(html, -1) {
+		if !strings.Contains(tag, `rel="stylesheet"`) {
+			continue
+		}
+		m := regexp.MustCompile(`\bhref="([^"]+)"`).FindStringSubmatch(tag)
+		if m == nil {
+			continue
+		}
+		b, err := webFS.ReadFile("web" + m[1])
+		if err != nil {
+			t.Fatalf("reading web%s from the embedded FS: %v", m[1], err)
+		}
+		sheets = append(sheets, string(b))
+	}
+	if len(sheets) == 0 {
+		t.Fatal("index.html links no stylesheet")
+	}
+	return strings.Join(sheets, "\n")
 }
 
 // #log and #history must carry no aria-live: a running agent otherwise has
@@ -73,8 +119,10 @@ func TestAnnouncerLiveRegionExists(t *testing.T) {
 // all) — the reply textarea needs a real one, and the existing placeholder
 // text has to stay exactly as it was.
 func TestReplyTextareaHasAccessibleName(t *testing.T) {
-	html := boardHTML(t)
-	m := regexp.MustCompile(`<textarea class="answer"[^>]*>`).FindString(html)
+	// The stop notice is rendered by the page, not written in index.html, so
+	// this reads the markup where it actually lives now: the modules the page
+	// loads, beside the file that loads them.
+	m := regexp.MustCompile(`<textarea class="answer"[^>]*>`).FindString(boardSource(t))
 	if m == "" {
 		t.Fatal("no textarea.answer found")
 	}
