@@ -186,6 +186,40 @@ func TestDrainWaitsForDiscoveryNotJustTransitions(t *testing.T) {
 	}
 }
 
+// The end-to-end version of the guarantee: once Run has returned, cmdServe's
+// defer releases the owner lock on the spot, so nothing Run started may still
+// be writing under the data directory by then. Cancelling ctx before calling
+// Run, as TestServingOpenOffLoopbackIsRefused does, is the sharpest version of
+// this — the poll goroutine's first list run starts against an
+// already-cancelled context, so any goroutine outliving Run's return would be
+// racing this test's own RemoveAll.
+func TestNothingWritesAfterRunReturns(t *testing.T) {
+	cfg, _, _ := pipelineFor(t)
+	// Rooted where production actually puts it (cfg.DataDir()/runs), not
+	// pipelineFor's own runs/ beside the config — this test's whole point is
+	// removing exactly the directory everything here writes under.
+	r := runner.New(filepath.Join(cfg.DataDir(), "runs"))
+	s := New(cfg, r)
+	cfg.Auth = config.Auth{Users: map[string]string{"amir": hashed(t, "s")}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Run(ctx, ":0", false); err != nil {
+		t.Fatalf("Run returned an error: %v", err)
+	}
+
+	dataDir := cfg.DataDir()
+	if err := os.RemoveAll(dataDir); err != nil {
+		t.Fatalf("RemoveAll(%s) right after Run returned: %v — something is still there", dataDir, err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if _, err := os.Stat(dataDir); err == nil {
+		t.Errorf("%s was recreated within 500ms of Run returning: something Run started outlived it", dataDir)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat %s: %v", dataDir, err)
+	}
+}
+
 // Shutdown must stop dispatch, cancel workers, wait for their completion and
 // only then let the caller release ownership — cmdServe's defer unlocks the
 // data directory the instant Run returns, so returning early hands a fresh
