@@ -954,12 +954,16 @@ function drawDoctor() {
 }
 
 async function startDoctor(apply) {
-  const res = await fetch("/api/doctor", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ apply }),
-  });
+  let res;
+  try {
+    res = await fetch("/api/doctor", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apply }),
+    });
+  } catch { fault("could not start the sweep: disconnected"); return; }
   if (res.status === 409) { alert("A sweep is already running."); return; }
+  if (!res.ok) { fault((await res.text()).trim() || `could not start the sweep (HTTP ${res.status})`); return; }
   loadDoctor();
 }
 
