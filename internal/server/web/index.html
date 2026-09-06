@@ -2254,11 +2254,26 @@ async function saveOrder() {
     console.warn("refusing to save an empty order");
     return;
   }
-  await fetch("/api/order", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(ids),
-  });
+  let res;
+  try {
+    res = await fetch("/api/order", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(ids),
+    });
+  } catch {
+    // The drag already moved the card in the DOM (el.ondrop's insertBefore);
+    // a save that never reached the server has to be undone the same way a
+    // rejected one is — draw() is the rollback, state is still what the
+    // server last confirmed.
+    fault("could not save the new order: disconnected");
+    draw();
+    return;
+  }
+  if (!res.ok) {
+    fault(`could not save the new order: ${(await res.text()).trim() || `HTTP ${res.status}`}`);
+    draw();
+  }
 }
 
 // Clearing a mark is a provider write, so the control says so while it lands:
