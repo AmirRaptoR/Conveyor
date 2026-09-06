@@ -372,18 +372,20 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 }
 
 // notePersistFault sets or clears the board-visible sticky fault from one
-// run's outcome: a run whose meta.json write failed sets it (naming the run
-// that failed to record itself honestly); any other run persisting means the
-// disk is not, or is no longer, the problem, and clears it. It is intentional
-// that this is not scoped to one item or source — a full disk is a fact
-// about the run store, not about the run that happened to notice it first.
+// run's outcome: a run whose meta.json write or log.txt append failed sets it
+// (naming the run that failed to record itself honestly); any other run
+// persisting means the disk is not, or is no longer, the problem, and clears
+// it. It is intentional that this is not scoped to one item or source — a
+// full disk is a fact about the run store, not about the run that happened to
+// notice it first.
 func (s *Server) notePersistFault(res *runner.Result) {
 	if res == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if strings.HasPrefix(res.Run.Error, "persist meta.json: ") {
+	if strings.HasPrefix(res.Run.Error, "persist meta.json: ") ||
+		strings.HasPrefix(res.Run.Error, "append log.txt: ") {
 		s.state.PersistFault = &PersistFault{
 			RunID: res.Run.ID, ItemID: res.Run.ItemID, Source: res.Run.Source,
 			Message: res.Run.Error, At: time.Now(),

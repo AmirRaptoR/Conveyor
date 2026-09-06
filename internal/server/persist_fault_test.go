@@ -26,6 +26,24 @@ func TestPersistenceFailureRaisesABoardVisibleFault(t *testing.T) {
 	}
 }
 
+// A log.txt append failure is a persistence fault exactly like a failed
+// meta.json write — the run's own record still could not be trusted, even
+// though meta.json itself may have written fine.
+func TestLogAppendFailureRaisesABoardVisibleFaultToo(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.notePersistFault(&runner.Result{Run: model.Run{
+		ID: "000000.000-y", ItemID: "s1:1", Source: "s1",
+		Error: "append log.txt: write /data/runs/.../log.txt: no space left on device",
+	}})
+	if s.state.PersistFault == nil {
+		t.Fatal("PersistFault is nil for a log.txt append failure, want it set")
+	}
+	if s.state.PersistFault.RunID != "000000.000-y" {
+		t.Errorf("RunID = %q, want 000000.000-y", s.state.PersistFault.RunID)
+	}
+}
+
 // The fault is sticky: it must survive a refresh, which rebuilds Warnings
 // from scratch every poll and would otherwise make a disk-full condition
 // disappear within one poll interval. Unlike Warnings, refresh must not be
