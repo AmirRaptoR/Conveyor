@@ -2452,10 +2452,23 @@ function openFromHash() {
 }
 addEventListener("hashchange", openFromHash);
 $("#tick").onclick = async e => {
-  e.target.disabled = true;
-  const res = await fetch("/api/tick", { method:"POST" });
-  if (res.status === 409) $("#line1").textContent = "a tick is already in flight";
-  setTimeout(() => e.target.disabled = false, 1500);
+  const btn = e.target;
+  btn.disabled = true;
+  let res;
+  try {
+    res = await fetch("/api/tick", { method:"POST" });
+  } catch {
+    btn.disabled = false;
+    fault("could not tick: disconnected");
+    return;
+  }
+  if (res.status === 409) { $("#line1").textContent = "a tick is already in flight"; }
+  else if (!res.ok) {
+    btn.disabled = false;
+    fault((await res.text()).trim() || `could not tick (HTTP ${res.status})`);
+    return;
+  }
+  setTimeout(() => btn.disabled = false, 1500);
 };
 
 const es = new EventSource("/api/events");
