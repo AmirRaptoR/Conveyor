@@ -391,9 +391,14 @@ type Server struct {
 	// wake instead of waiting for the next listing would hammer an already-
 	// failing provider once per poll interval rather than once per listing.
 	//
-	// Every listing clears it wholesale, because a listing IS the next poll.
-	// So does the tick button: that gesture means "look again now", and
-	// honouring a deferral against it would answer a person with nothing.
+	// A listing clears an item's deferral — a listing IS the next poll — but
+	// only if that item's source's own listing *began* after the deferral was
+	// set (F03): one already in flight when the deferral was set has not had
+	// the chance to answer it yet, and clearing it early would have the
+	// scheduler retry a stage the item is not actually resting in front of.
+	// See restingAt. The tick button's own clear ignores all of this: that
+	// gesture means "look again now", and honouring a deferral against it
+	// would answer a person with nothing.
 	resting map[string]bool
 	// restingAt is when each resting[id] entry was set. refresh clears a
 	// deferral only when the item's source's listing this pass began after
