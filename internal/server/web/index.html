@@ -1750,13 +1750,23 @@ function openAsk(id, title) {
 
 async function sendAnswer(id, answer) {
   const btn = document.querySelector("#stop .ask-btn");
+  const label = btn ? btn.textContent : "";
   if (btn) { btn.disabled = true; btn.textContent = "Sending…"; }
-  const res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ answer }),
-  });
-  if (!res.ok) { refuse(id, (await res.text()).trim() || `could not answer ${id}`); return; }
+  let res, msg;
+  try {
+    res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer }),
+    });
+  } catch { msg = `could not answer ${id}: disconnected`; }
+  if (res && !res.ok) msg = (await res.text()).trim() || `could not answer ${id}`;
+  if (msg) {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    refuse(id, msg);
+    panelFault(msg);
+    return;
+  }
   $("#stop").innerHTML = "";
 }
 
