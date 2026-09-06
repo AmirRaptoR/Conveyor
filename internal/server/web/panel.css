@@ -1,0 +1,116 @@
+/* ---- inspection panel -------------------------------------------------- */
+.scrim {
+  position:fixed; inset:0; background:rgba(0,0,0,.5); opacity:0; pointer-events:none;
+  transition:opacity .16s ease; z-index:9;
+}
+.scrim.open { opacity:1; pointer-events:auto; }
+aside {
+  position:fixed; top:0; right:0; width:min(700px, 96vw); height:100%;
+  background:var(--panel); border-left:1px solid var(--rule);
+  display:flex; flex-direction:column; transform:translateX(100%);
+  transition:transform .18s cubic-bezier(.4,0,.2,1); z-index:10;
+}
+aside.open { transform:none; }
+.ahead { display:flex; align-items:flex-start; gap:14px; padding:16px 18px; border-bottom:1px solid var(--rule); }
+.ahead h2 { margin:0; font-size:13px; font-weight:500; line-height:1.5; }
+.ahead .sub { margin-top:5px; color:var(--faint); font-size:10.5px; letter-spacing:.07em; text-transform:uppercase; }
+
+/* #stop, .report and .history read as one passage — a stop reason, then the
+   report, then the history that explains it — so they share one scroll
+   region rather than nesting three. `.log` stays its own: the tail-follow
+   behaviour reads `.log`'s own scrollTop/scrollHeight (see the SSE
+   handler), which only works if nothing above it also claims that scroll.
+   The cap is a percentage of `aside` (the wrapper this sits in), not of the
+   viewport, so it still means the same thing if the panel is ever resized
+   independently of the window — and it leaves `.log` a guaranteed share of
+   the panel's height rather than letting a long stop reason squeeze it to
+   nothing. */
+.upper { flex:0 1 auto; max-height:55%; overflow-y:auto; min-height:0; }
+
+/* A run history is genuinely a sequence, so it is drawn as one. */
+.history { padding:12px 18px; border-bottom:1px solid var(--rule); }
+.tr {
+  display:flex; align-items:center; gap:11px; width:100%; text-align:left;
+  background:transparent; border:0; border-left:1px solid var(--rule);
+  color:var(--dim); font:inherit; font-size:11px; padding:6px 0 6px 15px;
+  cursor:pointer; position:relative;
+}
+.tr::before {
+  content:""; position:absolute; left:-3.5px; top:50%; margin-top:-2.5px;
+  width:5px; height:5px; border-radius:50%; background:var(--faint);
+}
+.tr:hover { color:var(--ink); }
+.tr.sel { color:var(--ink); border-left-color:var(--faint); }
+.tr.sel::before { background:var(--ink); }
+.tr .when { flex:0 0 62px; color:var(--faint); font-variant-numeric:tabular-nums; }
+.tr .kind { flex:0 0 54px; color:var(--faint); letter-spacing:.08em; text-transform:uppercase; font-size:10px; }
+.tr .path { flex:1; }
+.tr .dur { flex:0 0 44px; color:var(--faint); font-variant-numeric:tabular-nums; text-align:right; }
+.tr .arrow { color:var(--faint); }
+.tr .verdict { letter-spacing:.06em; font-size:10.5px; }
+.tr.success .verdict { color:var(--ok); }      .tr.success::before { background:var(--ok); }
+.tr.failure .verdict, .tr.timeout .verdict { color:var(--stop); }
+.tr.failure::before, .tr.timeout::before { background:var(--stop); }
+.tr.blocked .verdict { color:var(--run); }      .tr.blocked::before { background:var(--run); }
+.tr.running .verdict { color:var(--run); }      .tr.running::before { background:var(--run); animation:pulse 1.1s ease-in-out infinite; }
+/* Killed, not failed: it never reached a verdict. */
+.tr.interrupted .verdict { color:var(--faint); font-style:italic; }
+.tr.interrupted::before { background:transparent; box-shadow:inset 0 0 0 1px var(--faint); }
+
+/* The agent's own plan, kept current: the log says what happened, this says
+   what it thinks is left. Sticky, because a plan mid-flight is only useful
+   at its latest state — the history of how it got there is already in the
+   log, as a terse TodoWrite line per update. */
+.todos {
+  flex:0 0 auto; padding:10px 18px; border-bottom:1px solid var(--rule);
+  font-size:11.5px; line-height:1.6;
+}
+.todo { display:flex; gap:8px; align-items:baseline; }
+.todo .mark { flex:0 0 1.1em; text-align:center; }
+.todo.completed { color:var(--faint); text-decoration:line-through; }
+.todo.completed .mark { color:var(--ok); }
+.todo.in_progress { color:var(--ink); font-weight:500; }
+.todo.in_progress .mark { color:var(--run); }
+.todo.pending .mark { color:var(--faint); }
+
+.log {
+  margin:0; flex:1 1 auto; min-height:0; overflow:auto; padding:14px 18px;
+  font-size:11.5px; line-height:1.7; color:var(--dim);
+}
+/* Loading/empty/error read as one line of text, not as log content, so they
+   are their own element rather than the `:empty::after` trick — that trick
+   could not tell "nothing fetched yet" from "fetched and genuinely blank"
+   apart, which is exactly the distinction these states exist to draw. */
+.log .status, .history .slot { color:var(--faint); }
+.log .status.err, .history .slot.err {
+  color:var(--stop); border-color:color-mix(in srgb, var(--stop) 40%, var(--rule-soft));
+}
+/* An indeterminate bar: one fetch of unknown length has no progress to
+   report, so it sweeps rather than fills. */
+.log .status.loading::before, .history .slot.loading::before {
+  content:""; display:block; height:2px; margin-bottom:8px;
+  background:linear-gradient(90deg, transparent, var(--run), transparent);
+  background-size:50% 100%; animation:loadbar 1.1s ease-in-out infinite;
+}
+@keyframes loadbar { 0%{background-position:-50% 0} 100%{background-position:150% 0} }
+.ln { white-space:pre-wrap; word-break:break-word; }
+.ln.blank { height:.55em; }
+/* stderr is where a script says something went wrong, and where the blocked
+   convention is reported. It should not look like prose. */
+.ln.stderr { color:var(--stop); }
+.ln.engine { color:var(--run); font-style:italic; }
+/* A tool call is an event, not a sentence: the agent did something. */
+.ln.tool {
+  color:var(--ink); margin:3px 0 3px -8px; padding-left:8px;
+  border-left:2px solid var(--run);
+}
+.ln.tool .tname { color:var(--run); letter-spacing:.06em; }
+.ln.tool .targ { color:var(--dim); }
+.ln.head { color:var(--ink); font-weight:600; margin-top:9px; }
+.ln.rule { border-top:1px solid var(--rule-soft); margin:8px 0; height:0; }
+.ln .bullet { color:var(--faint); }
+.log code {
+  background:color-mix(in srgb, var(--ink) 8%, transparent);
+  color:var(--ink); padding:0 3px; border-radius:2px;
+}
+.log strong { color:var(--ink); font-weight:600; }

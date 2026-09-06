@@ -352,12 +352,16 @@ tree. Add one and `./check` picks it up on its own.
 Adding a browser-free UI interaction test — no browser, no npm install, no
 network — means adding a file named `*.test.mjs` anywhere in the tree, written
 against Node's own `node:test` and `node:assert` (nothing else is
-installed). `internal/server/web/testutil.mjs` has a small helper,
-`loadFunctions`, that pulls a named function straight out of `index.html`'s
-inline script and evaluates it in a sandbox with `node:vm` — no DOM, no
-build step — so a pure function in the board's UI can be tested exactly as
-written; `internal/server/web/format_duration.test.mjs` is a working example.
-`./check` runs every `*.test.mjs` file it finds under `node --test`.
+installed). The board ships as ES modules (`internal/server/web/*.js`, entered
+at `main.js`), so a test simply imports the file it is about:
+`pure.test.mjs` imports `pure.js` directly, since nothing there touches a DOM.
+For anything that does, `internal/server/web/testutil.mjs` has `page()`, which
+installs a small hand-rolled DOM as globals and hands back a private copy of
+the board's whole module graph — one per call, so no test inherits another's
+state. `format_duration.test.mjs` is the smallest working example, and
+`draw.test.mjs`/`writes.test.mjs` are the same harness driving real rendering
+and real fetches. `./check` runs every `*.test.mjs` file it finds under
+`node --test`.
 
 ## Design notes
 

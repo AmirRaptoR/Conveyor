@@ -1,39 +1,19 @@
-// Exercises the pure logic in index.html's "---- pure helpers ----" region —
-// no DOM, no npm install, no network. Run with:
+// Exercises the pure logic in pure.js — no DOM, no npm install, no network.
+// Run with:
 //
-//   node --test internal/server/web/pure_test.mjs
+//   node --test internal/server/web/pure.test.mjs
 //
-// The region is pulled out of the live file by its marker comments and
-// evaluated with vm, rather than duplicated here, so this test fails the
-// moment the shipped functions change shape instead of silently testing a
-// stale copy. See index.html's own comment on that region for why these four
-// functions in particular are the ones written to take plain values instead
-// of DOM nodes.
+// The module is imported, not sliced out of a larger file, so this test
+// exercises exactly what the server serves. See pure.js's own comment on that
+// region for why these functions in particular are the ones written to take
+// plain values instead of DOM nodes.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
-import vm from "node:vm";
+import {
+  focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, staleThresholdMs, sourceDegraded,
+} from "./pure.js";
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const html = readFileSync(path.join(here, "index.html"), "utf8");
-
-const start = html.indexOf("// ---- pure helpers");
-const end = html.indexOf("// ---- end pure helpers");
-if (start < 0 || end < 0 || end <= start) {
-  throw new Error("could not find the pure-helpers region in index.html");
-}
-const region = html.slice(start, end);
-
-const sandbox = {};
-vm.createContext(sandbox);
-vm.runInContext(
-  region + "\nglobalThis.__pure = { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, staleThresholdMs, sourceDegraded };",
-  sandbox,
-);
-const { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, staleThresholdMs, sourceDegraded } = sandbox.__pure;
 
 test("focusKeyOf: a card and its .open link are different keys", () => {
   assert.equal(focusKeyOf({ kind: "card", id: "issue-44", control: "card" }), "card:issue-44:card");
