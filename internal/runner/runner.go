@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -123,7 +124,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	started := time.Now()
 	runID := fmt.Sprintf("%s-%s", started.UTC().Format("150405.000"), randSuffix())
 	dir := filepath.Join(r.Root, started.UTC().Format("2006-01-02"), runID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0o700: a run directory holds prompts, a person's typed answer (stdin.json)
+	// and logs, all meant for the operator who runs conveyor and nobody else.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create run dir: %w", err)
 	}
 
@@ -136,7 +139,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	}
 
 	logPath := filepath.Join(dir, "log.txt")
-	logFile, err := os.Create(logPath)
+	// 0o600: this file holds a script's stdout/stderr, meant for the operator
+	// who runs conveyor and nobody else, same as the rest of the run directory.
+	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +229,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		}
 		stdinJSON = b
 	}
-	if err := os.WriteFile(filepath.Join(dir, "stdin.json"), stdinJSON, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "stdin.json"), stdinJSON, 0o600); err != nil {
 		return nil, err
 	}
 
@@ -244,6 +249,14 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	deadline, _ := runCtx.Deadline()
 
 	resultPath := filepath.Join(dir, "result.json")
+	// Pre-created at 0o600 rather than left for the script's own `>` redirect
+	// to create: a shell redirection to an existing file opens it without
+	// re-applying a mode, so this is what keeps result.json — which can carry
+	// whatever the script decided was worth structuring — as restricted as
+	// everything else in the run directory once the script writes it.
+	if err := os.WriteFile(resultPath, nil, 0o600); err != nil {
+		return nil, err
+	}
 	env, envMap := buildEnv(spec, resultPath, deadline)
 	run.Env = envMap
 
@@ -392,13 +405,19 @@ func (r *Runner) finish(run *model.Run, started time.Time, persist func()) {
 // otherwise leaves a zero-byte meta.json and no record of what it was doing,
 // which is exactly the run someone needs to read afterwards.
 //
+// What reaches disk (and so GET /api/runs) is redacted, never run.Env itself:
+// the caller's map is untouched, because nothing downstream of a finished run
+// reads it in-process — only the copy that gets serialized needs to differ.
+//
 // The write is atomic: marshalled to a temp file in the same directory (so
 // the rename is on one filesystem) and renamed into place, so a write that
 // fails partway — a full disk — leaves the previous meta.json intact rather
 // than truncated, and a caller can tell the failure apart from success instead
 // of it being silently dropped.
 func writeMeta(run *model.Run, dir string) error {
-	b, err := json.MarshalIndent(run, "", "  ")
+	toWrite := *run
+	toWrite.Env = redactEnv(run.Env)
+	b, err := json.MarshalIndent(toWrite, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -416,7 +435,10 @@ func writeMeta(run *model.Run, dir string) error {
 		}
 		return closeErr
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	// 0o600: meta.json holds every parameter the run's source, provider and
+	// scripts were configured with — redacted above, but the keys and the
+	// CONVEYOR_-prefixed values are still meant for the operator alone.
+	if err := os.Chmod(tmpName, 0o600); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
@@ -425,6 +447,29 @@ func writeMeta(run *model.Run, dir string) error {
 		return err
 	}
 	return nil
+}
+
+// redactedValue stands in for any env value not worth ever writing to disk or
+// handing back over the API — a source's env:, provider.params: or
+// scripts.*.params:, which is exactly where a token lives (model.DoctorRun
+// exists for the same reason, one layer out). The CONVEYOR_ prefix is safe to
+// keep verbatim: it is paths, ids and a deadline, nothing the engine itself
+// did not already hand the script in the clear.
+const redactedValue = "«redacted»"
+
+func redactEnv(env map[string]string) map[string]string {
+	if env == nil {
+		return nil
+	}
+	out := make(map[string]string, len(env))
+	for k := range env {
+		if strings.HasPrefix(k, "CONVEYOR_") {
+			out[k] = env[k]
+		} else {
+			out[k] = redactedValue
+		}
+	}
+	return out
 }
 
 // capLine bounds a line kept in memory and published live: a single line over
@@ -573,15 +618,19 @@ func SweepInterrupted(root string) (int, error) {
 // record the durable pending-transition fact (F04) against the stage run
 // that produced it: NextStage, MoveConfirmed, MoveAttempts. run.Dir must
 // already be set, as it is on anything this package returned.
+//
+// The same write the run's own two go through, deliberately: this is a third
+// writer of the same file, and everything writeMeta does to it — redacting
+// every non-CONVEYOR_ env value, 0o600, the temp-and-rename that keeps a
+// failed write from truncating what was there — is a property of the file,
+// not of the moment it is written. Marshalling `run` straight to disk here
+// instead published the source's env: and params: in the clear over
+// GET /api/runs, on the one run kind that carries a stage's own tokens.
 func WriteMeta(run *model.Run) error {
 	if run.Dir == "" {
 		return errors.New("runner: WriteMeta: run has no directory")
 	}
-	b, err := json.MarshalIndent(run, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(run.Dir, "meta.json"), b, 0o644)
+	return writeMeta(run, run.Dir)
 }
 
 // PendingMove finds the most recent stage run for an item, at the given

@@ -100,6 +100,86 @@ invalidating the lines already written. Auth is in the app rather than in a
 proxy in front of it because a proxy was a second server, a second config file
 and a second password store for one line of behaviour.
 
+Every state-changing route also validates the request's `Host` and rejects an
+unsafe cross-origin request (`net/http`'s `CrossOriginProtection`), so a
+foreign page cannot drive the board through an authenticated browser and a
+loopback board cannot be reached by a DNS-rebinding trick. `auth.origins` is
+the escape hatch for a proxy that does not forward `Host` as Caddy's default
+does — extra origins (scheme, host, optional port) allowed to drive the board:
+
+```yaml
+auth:
+  origins:
+    - "https://board.example.com"
+```
+
+Empty, the default, means same-origin only. A malformed entry is a load
+error, like every other `auth` problem. See docs/CONTRACTS.md's section on
+what a stage script's credentials actually reach — worktrees isolate
+checkouts, not credentials or host access.
+
+### Post-deploy check: `conveyor probe`
+
+A deploy that builds, tests and installs cleanly can still leave the running
+board unreachable — an allowlist with no entry for the live config is green
+in CI and a 403 on the real box. `conveyor probe` is the check that catches
+that: it requests the board through every origin `auth.origins` says it is
+reachable by (plus any `-origin` given on the command line), the same way a
+browser would, and exits non-zero if any of them is not serving.
+
+```bash
+./conveyor probe -c conveyor.yaml
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-addr` | none | a loopback address to probe as a diagnostic — printed on its own line, never counted towards the exit status. `127.0.0.1` is precisely the address that kept answering while both real routes were broken, so a passing `-addr` next to a failing `auth.origins` entry is still a failed deploy |
+| `-wait` | `120s` | how long to keep retrying a failing origin before giving up |
+| `-request-timeout` | `10s` | timeout for one probe request — separate from `-wait` and from the config's own `timeout:`, which is a stage's limit and means something else entirely |
+| `-origin` | none | an extra origin to probe, repeatable; the probe set is `auth.origins` plus every `-origin` given |
+| `-notify` | `true` | on failure, send one Web Push — reusing the VAPID key pair and subscriptions already in the data directory — naming the failing origins. Sends nothing on success |
+
+A `200` or a `401` is a pass (the probe carries no credentials, so a
+challenge means auth itself is answering); a `403`, any other 4xx/5xx, a
+redirect, or a connection failure is a fail. `probe` is a client: it never
+takes the data directory's owner lock, never writes inside it — not even to
+mint a `vapid.json` that does not exist yet, or to prune a subscription the
+push service says is gone — so it is safe to run against a config whose
+engine is live.
+
+`probe` cannot run itself: the restart a deploy schedules is deliberately
+detached (`systemd-run --on-active=30 …`) so it outlives the stage that
+triggered it, and by the time the restart lands, the process that asked for
+it is long gone. Verifying it is therefore one more line an operator adds to
+their own deploy script, scheduled the same detached way, after the restart:
+
+```bash
+systemd-run --on-active=60 --unit=conveyor-probe --collect \
+  /path/to/conveyor probe -c /path/to/conveyor.yaml
+```
+
+Paired with, in `conveyor.service`:
+
+```ini
+Restart=always
+```
+
+`conveyor.service` ships `Restart=on-failure`, which is not what left the
+board down for hours on 2026-09-06 — that failure was `auth.origins`
+rejecting every real route, and `probe` above is what catches it. What
+`on-failure` misses is smaller and separate: the engine can also exit 0 on
+its own, and `on-failure` then leaves it dead, indistinguishable on the board
+from a deliberate stop, until someone notices. `Restart=always` does not mask
+an actual deliberate stop, though: systemd does not restart a service that
+was stopped with `systemctl stop`, whatever `Restart=` says (`systemd.service(5)`) —
+so `always` only ever covers the clean self-exit, the case that left the
+engine sitting dead for 22 minutes with nothing distinguishing it from an
+idle line.
+
+Both of these — the `systemd-run` line and the `Restart=always` change — are
+machine state, not project source, so no PR against this repository can ship
+them; they are pasted in by whoever operates the box.
+
 ## Configuration
 
 ```yaml
@@ -275,6 +355,12 @@ which a comment can change the outcome.
 It never sleeps: an item resting in a script stage has that script re-run every
 poll, so waiting is exit 10, not a blocked process holding a slot.
 
+This gate is a workflow control, not a security boundary: `approve` runs with
+the same repository credentials as `implement` and `review`, and an agent
+holding them could merge directly instead of waiting for it to pass. See
+docs/CONTRACTS.md's section on what a stage script's credentials actually
+reach.
+
 ## Writing a provider
 
 A provider is a folder under `providers/` holding one script per verb:
@@ -313,7 +399,9 @@ sources:
 ```
 
 Credentials are not part of this: the script inherits the ambient environment,
-so `gh`'s existing auth works and no token belongs in a committed config.
+so `gh`'s existing auth works and no token belongs in a committed config. See
+docs/CONTRACTS.md's section on what a stage script's credentials actually
+reach — a worktree isolates a checkout, not credentials or host access.
 
 `providers/github/selfcheck.sh` exercises both scripts against a stubbed `gh`
 and in dry-run, touching no network and no repository.

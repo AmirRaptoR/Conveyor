@@ -107,23 +107,29 @@ func (s *Server) stalled(ctx context.Context, every time.Duration) {
 //
 // Its own goroutine, for the same reason as everything else here: an advance
 // takes as long as a stage does, and the poll must not be behind it.
-func (s *Server) button(ctx context.Context, auto bool) {
+func (s *Server) button(ctx context.Context, mode Mode) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-s.tick:
-			if auto {
+			switch mode {
+			case ModeObserve:
+				// Nothing here ever advances an item, not even a press
+				// reaching this channel directly — the route above it
+				// already refuses, but this is the guarantee, not the route.
+				continue
+			case ModeManual:
+				s.advance(ctx)
+				s.refresh(ctx)
+			default: // auto
 				// "Look again now", so nothing gets to say "not yet".
 				s.mu.Lock()
 				clear(s.resting)
 				clear(s.restingAt)
 				s.mu.Unlock()
 				s.wakeUp()
-				continue
 			}
-			s.advance(ctx)
-			s.refresh(ctx)
 		}
 	}
 }

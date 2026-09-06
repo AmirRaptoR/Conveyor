@@ -356,6 +356,32 @@ It is still not unbounded. Scripts that run in the source's own checkout — a
 A stage script may spawn as many subagents as it likes internally — that is
 invisible to the engine.
 
+### What a stage script's credentials actually reach
+
+Three facts worth being explicit about, because a worktree is easy to
+over-read as a security boundary when it is only a filesystem one:
+
+- **A stage script runs as the conveyor user, with that user's whole ambient
+  environment and credentials** — the same `gh` auth, the same SSH keys, the
+  same cloud credentials any other process that user runs would have. The
+  engine adds nothing to that and takes nothing away from it.
+- **A worktree isolates a checkout, not credentials, network or host access.**
+  It is what lets two items in one repository run at once without one agent's
+  uncommitted work colliding with another's, and nothing more. It does not stop
+  a script from reading another repository, calling an external API, or acting
+  outside the worktree entirely.
+- **The `approve` gate (§"Merging is a gate, not a judgement" in README.md) is
+  a workflow control, not an enforced boundary.** It waits for checks, review
+  threads and a quiet PR before merging — but an agent running with the same
+  credentials `approve` itself uses could merge directly, or push to any other
+  branch it can reach, without going through the gate at all. What stops that
+  from happening is the prompt an adapter writes and the model that reads it,
+  not a permission the engine withholds.
+
+None of this is a defect to fix here: it is what "the extension is the
+scripts" (see the top of this document) means in practice, and a reader
+relying on worktrees or the approve gate as a sandbox should not.
+
 ## 6. Runs and logs
 
 Every script invocation is a **run**, and every run is a self-contained directory.

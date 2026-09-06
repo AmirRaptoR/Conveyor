@@ -44,6 +44,24 @@ export function startableRule(from, into, stages) {
   return !!into && stageDef?.next === into;
 }
 
+// Which controls a given mode offers, as a function of the mode string alone
+// — never of the DOM — so draw() can hide a control the server would only
+// ever 403, rather than offering it and reporting the refusal after the fact.
+// Every mutation route the engine actually gates refuses in observe and only
+// observe (CONTRACTS: manual still takes the tick button), so one flag serves
+// all five controls; they are named individually because that is what a
+// reader checking this against the acceptance criteria wants to see.
+export function controlsForMode(mode) {
+  const enabled = mode !== "observe";
+  return { tick: enabled, unblockAll: enabled, diagnose: enabled, handBack: enabled, dragStart: enabled };
+}
+
+// The same http(s)-only rule paraInline already applies to a report's own
+// `[text](url)` links (report.go's identityLine emits only that scheme), used
+// here for a card's provider link too: escaping markup is not validating a
+// scheme, and a `javascript:` URL from a provider is markup either way.
+export function isHttpUrl(u) { return /^https?:\/\//i.test(u || ""); }
+
 // The stale threshold a source's own lastListedAt is measured against: twice
 // the configured poll interval, floored at 60s so a poll under a minute
 // (this repo's own test configs set poll: 100ms) does not call every source

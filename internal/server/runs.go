@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -239,4 +240,12 @@ func parseLog(s string) []runner.LogLine {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// bodyTooLarge reports whether err came from an http.MaxBytesReader hitting
+// its limit, so the caller can answer 413 rather than the generic 400 a
+// truncated-looking JSON body would otherwise get.
+func bodyTooLarge(err error) bool {
+	var tooLarge *http.MaxBytesError
+	return errors.As(err, &tooLarge)
 }

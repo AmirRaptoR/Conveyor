@@ -1,5 +1,5 @@
 import { $ } from "./dom.js";
-import { startableRule } from "./pure.js";
+import { startableRule, controlsForMode } from "./pure.js";
 import { state, fault, startDoctor } from "./shared.js";
 import { draw, blocks, flushPendingRedraw } from "./board.js";
 
@@ -17,7 +17,8 @@ export let dragging = null, justDragged = false;
 // card by card.
 export const queueOf = el => el.closest(".queue[data-stage]")?.dataset.stage;
 export const stageBy = name => (state?.stages || []).find(st => st.name === name);
-export const startable = (from, into) => startableRule(from, into, state?.stages || []);
+export const startable = (from, into) =>
+  startableRule(from, into, state?.stages || []) && controlsForMode(state?.mode || "auto").dragStart;
 
 // A refusal belongs on the card that was dropped, not in a console: an operator
 // who sees nothing happen concludes the board is broken.

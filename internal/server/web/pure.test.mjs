@@ -12,8 +12,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, staleThresholdMs, sourceDegraded,
+  controlsForMode, isHttpUrl,
 } from "./pure.js";
-
 
 test("focusKeyOf: a card and its .open link are different keys", () => {
   assert.equal(focusKeyOf({ kind: "card", id: "issue-44", control: "card" }), "card:issue-44:card");
@@ -78,6 +78,33 @@ test("startableRule: the first stage into anything but its declared next is refu
 
 test("startableRule: an empty stage list has no first stage to start out of", () => {
   assert.equal(startableRule("backlog", "refining", []), false);
+});
+
+// Compared field by field, not with assert.deepEqual on the whole object:
+// controlsForMode runs inside the vm sandbox, so an object it returns and an
+// object literal written in this file are cross-realm and never
+// reference-equal even with identical own properties.
+const controlFields = ["tick", "unblockAll", "diagnose", "handBack", "dragStart"];
+
+test("controlsForMode: observe offers none of the five mutating controls", () => {
+  const got = controlsForMode("observe");
+  for (const f of controlFields) assert.equal(got[f], false, `${f} in observe`);
+});
+
+test("controlsForMode: auto and manual both offer every control — only observe differs", () => {
+  for (const mode of ["auto", "manual"]) {
+    const got = controlsForMode(mode);
+    for (const f of controlFields) assert.equal(got[f], true, `${f} in ${mode}`);
+  }
+});
+
+test("isHttpUrl: only http and https pass, case-insensitively", () => {
+  assert.equal(isHttpUrl("https://github.com/x/y/issues/1"), true);
+  assert.equal(isHttpUrl("HTTP://example.com"), true);
+  assert.equal(isHttpUrl("javascript:alert(1)"), false);
+  assert.equal(isHttpUrl("data:text/html,<script>1</script>"), false);
+  assert.equal(isHttpUrl(""), false);
+  assert.equal(isHttpUrl(undefined), false);
 });
 
 // ---- staleThresholdMs -------------------------------------------------------

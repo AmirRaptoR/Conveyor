@@ -1,5 +1,5 @@
 import { $, esc } from "./dom.js";
-import { shouldDeferDraw, sourceDegraded } from "./pure.js";
+import { shouldDeferDraw, sourceDegraded, controlsForMode, isHttpUrl } from "./pure.js";
 import { state, clock, fmtBytes, nowMs, focusDescriptor, findFocusTarget } from "./shared.js";
 import { updateRailCtl } from "./rail.js";
 import { openFromHash } from "./device.js";
@@ -103,12 +103,20 @@ export function draw() {
     `<span class="nlabel">${asking.length} need${asking.length === 1 ? "s" : ""} your decision</span>` +
     asking.map(it => `<button class="need" data-id="${esc(it.id)}" data-title="${esc(it.title)}"
       data-stage="${esc(it.stage)}" title="${esc(it.title)}">${esc(it.title)}</button>`).join("");
+  // Which controls this server's mode allows at all — observe refuses every
+  // one of these at the route, so offering them here would be a button that
+  // only ever answers 403.
+  const controls = controlsForMode(state.mode || "auto");
   const all = $("#unblock-all");
-  all.hidden = !marked;
+  all.hidden = !marked || !controls.unblockAll;
   all.textContent = `Unblock all (${marked})`;
   // Diagnose reads a reason before acting, so it is offered wherever a mark
   // exists to read — the same condition as the blunter Unblock all.
-  $("#diagnose").hidden = !marked;
+  $("#diagnose").hidden = !marked || !controls.diagnose;
+  $("#tick").hidden = !controls.tick;
+  const badge = $("#mode-badge");
+  badge.hidden = !state.mode || state.mode === "auto";
+  badge.textContent = state.mode || "";
 
   // A key for the edge colours, and the list of what is enrolled: without it
   // the colours are decoration, because nothing says which repo is which.
@@ -334,8 +342,10 @@ function card(it, active, place) {
       ${hasPrio ? `<span class="prio">p${it.priority}</span>` : ""}
       ${ageChip(it)}
       <span class="src">${esc(it.id)}</span>
-      ${it.url ? `<a class="open" href="${esc(it.url)}" target="_blank" rel="noopener"
-           title="Open on GitHub" aria-label="Open ${esc(it.id)} on GitHub">&#8599;</a>` : ""}
+      ${it.url ? (isHttpUrl(it.url)
+           ? `<a class="open" href="${esc(it.url)}" target="_blank" rel="noopener"
+                title="Open on GitHub" aria-label="Open ${esc(it.id)} on GitHub">&#8599;</a>`
+           : `<span class="open" title="${esc(it.url)}">${esc(it.url)}</span>`) : ""}
     </span>
     ${refusals.has(it.id) ? `<span class="refused">${esc(refusals.get(it.id))}</span>` : ""}
   </article>`;

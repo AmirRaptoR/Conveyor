@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -69,6 +70,10 @@ type State struct {
 	// Active is every transition running right now. The board lights those
 	// stations; without it the page cannot tell work from stillness.
 	Active []Active `json:"active"`
+	// Mode is what this process is willing to do: "auto", "manual" or
+	// "observe" — see Mode. The board reads it to hide a control that would
+	// only ever 403.
+	Mode string `json:"mode"`
 	// Storage is what the run store currently holds and how far back
 	// retention still reaches.
 	Storage StorageView `json:"storage"`
@@ -395,6 +400,16 @@ type Server struct {
 	// would be a queue of duplicates.
 	wake     chan struct{}
 	inFlight atomic.Int64
+	// shutdownWork counts everything drain must wait for that is not a
+	// transition: the loops Run starts (poll, button, schedule, stalled,
+	// sweep), the goroutines a handler spawns that run a script or write a
+	// data file (refresh, runDoctorSweep, unblockAll, a push send), and every
+	// in-flight HTTP request. Tracked apart from inFlight so inFlight keeps
+	// meaning exactly "transitions" for handleState's Running and for
+	// stalled/schedule's own checks, and so drain's give-up message can still
+	// name which items a stuck *transition* belongs to — something this
+	// counter alone cannot say.
+	shutdownWork atomic.Int64
 	// polling guards discovery against itself: the ticker and the button both
 	// ask for it, and running every list script twice at once buys nothing.
 	polling atomic.Bool
@@ -410,6 +425,26 @@ type Server struct {
 	pushKeys *push.Keys
 	pushSubs *push.Store
 
+	// verify bounds the cost of Auth.Check — see authVerifier.
+	verify *authVerifier
+	// mode is what this process is willing to do to the pipeline: auto (the
+	// scheduler drives it), manual (only the tick button does) or observe
+	// (nothing here ever runs a stage, a move or a doctor script). Set once,
+	// by Run, before any goroutine or route can read it.
+	mode Mode
+	// cop rejects unsafe cross-origin requests to every mutation route (F08).
+	// GET/HEAD/OPTIONS are always let through, so SSE and the static board are
+	// untouched.
+	cop *http.CrossOriginProtection
+	// listenHost is the host part of the address Run was given, so a Host
+	// header naming it is accepted alongside loopback and auth.origins.
+	listenHost string
+	// listening is a test seam: when set before Run is called, Run reports the
+	// address it actually bound (addr may be "127.0.0.1:0", letting the OS
+	// pick a port) so a test can dial a real, running server rather than
+	// reaching into its internals. Nil in production; Run skips the send.
+	listening chan string
+
 	// drainGrace bounds Run's shutdown wait, defaulted in New and overridden
 	// only by tests — there is no config key for it, the same way there is
 	// none for the runner's own gracePeriod.
@@ -417,6 +452,7 @@ type Server struct {
 }
 
 func New(cfg *config.Config, r *runner.Runner) *Server {
+	secureDataDir(cfg.DataDir())
 	s := &Server{
 		cfg:        cfg,
 		run:        r,
@@ -444,9 +480,16 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 	s.confirmedAt = map[string]time.Time{}
 	s.sourceGen = map[string]time.Time{}
 	s.answerInfo = map[string]AnswerView{}
+	s.mode = ModeAuto
+	s.verify = newAuthVerifier(s.cfg.Auth.Check)
 	s.listedAt = map[string]time.Time{}
 	s.listErr = map[string]string{}
-	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg, nil, nil), PollNs: cfg.Poll.D()}
+	s.state = State{
+		Stages:  stageViews(cfg),
+		Sources: sourceViews(cfg, nil, nil),
+		Mode:    string(s.mode),
+		PollNs:  cfg.Poll.D(),
+	}
 
 	// Every log line reaches the browser as it is produced. This is the whole
 	// reason logs are a stream and not a file read at the end.
