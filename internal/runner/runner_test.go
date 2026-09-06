@@ -2,9 +2,12 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -100,6 +103,93 @@ func TestTimeoutKillsProcessGroup(t *testing.T) {
 	}
 	if !res.Run.TimedOut {
 		t.Error("TimedOut not set")
+	}
+}
+
+// Cancelling for an ordinary reason — not a deadline — must still reap the
+// group before Run returns. A well-behaved parent exits on TERM, which lets
+// wg.Wait/cmd.Wait return once a resistant descendant has closed the pipes
+// being watched, even though that descendant is still alive; only an
+// unconditional sweep on any cancellation catches it.
+func TestCancellationReapsProcessGroup(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
+	body := `
+trap 'exit 0' TERM
+(
+	trap '' TERM
+	exec >/dev/null 2>&1
+	echo $BASHPID > "` + pidFile + `"
+	sleep 60
+) &
+disown
+sleep 60
+`
+	r := New(t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type outcome struct {
+		res *Result
+		err error
+	}
+	resCh := make(chan outcome, 1)
+	go func() {
+		res, err := r.Run(ctx, Spec{
+			Script: script(t, body), Kind: "stage", Workdir: t.TempDir(), Source: "test",
+		})
+		resCh <- outcome{res, err}
+	}()
+
+	var pid int
+	waitUntil := time.Now().Add(5 * time.Second)
+	for time.Now().Before(waitUntil) {
+		if b, err := os.ReadFile(pidFile); err == nil && len(b) > 0 {
+			if p, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && p > 0 {
+				pid = p
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if pid == 0 {
+		t.Fatal("the TERM-resistant grandchild never recorded its pid")
+	}
+
+	cancel()
+
+	var got outcome
+	select {
+	case got = <-resCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+	if got.err != nil {
+		t.Fatalf("run: %v", got.err)
+	}
+
+	if syscall.Kill(pid, 0) == nil {
+		t.Fatal("the grandchild is still alive after Run returned")
+	}
+
+	if got.res.Run.Outcome != model.OutcomeInterrupted {
+		t.Errorf("outcome = %s, want interrupted", got.res.Run.Outcome)
+	}
+	if got.res.Run.TimedOut {
+		t.Error("TimedOut set for a cancellation that was not a deadline")
+	}
+
+	// The record on disk is what a restarted engine and the board both read —
+	// it has to say the same thing as the in-memory result.
+	b, err := os.ReadFile(filepath.Join(got.res.Run.Dir, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk model.Run
+	if err := json.Unmarshal(b, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.Outcome != model.OutcomeInterrupted || onDisk.TimedOut {
+		t.Errorf("meta.json = {outcome: %s, timedOut: %v}, want {interrupted, false}", onDisk.Outcome, onDisk.TimedOut)
 	}
 }
 
