@@ -349,6 +349,21 @@ func sourceViews(c *config.Config) []SourceView {
 // Run serves until ctx is done. auto drives the pipeline; without it the server
 // only ever reads.
 func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
+	// The board is a control plane: it starts agent runs, reorders work and
+	// hands marked items back. Reaching it is enough to drive every repository
+	// the config enrols, so an open one on a public interface is not a
+	// read-only inconvenience. This refuses rather than warns, because the
+	// mistake it prevents is silent and the fix is one command.
+	//
+	// Checked before anything below starts: the three loops read and write
+	// through ctx, not through this call's error return, so launching them
+	// ahead of a refusal left every one of them running regardless — on
+	// context.Background() if the caller never cancelled it, forever.
+	if !s.cfg.Auth.Enabled() && !loopback(addr) {
+		return fmt.Errorf("refusing to serve %s with no auth: configure auth.users "+
+			"(run `conveyor passwd <name>` for a line to paste) or bind a loopback address", addr)
+	}
+
 	s.ctx = ctx
 	// Three loops, and they are separate on purpose. Discovery must keep its
 	// interval while a 90-minute stage runs, so nothing that waits for work to
@@ -389,16 +404,6 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 		return err
 	}
 	mux.Handle("/", http.FileServer(http.FS(sub)))
-
-	// The board is a control plane: it starts agent runs, reorders work and
-	// hands marked items back. Reaching it is enough to drive every repository
-	// the config enrols, so an open one on a public interface is not a
-	// read-only inconvenience. This refuses rather than warns, because the
-	// mistake it prevents is silent and the fix is one command.
-	if !s.cfg.Auth.Enabled() && !loopback(addr) {
-		return fmt.Errorf("refusing to serve %s with no auth: configure auth.users "+
-			"(run `conveyor passwd <name>` for a line to paste) or bind a loopback address", addr)
-	}
 
 	srv := &http.Server{Addr: addr, Handler: s.authed(mux)}
 	go func() { <-ctx.Done(); _ = srv.Close() }()

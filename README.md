@@ -332,6 +332,33 @@ Logs and data are separate channels on purpose. An AI stage script writes
 megabytes of prose to stdout; treating that as a data channel is how this kind of
 system breaks.
 
+## Running the checks
+
+```bash
+./check
+```
+
+is the one command: `go build`, `go vet`, `go test`, `go test -race`, every
+self-check suite in the tree, `bash -n` over every shell script under
+`agents/` and `providers/`, and `conveyor validate` against the example
+config — in that order, stopping at the first failure and naming it.
+`.github/workflows/check.yml` runs this same script on push and pull request
+against `main`, so CI and local are never two things to keep in sync.
+
+Self-check suites are found by name, not listed: anything called `selfcheck`
+or `selfcheck.sh`, or ending `-selfcheck`/`-selfcheck.sh`, anywhere in the
+tree. Add one and `./check` picks it up on its own.
+
+Adding a browser-free UI interaction test — no browser, no npm install, no
+network — means adding a file named `*.test.mjs` anywhere in the tree, written
+against Node's own `node:test` and `node:assert` (nothing else is
+installed). `internal/server/web/testutil.mjs` has a small helper,
+`loadFunctions`, that pulls a named function straight out of `index.html`'s
+inline script and evaluates it in a sandbox with `node:vm` — no DOM, no
+build step — so a pure function in the board's UI can be tested exactly as
+written; `internal/server/web/format_duration.test.mjs` is a working example.
+`./check` runs every `*.test.mjs` file it finds under `node --test`.
+
 ## Design notes
 
 - **The engine writes provider state before running a stage**, not after. If the
