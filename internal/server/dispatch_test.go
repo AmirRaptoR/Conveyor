@@ -207,3 +207,49 @@ func TestAdvanceOverridesAPausedAgentButStartDoesNot(t *testing.T) {
 		t.Errorf("refusal = %q, want it to name the paused agent", w.Body.String())
 	}
 }
+
+// F02: claim's own atomicity. A refusal must roll back exactly what it
+// already took — nothing more, nothing less — whether it is refused because
+// the item is already claimed or because the (source, stage) slot has none
+// free, checked directly against Locks().Snapshot() and a working probe
+// rather than inferred from a whole dispatch's end state.
+func TestClaimRollsBackExactlyWhatItTook(t *testing.T) {
+	cfg, r := slowBoardFor(t, "0.1")
+	s := New(cfg, r)
+	s.ctx = context.Background()
+	item := model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"}
+
+	// Exhaust the (source, stage) slot directly (capacity 2), bypassing
+	// claim, so the claim under test is refused only on the slot.
+	if !s.eng.Locks().TryAcquire("s1", "working") || !s.eng.Locks().TryAcquire("s1", "working") {
+		t.Fatal("could not exhaust the slot ahead of the claim under test")
+	}
+	beforeSrc, beforeStage, beforeGlobal, _, _, _ := s.eng.Locks().Snapshot()
+
+	if got := s.claim(item, "working", false); got != claimSlotBusy {
+		t.Fatalf("claim() = %v, want claimSlotBusy", got)
+	}
+	if _, held := s.working.Load(item.ID); held {
+		t.Error("working still holds the item after a slot refusal — the item claim was not rolled back")
+	}
+	afterSrc, afterStage, afterGlobal, _, _, _ := s.eng.Locks().Snapshot()
+	if afterSrc["s1"] != beforeSrc["s1"] || afterStage["working"] != beforeStage["working"] || afterGlobal != beforeGlobal {
+		t.Errorf("locks changed across a refused claim: before src=%d stage=%d global=%d, after src=%d stage=%d global=%d",
+			beforeSrc["s1"], beforeStage["working"], beforeGlobal, afterSrc["s1"], afterStage["working"], afterGlobal)
+	}
+	s.eng.Locks().Release("s1", "working")
+	s.eng.Locks().Release("s1", "working")
+
+	// The item already claimed: the slot must never even be touched, so a
+	// second refusal reason must leave Locks completely untouched too.
+	s.working.Store(item.ID, struct{}{})
+	beforeSrc2, beforeStage2, beforeGlobal2, _, _, _ := s.eng.Locks().Snapshot()
+	if got := s.claim(item, "working", false); got != claimItemBusy {
+		t.Fatalf("claim() = %v, want claimItemBusy", got)
+	}
+	afterSrc2, afterStage2, afterGlobal2, _, _, _ := s.eng.Locks().Snapshot()
+	if afterSrc2["s1"] != beforeSrc2["s1"] || afterStage2["working"] != beforeStage2["working"] || afterGlobal2 != beforeGlobal2 {
+		t.Error("claim() acquired the slot even though the item claim was already refused")
+	}
+	s.working.Delete(item.ID)
+}
