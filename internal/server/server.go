@@ -226,6 +226,14 @@ type Server struct {
 	// the durable record, this is only the index into them a board read
 	// cannot afford to rebuild.
 	times map[string]ItemTime
+	// everSwept is whether the retention sweep has ever actually deleted a
+	// run. It is what tells a run ID that resolves to nothing apart from "it
+	// never existed" (404) from "it is gone because retention removed it"
+	// (410) — an arbitrary lookup cutoff used to conflate the two.
+	everSwept bool
+	// sweepHorizon is the oldest day the last sweep left standing, named in a
+	// 410 so an operator knows how far back retention still reaches.
+	sweepHorizon time.Time
 	// paused is the agents the scheduler is holding work back from, by name.
 	//
 	// Not persisted, deliberately: it is a fact about the outside world right
@@ -1611,20 +1619,87 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	runs, err := s.listRuns("", 500)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if !runner.ValidID(id) {
+		// Never interpret an arbitrary request path as a filesystem path: a
+		// malformed id is rejected before it is joined onto anything.
+		http.Error(w, "invalid run id", http.StatusBadRequest)
 		return
 	}
-	for _, run := range runs {
-		if run.ID == id {
-			b, _ := os.ReadFile(filepath.Join(run.Dir, "log.txt"))
-			run.Lines = parseLog(string(b))
-			writeJSON(w, run)
+	run, ok := s.findRun(id)
+	if !ok {
+		s.mu.RLock()
+		swept := s.everSwept
+		horizon := s.sweepHorizon
+		s.mu.RUnlock()
+		if swept {
+			// Genuinely honest but coarse: day directories are the unit of
+			// retention and no per-run tombstone is kept, so this cannot
+			// prove the id was swept rather than never having existed — only
+			// that runs before the horizon are gone. See CONTRACTS §6.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":   "retained",
+				"horizon": horizon.Format("2006-01-02"),
+			})
 			return
 		}
+		http.NotFound(w, r)
+		return
 	}
-	http.NotFound(w, r)
+	b, _ := os.ReadFile(filepath.Join(run.Dir, "log.txt"))
+	run.Lines = parseLog(string(b))
+	writeJSON(w, run)
+}
+
+// findRun resolves a run ID directly against the run root: the ID is the run
+// directory's own name (runner.Run's leaf), so the lookup is a stat per day
+// directory rather than a walk that reads every meta.json to find a match —
+// O(retained days), not O(retained runs). id is assumed already validated by
+// runner.ValidID; findRun additionally refuses a match that turns out to be a
+// symlink escaping the run root.
+func (s *Server) findRun(id string) (RunMeta, bool) {
+	root := s.run.Root
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return RunMeta{}, false
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		resolvedRoot = absRoot
+	}
+	days, err := os.ReadDir(root)
+	if err != nil {
+		return RunMeta{}, false
+	}
+	for _, day := range days {
+		if !day.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, day.Name(), id)
+		fi, err := os.Stat(dir)
+		if err != nil || !fi.IsDir() {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			continue
+		}
+		if resolved != resolvedRoot && !strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator)) {
+			continue // a symlink inside the run root pointing outside it
+		}
+		b, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+		if err != nil || len(b) == 0 {
+			continue
+		}
+		var m RunMeta
+		if json.Unmarshal(b, &m) != nil {
+			continue
+		}
+		m.Dir = dir
+		return m, true
+	}
+	return RunMeta{}, false
 }
 
 // listRuns walks the run root newest-day-first and stops once it has enough.

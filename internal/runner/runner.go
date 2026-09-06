@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"syscall"
 	"time"
@@ -91,6 +92,16 @@ type Runner struct {
 const gracePeriod = 30 * time.Second
 
 func New(root string) *Runner { return &Runner{Root: root} }
+
+// idRe is the shape Run() gives a run ID: HHMMSS.mmm-<base36 suffix>. A
+// caller resolving an ID from a request path must reject anything else before
+// it ever becomes part of a filesystem path — "../", an absolute path, an
+// encoded separator and an empty string all fail this and touch no file.
+var idRe = regexp.MustCompile(`^[0-9]{6}\.[0-9]{3}-[0-9a-z]{1,10}$`)
+
+// ValidID reports whether id has the shape Run() gives a run — the only
+// vocabulary a request is allowed to name a run in.
+func ValidID(id string) bool { return idRe.MatchString(id) }
 
 // Run executes the script and returns only after the run directory is complete.
 // A non-zero exit is NOT a Go error: it is an outcome, carried in Result.Run.
