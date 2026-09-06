@@ -210,7 +210,12 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   reason comes from the run that marked it and is recovered from run history
   after a restart — never from a label, and never by parsing a log. A red card
   that cannot say what it is waiting for sends the reader to the logs, which is
-  the trip the mark exists to save.
+  the trip the mark exists to save. The one exception is a mark no run in this
+  pipeline produced: a listing may supply its own reason (`blockReason` on the
+  item) for a mark it decided on itself — a closed issue found sitting in a
+  non-terminal stage, say. A recovered run-history reason always wins when
+  there is one; the listing's is only the fallback for the gap where no run
+  explains the mark at all.
 - **Only a person clears a mark**, with two exceptions, and both are the outside
   world coming back rather than a decision being made. `retryStalled:` clears
   them all when *every* item is marked and the line cannot move at all — the
@@ -260,6 +265,15 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   by `finishedAt` descending instead, which is also what merges every source's
   closed work into one ledger rather than one newest-first block per
   repository. The board draws ten and offers the rest ten at a time.
+- **Open-issue discovery does not truncate before it filters.** `list.sh` asks
+  `gh` once per enrolling label — every mapped stage label, the mark, the
+  onboarding tag — and unions the results, rather than one `--state open`
+  call capped at `LIMIT` before enrolment is even checked. Older enrolled work
+  can no longer be pushed off the page by newer unrelated issues; a label-scoped
+  call is server-side filtered; there is nothing to push it behind. Closed
+  history stays a single listing, but is sorted newest-`closedAt`-first
+  *before* `CLOSED_LIMIT` cuts it down, so that is the N most recently closed
+  rather than an arbitrary N `gh` happened to return first.
 - **`list` reads closed issues it labelled, and only those.** A finished item is
   a closed issue — the pull request says `Closes #N` — so listing open ones
   alone left the last stages empty: an item did not arrive in `done`, it
@@ -267,6 +281,13 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   handed over but carries no stage label yet is new work and lands in
   `DEFAULT_STAGE`; a *closed* one with no stage label is finished, and letting
   the onboarding tag alone put it back would re-list it as new work every poll.
+  A closed issue that *does* carry a mapped stage label is only "finished" if
+  that stage is terminal — `ListInput` carries `terminalStages` alongside
+  `stages` for exactly this, so a list script never keeps its own copy of the
+  stage graph. One whose mapped stage is not terminal stopped mid-flight
+  (someone closed it by hand, say) rather than finished: it keeps that stage
+  and is marked, with a `blockReason` a person can read on the card, instead of
+  being silently reported as work the pipeline never actually completed.
 - **Listing is opt-in, and there is no way to opt out.** Three labels put an
   issue on the board and nothing else does: a mapped stage label (the pipeline
   put it there), the `BLOCKED_LABEL` (it stopped there), or the bare onboarding

@@ -31,6 +31,11 @@ arrive in this shape.
   "blocked": false,             // a MARK, not a stage. true means a human must
                                 // decide, and the item stays exactly where it
                                 // is. The scheduler never picks a marked item.
+  "blockReason": null,          // optional. A reason for `blocked` the LISTING
+                                // itself supplies — for a mark no run in this
+                                // pipeline produced, so there is nothing to
+                                // recover from run history (§6). A recovered
+                                // run reason always wins when there is one.
   "priority": 2,                // 0 = most urgent. null = unranked.
   "assignee": null,
   "createdAt": "2026-08-20T10:00:00Z",
@@ -63,7 +68,7 @@ author learns it once.
 
 | | |
 | --- | --- |
-| `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "blocked": false, "config": {...}}`, plus `"answer"` and `"session"` when this run follows a stop a person answered (§5a). For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "config": {...}}` |
+| `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "blocked": false, "config": {...}}`, plus `"answer"` and `"session"` when this run follows a stop a person answered (§5a). For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "terminalStages": ["done"], "config": {...}}` — `terminalStages` is which of `stages` are terminal, so a list script can tell a finished item from one that merely stopped without keeping its own copy of the stage graph in source `env:` |
 | env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, `CONVEYOR_DEADLINE` (§4b), plus everything in the source's `env:` block |
 
 **Output** is split deliberately:
@@ -410,7 +415,12 @@ about to become a label on someone's issue tracker.
 item is marked; *why* is the engine's own note, taken from the run that marked
 it and recovered from run history after a restart. A red card that cannot say
 what it is waiting for sends the reader to the logs, which is the trip the mark
-exists to save. A mark someone applied by hand has no run behind it, and says so.
+exists to save. A mark someone applied by hand has no run behind it, and says so
+— unless the listing itself supplied a reason (`blockReason` on the item, §1),
+for a mark this pipeline decided on during listing rather than during a stage
+run (a closed issue found sitting in a non-terminal stage, say). A recovered
+run-history reason always wins when one exists; the listing's reason is only
+the fallback for the gap where no run explains the mark at all.
 
 **A stop is either a question or a condition**, and the script says which. A
 condition — out of quota, a dirty checkout, a network that was down — may have
