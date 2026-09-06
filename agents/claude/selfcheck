@@ -187,4 +187,30 @@ chk "nor is reading the model"               "$(claude_model >/dev/null; echo $?
 record_session
 chk "record_session gets a session out of it" "$(jq -r .session "$CONVEYOR_RESULT")" "sess-long"
 
+# 18. hit_limit tells the CLI refusing to run from the model talking about a
+#     refusal. Both are in $CLAUDE_SAID and only the first one is ours: the
+#     mark it produces pauses every claude stage on the board, so reading the
+#     second as the first stops the whole line over someone else's quota.
+printf '%s\n' "You've hit your session limit · resets 8:30pm (UTC)" >"$CLAUDE_SAID"
+chk "the CLI's own refusal is recognised" "$(hit_limit && echo yes)" "yes"
+
+# The same line where it really appears: last, after a run's worth of output.
+printf '%s\n' 'Analyzer clean. Now the real gate:' '  · Bash: dart test test/feed/' \
+	"You've hit your weekly limit · resets Sep 8th (UTC)" >"$CLAUDE_SAID"
+chk "recognised at the end of a real transcript" "$(hit_limit && echo yes)" "yes"
+
+# The regression: a refine that finished its work and then explained why Codex
+# could not run. Quoting a quota error is not hitting one.
+printf '%s\n' '**Codex did not run.** Same block as before — the account is over its limit' \
+	'until 2026-09-08 (`ERROR: You'"'"'ve hit your usage limit... try again at Sep 8th`).' \
+	'Per the skill'"'"'s one-round rule the spec ships without it.' >"$CLAUDE_SAID"
+chk "the model quoting a quota error is not one" "$(hit_limit && echo yes)" ""
+
+# The typographic apostrophe the CLI may render instead of the plain one.
+printf '%s\n' "You’ve hit your usage limit · resets 1:30am (UTC)" >"$CLAUDE_SAID"
+chk "a curly apostrophe is still recognised" "$(hit_limit && echo yes)" "yes"
+
+: > "$CLAUDE_SAID"
+chk "an empty transcript is not a quota stop" "$(hit_limit && echo yes)" ""
+
 exit $fail
