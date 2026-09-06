@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -611,4 +612,80 @@ func SweepInterrupted(root string) (int, error) {
 		}
 	}
 	return n, errors.Join(errs...)
+}
+
+// WriteMeta rewrites a run's own meta.json in place, after the fact — used to
+// record the durable pending-transition fact (F04) against the stage run
+// that produced it: NextStage, MoveConfirmed, MoveAttempts. run.Dir must
+// already be set, as it is on anything this package returned.
+//
+// The same write the run's own two go through, deliberately: this is a third
+// writer of the same file, and everything writeMeta does to it — redacting
+// every non-CONVEYOR_ env value, 0o600, the temp-and-rename that keeps a
+// failed write from truncating what was there — is a property of the file,
+// not of the moment it is written. Marshalling `run` straight to disk here
+// instead published the source's env: and params: in the clear over
+// GET /api/runs, on the one run kind that carries a stage's own tokens.
+func WriteMeta(run *model.Run) error {
+	if run.Dir == "" {
+		return errors.New("runner: WriteMeta: run has no directory")
+	}
+	return writeMeta(run, run.Dir)
+}
+
+// PendingMove finds the most recent stage run for an item, at the given
+// stage, that finished successfully but whose outgoing move to another stage
+// was never confirmed — the durable fact a recovering Advance needs to retry
+// only that move instead of re-running a stage that already succeeded.
+//
+// Newest first: a stage retried more than once leaves one run per attempt,
+// and only the latest's pending move is still current. Runs newer than it for
+// the same item and stage that are NOT pending (script failed outright, or a
+// person re-queued it) mean recovery has moved past this one, so the walk
+// stops at the first stage run for this item and stage, pending or not.
+func PendingMove(root, itemID, stage string) (model.Run, bool) {
+	days, err := os.ReadDir(root)
+	if err != nil {
+		return model.Run{}, false
+	}
+	dayNames := make([]string, 0, len(days))
+	for _, d := range days {
+		if d.IsDir() {
+			dayNames = append(dayNames, d.Name())
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(dayNames)))
+	for _, day := range dayNames {
+		entries, err := os.ReadDir(filepath.Join(root, day))
+		if err != nil {
+			continue
+		}
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			if e.IsDir() {
+				names = append(names, e.Name())
+			}
+		}
+		sort.Sort(sort.Reverse(sort.StringSlice(names)))
+		for _, name := range names {
+			dir := filepath.Join(root, day, name)
+			b, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+			if err != nil || len(b) == 0 {
+				continue
+			}
+			var run model.Run
+			if json.Unmarshal(b, &run) != nil {
+				continue
+			}
+			if run.Kind != "stage" || run.ItemID != itemID || run.To != stage {
+				continue
+			}
+			run.Dir = dir
+			if run.Outcome == model.OutcomeSuccess && run.NextStage != "" && !run.MoveConfirmed {
+				return run, true
+			}
+			return model.Run{}, false
+		}
+	}
+	return model.Run{}, false
 }

@@ -267,6 +267,17 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 		return tr, nil
 	}
 
+	// A recovery re-entry into the very stage the item is already in (F04):
+	// if the last run of this stage for this item already succeeded and only
+	// its outgoing move never got confirmed, the stage does not run again —
+	// only the move is retried. Re-running a stage script that already did
+	// its work is the side effect this exists to stop.
+	if to == from {
+		if pending, ok := runner.PendingMove(e.runner.Root, item.ID, to); ok {
+			return e.resumePendingMove(ctx, client, item, tr, pending)
+		}
+	}
+
 	src := mustSource(e.cfg, srcName)
 	script, ok := src.Paths[stage.Script]
 	timeout := timeoutFor(src, stage)
@@ -278,35 +289,56 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 		script, ok = "", true // written into the run directory instead
 		env = src.Env
 	}
+
+	// res always ends up non-nil below unless the failure is one route() has
+	// no run record to route through at all (the run directory itself could
+	// not be created) — everything else, including a script that could not be
+	// started and a source that declares none, is a stage outcome like any
+	// other and must count toward maxAttempts rather than being retried
+	// forever uncounted or returned before an attempt is recorded.
+	var res *runner.Result
+	var runErr error
 	if !ok {
 		// resolveSources already recorded why, and Engine skips unhealthy
 		// sources — reaching here means one went bad after load.
-		tr.Outcome = model.OutcomeFailure
-		tr.Err = fmt.Errorf("source %q declares no script named %q", srcName, stage.Script)
-		return tr, tr.Err
+		msg := fmt.Sprintf("source %q declares no script named %q", srcName, stage.Script)
+		runErr = errors.New(msg)
+		res = &runner.Result{Run: model.Run{
+			Source: srcName, ItemID: item.ID, Kind: "stage", From: from, To: to,
+			Outcome: model.OutcomeFailure, Error: msg,
+		}}
+	} else {
+		res, runErr = e.runner.Run(ctx, runner.Spec{
+			Script:  script,
+			Inline:  stage.Run,
+			Kind:    "stage",
+			Workdir: e.cfg.Workdir(mustSource(e.cfg, srcName)),
+			Env:     env,
+			Source:  srcName,
+			Item:    item,
+			From:    from,
+			To:      to,
+			Timeout: timeout,
+			Stdin:   model.StageInput{Item: item, Stage: to, From: from, Answer: resume.Answer, Session: resume.Session},
+		})
+		if runErr != nil && res == nil {
+			// A genuine infrastructure failure before the script had any
+			// chance to run — its own run directory could not even be
+			// created. There is no run record to route through, so this
+			// cannot be counted as an attempt or marked; the caller is left
+			// to decide how to back off.
+			tr.Err = runErr
+			tr.Outcome = model.OutcomeFailure
+			return tr, runErr
+		}
 	}
 
-	res, err := e.runner.Run(ctx, runner.Spec{
-		Script:  script,
-		Inline:  stage.Run,
-		Kind:    "stage",
-		Workdir: e.cfg.Workdir(mustSource(e.cfg, srcName)),
-		Env:     env,
-		Source:  srcName,
-		Item:    item,
-		From:    from,
-		To:      to,
-		Timeout: timeout,
-		Stdin:   model.StageInput{Item: item, Stage: to, From: from, Answer: resume.Answer, Session: resume.Session},
-	})
-	if err != nil {
-		tr.Err = err
-		tr.Outcome = model.OutcomeFailure
-		return tr, err
-	}
 	tr.Outcome = res.Run.Outcome
 	tr.RunID = res.Run.ID
 	tr.RunDir = res.Run.Dir
+	if runErr != nil {
+		tr.Err = runErr
+	}
 
 	next, mark := e.route(stage, res, item.ID, tr)
 	tr.Next = next
@@ -324,16 +356,71 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 			return tr, err
 		}
 		tr.Item = *item
-		return tr, nil
+		return tr, runErr
 	}
 	if next == "" || next == to {
-		return tr, nil
+		return tr, runErr
 	}
+	// Recorded against this run before the write is even attempted: if the
+	// process dies between here and the move landing, the next recovery pass
+	// still finds NextStage set and knows the script does not need re-running
+	// — only the move does.
+	res.Run.NextStage = next
+	_ = runner.WriteMeta(&res.Run)
 	if _, err := client.Move(ctx, item, next, source.Mark{}); err != nil {
 		tr.Err = err
 		return tr, err
 	}
+	res.Run.MoveConfirmed = true
+	_ = runner.WriteMeta(&res.Run)
 	tr.Item = *item
+	return tr, runErr
+}
+
+// maxMoveAttempts bounds how many times resumePendingMove retries an
+// outgoing write that keeps failing after its stage already succeeded,
+// before marking the item so a person decides. Not configuration — a
+// provider write either recovers in a poll or two or it needs a person,
+// and this is the same order of magnitude as the rest of the engine's
+// fixed retry constants (CLAUDE.md: RESUME_MAX_ATTEMPTS).
+const maxMoveAttempts = 3
+
+// resumePendingMove retries only the outgoing move a previous, successful run
+// of this stage left unconfirmed (F04) — never the stage script itself.
+func (e *Engine) resumePendingMove(ctx context.Context, client *source.Client, item *model.Item, tr *Transition, pending model.Run) (*Transition, error) {
+	tr.Outcome = model.OutcomeSuccess
+	tr.RunID = pending.ID
+	tr.RunDir = pending.Dir
+	next := pending.NextStage
+
+	if _, err := client.Move(ctx, item, next, source.Mark{}); err != nil {
+		pending.MoveAttempts++
+		tr.Attempts = pending.MoveAttempts
+		tr.Err = err
+		if pending.MoveAttempts >= maxMoveAttempts {
+			mark := source.Mark{Blocked: true, Kind: "error",
+				Reason: fmt.Sprintf("%s: the stage finished but moving it on to %s kept failing: %s", pending.To, next, err)}
+			if _, mErr := client.Move(ctx, item, pending.To, mark); mErr == nil {
+				tr.Item = *item
+				tr.Blocked = true
+				tr.Reason = mark.Reason
+				tr.Kind = mark.Kind
+				// Marked: this pending move is settled one way or another,
+				// so it must not be found and retried again.
+				pending.MoveConfirmed = true
+				_ = runner.WriteMeta(&pending)
+				return tr, err
+			}
+			// The mark itself could not be written either; leave the
+			// pending record as is and let the next poll try again.
+		}
+		_ = runner.WriteMeta(&pending)
+		return tr, err
+	}
+	pending.MoveConfirmed = true
+	_ = runner.WriteMeta(&pending)
+	tr.Item = *item
+	tr.Next = next
 	return tr, nil
 }
 
@@ -410,7 +497,15 @@ func Marked(stage string, run model.Run, data json.RawMessage, timeout time.Dura
 			m.Kind = "error"
 		}
 		if m.Reason == "" {
-			m.Reason = fmt.Sprintf("%s failed (exit %d)", stage, run.ExitCode)
+			// run.Error is set when the script could not be run at all
+			// (missing, not executable, or the source declares none) —
+			// "exit -1" or "exit 0" would say nothing true about a script
+			// that never started, so this is preferred whenever it is set.
+			if run.Error != "" {
+				m.Reason = fmt.Sprintf("%s: %s", stage, run.Error)
+			} else {
+				m.Reason = fmt.Sprintf("%s failed (exit %d)", stage, run.ExitCode)
+			}
 			if attempts > 1 {
 				m.Reason += fmt.Sprintf(" on attempt %d", attempts)
 			}

@@ -95,6 +95,9 @@ func (c *Client) validate(in []model.Item) ([]model.Item, []Warning) {
 		case it.ID == "":
 			warns = append(warns, Warning{Reason: fmt.Sprintf("items[%d] has no id; skipped", i)})
 			continue
+		case it.Ref == "":
+			warns = append(warns, Warning{Reason: fmt.Sprintf("items[%d] has no ref; skipped", i)})
+			continue
 		case seen[it.ID]:
 			warns = append(warns, Warning{ItemID: it.ID, Reason: "duplicate id in one listing; first wins"})
 			continue

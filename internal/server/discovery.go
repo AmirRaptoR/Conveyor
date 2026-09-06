@@ -126,6 +126,7 @@ func (s *Server) button(ctx context.Context, mode Mode) {
 				// "Look again now", so nothing gets to say "not yet".
 				s.mu.Lock()
 				clear(s.resting)
+				clear(s.restingAt)
 				s.mu.Unlock()
 				s.wakeUp()
 			}
@@ -221,18 +222,34 @@ func (s *Server) refresh(ctx context.Context) {
 		if !ok {
 			continue
 		}
+		// Stamped immediately before this source's own List call, not once
+		// for the whole refresh: a slow source earlier in the loop must not
+		// make this source's fresh listing look like it began before a
+		// transition that actually completed while the slow one was still
+		// running (F03).
+		genStart := time.Now()
+		s.mu.Lock()
+		s.sourceGen[src.Name] = genStart
+		s.mu.Unlock()
 		res, err := client.List(ctx)
 		if err != nil {
 			warnings = append(warnings, src.Name+": "+err.Error())
 			failedNow[src.Name] = err.Error()
+			// A failed listing is no information about this source, not a
+			// signal that its work vanished: keep what was already known
+			// about it rather than have the wholesale assignment below wipe
+			// it off the board. A *successful* listing that genuinely omits
+			// an item still removes it — tombstones remain out of scope.
+			items = append(items, s.mergeSourceListing(src.Name, genStart, nil, true)...)
 			continue
 		}
 		listedNow[src.Name] = time.Now()
 		for _, w := range res.Warnings {
 			warnings = append(warnings, src.Name+": "+w.String())
 		}
-		items = append(items, res.Items...)
+		items = append(items, s.mergeSourceListing(src.Name, genStart, res.Items, false)...)
 	}
+	items = dedupeCrossSource(items, func(msg string) { warnings = append(warnings, msg) })
 
 	s.askAgents(ctx)
 	s.recallBlocks(items)
@@ -258,8 +275,27 @@ func (s *Server) refresh(ctx context.Context) {
 	s.state.Storage = storage
 	s.state.PollNs = s.cfg.Poll.D()
 	// The listing every deferred stage was waiting for. Whatever it exited 10
-	// over has had a poll interval to change.
-	clear(s.resting)
+	// over has had a poll interval to change — but only for an item whose
+	// deferral was set *before* its source's own listing began (F03). One set
+	// by a transition that completed after that listing began is not yet
+	// answered by it: the listing may well have reported that transition's
+	// pre-image, and clearing the deferral would have the scheduler retry a
+	// stage the item is not actually resting in front of anymore, or retry an
+	// infrastructure failure the listing never had a chance to resolve.
+	srcOf := make(map[string]string, len(items))
+	for _, it := range items {
+		srcOf[it.ID] = it.Source
+	}
+	for id := range s.resting {
+		src, onBoard := srcOf[id]
+		gen, knownGen := s.sourceGen[src]
+		since, haveSince := s.restingAt[id]
+		if onBoard && knownGen && haveSince && since.After(gen) {
+			continue // the listing that just landed predates this deferral
+		}
+		delete(s.resting, id)
+		delete(s.restingAt, id)
+	}
 	// A mark cleared on the provider — a label removed by hand — takes its
 	// note with it. The provider is the authority on whether, always.
 	marked := map[string]bool{}
@@ -282,8 +318,119 @@ func (s *Server) refresh(ctx context.Context) {
 			delete(s.times, id)
 		}
 	}
+	for id := range s.transitionErrs {
+		if !onBoard[id] {
+			delete(s.transitionErrs, id)
+		}
+	}
+	for id := range s.confirmedAt {
+		if !onBoard[id] {
+			delete(s.confirmedAt, id)
+		}
+	}
+	for id := range s.answerInfo {
+		if !onBoard[id] {
+			delete(s.answerInfo, id)
+		}
+	}
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
+}
+
+// mergeSourceListing reconciles one source's listing (fresh may be nil, for a
+// failed List) against the board's own live cache, so that a listing which
+// began before a transition completed cannot publish that transition's
+// pre-image (F03). genStart is when this source's List call began.
+//
+// The rule is by *when* the listing began, never by what it says: an item
+// reported differently by a listing that began after the transition
+// completed — a person moved it by hand — is trusted, even though its content
+// disagrees with the transition. Only a listing that began earlier is
+// refused, because it may be reporting what the provider looked like before
+// the transition wrote to it.
+func (s *Server) mergeSourceListing(src string, genStart time.Time, fresh []model.Item, failed bool) []model.Item {
+	s.mu.RLock()
+	cached := make(map[string]model.Item, len(s.state.Items))
+	for _, it := range s.state.Items {
+		if it.Source == src {
+			cached[it.ID] = it
+		}
+	}
+	s.mu.RUnlock()
+
+	if failed {
+		// No information about this source at all, not a signal that its
+		// work vanished: keep everything already known about it.
+		out := make([]model.Item, 0, len(cached))
+		for _, it := range cached {
+			out = append(out, it)
+		}
+		return out
+	}
+
+	out := make([]model.Item, 0, len(fresh)+len(cached))
+	seen := make(map[string]bool, len(fresh))
+	for _, it := range fresh {
+		seen[it.ID] = true
+		s.mu.RLock()
+		confirmedAt, haveConfirmed := s.confirmedAt[it.ID]
+		s.mu.RUnlock()
+		if haveConfirmed && confirmedAt.After(genStart) {
+			// A transition finished after this listing began: trust the
+			// cache, which already holds that transition's own outcome,
+			// over content this listing may have read beforehand.
+			if cur, ok := cached[it.ID]; ok {
+				out = append(out, cur)
+				continue
+			}
+		}
+		out = append(out, it)
+	}
+	// An item this source previously reported that the fresh listing does not
+	// (or could not, on a failed List) is normally gone — a successful
+	// listing that genuinely omits an item still removes it; tombstones stay
+	// out of scope. But its absence here is not new information when a
+	// transition for it is still running, or completed after this listing
+	// began: the listing did not include it because it was not done yet, not
+	// because the provider stopped reporting it.
+	for id, cur := range cached {
+		if seen[id] {
+			continue
+		}
+		if _, working := s.working.Load(id); working {
+			out = append(out, cur)
+			continue
+		}
+		s.mu.RLock()
+		confirmedAt, haveConfirmed := s.confirmedAt[id]
+		s.mu.RUnlock()
+		if haveConfirmed && confirmedAt.After(genStart) {
+			out = append(out, cur)
+		}
+	}
+	return out
+}
+
+// dedupeCrossSource enforces CONTRACTS.md §1's duplicate-id rule across the
+// whole poll, not merely within one source's own listing.
+// source.Client.validate already catches a source repeating its own id; this
+// catches two different sources emitting the same one. The server keys
+// working, blocks, times and the manual order by the bare id, and a second
+// source silently sharing it would have all of those disagree about which
+// item a given id names. First in configuration order wins, matching the
+// single-source rule, because items arrive here in that same order.
+func dedupeCrossSource(items []model.Item, warn func(string)) []model.Item {
+	winner := make(map[string]string, len(items)) // id -> the source that kept it
+	out := make([]model.Item, 0, len(items))
+	for _, it := range items {
+		if src, dup := winner[it.ID]; dup {
+			warn(fmt.Sprintf("%s: duplicate id %q also reported by %s; %s wins", it.Source, it.ID, src, src))
+			continue
+		}
+		winner[it.ID] = it.Source
+		out = append(out, it)
+	}
+	return out
 }
 
 // askAgents runs each agent's status script and collects what it says.

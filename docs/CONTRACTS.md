@@ -47,7 +47,11 @@ arrive in this shape.
 Rules the engine enforces:
 
 - Unknown `stage` → the item is rejected and logged, not silently dropped.
-- Duplicate `id` within one poll → first wins, the collision is logged.
+- Missing `ref` → the item is rejected and logged, the same as a missing `id`.
+- Duplicate `id` within one poll → first wins, the collision is logged. This is
+  enforced across every source's listing, not merely within one source's own —
+  the engine keys `working`, marks, timers and the manual order by the bare id,
+  and two sources cannot be trusted not to collide.
 - An item that disappears from a source is marked gone, not deleted, so its run
   history survives.
 - A marked item is never picked. That is the whole mechanism by which a stage
@@ -98,7 +102,12 @@ finished transition wakes the scheduler, and the item that just exited 10 has
 not moved — it is still the best candidate in the stage it never left, so
 without this it is picked again immediately and the "try again later" it asked
 for arrives two seconds later, forever. A stage that deferred is skipped until
-the next listing lands; a person pressing the tick button clears that too.
+its source's next listing lands — specifically, a listing that *began* after
+the deferral was set; one already in flight when the deferral was set has not
+had the chance to answer it yet and leaves the item resting. A person pressing
+the tick button clears every deferral regardless of timing: that gesture means
+"look again now", and honouring one against it would answer a person with
+nothing.
 
 A blocked script may say why: `{"blocked": true, "reason": "…"}` in
 `$CONVEYOR_RESULT`. The engine passes the reason to `move`, and a provider that

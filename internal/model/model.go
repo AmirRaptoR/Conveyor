@@ -119,6 +119,20 @@ type Run struct {
 	Dir  string            `json:"-"`
 	Env  map[string]string `json:"env,omitempty"`
 	Item *Item             `json:"item,omitempty"`
+
+	// NextStage, MoveConfirmed and MoveAttempts are the durable pending-
+	// transition record (F04): a stage run that finished successfully but
+	// whose *outgoing* move to NextStage has not yet been confirmed. Written
+	// against the run that produced them, not a new store — CONTRACTS §6
+	// already makes a run directory self-contained, and this is one more
+	// fact about the run it belongs to. A recovery that finds NextStage set
+	// and MoveConfirmed false retries only the move, never the script that
+	// already succeeded; MoveAttempts bounds that retry so a provider that
+	// keeps refusing the write eventually marks the item instead of retrying
+	// forever.
+	NextStage     string `json:"nextStage,omitempty"`
+	MoveConfirmed bool   `json:"moveConfirmed,omitempty"`
+	MoveAttempts  int    `json:"moveAttempts,omitempty"`
 }
 
 // StageInput is the JSON piped to a stage or move script's stdin.

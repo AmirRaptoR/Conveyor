@@ -79,15 +79,19 @@ func TestAnsweringCapturesTheSessionBeforeTheMarkIsCleared(t *testing.T) {
 		t.Error("the mark survived being answered")
 	}
 
-	got := s.answers.Take("s1:1")
+	got := s.answers.Get("s1:1")
 	if got.Answer != "no, keep backwards compatibility" {
 		t.Errorf("answer = %q, want the reply that was typed", got.Answer)
 	}
 	if got.Session != "sess-abc" {
 		t.Errorf("session = %q, want sess-abc: the conversation was lost with the mark", got.Session)
 	}
+	spent, err := s.answers.Take("s1:1", got)
+	if err != nil || !spent {
+		t.Fatalf("Take(%v) = (%v, %v), want (true, nil)", got, spent, err)
+	}
 	// Said once. A second run of the stage is not a second question.
-	if again := s.answers.Take("s1:1"); again.Answer != "" {
+	if again := s.answers.Get("s1:1"); again.Answer != "" {
 		t.Errorf("the answer was handed over twice: %q", again.Answer)
 	}
 }
