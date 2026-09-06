@@ -32,9 +32,9 @@ one is a queue where items rest. Exit codes are the whole control flow:
 | Code | Meaning | Engine does |
 | --- | --- | --- |
 | `0` | Success | Advance to `onSuccess` |
-| `10` | No-op | Leave the item where it is |
-| `20` | Blocked — needs a human | Route to `onBlocked` |
-| anything else | Failure | Route to `onFailure`, count an attempt |
+| `10` | No-op | Leave the item where it is; not retried until the next listing |
+| `20` | Blocked — needs a human | Mark the item blocked in place, with a reason |
+| anything else | Failure | Mark the item blocked in place, counting an attempt against `maxAttempts` |
 
 Because a stage is just an executable, a stage can be a headless AI agent, a test
 suite, a deploy, or a shell one-liner. Claude Code, Codex and opencode are all
