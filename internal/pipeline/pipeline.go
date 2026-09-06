@@ -542,8 +542,13 @@ func Pick(cfg *config.Config, items []model.Item, order []string) (*model.Item, 
 // drawing them in the order they arrive is then enough.
 //
 // Items with nowhere to go — marked, terminal, resting in a queue with no exit
-// — keep their listing order at the back. They are not in the queue, so they
-// have no claim on a place in it.
+// — sort at the back. They are not in the queue, so they have no claim on a
+// place in it. Terminal items sort ahead of the rest of that tail, newest
+// finishedAt first (falling back to listing order when it is empty or does
+// not parse as RFC 3339); a marked item and a queue with no exit keep the
+// rungs Pick would use if they were workable — manual order, then priority,
+// then listing order — which is the doctor sweep's order too, unaffected by
+// any of this since it only ever walks marked items.
 func Order(cfg *config.Config, items []model.Item, order []string) []model.Item {
 	pos := index(order)
 	depths := stageDepths(cfg)
@@ -597,6 +602,16 @@ func rate(cfg *config.Config, it *model.Item, listed int, pos map[string]int, de
 	if it.Priority != nil {
 		prio = *it.Priority
 	}
+	terminal := false
+	if stage, found := cfg.Stage(it.Stage); found {
+		terminal = stage.Terminal
+	}
+	finish, hasFinish := time.Time{}, false
+	if it.FinishedAt != "" {
+		if t, err := time.Parse(time.RFC3339, it.FinishedAt); err == nil {
+			finish, hasFinish = t, true
+		}
+	}
 	// Target returns the same stage an item is already in only when that stage
 	// runs something and the previous run did not finish.
 	return candidate{
@@ -607,6 +622,9 @@ func rate(cfg *config.Config, it *model.Item, listed int, pos map[string]int, de
 		idx:        oi,
 		prio:       prio,
 		pos:        listed,
+		terminal:   terminal,
+		hasFinish:  hasFinish,
+		finish:     finish,
 	}, target
 }
 
@@ -619,6 +637,13 @@ type candidate struct {
 	idx        int  // where, if it is
 	prio       int  // 0 most urgent; unranked is huge
 	pos        int  // the source's own listing order
+
+	// The rest describe an unworkable item's place at the back of the queue.
+	// terminal items — finished work — never reach Pick (Target refuses a
+	// terminal stage outright), so these three matter only inside Order.
+	terminal  bool      // in a terminal stage: finished, not merely stuck
+	hasFinish bool      // finishedAt parsed as RFC 3339
+	finish    time.Time // parsed, only meaningful when hasFinish
 }
 
 // better reports whether a should be worked before b. A ladder, most decisive
@@ -626,6 +651,25 @@ type candidate struct {
 func better(a, b candidate) bool {
 	if a.workable != b.workable {
 		return a.workable // nothing to run is not a place in the queue
+	}
+	if !a.workable {
+		// Both are off the queue entirely. Finished work sorts ahead of the
+		// rest — marked items and queues with no exit — which is what keeps
+		// the doctor sweep's order over marked items untouched: it never sees
+		// a terminal item in the first place.
+		if a.terminal != b.terminal {
+			return a.terminal
+		}
+		if a.terminal {
+			if a.hasFinish != b.hasFinish {
+				return a.hasFinish // a usable timestamp outranks none at all
+			}
+			if a.hasFinish && !a.finish.Equal(b.finish) {
+				return a.finish.After(b.finish) // newest-finished first
+			}
+			return a.pos < b.pos
+		}
+		// Two non-terminal unworkable items: today's rungs, unchanged.
 	}
 	if a.depth != b.depth {
 		return a.depth > b.depth // finish an item before starting another

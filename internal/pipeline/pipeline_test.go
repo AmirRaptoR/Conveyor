@@ -347,6 +347,157 @@ func TestUnworkableItemsKeepListingOrderAtTheBack(t *testing.T) {
 	}
 }
 
+// The done column has to read newest-finished first. Before this, a terminal
+// item still climbed the scheduling rungs meant for workable items — the
+// manual order named it once, dragged there while it was still in flight, and
+// it never came back down after it finished.
+func TestTerminalItemsOrderByFinishedAtNotManualOrder(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{
+		{Name: "backlog", OnSuccess: "refining"},
+		{Name: "refining", Script: "refine", OnSuccess: "done"},
+		{Name: "done", Terminal: true},
+	}}
+	items := []model.Item{
+		{ID: "a:8", Source: "a", Stage: "done", Title: "closed 2026-09-01", FinishedAt: "2026-09-01T00:00:00Z"},
+		{ID: "a:21", Source: "a", Stage: "done", Title: "closed 2026-09-05", FinishedAt: "2026-09-05T00:00:00Z"},
+		{ID: "a:14", Source: "a", Stage: "done", Title: "closed 2026-09-03", FinishedAt: "2026-09-03T00:00:00Z"},
+	}
+	// a:8 finished first of the three but is the one named in the persisted
+	// manual order — exactly the drag that used to hoist it to the top.
+	var got []string
+	for _, it := range Order(cfg, items, []string{"a:8"}) {
+		got = append(got, it.ID)
+	}
+	want := []string{"a:21", "a:14", "a:8"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("Order = %v, want %v — newest-finished first, manual order ignored in a terminal stage", got, want)
+	}
+}
+
+// Priority is a scheduling rung too, and a terminal item is not scheduled.
+func TestTerminalItemsIgnorePriority(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{{Name: "done", Terminal: true}}}
+	p0 := 0
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "done", Title: "urgent but stale", Priority: &p0, FinishedAt: "2026-09-01T00:00:00Z"},
+		{ID: "a:2", Source: "a", Stage: "done", Title: "unranked but recent", FinishedAt: "2026-09-05T00:00:00Z"},
+	}
+	got := Order(cfg, items, nil)
+	if got[0].ID != "a:2" {
+		t.Errorf("first = %q, want a:2 — finished more recently; priority 0 does not outrank it", got[0].ID)
+	}
+}
+
+// Server.refresh concatenates each source's own listing in config order, so
+// nothing but Order merges finished work across repositories into one ledger.
+func TestTerminalItemsMergeAcrossSources(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{{Name: "done", Terminal: true}}}
+	// Each source's own newest-first block, one after another — the shape
+	// Server.refresh builds.
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "done", FinishedAt: "2026-09-05T00:00:00Z"},
+		{ID: "a:2", Source: "a", Stage: "done", FinishedAt: "2026-09-03T00:00:00Z"},
+		{ID: "b:1", Source: "b", Stage: "done", FinishedAt: "2026-09-04T00:00:00Z"},
+		{ID: "b:2", Source: "b", Stage: "done", FinishedAt: "2026-09-02T00:00:00Z"},
+	}
+	var got []string
+	for _, it := range Order(cfg, items, nil) {
+		got = append(got, it.ID)
+	}
+	want := []string{"a:1", "b:1", "a:2", "b:2"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("Order = %v, want %v — interleaved strictly newest-finished first", got, want)
+	}
+}
+
+// A provider may send nothing, or send something that does not parse: neither
+// is an error, and both sort after every terminal item with a usable
+// timestamp, keeping their own listing order rather than being reshuffled.
+func TestTerminalItemsWithNoUsableFinishSortLast(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{{Name: "done", Terminal: true}}}
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "done", Title: "not RFC 3339", FinishedAt: "yesterday"},
+		{ID: "a:2", Source: "a", Stage: "done", Title: "no finishedAt at all"},
+		{ID: "a:3", Source: "a", Stage: "done", Title: "has one", FinishedAt: "2026-09-01T00:00:00Z"},
+	}
+	var got []string
+	for _, it := range Order(cfg, items, nil) {
+		got = append(got, it.ID)
+	}
+	want := []string{"a:3", "a:1", "a:2"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("Order = %v, want %v — unusable timestamps sort last, in listing order", got, want)
+	}
+}
+
+// Two items finishing at the same instant is not a tie the comparator may
+// leave ambiguous: sort.SliceStable needs a strict weak ordering, so it falls
+// back to listing order like every other tie below it.
+func TestTerminalItemsWithEqualFinishedAtKeepListingOrder(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{{Name: "done", Terminal: true}}}
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "done", FinishedAt: "2026-09-01T00:00:00Z"},
+		{ID: "a:2", Source: "a", Stage: "done", FinishedAt: "2026-09-01T00:00:00Z"},
+	}
+	var got []string
+	for _, it := range Order(cfg, items, nil) {
+		got = append(got, it.ID)
+	}
+	want := []string{"a:1", "a:2"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("Order = %v, want %v — an equal finish time keeps listing order", got, want)
+	}
+}
+
+// Rung 1 survives untouched: a workable item beats every unworkable one,
+// however recently a terminal item finished.
+func TestWorkableItemOutranksAFinishedTerminalItem(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{
+		{Name: "backlog", OnSuccess: "done"},
+		{Name: "done", Terminal: true},
+	}}
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "done", Title: "finished just now", FinishedAt: "2026-09-05T00:00:00Z"},
+		{ID: "a:2", Source: "a", Stage: "backlog", Title: "not started, no timestamp at all"},
+	}
+	got, target := Pick(cfg, items, nil)
+	if got == nil || got.ID != "a:2" {
+		t.Fatalf("picked %v, want a:2 — the only workable item", got)
+	}
+	if target != "done" {
+		t.Errorf("target = %q, want done", target)
+	}
+	if ordered := Order(cfg, items, nil); ordered[0].ID != "a:2" {
+		t.Errorf("first = %q, want a:2 — workable outranks a finished terminal item", ordered[0].ID)
+	}
+}
+
+// The other unworkable items — marked, and resting in a queue with no exit —
+// are untouched by this change: they keep the rungs they have today, and sort
+// after every terminal item, which is what keeps the doctor sweep's order
+// (a second consumer of Order, over marked items only) exactly as it is now.
+func TestOtherUnworkableItemsSortAfterTerminalOnes(t *testing.T) {
+	cfg := &config.Config{Stages: []config.Stage{
+		{Name: "backlog", OnSuccess: "refining"},
+		{Name: "refining", Script: "refine", OnSuccess: "ready"},
+		{Name: "ready"}, // a queue with no exit: items rest here
+		{Name: "done", Terminal: true},
+	}}
+	items := []model.Item{
+		{ID: "a:1", Source: "a", Stage: "ready", Title: "resting, no exit"},
+		{ID: "a:2", Source: "a", Stage: "refining", Title: "waiting for a human", Blocked: true},
+		{ID: "a:3", Source: "a", Stage: "done", Title: "finished", FinishedAt: "2026-09-01T00:00:00Z"},
+	}
+	var got []string
+	for _, it := range Order(cfg, items, nil) {
+		got = append(got, it.ID)
+	}
+	want := []string{"a:3", "a:1", "a:2"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("Order = %v, want %v — terminal first, then today's rungs unchanged", got, want)
+	}
+}
+
 // Order must not disturb the caller's slice: the server sorts on the way out
 // while the scheduler is reading the same listing.
 func TestOrderLeavesTheListingAlone(t *testing.T) {
