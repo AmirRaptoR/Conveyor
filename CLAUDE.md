@@ -99,10 +99,22 @@ every repository the config enrols.
   Reclaim is a positive allowlist, never an inference from a clean status: a
   path is touched — created into, emptied, or removed — only when it resolves
   to exactly `<managed root>/<source>/<ref>` and carries the marker
-  `item_worktree` wrote into it when it created it. The primary checkout, an
+  `item_worktree` wrote into it when it created it — or, missing that marker,
+  proves itself anyway: a **linked** worktree (its git dir sits under the
+  repository's common dir's `worktrees/`, not the common dir itself) of this
+  same repository whose `HEAD` is exactly `issue-<ref>` is a worktree made
+  before the marker existed, since #33 shipped the marker with no migration
+  path and stranded everything created before it. The marker is written the
+  first time that proof succeeds, so adoption costs nothing again, and a
+  marker that fails to write (a read-only git dir) does not undo the proof —
+  the next call just proves the same worktree again. The proof stands on its
+  own merits and never expires: there is no reliable "predates the marker"
+  signal to retire it by. The primary checkout, an
   external `git worktree`, a directory a person made, a symlink escaping the
-  managed root — none of that is ever Conveyor's, however clean or old it
-  looks. A branch already checked out somewhere else is refused, not
+  managed root, a linked worktree of a *different* repository or on a
+  *different* branch — none of that is ever Conveyor's, however clean or old
+  it looks, and adoption leaves it untouched. A branch already checked out
+  somewhere else is refused, not
   reclaimed: reclaiming a *clean* holder used to be the rule, and Git's own
   refusal to remove the primary checkout — always clean, always listed in
   `git worktree list` — is exactly what turned that refusal into the trigger

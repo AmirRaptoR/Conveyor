@@ -29,6 +29,16 @@
 # Conveyor's, no matter how clean or how old it is. A held branch is refused,
 # never reclaimed: Git allows a branch in exactly one worktree, and the only
 # safe response to "something else already has it" is to say so and stop.
+#
+# A directory at the managed path with no marker is not automatically
+# unowned, either: it is adopted when a narrow proof shows it is genuinely
+# this item's worktree anyway (right path, a *linked* worktree of this same
+# repository, on branch `issue-<ref>`) — which is exactly what a worktree made
+# before the marker existed looks like, since the marker shipped with no
+# migration path (#33, then #60). The marker is written the moment the proof
+# succeeds, so adoption is a one-time cost, never inferred from a clean status
+# or the path alone, and the proof never expires — there is no reliable
+# "predates the marker" signal to retire it by.
 
 # worktree_root — where per-item checkouts go. Override with WORKTREES.
 worktree_root() { printf '%s' "${WORKTREES:-$HOME/codes/.worktrees}"; }
@@ -74,10 +84,97 @@ _worktree_gitdir() {
 	git -C "$1" rev-parse --absolute-git-dir 2>/dev/null
 }
 
-# _worktree_owned <source> <ref> <dir> — true only when dir is exactly this
-# item's managed path (symlinks resolved) and carries the marker written when
-# item_worktree created it. Never inferred from a clean status, an age, or the
-# fact that something is sitting where an item's worktree would go.
+# _worktree_common_dir <dir> — the absolute, resolved common git dir for dir:
+# for a linked worktree this is the main repository's `.git`, not the
+# worktree's own private git dir; for the primary checkout the two are the
+# same. `git rev-parse --git-common-dir` prints relative to dir's cwd (and
+# `--path-format=absolute` needs git >= 2.31), so this resolves it the
+# portable way: cd there, then ask pwd. Empty on failure, same as _realpath.
+_worktree_common_dir() {
+	(cd -- "$1" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)
+}
+
+# _worktree_is_linked <dir> — true when dir is a *linked* worktree: its
+# absolute git dir is not the common dir, and sits under the common dir's
+# `worktrees/`. False for the primary checkout (the two dirs are equal), and
+# false for a plain directory or one git resolves to an enclosing repository
+# (its git dir is that repository's own, not a `worktrees/` entry).
+_worktree_is_linked() {
+	local dir=$1 gd cd
+	gd=$(_worktree_gitdir "$dir") || return 1
+	cd=$(_worktree_common_dir "$dir") || return 1
+	[[ -n "$gd" && -n "$cd" && "$gd" != "$cd" ]] || return 1
+	case "$gd" in
+		"$cd"/worktrees/*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# _worktree_same_repo <dir> — true when dir's repository is the same one the
+# caller is running from (its cwd), compared by common dir so it works whether
+# the caller is the source's checkout or, as `drop_worktree`'s callers do,
+# already `cd`'d into the worktree itself. Fails closed: a caller not inside a
+# repository at all proves nothing.
+_worktree_same_repo() {
+	local dir=$1 dc cc
+	dc=$(_worktree_common_dir "$dir") || return 1
+	cc=$(_worktree_common_dir ".") || return 1
+	[[ -n "$dc" && "$dc" == "$cc" ]]
+}
+
+# _worktree_expected_branch <ref> — the branch item_worktree synthesises for a
+# fresh item: spaces in ref are fine in a directory name and not in a branch
+# name. Derived once so the adoption proof and creation never drift apart.
+_worktree_expected_branch() {
+	printf 'issue-%s' "${1// /-}"
+}
+
+# _worktree_on_expected_branch <dir> <ref> — true when HEAD is a symbolic ref
+# to exactly issue-<ref>. False on a detached HEAD (symbolic-ref fails, which
+# is the refusal for free) and false on any other branch, rework included.
+_worktree_on_expected_branch() {
+	local dir=$1 ref=$2 cur
+	cur=$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null) || return 1
+	[[ "$cur" == "$(_worktree_expected_branch "$ref")" ]]
+}
+
+# _worktree_linked_to_caller <dir> — side-effect-free: true when dir is a
+# linked worktree of the same repository the caller is running from, saying
+# nothing about which branch it is on. Used only to choose the wording of a
+# refusal after _worktree_owned has already said no — ownership itself is
+# _worktree_owned's alone to decide.
+_worktree_linked_to_caller() {
+	local dir=$1
+	_worktree_is_linked "$dir" && _worktree_same_repo "$dir"
+}
+
+# _worktree_provable <source> <ref> <dir> — the narrow proof that an unmarked
+# directory is genuinely this item's worktree: the resolved path is exactly
+# right, it is a linked worktree, of the caller's own repository, on exactly
+# the branch item_worktree would have put it on. All four, or no adoption.
+_worktree_provable() {
+	local source=$1 ref=$2 dir=$3 root want real
+	root=$(_managed_root) || return 1
+	want="$root/$source/$ref"
+	real=$(_realpath "$dir") || return 1
+	[[ "$real" == "$want" ]] || return 1
+	_worktree_is_linked "$dir" || return 1
+	_worktree_same_repo "$dir" || return 1
+	_worktree_on_expected_branch "$dir" "$ref" || return 1
+	return 0
+}
+
+# _worktree_owned <source> <ref> <dir> — true when dir is exactly this item's
+# managed path (symlinks resolved) and either already carries the marker
+# item_worktree writes at creation, or — missing that — proves itself by
+# _worktree_provable, in which case the marker is written before answering so
+# the proof is a one-time cost. That write is a side effect on what reads as a
+# pure question: a caller asking "owned?" would not otherwise expect a file to
+# appear. The answer is the proof, not the bookkeeping — a marker that fails
+# to write (a git dir made read-only) still answers true, is reported on
+# stderr, and leaves the next call to prove the same worktree again. Never
+# inferred from a clean status, an age, or the fact that something is sitting
+# where an item's worktree would go.
 _worktree_owned() {
 	local source=$1 ref=$2 dir=$3 root want real gd
 	[[ -e "$dir" ]] || return 1
@@ -86,7 +183,11 @@ _worktree_owned() {
 	real=$(_realpath "$dir") || return 1
 	[[ "$real" == "$want" ]] || return 1
 	gd=$(_worktree_gitdir "$dir") || return 1
-	[[ -f "$gd/conveyor-owner" ]] || return 1
+	[[ -f "$gd/conveyor-owner" ]] && return 0
+
+	_worktree_provable "$source" "$ref" "$dir" || return 1
+	_worktree_write_marker "$source" "$ref" "$dir" ||
+		echo "conveyor: could not write ownership marker in $gd for $dir" >&2
 	return 0
 }
 
@@ -166,9 +267,28 @@ item_worktree() {
 			printf '%s' "$wt"
 			return 0
 		fi
-		# Something is at this exact path and it is not ours: a person's
-		# directory, a leftover from before ownership markers existed, anything.
-		# Not removed, not emptied, not handed to an agent as a workdir.
+		# Something is at this exact path and _worktree_owned would not adopt
+		# it. _worktree_owned never says why — it only answers yes or no — so
+		# the wording here asks one further, side-effect-free question: is this
+		# at least a linked worktree of this same repository? If so the likely
+		# story is a version boundary (a worktree made before #33's ownership
+		# marker existed, or a rework worktree tracking a differently-named pull
+		# request branch), and the mark should say so rather than imply someone
+		# put a stray directory here. Not removed, not emptied, not handed to an
+		# agent as a workdir either way.
+		if _worktree_linked_to_caller "$wt"; then
+			local branch_desc want_branch
+			want_branch=$(_worktree_expected_branch "$ref")
+			if branch_desc=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null); then
+				branch_desc="branch '$branch_desc'"
+			else
+				branch_desc="a detached HEAD"
+			fi
+			blocked worktree "$wt is a linked worktree of this repository with no \
+conveyor-owner marker; the likely cause is that it was created before ownership markers \
+existed. It is on $branch_desc, not the expected '$want_branch', so it cannot be adopted \
+automatically. Move it aside, remove it by hand, or check out '$want_branch' in it."
+		fi
 		blocked worktree "$wt exists but was not created by Conveyor; refusing to touch it. \
 Move it aside or remove it by hand."
 	fi
@@ -206,8 +326,10 @@ item's worktree ($wt); refusing to touch another checkout to reclaim it."
 	else
 		base=$(default_branch)
 		# A space in $ref is fine in a directory name and not in a branch name;
-		# the synthesized branch is sanitized, the path stays literal.
-		git worktree add --quiet -B "${branch:-issue-${ref// /-}}" "$wt" "origin/$base" >&2 || return 1
+		# the synthesized branch is sanitized, the path stays literal. Derived
+		# by _worktree_expected_branch so the adoption proof never drifts from
+		# what creation actually does.
+		git worktree add --quiet -B "${branch:-$(_worktree_expected_branch "$ref")}" "$wt" "origin/$base" >&2 || return 1
 	fi
 
 	# Checked, not assumed. Printing a path that was never made sends the agent
