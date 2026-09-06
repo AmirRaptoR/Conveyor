@@ -16,7 +16,7 @@ let the model decide the flow.
 ## Status
 
 Working: `internal/{model,config,runner,source,pipeline}` and the CLI
-(`validate | list | run | tick`). `./conveyor tick -n 8 -c conveyor.example.yaml`
+(`validate | list | run | tick`). `./conveyor tick -n 10 -c conveyor.example.yaml`
 drains the mock pipeline in priority order and marks a blocked item in place.
 `providers/github/` runs against real repositories.
 
