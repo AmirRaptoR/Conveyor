@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Runs every check this repository has, in order, failing on the first
+# failure and naming the step that failed. CI runs this same script — see
+# .github/workflows/check.yml and README.md#running-the-checks.
+#
+#   ./check
+set -uo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$here"
+
+step() {
+  local name=$1
+  shift
+  echo "== $name =="
+  if ! "$@"; then
+    echo "check: FAILED at: $name" >&2
+    exit 1
+  fi
+}
+
+step "go build ./..." go build ./...
+step "go vet ./..." go vet ./...
+step "go test ./..." go test ./...
+step "go test -race ./..." go test -race ./...
+
+# Self-check suites: bash scripts named `selfcheck`, `selfcheck.sh`, or
+# ending `-selfcheck`/`-selfcheck.sh`, anywhere in the tree. Discovered by
+# name, not listed, so a newly added suite runs without editing this script.
+# A script under test by one of these (`approve`, the subject of
+# `approve-selfcheck`) never matches, because its own name has no
+# "selfcheck" in it.
+mapfile -t selfchecks < <(find "$here" -type f \( \
+    -name 'selfcheck' -o -name 'selfcheck.sh' \
+    -o -name '*-selfcheck' -o -name '*-selfcheck.sh' \
+  \) | sort)
+if [[ ${#selfchecks[@]} -eq 0 ]]; then
+  echo "check: FAILED at: self-check discovery (found none)" >&2
+  exit 1
+fi
+for sc in "${selfchecks[@]}"; do
+  step "selfcheck: ${sc#"$here"/}" "$sc"
+done
+
+# bash -n over every shell script under agents/ and providers/: anything with
+# a bash shebang, whether or not it carries a .sh extension. Non-bash scripts
+# (agents/claude/status and agents/codex/status are python3) are left alone.
+mapfile -t shell_scripts < <(find "$here/agents" "$here/providers" -type f | \
+  while IFS= read -r f; do
+    if [[ "$f" == *.sh ]] || head -n1 "$f" | grep -q '^#!.*bash'; then
+      printf '%s\n' "$f"
+    fi
+  done | sort)
+for f in "${shell_scripts[@]}"; do
+  step "bash -n: ${f#"$here"/}" bash -n "$f"
+done
+
+# A subshell, not a function: a trap on RETURN fires on every function
+# return for the rest of the script, not just this one's, so a plain
+# function leaked "tmp: unbound variable" into the very next step. A
+# subshell's trap table is its own.
+check_validate() (
+  set -e
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  go build -o "$tmp/conveyor" ./cmd/conveyor
+  "$tmp/conveyor" validate -c conveyor.example.yaml
+)
+step "conveyor validate -c conveyor.example.yaml" check_validate
+
+# UI interaction tests: any *.test.mjs file, anywhere in the tree, run with
+# node:test + node:assert from a stock Node — no npm install, no network. See
+# README.md#running-the-checks for how to add one.
+mapfile -t ui_tests < <(find "$here" -type f -name '*.test.mjs' | sort)
+if [[ ${#ui_tests[@]} -eq 0 ]]; then
+  echo "check: FAILED at: UI test discovery (found none)" >&2
+  exit 1
+fi
+if ! command -v node >/dev/null 2>&1; then
+  echo "check: FAILED at: node --test (UI) — node not found on PATH" >&2
+  exit 1
+fi
+step "node --test (UI)" node --test "${ui_tests[@]}"
+
+echo "check: all steps passed"
