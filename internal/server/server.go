@@ -857,6 +857,64 @@ func (s *Server) recallBlocks(items []model.Item) {
 	s.mu.Unlock()
 }
 
+// claimRefusal is why claimAndLaunch declined to start a transition.
+type claimRefusal int
+
+const (
+	claimAccepted claimRefusal = iota
+	claimItemBusy              // this item already has a transition in flight
+	claimSlotBusy              // the (source, stage) slot has none free
+	claimAgentPaused           // the stage's agent is over quota and overridePause is false
+)
+
+// claim is the only place s.working is populated. Every dispatch path — the
+// scheduler (launch), the tick button (advance) and a manual start
+// (handleStart) — calls this and nothing else stores into working, so "an
+// item has a transition in flight" is asserted in one place instead of three.
+//
+// The reservation is atomic: working.LoadOrStore either claims the item or
+// finds it already claimed, with no gap in which a second caller can read
+// "free" before the first writes "taken". The (source, stage) slot is taken
+// only after the item is reserved, and released again immediately if the slot
+// turns out to be full — a caller that gets back anything other than
+// claimAccepted has changed nothing: working and Locks are exactly as they
+// were found.
+//
+// overridePause is true only for the tick button: CLAUDE.md is explicit that
+// "the tick button still overrides" a paused agent, because under -watch it
+// is the only thing that moves anything. Every other caller is stopped by a
+// paused agent exactly as it is stopped by a busy slot.
+//
+// claim only reserves; it does not run anything. advance runs the transition
+// inline so it can refresh right afterwards (the button's contract under
+// -watch), while launch and handleStart hand it to a goroutine — both call
+// this same function first.
+func (s *Server) claim(item model.Item, target string, overridePause bool) claimRefusal {
+	if !overridePause && s.agentPaused(s.cfg.AgentFor(item.Source, target)) {
+		return claimAgentPaused
+	}
+	if _, already := s.working.LoadOrStore(item.ID, struct{}{}); already {
+		return claimItemBusy
+	}
+	if !s.eng.Locks().TryAcquire(item.Source, target) {
+		s.working.Delete(item.ID)
+		return claimSlotBusy
+	}
+	return claimAccepted
+}
+
+// claimAndLaunch reserves the item (via claim) and, once reserved, runs the
+// transition asynchronously — the shape every dispatch path except the tick
+// button wants.
+func (s *Server) claimAndLaunch(ctx context.Context, item model.Item, target string, overridePause bool) claimRefusal {
+	r := s.claim(item, target, overridePause)
+	if r == claimAccepted {
+		s.inFlight.Add(1)
+		go s.transition(ctx, item, target)
+	}
+	return r
+}
+
 // launch starts every transition the locks currently permit and returns how
 // many it started. Candidates whose source or target stage is already busy are
 // skipped rather than queued, so a slow stage never holds up a free one.
@@ -876,12 +934,16 @@ func (s *Server) launch(ctx context.Context) int {
 	// re-picking the same candidate and never terminates.
 	fullSrc := map[string]bool{}
 	fullStage := map[string]bool{}
+	// Items claimAndLaunch has already turned away this pass — a race with a
+	// manual start, not a full axis, so it excludes only this one candidate
+	// rather than every item sharing its source or stage.
+	busy := map[string]bool{}
 
 	for {
 		free := items[:0:0]
 		for _, it := range items {
 			target, ok := pipeline.Target(s.cfg, &it)
-			if !ok || fullSrc[it.Source] || fullStage[target] ||
+			if !ok || fullSrc[it.Source] || fullStage[target] || busy[it.ID] ||
 				s.eng.Locks().Busy(it.Source, target) {
 				continue
 			}
@@ -904,22 +966,20 @@ func (s *Server) launch(ctx context.Context) int {
 		if item == nil {
 			return n
 		}
-		// Claim before launching. Checking Busy and starting a goroutine leaves
-		// a gap in which the next pass sees the slot free and decides the same
-		// thing again; the duplicate then bails, having spent a launch. The
-		// locks are the authority on capacity — Busy above re-reads them every
-		// iteration, so the pass keeps filling slots until they are actually
-		// gone.
-		if !s.eng.Locks().TryAcquire(item.Source, target) {
+		// Claim before launching, atomically: claimAndLaunch reserves the item
+		// and the (source, stage) slot together and releases both if either is
+		// refused, so a concurrent manual start or scheduler pass can never
+		// double-launch this item.
+		switch s.claimAndLaunch(ctx, *item, target, false) {
+		case claimSlotBusy:
 			fullSrc[item.Source] = true
 			fullStage[target] = true
 			continue
+		case claimItemBusy, claimAgentPaused:
+			busy[item.ID] = true
+			continue
 		}
-		it, to := *item, target
-		s.working.Store(it.ID, struct{}{})
-		s.inFlight.Add(1)
 		n++
-		go s.transition(ctx, it, to)
 	}
 }
 
@@ -1044,11 +1104,13 @@ func (s *Server) advance(ctx context.Context) bool {
 	if item == nil {
 		return false
 	}
-	if !s.eng.Locks().TryAcquire(item.Source, target) {
+	// overridePause: true. CLAUDE.md — "the tick button still overrides" — and
+	// under -watch this is the only thing that ever moves an item, so a paused
+	// agent must not be able to wedge the whole board shut.
+	if s.claim(*item, target, true) != claimAccepted {
 		return false
 	}
 	defer s.eng.Locks().Release(item.Source, target)
-	s.working.Store(item.ID, struct{}{})
 	defer s.working.Delete(item.ID)
 	s.runOne(ctx, *item, target)
 	return true
@@ -1186,15 +1248,28 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Claim before launching, exactly as the scheduler does: a check followed
-	// by a goroutine leaves a gap the next pass can decide the same thing in.
-	if !s.eng.Locks().TryAcquire(item.Source, target) {
+	// A manual start goes through the same atomic claim as every other
+	// dispatch path (claim), and overrides exactly one guard:
+	//   - overrides: resting — a deferral means "wait for the next listing",
+	//     and dragging a card out of the backlog is a person asking for that
+	//     listing right now, in spirit if not in fact.
+	//   - does not override: the item claim (claimItemBusy below), the
+	//     (source, stage) slot (claimSlotBusy), a paused agent
+	//     (claimAgentPaused — unlike the tick button, a manual start is not
+	//     the last resort under -watch and must meet the same wall every
+	//     other launch does), or pipeline.Target refusing above (a marked
+	//     item, or no next stage).
+	switch s.claimAndLaunch(s.ctx, item, target, false) {
+	case claimItemBusy:
+		http.Error(w, fmt.Sprintf("%s is already running in %s", id, target), http.StatusConflict)
+		return
+	case claimSlotBusy:
 		http.Error(w, s.whyBusy(item.Source, target), http.StatusConflict)
 		return
+	case claimAgentPaused:
+		http.Error(w, s.whyPaused(s.cfg.AgentFor(item.Source, target)), http.StatusConflict)
+		return
 	}
-	s.working.Store(item.ID, struct{}{})
-	s.inFlight.Add(1)
-	go s.transition(s.ctx, item, target)
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -1592,6 +1667,22 @@ func (s *Server) whyBusy(src, stage string) string {
 		}
 	}
 	return fmt.Sprintf("%s or %s is already busy", src, stage)
+}
+
+// whyPaused names the agent and the reset it reported, for a manual start
+// refused because the stage's agent is over quota — the policy launch already
+// applies by silently skipping the item.
+func (s *Server) whyPaused(agent string) string {
+	s.mu.RLock()
+	p, held := s.paused[agent]
+	s.mu.RUnlock()
+	if !held {
+		return fmt.Sprintf("%s is paused", agent)
+	}
+	if p.Until.IsZero() {
+		return fmt.Sprintf("%s is paused: %s", agent, p.Reason)
+	}
+	return fmt.Sprintf("%s is paused until %s: %s", agent, p.Until.Format(time.RFC3339), p.Reason)
 }
 
 // RunMeta is one run directory, as the board needs it.
