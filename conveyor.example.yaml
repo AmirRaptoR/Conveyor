@@ -31,8 +31,10 @@ version: 1
 #     amir: "pbkdf2-sha256$600000$<salt>$<key>"
 
 concurrency:
-  perSource: 1        # fixed at 1: a source maps to a git worktree, and two
-                      # agents in one checkout corrupt each other. See §5.
+  perSource: 1        # items in flight per this source. Safe above 1 too: an
+                      # item works in its own git worktree, not the source's
+                      # checkout, so two agents on one repository never share
+                      # a directory. See §5.
   perStage: 1         # one item per stage, so the pipeline behaves like a line:
                       # a station works a single item while others run their own
   global: 4           # total in flight. Every slot is an agent.
@@ -50,12 +52,17 @@ retryStalled: 1h      # when EVERY item is marked and nothing can move at all,
 timeout: 90m          # default per-script timeout; stages may override
 
 logs:
-  retention: 30d      # runs older than this are swept
-  sweepAt: "04:00"    # daily, and once on startup
-                      # A run is PINNED and never swept while it is the most
-                      # recent failed/blocked run of an item still in that state:
-                      # retention must not delete the evidence for the thing
-                      # currently asking for attention.
+  # Read and validated now, but not yet enforced: no sweep runs against these
+  # keys today, so run directories accumulate under data/runs/ regardless of
+  # what is set here. The values are reserved for the sweep that will read
+  # them, whenever it lands, so the schema does not change out from under a
+  # working config.
+  retention: 30d      # once implemented: runs older than this are swept
+  sweepAt: "04:00"    # once implemented: daily, and once on startup
+                      # A run will be PINNED and never swept while it is the
+                      # most recent failed/blocked run of an item still in
+                      # that state: retention must not delete the evidence
+                      # for the thing currently asking for attention.
 
 # ---------------------------------------------------------------------------
 # Stages. Minimum two. Order defines the board's columns, left to right, and the
