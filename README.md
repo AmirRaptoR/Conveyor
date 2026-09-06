@@ -51,7 +51,7 @@ go build -o conveyor ./cmd/conveyor
 # -c keeps your own conveyor.yaml, if you have one, out of the way
 ./conveyor validate -c conveyor.example.yaml   # check config, print the graph
 ./conveyor list     -c conveyor.example.yaml   # run every source's list script
-./conveyor tick     -c conveyor.example.yaml -n 8 -v
+./conveyor tick     -c conveyor.example.yaml -n 10 -v
 ```
 
 `conveyor.yaml` is the working config and is deliberately untracked;
@@ -66,8 +66,9 @@ providers: ~/codes/Conveyor/providers
 
 Without the key, `providers/` is looked for beside the config file.
 
-You should see items advance in priority order, one blocked item routed out of
-the pipeline, and then `nothing to do`.
+You should see the furthest-along item go first each pass — priority only
+decides between items at the same depth — one item end up marked blocked in
+place in `refining`, and then `nothing to do`.
 
 ### Serving the board
 
