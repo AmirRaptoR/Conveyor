@@ -347,6 +347,11 @@ half_merged() {
 	g -C "$src" branch --quiet -f issue-7 "$issue7_base"
 	g -C "$src" push --quiet --force origin issue-7
 	g -C "$src" worktree add --quiet --force "$wt" issue-7
+	# item_worktree only reuses a path it recognizes as its own — the marker it
+	# would have written the run that left this mid-merge state. Written by
+	# hand here because this fixture builds the worktree straight from `git`,
+	# never through item_worktree itself.
+	printf 's1\n7\n' >"$(g -C "$wt" rev-parse --absolute-git-dir)/conveyor-owner"
 	g -C "$wt" merge --no-edit origin/main >/dev/null 2>&1
 	printf '%s\n' "$1" >"$wt/f.txt"
 	g -C "$wt" add f.txt

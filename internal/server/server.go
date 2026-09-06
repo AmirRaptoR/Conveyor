@@ -87,6 +87,32 @@ type State struct {
 	// Active is every transition running right now. The board lights those
 	// stations; without it the page cannot tell work from stillness.
 	Active []Active `json:"active"`
+	// Storage is what the run store currently holds and how far back
+	// retention still reaches.
+	Storage StorageView `json:"storage"`
+	// PersistFault is a run whose own record could not be trusted — a full
+	// disk during its meta.json write — kept until a later run persists
+	// cleanly. Unlike Warnings, refresh never rebuilds this: a disk-full
+	// fault must survive to the next poll, not vanish within one interval.
+	PersistFault *PersistFault `json:"persistFault,omitempty"`
+	// PollNs is the configured poll interval, so the board can tell a stale
+	// listing from a fresh one without guessing at a constant of its own —
+	// the engine says what "stale" means, the same way it says everything
+	// else the page renders (CLAUDE.md: "the board never derives what the
+	// engine knows").
+	PollNs time.Duration `json:"pollNs"`
+}
+
+// PersistFault is one run whose own record-keeping failed — set from
+// runner.Result.PersistErr, which is what a failed meta.json write or
+// log.txt append leaves there instead of a record that looks like a clean
+// success.
+type PersistFault struct {
+	RunID   string    `json:"runId"`
+	ItemID  string    `json:"itemId,omitempty"`
+	Source  string    `json:"source,omitempty"`
+	Message string    `json:"message"`
+	At      time.Time `json:"at"`
 }
 
 // SlotsView is the concurrency state, as the scheduler sees it.
@@ -122,6 +148,10 @@ type Active struct {
 type ItemTime struct {
 	Stage        string    `json:"stage"`
 	EnteredStage time.Time `json:"enteredStage"`
+	// RunID is the move run that landed the item in Stage — the same run
+	// CONTRACTS §6 pins against retention so the stage-age chip never goes
+	// blank out from under a currently-listed item.
+	RunID string `json:"-"`
 }
 
 // TransitionError is an infrastructure failure a transition hit for an item —
@@ -237,6 +267,16 @@ type SourceView struct {
 	Provider string   `json:"provider"`
 	Workdir  string   `json:"workdir"`
 	Problems []string `json:"problems,omitempty"`
+	// LastListedAt is the last listing that returned without error, RFC3339,
+	// omitted when this source has never been listed successfully — not a
+	// zero time, which would render as 1970 on the board.
+	LastListedAt string `json:"lastListedAt,omitempty"`
+	// ListError is the error from the latest listing attempt, empty when
+	// that attempt succeeded (or none has been made yet). It describes only
+	// the most recent attempt, not a high-water mark: a source that failed
+	// and then succeeded shows no error here, even though LastListedAt is
+	// what actually moved.
+	ListError string `json:"listError,omitempty"`
 }
 
 type Server struct {
@@ -287,6 +327,14 @@ type Server struct {
 	// handling of a reply, not something a restart can recover from run
 	// history or the answers file, which holds only the reply itself.
 	answerInfo map[string]AnswerView
+	// everSwept is whether the retention sweep has ever actually deleted a
+	// run. It is what tells a run ID that resolves to nothing apart from "it
+	// never existed" (404) from "it is gone because retention removed it"
+	// (410) — an arbitrary lookup cutoff used to conflate the two.
+	everSwept bool
+	// sweepHorizon is the oldest day the last sweep left standing, named in a
+	// 410 so an operator knows how far back retention still reaches.
+	sweepHorizon time.Time
 	// paused is the agents the scheduler is holding work back from, by name.
 	//
 	// Not persisted, deliberately: it is a fact about the outside world right
@@ -294,6 +342,15 @@ type Server struct {
 	// the agents' own status scripts. A pause recovered from disk would be a
 	// guess about a window that may have closed while the process was down.
 	paused map[string]PauseView
+	// listedAt is the last successful listing for each source, by name; a
+	// source absent from this map has never been listed. listErr is the
+	// latest attempt's error, present only when that attempt failed — a
+	// source can be in both maps at once (it listed successfully once, and
+	// has failed on every attempt since). Neither survives a restart, the
+	// same as paused: a just-started process has nothing to say yet about a
+	// source it has not listed.
+	listedAt map[string]time.Time
+	listErr  map[string]string
 
 	hub   *hub
 	order *store.Order
@@ -365,19 +422,25 @@ type Server struct {
 	// key file, and the board simply does not notify.
 	pushKeys *push.Keys
 	pushSubs *push.Store
+
+	// drainGrace bounds Run's shutdown wait, defaulted in New and overridden
+	// only by tests — there is no config key for it, the same way there is
+	// none for the runner's own gracePeriod.
+	drainGrace time.Duration
 }
 
 func New(cfg *config.Config, r *runner.Runner) *Server {
 	s := &Server{
-		cfg:     cfg,
-		run:     r,
-		eng:     pipeline.New(cfg, r),
-		hub:     newHub(),
-		order:   store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
-		answers: store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
-		tick:    make(chan struct{}, 1),
-		wake:    make(chan struct{}, 1),
-		ctx:     context.Background(),
+		cfg:        cfg,
+		run:        r,
+		eng:        pipeline.New(cfg, r),
+		hub:        newHub(),
+		order:      store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
+		answers:    store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
+		tick:       make(chan struct{}, 1),
+		wake:       make(chan struct{}, 1),
+		ctx:        context.Background(),
+		drainGrace: drainGrace,
 	}
 	s.pushSubs = push.OpenStore(filepath.Join(cfg.DataDir(), "push.json"))
 	if keys, err := push.LoadKeys(filepath.Join(cfg.DataDir(), "vapid.json")); err != nil {
@@ -394,7 +457,9 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 	s.confirmedAt = map[string]time.Time{}
 	s.sourceGen = map[string]time.Time{}
 	s.answerInfo = map[string]AnswerView{}
-	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
+	s.listedAt = map[string]time.Time{}
+	s.listErr = map[string]string{}
+	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg, nil, nil), PollNs: cfg.Poll.D()}
 
 	// Every log line reaches the browser as it is produced. This is the whole
 	// reason logs are a stream and not a file read at the end.
@@ -405,7 +470,47 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 		}
 		s.hub.publish(event{Kind: "log", RunID: runID, Line: &l})
 	}
+	// Every run this Runner executes — list, move, stage, doctor, status —
+	// reaches here, which is what lets one place notice a persistence fault
+	// without a check threaded through every call site that starts a run.
+	prevResult := r.OnResult
+	r.OnResult = func(res *runner.Result) {
+		if prevResult != nil {
+			prevResult(res)
+		}
+		s.notePersistFault(res)
+	}
 	return s
+}
+
+// notePersistFault sets or clears the board-visible sticky fault from one
+// run's outcome: a run whose meta.json write or log.txt append failed sets it
+// (naming the run that failed to record itself honestly); any other run
+// persisting means the disk is not, or is no longer, the problem, and clears
+// it. It is intentional that this is not scoped to one item or source — a
+// full disk is a fact about the run store, not about the run that happened to
+// notice it first.
+//
+// This reads res.PersistErr, not res.Run.Error: Run.Error keeps only the
+// first failure a run hit, so a run whose process failed to start *and*
+// whose log.txt append failed on the same full disk would carry the start
+// failure there, and a prefix check against it would miss the persistence
+// failure entirely — masking the fault instead of raising it, and silently
+// clearing a real one already on the board.
+func (s *Server) notePersistFault(res *runner.Result) {
+	if res == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if res.PersistErr != "" {
+		s.state.PersistFault = &PersistFault{
+			RunID: res.Run.ID, ItemID: res.Run.ItemID, Source: res.Run.Source,
+			Message: res.PersistErr, At: time.Now(),
+		}
+	} else {
+		s.state.PersistFault = nil
+	}
 }
 
 func stageViews(c *config.Config) []StageView {
@@ -416,10 +521,18 @@ func stageViews(c *config.Config) []StageView {
 	return out
 }
 
-func sourceViews(c *config.Config) []SourceView {
+// sourceViews builds the board's per-source view. listedAt and listErr carry
+// what refresh has learned about each source's listing so far — nil at
+// construction, before anything has been listed — keyed by source name.
+func sourceViews(c *config.Config, listedAt map[string]time.Time, listErr map[string]string) []SourceView {
 	out := make([]SourceView, len(c.Sources))
 	for i, s := range c.Sources {
-		out[i] = SourceView{Name: s.Name, Provider: s.Provider.Name, Workdir: c.Workdir(s), Problems: s.Problems}
+		v := SourceView{Name: s.Name, Provider: s.Provider.Name, Workdir: c.Workdir(s), Problems: s.Problems}
+		if t, ok := listedAt[s.Name]; ok {
+			v.LastListedAt = t.UTC().Format(time.RFC3339)
+		}
+		v.ListError = listErr[s.Name]
+		out[i] = v
 	}
 	return out
 }
@@ -453,6 +566,7 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 		if d := s.cfg.RetryStalled.D(); d > 0 {
 			go s.stalled(ctx, d)
 		}
+		go s.sweep(ctx)
 	}
 
 	mux := http.NewServeMux()
@@ -502,7 +616,39 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
+	// The HTTP listener is down the moment ctx is cancelled, but a transition
+	// already launched keeps running — a stage script, an agent, a git push.
+	// cmdServe releases the data-directory lock in a defer right after Run
+	// returns, so returning here before that work is done would let a
+	// restarted engine claim an item whose old run has not actually stopped.
+	s.drain()
 	return nil
+}
+
+// drainGrace bounds how long shutdown waits for in-flight transitions before
+// giving up and returning anyway. It must exceed the runner's own grace
+// period (30s): a script whose child ignores TERM is not reaped until the
+// runner's own SIGKILL lands, and draining any less than that would time out
+// on exactly the case it exists for.
+const drainGrace = 45 * time.Second
+
+// drain waits for every transition already claimed — schedule's launches,
+// handleStart, and the tick button's own advance — to finish, or gives up
+// after drainGrace and says what is still running rather than hanging
+// forever on a run that will not.
+func (s *Server) drain() {
+	deadline := time.Now().Add(s.drainGrace)
+	for s.inFlight.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := s.inFlight.Load(); n != 0 {
+		var running []string
+		for _, a := range s.activeList() {
+			running = append(running, a.ItemID)
+		}
+		fmt.Fprintf(os.Stderr, "conveyor: shutting down with %d transition(s) still running after %s: %s\n",
+			n, s.drainGrace, strings.Join(running, ", "))
+	}
 }
 
 // poll re-lists every source on the configured interval, and does nothing
@@ -685,6 +831,15 @@ func (s *Server) refresh(ctx context.Context) {
 
 	var items []model.Item
 	var warnings []string
+	// Accumulated during the loop below and applied only once, inside the
+	// same lock that assigns Items/Warnings/UpdatedAt — so /api/state can
+	// never serve a fresh lastListedAt beside the previous poll's items.
+	// Two of the three ways to skip a source below (config problems, no
+	// engine client) leave both maps untouched for that source: neither is
+	// an attempt, so there is no outcome to record — the absence itself is
+	// what the board reads as "never listed".
+	listedNow := map[string]time.Time{}
+	failedNow := map[string]string{}
 
 	s.mu.Lock()
 	s.state.Polling = true
@@ -711,6 +866,7 @@ func (s *Server) refresh(ctx context.Context) {
 		res, err := client.List(ctx)
 		if err != nil {
 			warnings = append(warnings, src.Name+": "+err.Error())
+			failedNow[src.Name] = err.Error()
 			// A failed listing is no information about this source, not a
 			// signal that its work vanished: keep what was already known
 			// about it rather than have the wholesale assignment below wipe
@@ -719,6 +875,7 @@ func (s *Server) refresh(ctx context.Context) {
 			items = append(items, s.mergeSourceListing(src.Name, genStart, nil, true)...)
 			continue
 		}
+		listedNow[src.Name] = time.Now()
 		for _, w := range res.Warnings {
 			warnings = append(warnings, src.Name+": "+w.String())
 		}
@@ -728,14 +885,27 @@ func (s *Server) refresh(ctx context.Context) {
 
 	s.askAgents(ctx)
 	s.recallBlocks(items)
+	storage := s.storageUse()
 
 	s.mu.Lock()
+	// Both fields describe the latest attempt, not a high-water mark: a
+	// success clears the previous failure, and a later failure sets it again
+	// without disturbing the lastListedAt a prior success already wrote.
+	for name, t := range listedNow {
+		s.listedAt[name] = t
+		delete(s.listErr, name)
+	}
+	for name, e := range failedNow {
+		s.listErr[name] = e
+	}
 	s.state.Items = items
 	s.state.Warnings = warnings
-	s.state.Sources = sourceViews(s.cfg)
+	s.state.Sources = sourceViews(s.cfg, s.listedAt, s.listErr)
 	s.state.Order = s.order.IDs()
 	s.state.UpdatedAt = time.Now()
 	s.state.Polling = false
+	s.state.Storage = storage
+	s.state.PollNs = s.cfg.Poll.D()
 	// The listing every deferred stage was waiting for. Whatever it exited 10
 	// over has had a poll interval to change — but only for an item whose
 	// deferral was set *before* its source's own listing began (F03). One set
@@ -1037,7 +1207,7 @@ func (s *Server) recallBlocks(items []model.Item) {
 		// it — exactly the instant a card's age should be measured from.
 		if wantTimes[m.ItemID] && m.Kind == "move" && m.Outcome == model.OutcomeSuccess &&
 			m.From != m.To && m.To == stageOf[m.ItemID] {
-			foundTimes[m.ItemID] = ItemTime{Stage: m.To, EnteredStage: m.FinishedAt}
+			foundTimes[m.ItemID] = ItemTime{Stage: m.To, EnteredStage: m.FinishedAt, RunID: m.ID}
 			delete(wantTimes, m.ItemID)
 		}
 		return len(wantBlocks) > 0 || len(wantTimes) > 0
@@ -1144,6 +1314,12 @@ func (s *Server) claimAndLaunch(ctx context.Context, item model.Item, target str
 // many it started. Candidates whose source or target stage is already busy are
 // skipped rather than queued, so a slow stage never holds up a free one.
 func (s *Server) launch(ctx context.Context) int {
+	// Shutting down: nothing new starts, whatever the locks would otherwise
+	// permit. schedule's own ctx.Done() case returns it from the loop right
+	// after, but a claim made in the meantime would still need reaping.
+	if ctx.Err() != nil {
+		return 0
+	}
 	s.mu.RLock()
 	items := append([]model.Item(nil), s.state.Items...)
 	resting := make(map[string]bool, len(s.resting))
@@ -1318,7 +1494,7 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// confirmation, a mark — did not arrive anywhere, and its existing entry,
 	// if it has one, is left untouched.
 	if tr.Item.Stage != tr.From {
-		s.times[tr.Item.ID] = ItemTime{Stage: tr.Item.Stage, EnteredStage: now}
+		s.times[tr.Item.ID] = ItemTime{Stage: tr.Item.Stage, EnteredStage: now, RunID: tr.RunID}
 	}
 	// tr.Err is set on an infrastructure failure — an initial provider move
 	// that failed before any script ran (tr.Outcome == "") is the one F04
@@ -1374,6 +1550,11 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 // advance runs a single transition: the button, which works whether or not the
 // pipeline is running itself.
 func (s *Server) advance(ctx context.Context) bool {
+	// Shutting down: the button is the only mover in -watch mode, so this is
+	// the whole of what a drain waits for there, not an edge of it.
+	if ctx.Err() != nil {
+		return false
+	}
 	s.mu.RLock()
 	items := append([]model.Item(nil), s.state.Items...)
 	s.mu.RUnlock()
@@ -1390,6 +1571,11 @@ func (s *Server) advance(ctx context.Context) bool {
 	}
 	defer s.eng.Locks().Release(item.Source, target)
 	defer s.working.Delete(item.ID)
+	// Counted the same way schedule's launches are, so a drain waiting on
+	// inFlight actually waits for this too — the only mover with -watch set,
+	// where schedule never launches anything at all.
+	s.inFlight.Add(1)
+	defer s.inFlight.Add(-1)
 	s.runOne(ctx, *item, target)
 	return true
 }
@@ -1456,6 +1642,13 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 // running is dropped rather than queued, because two agents in one worktree is
 // exactly what perSource exists to prevent.
 func (s *Server) handleTick(w http.ResponseWriter, r *http.Request) {
+	// Shutting down: button's own goroutine has already returned or is about
+	// to, so a tick queued here would never be read. Say so rather than
+	// accepting a gesture that does nothing.
+	if s.ctx.Err() != nil {
+		http.Error(w, "conveyor is shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	select {
 	case s.tick <- struct{}{}:
 		w.WriteHeader(http.StatusAccepted)
@@ -1534,6 +1727,12 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Shutting down: refuse rather than claim an item whose run would outlive
+	// the engine that started it.
+	if s.ctx.Err() != nil {
+		http.Error(w, "conveyor is shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	// A manual start goes through the same atomic claim as every other
 	// dispatch path (claim), and overrides exactly one guard:
 	//   - overrides: resting — a deferral means "wait for the next listing",
@@ -1989,7 +2188,12 @@ type RunMeta struct {
 	// Lines, not a blob: a log carries structure the writer already knew —
 	// which stream a line came from — and handing back one string throws it
 	// away, so a finished run could not be rendered the way a live one is.
-	Lines []runner.LogLine `json:"lines,omitempty"`
+	//
+	// Bounded: at most tail lines (2000 by default), from offset if given —
+	// see logWindow. TotalLines is the true count, so a caller can page to
+	// the rest instead of being handed a log's whole size in one response.
+	Lines      []runner.LogLine `json:"lines,omitempty"`
+	TotalLines int              `json:"totalLines"`
 }
 
 // handleRuns lists recent runs, newest first, optionally for one item.
@@ -2005,20 +2209,123 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	runs, err := s.listRuns("", 500)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if !runner.ValidID(id) {
+		// Never interpret an arbitrary request path as a filesystem path: a
+		// malformed id is rejected before it is joined onto anything.
+		http.Error(w, "invalid run id", http.StatusBadRequest)
 		return
 	}
-	for _, run := range runs {
-		if run.ID == id {
-			b, _ := os.ReadFile(filepath.Join(run.Dir, "log.txt"))
-			run.Lines = parseLog(string(b))
-			writeJSON(w, run)
+	run, ok := s.findRun(id)
+	if !ok {
+		s.mu.RLock()
+		swept := s.everSwept
+		horizon := s.sweepHorizon
+		s.mu.RUnlock()
+		if swept {
+			// Genuinely honest but coarse: day directories are the unit of
+			// retention and no per-run tombstone is kept, so this cannot
+			// prove the id was swept rather than never having existed — only
+			// that runs before the horizon are gone. See CONTRACTS §6.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":   "retained",
+				"horizon": horizon.Format("2006-01-02"),
+			})
 			return
 		}
+		http.NotFound(w, r)
+		return
 	}
-	http.NotFound(w, r)
+	b, _ := os.ReadFile(filepath.Join(run.Dir, "log.txt"))
+	all := parseLog(string(b))
+	run.TotalLines = len(all)
+	run.Lines = logWindow(all, r.URL.Query().Get("tail"), r.URL.Query().Get("offset"))
+	writeJSON(w, run)
+}
+
+// defaultTailLines is what GET /api/runs/{id} returns when the caller asks
+// for nothing in particular: a large log must not be handed over whole.
+const defaultTailLines = 2000
+
+// logWindow slices a bounded piece out of a run's full log, in units of
+// lines: tail with no offset is the last N lines (2000 if tail is absent or
+// invalid); an offset pages from that line index for up to tail lines.
+func logWindow(all []runner.LogLine, tailParam, offsetParam string) []runner.LogLine {
+	tail := defaultTailLines
+	if n, err := strconv.Atoi(tailParam); err == nil && n >= 0 {
+		tail = n
+	}
+	total := len(all)
+	if offsetParam == "" {
+		start := total - tail
+		if start < 0 {
+			start = 0
+		}
+		return all[start:]
+	}
+	offset, err := strconv.Atoi(offsetParam)
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	end := offset + tail
+	if end > total {
+		end = total
+	}
+	return all[offset:end]
+}
+
+// findRun resolves a run ID directly against the run root: the ID is the run
+// directory's own name (runner.Run's leaf), so the lookup is a stat per day
+// directory rather than a walk that reads every meta.json to find a match —
+// O(retained days), not O(retained runs). id is assumed already validated by
+// runner.ValidID; findRun additionally refuses a match that turns out to be a
+// symlink escaping the run root.
+func (s *Server) findRun(id string) (RunMeta, bool) {
+	root := s.run.Root
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return RunMeta{}, false
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		resolvedRoot = absRoot
+	}
+	days, err := os.ReadDir(root)
+	if err != nil {
+		return RunMeta{}, false
+	}
+	for _, day := range days {
+		if !day.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, day.Name(), id)
+		fi, err := os.Stat(dir)
+		if err != nil || !fi.IsDir() {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			continue
+		}
+		if resolved != resolvedRoot && !strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator)) {
+			continue // a symlink inside the run root pointing outside it
+		}
+		b, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+		if err != nil || len(b) == 0 {
+			continue
+		}
+		var m RunMeta
+		if json.Unmarshal(b, &m) != nil {
+			continue
+		}
+		m.Dir = dir
+		return m, true
+	}
+	return RunMeta{}, false
 }
 
 // listRuns walks the run root newest-day-first and stops once it has enough.
