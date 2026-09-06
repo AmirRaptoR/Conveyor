@@ -62,7 +62,13 @@ type State struct {
 	// decision for a person, only a fact the board must not lose behind the
 	// next successful listing the way State.Warnings would.
 	TransitionErrors map[string]TransitionError `json:"transitionErrors,omitempty"`
-	UpdatedAt        time.Time                  `json:"updatedAt"`
+	// Answers is, per item, whether a person's reply is held and when it was
+	// recorded, and — once a run has actually received it — that run's id.
+	// Never the reverse order: an answer is never shown consumed before a run
+	// has been given it. Pruned when the item leaves the board, the same
+	// lifetime rule Times uses.
+	Answers   map[string]AnswerView `json:"answers,omitempty"`
+	UpdatedAt time.Time             `json:"updatedAt"`
 	Polling   bool                `json:"polling"`
 	// Agents is how each agent the sources call says it is doing — a usage
 	// limit, a quota, whatever its own status script chose to report. Empty
@@ -126,6 +132,17 @@ type ItemTime struct {
 type TransitionError struct {
 	Reason string    `json:"reason"`
 	At     time.Time `json:"at"`
+}
+
+// AnswerView is what the board can say about a held reply without reading the
+// answer itself: when it was recorded, and — once a run has actually been
+// given it — which run that was.
+type AnswerView struct {
+	RecordedAt time.Time `json:"recordedAt"`
+	// ConsumedBy is the run id that received this answer, set only after
+	// store.Answers.Take has actually spent it — never before, and never
+	// merely because a run started.
+	ConsumedBy string `json:"consumedBy,omitempty"`
 }
 
 type StageView struct {
@@ -264,6 +281,12 @@ type Server struct {
 	// than once for the whole poll, so a slow source cannot make a fast
 	// source's fresh listing look stale in the same pass.
 	sourceGen map[string]time.Time
+	// answerInfo is, per item, when its currently-held or last-recorded
+	// answer was recorded, and the run id that consumed it once one has.
+	// Memory-only, like paused: it is a fact about this process's own
+	// handling of a reply, not something a restart can recover from run
+	// history or the answers file, which holds only the reply itself.
+	answerInfo map[string]AnswerView
 	// paused is the agents the scheduler is holding work back from, by name.
 	//
 	// Not persisted, deliberately: it is a fact about the outside world right
@@ -370,6 +393,7 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 	s.restingAt = map[string]time.Time{}
 	s.confirmedAt = map[string]time.Time{}
 	s.sourceGen = map[string]time.Time{}
+	s.answerInfo = map[string]AnswerView{}
 	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
 
 	// Every log line reaches the browser as it is produced. This is the whole
@@ -764,6 +788,11 @@ func (s *Server) refresh(ctx context.Context) {
 	for id := range s.confirmedAt {
 		if !onBoard[id] {
 			delete(s.confirmedAt, id)
+		}
+	}
+	for id := range s.answerInfo {
+		if !onBoard[id] {
+			delete(s.answerInfo, id)
 		}
 	}
 	s.mu.Unlock()
@@ -1233,8 +1262,17 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 			_ = s.answers.Set(item.ID, model.Resume{Answer: resume.Answer})
 		}
 	default:
-		if _, err := s.answers.Take(item.ID, resume); err != nil {
+		spent, err := s.answers.Take(item.ID, resume)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "conveyor: %s: could not record its answer as spent: %v\n", item.ID, err)
+		} else if spent && resume.Answer != "" {
+			// Only now — after the run named by tr has actually been handed
+			// the answer — does the board get to say who received it.
+			s.mu.Lock()
+			info := s.answerInfo[item.ID]
+			info.ConsumedBy = tr.RunID
+			s.answerInfo[item.ID] = info
+			s.mu.Unlock()
 		}
 	}
 	s.applyTransition(tr)
@@ -1400,6 +1438,10 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	st.TransitionErrors = make(map[string]TransitionError, len(s.transitionErrs))
 	for id, e := range s.transitionErrs {
 		st.TransitionErrors[id] = e
+	}
+	st.Answers = make(map[string]AnswerView, len(s.answerInfo))
+	for id, a := range s.answerInfo {
+		st.Answers[id] = a
 	}
 	s.mu.RUnlock()
 	writeJSON(w, st)
@@ -1592,6 +1634,11 @@ func (s *Server) answerThenUnblock(ctx context.Context, item model.Item, answer 
 			_, _ = s.answers.Take(item.ID, resume)
 		}
 		return err
+	}
+	if answer != "" {
+		s.mu.Lock()
+		s.answerInfo[item.ID] = AnswerView{RecordedAt: time.Now()}
+		s.mu.Unlock()
 	}
 	return nil
 }
