@@ -810,6 +810,15 @@ let dragging = null, justDragged = false;
 let blocks = {};
 const clock = iso => { const d = new Date(iso);
   return isNaN(d) ? iso : d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}); };
+// The run store's own size, in the units a person reads it in — the board
+// says "2.3 GB", never a raw byte count.
+const fmtBytes = n => {
+  if (!n) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
+};
 
 // The board is served to phones over the network, where a skewed device
 // clock is an everyday thing. Every other timestamp here is absolute, so a
@@ -953,6 +962,15 @@ function draw() {
   // the colours are decoration, because nothing says which repo is which.
   const counts = {};
   for (const it of items) counts[it.source] = (counts[it.source] || 0) + 1;
+  // How much the run store holds and how far back retention still reaches —
+  // one figure, in the same strip as what is enrolled, because both answer
+  // "what does this board's disk footprint look like right now".
+  const storage = state.storage;
+  const storageChip = storage && storage.runs ? `<span class="src-chip storage" title="run store on disk">
+        <span class="n">${fmtBytes(storage.bytes)}</span>
+        <span class="repo">${storage.runs} run${storage.runs === 1 ? "" : "s"}${
+          storage.oldestDay ? ` retained since ${esc(storage.oldestDay)}` : ""}</span>
+      </span>` : "";
   $("#sources").innerHTML = `<div class="sources">${
     (state.sources || []).map(s => {
       const broken = (s.problems || []).length > 0;
@@ -963,13 +981,19 @@ function draw() {
         <span class="n">${counts[s.name] || 0}</span>
         ${broken ? `<span class="repo">cannot run</span>` : ""}
       </span>`;
-    }).join("")
+    }).join("") + storageChip
   }</div>`;
 
   const bad = (state.sources || []).filter(s => (s.problems || []).length);
-  $("#faults").innerHTML = bad.length ? `<div class="faults">
-      <h2>${bad.length} source${bad.length > 1 ? "s" : ""} cannot run</h2>
-      ${bad.map(s => `<div><b>${esc(s.name)}</b> — ${s.problems.map(esc).join("<br>")}</div>`).join("")}
+  // A persistence fault is not a source problem — it is a fact about the run
+  // store itself — but it is the same tone (red, sticky, needs a person) and
+  // belongs beside them rather than inventing a second strip for one line.
+  const pf = state.persistFault;
+  $("#faults").innerHTML = (bad.length || pf) ? `<div class="faults">
+      ${bad.length ? `<h2>${bad.length} source${bad.length > 1 ? "s" : ""} cannot run</h2>
+      ${bad.map(s => `<div><b>${esc(s.name)}</b> — ${s.problems.map(esc).join("<br>")}</div>`).join("")}` : ""}
+      ${pf ? `<h2>run store cannot record itself</h2>
+      <div><b>${esc(pf.runId)}</b>${pf.itemId ? ` (${esc(pf.itemId)})` : ""} — ${esc(pf.message)}</div>` : ""}
     </div>` : "";
 
   $("#lamp").className = "lamp " + (active.length || state.polling ? "busy" : "idle");
