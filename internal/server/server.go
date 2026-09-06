@@ -75,6 +75,9 @@ type State struct {
 	// Active is every transition running right now. The board lights those
 	// stations; without it the page cannot tell work from stillness.
 	Active []Active `json:"active"`
+	// Storage is what the run store currently holds and how far back
+	// retention still reaches.
+	Storage StorageView `json:"storage"`
 }
 
 // SlotsView is the concurrency state, as the scheduler sees it.
@@ -110,6 +113,10 @@ type Active struct {
 type ItemTime struct {
 	Stage        string    `json:"stage"`
 	EnteredStage time.Time `json:"enteredStage"`
+	// RunID is the move run that landed the item in Stage — the same run
+	// CONTRACTS §6 pins against retention so the stage-age chip never goes
+	// blank out from under a currently-listed item.
+	RunID string `json:"-"`
 }
 
 type StageView struct {
@@ -368,6 +375,7 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 		if d := s.cfg.RetryStalled.D(); d > 0 {
 			go s.stalled(ctx, d)
 		}
+		go s.sweep(ctx)
 	}
 
 	mux := http.NewServeMux()
@@ -636,6 +644,7 @@ func (s *Server) refresh(ctx context.Context) {
 
 	s.askAgents(ctx)
 	s.recallBlocks(items)
+	storage := s.storageUse()
 
 	s.mu.Lock()
 	s.state.Items = items
@@ -644,6 +653,7 @@ func (s *Server) refresh(ctx context.Context) {
 	s.state.Order = s.order.IDs()
 	s.state.UpdatedAt = time.Now()
 	s.state.Polling = false
+	s.state.Storage = storage
 	// The listing every deferred stage was waiting for. Whatever it exited 10
 	// over has had a poll interval to change.
 	clear(s.resting)
@@ -815,7 +825,7 @@ func (s *Server) recallBlocks(items []model.Item) {
 		// it — exactly the instant a card's age should be measured from.
 		if wantTimes[m.ItemID] && m.Kind == "move" && m.Outcome == model.OutcomeSuccess &&
 			m.From != m.To && m.To == stageOf[m.ItemID] {
-			foundTimes[m.ItemID] = ItemTime{Stage: m.To, EnteredStage: m.FinishedAt}
+			foundTimes[m.ItemID] = ItemTime{Stage: m.To, EnteredStage: m.FinishedAt, RunID: m.ID}
 			delete(wantTimes, m.ItemID)
 		}
 		return len(wantBlocks) > 0 || len(wantTimes) > 0
@@ -1001,7 +1011,7 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// confirmation, a mark — did not arrive anywhere, and its existing entry,
 	// if it has one, is left untouched.
 	if tr.Item.Stage != tr.From {
-		s.times[tr.Item.ID] = ItemTime{Stage: tr.Item.Stage, EnteredStage: now}
+		s.times[tr.Item.ID] = ItemTime{Stage: tr.Item.Stage, EnteredStage: now, RunID: tr.RunID}
 	}
 	// A no-op in the stage the item was already in is the script saying it has
 	// nothing to do yet — a pull request still settling, a check still running.

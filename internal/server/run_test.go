@@ -6,7 +6,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 )
@@ -119,6 +121,36 @@ func TestRunLookupRejectsUnsafeIDsWith400(t *testing.T) {
 		if w.Body.String() != "" && w.Code == 200 {
 			t.Errorf("id %q: leaked file contents: %s", id, w.Body.String())
 		}
+	}
+}
+
+// An id that resolves to nothing is 404 until retention has actually removed
+// something, and 410 afterwards — naming the horizon, never confused with the
+// old arbitrary 500-run lookup cutoff.
+func TestRunLookupDistinguishesNeverExistedFromRetained(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+
+	req := httptest.NewRequest("GET", "/api/runs/000000.000-nope", nil)
+	req.SetPathValue("id", "000000.000-nope")
+	w := httptest.NewRecorder()
+	s.handleRun(w, req)
+	if w.Code != 404 {
+		t.Fatalf("before any sweep: status = %d, want 404", w.Code)
+	}
+
+	s.mu.Lock()
+	s.everSwept = true
+	s.sweepHorizon = time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	s.mu.Unlock()
+
+	w = httptest.NewRecorder()
+	s.handleRun(w, req)
+	if w.Code != 410 {
+		t.Fatalf("after a sweep removed something: status = %d, want 410", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "2026-08-01") {
+		t.Errorf("410 body does not name the horizon: %s", w.Body.String())
 	}
 }
 
