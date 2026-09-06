@@ -83,6 +83,12 @@ type State struct {
 	// cleanly. Unlike Warnings, refresh never rebuilds this: a disk-full
 	// fault must survive to the next poll, not vanish within one interval.
 	PersistFault *PersistFault `json:"persistFault,omitempty"`
+	// PollNs is the configured poll interval, so the board can tell a stale
+	// listing from a fresh one without guessing at a constant of its own —
+	// the engine says what "stale" means, the same way it says everything
+	// else the page renders (CLAUDE.md: "the board never derives what the
+	// engine knows").
+	PollNs time.Duration `json:"pollNs"`
 }
 
 // PersistFault is one run whose own record-keeping failed — set from
@@ -228,6 +234,16 @@ type SourceView struct {
 	Provider string   `json:"provider"`
 	Workdir  string   `json:"workdir"`
 	Problems []string `json:"problems,omitempty"`
+	// LastListedAt is the last listing that returned without error, RFC3339,
+	// omitted when this source has never been listed successfully — not a
+	// zero time, which would render as 1970 on the board.
+	LastListedAt string `json:"lastListedAt,omitempty"`
+	// ListError is the error from the latest listing attempt, empty when
+	// that attempt succeeded (or none has been made yet). It describes only
+	// the most recent attempt, not a high-water mark: a source that failed
+	// and then succeeded shows no error here, even though LastListedAt is
+	// what actually moved.
+	ListError string `json:"listError,omitempty"`
 }
 
 type Server struct {
@@ -265,6 +281,15 @@ type Server struct {
 	// the agents' own status scripts. A pause recovered from disk would be a
 	// guess about a window that may have closed while the process was down.
 	paused map[string]PauseView
+	// listedAt is the last successful listing for each source, by name; a
+	// source absent from this map has never been listed. listErr is the
+	// latest attempt's error, present only when that attempt failed — a
+	// source can be in both maps at once (it listed successfully once, and
+	// has failed on every attempt since). Neither survives a restart, the
+	// same as paused: a just-started process has nothing to say yet about a
+	// source it has not listed.
+	listedAt map[string]time.Time
+	listErr  map[string]string
 
 	hub   *hub
 	order *store.Order
@@ -354,7 +379,9 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 	s.times = map[string]ItemTime{}
 	s.paused = map[string]PauseView{}
 	s.resting = map[string]bool{}
-	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
+	s.listedAt = map[string]time.Time{}
+	s.listErr = map[string]string{}
+	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg, nil, nil), PollNs: cfg.Poll.D()}
 
 	// Every log line reaches the browser as it is produced. This is the whole
 	// reason logs are a stream and not a file read at the end.
@@ -416,10 +443,18 @@ func stageViews(c *config.Config) []StageView {
 	return out
 }
 
-func sourceViews(c *config.Config) []SourceView {
+// sourceViews builds the board's per-source view. listedAt and listErr carry
+// what refresh has learned about each source's listing so far — nil at
+// construction, before anything has been listed — keyed by source name.
+func sourceViews(c *config.Config, listedAt map[string]time.Time, listErr map[string]string) []SourceView {
 	out := make([]SourceView, len(c.Sources))
 	for i, s := range c.Sources {
-		out[i] = SourceView{Name: s.Name, Provider: s.Provider.Name, Workdir: c.Workdir(s), Problems: s.Problems}
+		v := SourceView{Name: s.Name, Provider: s.Provider.Name, Workdir: c.Workdir(s), Problems: s.Problems}
+		if t, ok := listedAt[s.Name]; ok {
+			v.LastListedAt = t.UTC().Format(time.RFC3339)
+		}
+		v.ListError = listErr[s.Name]
+		out[i] = v
 	}
 	return out
 }
@@ -717,6 +752,15 @@ func (s *Server) refresh(ctx context.Context) {
 
 	var items []model.Item
 	var warnings []string
+	// Accumulated during the loop below and applied only once, inside the
+	// same lock that assigns Items/Warnings/UpdatedAt — so /api/state can
+	// never serve a fresh lastListedAt beside the previous poll's items.
+	// Two of the three ways to skip a source below (config problems, no
+	// engine client) leave both maps untouched for that source: neither is
+	// an attempt, so there is no outcome to record — the absence itself is
+	// what the board reads as "never listed".
+	listedNow := map[string]time.Time{}
+	failedNow := map[string]string{}
 
 	s.mu.Lock()
 	s.state.Polling = true
@@ -734,8 +778,10 @@ func (s *Server) refresh(ctx context.Context) {
 		res, err := client.List(ctx)
 		if err != nil {
 			warnings = append(warnings, src.Name+": "+err.Error())
+			failedNow[src.Name] = err.Error()
 			continue
 		}
+		listedNow[src.Name] = time.Now()
 		for _, w := range res.Warnings {
 			warnings = append(warnings, src.Name+": "+w.String())
 		}
@@ -747,13 +793,24 @@ func (s *Server) refresh(ctx context.Context) {
 	storage := s.storageUse()
 
 	s.mu.Lock()
+	// Both fields describe the latest attempt, not a high-water mark: a
+	// success clears the previous failure, and a later failure sets it again
+	// without disturbing the lastListedAt a prior success already wrote.
+	for name, t := range listedNow {
+		s.listedAt[name] = t
+		delete(s.listErr, name)
+	}
+	for name, e := range failedNow {
+		s.listErr[name] = e
+	}
 	s.state.Items = items
 	s.state.Warnings = warnings
-	s.state.Sources = sourceViews(s.cfg)
+	s.state.Sources = sourceViews(s.cfg, s.listedAt, s.listErr)
 	s.state.Order = s.order.IDs()
 	s.state.UpdatedAt = time.Now()
 	s.state.Polling = false
 	s.state.Storage = storage
+	s.state.PollNs = s.cfg.Poll.D()
 	// The listing every deferred stage was waiting for. Whatever it exited 10
 	// over has had a poll interval to change.
 	clear(s.resting)
