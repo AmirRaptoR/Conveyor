@@ -75,6 +75,26 @@ type State struct {
 	// Active is every transition running right now. The board lights those
 	// stations; without it the page cannot tell work from stillness.
 	Active []Active `json:"active"`
+	// Storage is what the run store currently holds and how far back
+	// retention still reaches.
+	Storage StorageView `json:"storage"`
+	// PersistFault is a run whose own record could not be trusted — a full
+	// disk during its meta.json write — kept until a later run persists
+	// cleanly. Unlike Warnings, refresh never rebuilds this: a disk-full
+	// fault must survive to the next poll, not vanish within one interval.
+	PersistFault *PersistFault `json:"persistFault,omitempty"`
+}
+
+// PersistFault is one run whose own record-keeping failed — set from
+// runner.Result.PersistErr, which is what a failed meta.json write or
+// log.txt append leaves there instead of a record that looks like a clean
+// success.
+type PersistFault struct {
+	RunID   string    `json:"runId"`
+	ItemID  string    `json:"itemId,omitempty"`
+	Source  string    `json:"source,omitempty"`
+	Message string    `json:"message"`
+	At      time.Time `json:"at"`
 }
 
 // SlotsView is the concurrency state, as the scheduler sees it.
@@ -110,6 +130,10 @@ type Active struct {
 type ItemTime struct {
 	Stage        string    `json:"stage"`
 	EnteredStage time.Time `json:"enteredStage"`
+	// RunID is the move run that landed the item in Stage — the same run
+	// CONTRACTS §6 pins against retention so the stage-age chip never goes
+	// blank out from under a currently-listed item.
+	RunID string `json:"-"`
 }
 
 type StageView struct {
@@ -226,6 +250,14 @@ type Server struct {
 	// the durable record, this is only the index into them a board read
 	// cannot afford to rebuild.
 	times map[string]ItemTime
+	// everSwept is whether the retention sweep has ever actually deleted a
+	// run. It is what tells a run ID that resolves to nothing apart from "it
+	// never existed" (404) from "it is gone because retention removed it"
+	// (410) — an arbitrary lookup cutoff used to conflate the two.
+	everSwept bool
+	// sweepHorizon is the oldest day the last sweep left standing, named in a
+	// 410 so an operator knows how far back retention still reaches.
+	sweepHorizon time.Time
 	// paused is the agents the scheduler is holding work back from, by name.
 	//
 	// Not persisted, deliberately: it is a fact about the outside world right
@@ -333,7 +365,47 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 		}
 		s.hub.publish(event{Kind: "log", RunID: runID, Line: &l})
 	}
+	// Every run this Runner executes — list, move, stage, doctor, status —
+	// reaches here, which is what lets one place notice a persistence fault
+	// without a check threaded through every call site that starts a run.
+	prevResult := r.OnResult
+	r.OnResult = func(res *runner.Result) {
+		if prevResult != nil {
+			prevResult(res)
+		}
+		s.notePersistFault(res)
+	}
 	return s
+}
+
+// notePersistFault sets or clears the board-visible sticky fault from one
+// run's outcome: a run whose meta.json write or log.txt append failed sets it
+// (naming the run that failed to record itself honestly); any other run
+// persisting means the disk is not, or is no longer, the problem, and clears
+// it. It is intentional that this is not scoped to one item or source — a
+// full disk is a fact about the run store, not about the run that happened to
+// notice it first.
+//
+// This reads res.PersistErr, not res.Run.Error: Run.Error keeps only the
+// first failure a run hit, so a run whose process failed to start *and*
+// whose log.txt append failed on the same full disk would carry the start
+// failure there, and a prefix check against it would miss the persistence
+// failure entirely — masking the fault instead of raising it, and silently
+// clearing a real one already on the board.
+func (s *Server) notePersistFault(res *runner.Result) {
+	if res == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if res.PersistErr != "" {
+		s.state.PersistFault = &PersistFault{
+			RunID: res.Run.ID, ItemID: res.Run.ItemID, Source: res.Run.Source,
+			Message: res.PersistErr, At: time.Now(),
+		}
+	} else {
+		s.state.PersistFault = nil
+	}
 }
 
 func stageViews(c *config.Config) []StageView {
@@ -381,6 +453,7 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 		if d := s.cfg.RetryStalled.D(); d > 0 {
 			go s.stalled(ctx, d)
 		}
+		go s.sweep(ctx)
 	}
 
 	mux := http.NewServeMux()
@@ -671,6 +744,7 @@ func (s *Server) refresh(ctx context.Context) {
 
 	s.askAgents(ctx)
 	s.recallBlocks(items)
+	storage := s.storageUse()
 
 	s.mu.Lock()
 	s.state.Items = items
@@ -679,6 +753,7 @@ func (s *Server) refresh(ctx context.Context) {
 	s.state.Order = s.order.IDs()
 	s.state.UpdatedAt = time.Now()
 	s.state.Polling = false
+	s.state.Storage = storage
 	// The listing every deferred stage was waiting for. Whatever it exited 10
 	// over has had a poll interval to change.
 	clear(s.resting)
@@ -850,7 +925,7 @@ func (s *Server) recallBlocks(items []model.Item) {
 		// it — exactly the instant a card's age should be measured from.
 		if wantTimes[m.ItemID] && m.Kind == "move" && m.Outcome == model.OutcomeSuccess &&
 			m.From != m.To && m.To == stageOf[m.ItemID] {
-			foundTimes[m.ItemID] = ItemTime{Stage: m.To, EnteredStage: m.FinishedAt}
+			foundTimes[m.ItemID] = ItemTime{Stage: m.To, EnteredStage: m.FinishedAt, RunID: m.ID}
 			delete(wantTimes, m.ItemID)
 		}
 		return len(wantBlocks) > 0 || len(wantTimes) > 0
@@ -1042,7 +1117,7 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// confirmation, a mark — did not arrive anywhere, and its existing entry,
 	// if it has one, is left untouched.
 	if tr.Item.Stage != tr.From {
-		s.times[tr.Item.ID] = ItemTime{Stage: tr.Item.Stage, EnteredStage: now}
+		s.times[tr.Item.ID] = ItemTime{Stage: tr.Item.Stage, EnteredStage: now, RunID: tr.RunID}
 	}
 	// A no-op in the stage the item was already in is the script saying it has
 	// nothing to do yet — a pull request still settling, a check still running.
@@ -1667,7 +1742,12 @@ type RunMeta struct {
 	// Lines, not a blob: a log carries structure the writer already knew —
 	// which stream a line came from — and handing back one string throws it
 	// away, so a finished run could not be rendered the way a live one is.
-	Lines []runner.LogLine `json:"lines,omitempty"`
+	//
+	// Bounded: at most tail lines (2000 by default), from offset if given —
+	// see logWindow. TotalLines is the true count, so a caller can page to
+	// the rest instead of being handed a log's whole size in one response.
+	Lines      []runner.LogLine `json:"lines,omitempty"`
+	TotalLines int              `json:"totalLines"`
 }
 
 // handleRuns lists recent runs, newest first, optionally for one item.
@@ -1683,20 +1763,123 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	runs, err := s.listRuns("", 500)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if !runner.ValidID(id) {
+		// Never interpret an arbitrary request path as a filesystem path: a
+		// malformed id is rejected before it is joined onto anything.
+		http.Error(w, "invalid run id", http.StatusBadRequest)
 		return
 	}
-	for _, run := range runs {
-		if run.ID == id {
-			b, _ := os.ReadFile(filepath.Join(run.Dir, "log.txt"))
-			run.Lines = parseLog(string(b))
-			writeJSON(w, run)
+	run, ok := s.findRun(id)
+	if !ok {
+		s.mu.RLock()
+		swept := s.everSwept
+		horizon := s.sweepHorizon
+		s.mu.RUnlock()
+		if swept {
+			// Genuinely honest but coarse: day directories are the unit of
+			// retention and no per-run tombstone is kept, so this cannot
+			// prove the id was swept rather than never having existed — only
+			// that runs before the horizon are gone. See CONTRACTS §6.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":   "retained",
+				"horizon": horizon.Format("2006-01-02"),
+			})
 			return
 		}
+		http.NotFound(w, r)
+		return
 	}
-	http.NotFound(w, r)
+	b, _ := os.ReadFile(filepath.Join(run.Dir, "log.txt"))
+	all := parseLog(string(b))
+	run.TotalLines = len(all)
+	run.Lines = logWindow(all, r.URL.Query().Get("tail"), r.URL.Query().Get("offset"))
+	writeJSON(w, run)
+}
+
+// defaultTailLines is what GET /api/runs/{id} returns when the caller asks
+// for nothing in particular: a large log must not be handed over whole.
+const defaultTailLines = 2000
+
+// logWindow slices a bounded piece out of a run's full log, in units of
+// lines: tail with no offset is the last N lines (2000 if tail is absent or
+// invalid); an offset pages from that line index for up to tail lines.
+func logWindow(all []runner.LogLine, tailParam, offsetParam string) []runner.LogLine {
+	tail := defaultTailLines
+	if n, err := strconv.Atoi(tailParam); err == nil && n >= 0 {
+		tail = n
+	}
+	total := len(all)
+	if offsetParam == "" {
+		start := total - tail
+		if start < 0 {
+			start = 0
+		}
+		return all[start:]
+	}
+	offset, err := strconv.Atoi(offsetParam)
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	end := offset + tail
+	if end > total {
+		end = total
+	}
+	return all[offset:end]
+}
+
+// findRun resolves a run ID directly against the run root: the ID is the run
+// directory's own name (runner.Run's leaf), so the lookup is a stat per day
+// directory rather than a walk that reads every meta.json to find a match —
+// O(retained days), not O(retained runs). id is assumed already validated by
+// runner.ValidID; findRun additionally refuses a match that turns out to be a
+// symlink escaping the run root.
+func (s *Server) findRun(id string) (RunMeta, bool) {
+	root := s.run.Root
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return RunMeta{}, false
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		resolvedRoot = absRoot
+	}
+	days, err := os.ReadDir(root)
+	if err != nil {
+		return RunMeta{}, false
+	}
+	for _, day := range days {
+		if !day.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, day.Name(), id)
+		fi, err := os.Stat(dir)
+		if err != nil || !fi.IsDir() {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			continue
+		}
+		if resolved != resolvedRoot && !strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator)) {
+			continue // a symlink inside the run root pointing outside it
+		}
+		b, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+		if err != nil || len(b) == 0 {
+			continue
+		}
+		var m RunMeta
+		if json.Unmarshal(b, &m) != nil {
+			continue
+		}
+		m.Dir = dir
+		return m, true
+	}
+	return RunMeta{}, false
 }
 
 // listRuns walks the run root newest-day-first and stops once it has enough.

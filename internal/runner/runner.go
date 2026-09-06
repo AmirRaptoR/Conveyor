@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"syscall"
 	"time"
@@ -59,8 +60,31 @@ type Result struct {
 	// Data is the parsed $CONVEYOR_RESULT file; nil when the script wrote
 	// nothing, which is not an error.
 	Data json.RawMessage
-	Log  []LogLine
+	// Log is a bounded tail of the run's output — at most maxLogLines lines,
+	// each at most maxLineBytes. Nothing in production reads it (only this
+	// package's own tests do); log.txt on disk is always the complete,
+	// untruncated record. See CONTRACTS §6.
+	Log []LogLine
+	// PersistErr names a failure to write meta.json or append log.txt, set
+	// independently of Run.Error. Run.Error keeps only the first failure a
+	// run hit — a process that fails to start sets it before persist() ever
+	// runs — so a simultaneous persistence failure could occupy no field a
+	// caller could reliably detect it from. This is that field.
+	PersistErr string
 }
+
+// maxLogLines bounds the in-memory copy of a run's log kept alongside the
+// file on disk. A long agent session can emit hundreds of thousands of
+// lines; nothing in production reads Result.Log, so there is no reason for it
+// to grow with the run instead of staying a fixed-size tail.
+const maxLogLines = 1000
+
+// maxLineBytes bounds a single log line kept in memory and published over
+// SSE. A script can emit one very long line — scan() below never limits a
+// read for exactly that reason — but a browser rendering it, or this slice
+// holding it, must not be handed the whole thing. log.txt still gets it in
+// full.
+const maxLineBytes = 64 * 1024
 
 // Runner writes run directories under Root.
 type Runner struct {
@@ -68,12 +92,28 @@ type Runner struct {
 	// OnLog, if set, is called for every line as it is produced — this is what
 	// makes logs live in the UI. Called from a single goroutine, in order.
 	OnLog func(runID string, line LogLine)
+	// OnResult, if set, is called once for every run this Runner executes,
+	// after its final meta.json write (or failed attempt at one) — list,
+	// move, stage, doctor, status, all of it. It is what lets a single place
+	// notice a persistence fault (Result.Run.Error naming one) without
+	// threading a check through every call site that starts a run.
+	OnResult func(res *Result)
 }
 
 // gracePeriod is how long a script gets to exit after SIGTERM before SIGKILL.
 const gracePeriod = 30 * time.Second
 
 func New(root string) *Runner { return &Runner{Root: root} }
+
+// idRe is the shape Run() gives a run ID: HHMMSS.mmm-<base36 suffix>. A
+// caller resolving an ID from a request path must reject anything else before
+// it ever becomes part of a filesystem path — "../", an absolute path, an
+// encoded separator and an empty string all fail this and touch no file.
+var idRe = regexp.MustCompile(`^[0-9]{6}\.[0-9]{3}-[0-9a-z]{1,10}$`)
+
+// ValidID reports whether id has the shape Run() gives a run — the only
+// vocabulary a request is allowed to name a run in.
+func ValidID(id string) bool { return idRe.MatchString(id) }
 
 // Run executes the script and returns only after the run directory is complete.
 // A non-zero exit is NOT a Go error: it is an outcome, carried in Result.Run.
@@ -94,9 +134,77 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		run.ItemID = spec.Item.ID
 	}
 
+	logPath := filepath.Join(dir, "log.txt")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return nil, err
+	}
+	defer logFile.Close()
+
+	var (
+		mu          sync.Mutex
+		lines       []LogLine
+		logWriteErr error
+	)
+	emit := func(stream, text string) {
+		now := time.Now()
+		_, werr := fmt.Fprintf(logFile, "%s %-6s %s\n", now.UTC().Format("15:04:05.000"), stream, text)
+		line := LogLine{At: now, Stream: stream, Text: capLine(text)}
+		mu.Lock()
+		if werr != nil && logWriteErr == nil {
+			logWriteErr = werr
+		}
+		lines = append(lines, line)
+		if len(lines) > maxLogLines {
+			lines = lines[len(lines)-maxLogLines:]
+		}
+		mu.Unlock()
+		if r.OnLog != nil {
+			r.OnLog(runID, line)
+		}
+	}
+	// persist writes meta.json and, on failure, makes that failure part of the
+	// run's own record instead of a record that looks like a clean success —
+	// a full disk must never be silently indistinguishable from nothing going
+	// wrong at all. A failed append to log.txt gets the same treatment; it
+	// cannot be logged through the same broken file, so it goes to the
+	// process's own stderr instead.
+	//
+	// persistErr is recorded separately from run.Error: run.Error keeps only
+	// the first failure a run hit (a process that fails to start sets it
+	// before persist() ever runs), so a persistence failure landing behind an
+	// earlier one would occupy no field a caller could detect it from.
+	// persistErr always carries it, whatever else went wrong first.
+	var persistErr string
+	persist := func() {
+		mu.Lock()
+		lwErr := logWriteErr
+		mu.Unlock()
+		if lwErr != nil {
+			msg := fmt.Sprintf("append log.txt: %v", lwErr)
+			if run.Error == "" {
+				run.Error = msg
+			}
+			if persistErr == "" {
+				persistErr = msg
+			}
+			fmt.Fprintln(os.Stderr, "conveyor: "+msg)
+		}
+		if err := writeMeta(&run, dir); err != nil {
+			msg := fmt.Sprintf("persist meta.json: %v", err)
+			if run.Error == "" {
+				run.Error = msg
+			}
+			if persistErr == "" {
+				persistErr = msg
+			}
+			emit("engine", msg)
+		}
+	}
+
 	// Recorded before the script starts, so a killed run still says what it was.
 	run.Outcome = model.OutcomeRunning
-	writeMeta(&run, dir)
+	persist()
 
 	script := spec.Script
 	if spec.Inline != "" {
@@ -153,35 +261,17 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		return nil, err
 	}
 
-	logPath := filepath.Join(dir, "log.txt")
-	logFile, err := os.Create(logPath)
-	if err != nil {
-		return nil, err
-	}
-	defer logFile.Close()
-
-	var (
-		mu    sync.Mutex
-		lines []LogLine
-	)
-	emit := func(stream, text string) {
-		line := LogLine{At: time.Now(), Stream: stream, Text: text}
-		mu.Lock()
-		lines = append(lines, line)
-		fmt.Fprintf(logFile, "%s %-6s %s\n", line.At.UTC().Format("15:04:05.000"), stream, text)
-		mu.Unlock()
-		if r.OnLog != nil {
-			r.OnLog(runID, line)
-		}
-	}
-
 	if err := cmd.Start(); err != nil {
 		emit("engine", "failed to start: "+err.Error())
 		run.Error = err.Error()
 		run.Outcome = model.OutcomeFailure
 		run.ExitCode = -1
-		r.finish(&run, dir, started)
-		return &Result{Run: run, Log: lines}, fmt.Errorf("start %s: %w", script, err)
+		r.finish(&run, started, persist)
+		res := &Result{Run: run, Log: lines, PersistErr: persistErr}
+		if r.OnResult != nil {
+			r.OnResult(res)
+		}
+		return res, fmt.Errorf("start %s: %w", script, err)
 	}
 
 	var wg sync.WaitGroup
@@ -272,9 +362,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	default:
 		run.Outcome = model.OutcomeFor(run.ExitCode, false)
 	}
-	r.finish(&run, dir, started)
+	r.finish(&run, started, persist)
 
-	res := &Result{Run: run, Log: lines}
+	res := &Result{Run: run, Log: lines, PersistErr: persistErr}
 	if b, err := os.ReadFile(resultPath); err == nil && len(b) > 0 {
 		if json.Valid(b) {
 			res.Data = json.RawMessage(b)
@@ -284,22 +374,66 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 			emit("engine", "result.json is not valid JSON; ignoring")
 		}
 	}
+	if r.OnResult != nil {
+		r.OnResult(res)
+	}
 	return res, nil
 }
 
-func (r *Runner) finish(run *model.Run, dir string, started time.Time) {
+func (r *Runner) finish(run *model.Run, started time.Time, persist func()) {
 	run.FinishedAt = time.Now()
 	run.Duration = run.FinishedAt.Sub(started)
-	writeMeta(run, dir)
+	persist()
 }
 
 // writeMeta is called twice: once before the process starts and again when it
 // ends. A run killed mid-flight — a timeout, a crash, an interrupted session —
 // otherwise leaves a zero-byte meta.json and no record of what it was doing,
 // which is exactly the run someone needs to read afterwards.
-func writeMeta(run *model.Run, dir string) {
-	b, _ := json.MarshalIndent(run, "", "  ")
-	_ = os.WriteFile(filepath.Join(dir, "meta.json"), b, 0o644)
+//
+// The write is atomic: marshalled to a temp file in the same directory (so
+// the rename is on one filesystem) and renamed into place, so a write that
+// fails partway — a full disk — leaves the previous meta.json intact rather
+// than truncated, and a caller can tell the failure apart from success instead
+// of it being silently dropped.
+func writeMeta(run *model.Run, dir string) error {
+	b, err := json.MarshalIndent(run, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".meta-*.json.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	_, writeErr := tmp.Write(b)
+	closeErr := tmp.Close()
+	if writeErr != nil || closeErr != nil {
+		os.Remove(tmpName)
+		if writeErr != nil {
+			return writeErr
+		}
+		return closeErr
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, filepath.Join(dir, "meta.json")); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+// capLine bounds a line kept in memory and published live: a single line over
+// maxLineBytes is truncated with an explicit marker. log.txt, written before
+// this is ever called, always has the line in full.
+func capLine(text string) string {
+	if len(text) <= maxLineBytes {
+		return text
+	}
+	return fmt.Sprintf("%s... [truncated, %d more bytes]", text[:maxLineBytes], len(text)-maxLineBytes)
 }
 
 // scan reads lines without a length limit: an AI script can emit a single very
@@ -386,21 +520,34 @@ func SweepInterrupted(root string) (int, error) {
 		return 0, err
 	}
 	n := 0
+	var errs []error
 	for _, day := range days {
 		if !day.IsDir() {
 			continue
 		}
-		entries, err := os.ReadDir(filepath.Join(root, day.Name()))
+		dayDir := filepath.Join(root, day.Name())
+		entries, err := os.ReadDir(dayDir)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("read %s: %w", dayDir, err))
 			continue
 		}
 		for _, e := range entries {
 			if !e.IsDir() {
 				continue
 			}
-			meta := filepath.Join(root, day.Name(), e.Name(), "meta.json")
+			dir := filepath.Join(dayDir, e.Name())
+			meta := filepath.Join(dir, "meta.json")
 			b, err := os.ReadFile(meta)
-			if err != nil || len(b) == 0 {
+			if err != nil {
+				// A run dir with no meta.json at all (mkdir happened, nothing
+				// was ever written) is not a fault worth reporting; anything
+				// else — permission denied, an I/O error — is.
+				if !os.IsNotExist(err) {
+					errs = append(errs, fmt.Errorf("read %s: %w", meta, err))
+				}
+				continue
+			}
+			if len(b) == 0 {
 				continue
 			}
 			var run model.Run
@@ -411,14 +558,12 @@ func SweepInterrupted(root string) (int, error) {
 			if run.FinishedAt.IsZero() {
 				run.FinishedAt = run.StartedAt
 			}
-			out, err := json.MarshalIndent(run, "", "  ")
-			if err != nil {
+			if err := writeMeta(&run, dir); err != nil {
+				errs = append(errs, fmt.Errorf("write %s: %w", meta, err))
 				continue
 			}
-			if os.WriteFile(meta, out, 0o644) == nil {
-				n++
-			}
+			n++
 		}
 	}
-	return n, nil
+	return n, errors.Join(errs...)
 }

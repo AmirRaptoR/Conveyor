@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // script creates an executable file, making parents as needed.
@@ -590,5 +591,76 @@ func TestAgentsComeFromTheSourcesThatUseThem(t *testing.T) {
 	}
 	if got[1].Name != "codex" || got[1].Status == "" {
 		t.Errorf("codex = %+v, want its status script found", got[1])
+	}
+}
+
+// logsConfig writes a config with an explicit logs: block, distinct from write()
+// which always leaves logs unset so defaulting can be exercised on its own.
+func logsConfig(t *testing.T, dir, logs string) string {
+	t.Helper()
+	path := filepath.Join(dir, "conveyor.yaml")
+	body := "version: 1\n" + logs + stages[len("version: 1\n"):] + declared
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestSweepAtMustBeHHMM(t *testing.T) {
+	for _, tc := range []struct{ name, sweepAt string }{
+		{"not a time", "logs:\n  sweepAt: soon\n"},
+		{"minutes out of range", "logs:\n  sweepAt: \"04:75\"\n"},
+		{"hours out of range", "logs:\n  sweepAt: \"25:00\"\n"},
+		{"12-hour form", "logs:\n  sweepAt: \"4:00pm\"\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			provider(t, dir)
+			script(t, filepath.Join(dir, "agents", "claude", "refine"))
+			workdir(t, filepath.Join(dir, "repo"))
+			_, err := Load(logsConfig(t, dir, tc.sweepAt))
+			if err == nil || !strings.Contains(err.Error(), "sweepAt") {
+				t.Fatalf("error = %v, want it to name sweepAt", err)
+			}
+		})
+	}
+}
+
+func TestSweepAtValidPasses(t *testing.T) {
+	dir := t.TempDir()
+	provider(t, dir)
+	script(t, filepath.Join(dir, "agents", "claude", "refine"))
+	workdir(t, filepath.Join(dir, "repo"))
+	cfg, err := Load(logsConfig(t, dir, "logs:\n  sweepAt: \"23:59\"\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Logs.SweepAt != "23:59" {
+		t.Errorf("SweepAt = %q, want 23:59", cfg.Logs.SweepAt)
+	}
+}
+
+func TestExplicitZeroRetentionIsALoadError(t *testing.T) {
+	dir := t.TempDir()
+	provider(t, dir)
+	script(t, filepath.Join(dir, "agents", "claude", "refine"))
+	workdir(t, filepath.Join(dir, "repo"))
+	_, err := Load(logsConfig(t, dir, "logs:\n  retention: 0\n"))
+	if err == nil || !strings.Contains(err.Error(), "retention") {
+		t.Fatalf("error = %v, want it to name retention", err)
+	}
+}
+
+func TestOmittedRetentionStillDefaultsTo30Days(t *testing.T) {
+	dir := t.TempDir()
+	provider(t, dir)
+	script(t, filepath.Join(dir, "agents", "claude", "refine"))
+	workdir(t, filepath.Join(dir, "repo"))
+	cfg, err := Load(write(t, dir, declared))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Logs.Retention.D() != 30*24*time.Hour {
+		t.Errorf("Retention = %v, want 30d default", cfg.Logs.Retention.D())
 	}
 }

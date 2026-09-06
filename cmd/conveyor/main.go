@@ -139,8 +139,12 @@ func own(cfg *config.Config, r *runner.Runner, settle bool) (func(), error) {
 		return nil, err
 	}
 	if settle {
-		if n, err := runner.SweepInterrupted(r.Root); err == nil && n > 0 {
+		n, err := runner.SweepInterrupted(r.Root)
+		if n > 0 {
 			fmt.Fprintf(os.Stderr, "conveyor: marked %d interrupted run(s) from a previous process\n", n)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: interrupted-run sweep had errors: %v\n", err)
 		}
 	}
 	return func() { _ = lock.Release() }, nil
