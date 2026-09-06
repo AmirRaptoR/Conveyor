@@ -317,6 +317,16 @@ type Server struct {
 	// would be a queue of duplicates.
 	wake     chan struct{}
 	inFlight atomic.Int64
+	// shutdownWork counts everything drain must wait for that is not a
+	// transition: the loops Run starts (poll, button, schedule, stalled,
+	// sweep), the goroutines a handler spawns that run a script or write a
+	// data file (refresh, runDoctorSweep, unblockAll, a push send), and every
+	// in-flight HTTP request. Tracked apart from inFlight so inFlight keeps
+	// meaning exactly "transitions" for handleState's Running and for
+	// stalled/schedule's own checks, and so drain's give-up message can still
+	// name which items a stuck *transition* belongs to — something this
+	// counter alone cannot say.
+	shutdownWork atomic.Int64
 	// polling guards discovery against itself: the ticker and the button both
 	// ask for it, and running every list script twice at once buys nothing.
 	polling atomic.Bool

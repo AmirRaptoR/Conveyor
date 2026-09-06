@@ -41,7 +41,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
-	go s.refresh(s.ctx)
+	s.spawn(func() { s.refresh(s.ctx) })
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -252,7 +252,7 @@ func (s *Server) handleUnblockAll(w http.ResponseWriter, r *http.Request) {
 		held = append(held, it)
 	}
 	s.mu.RUnlock()
-	go s.unblockAll(s.ctx, held)
+	s.spawn(func() { s.unblockAll(s.ctx, held) })
 	writeJSON(w, map[string]int{"unblocking": len(held), "waitingOnYou": skipped})
 }
 

@@ -32,7 +32,8 @@ func (s *Server) notify(title, body, itemID string) {
 		"url": "/#item=" + url.PathEscape(itemID),
 	})
 	for _, sub := range s.pushSubs.All() {
-		go func(sub push.Subscription) {
+		sub := sub
+		s.spawn(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			err := s.pushKeys.Send(ctx, sub, payload, "https://github.com/AmirRaptoR/Conveyor")
@@ -42,7 +43,7 @@ func (s *Server) notify(title, body, itemID string) {
 			case err != nil:
 				fmt.Fprintf(os.Stderr, "conveyor: push to %s: %v\n", sub.Endpoint, err)
 			}
-		}(sub)
+		})
 	}
 }
 
@@ -70,7 +71,7 @@ func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 	// A new device hears back at once, so turning notifications on is its
 	// own proof; the page re-posts on every load and those stay silent.
 	if fresh && s.pushKeys != nil {
-		go func() {
+		s.spawn(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			payload, _ := json.Marshal(map[string]string{"title": "Conveyor",
@@ -78,7 +79,7 @@ func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 			if err := s.pushKeys.Send(ctx, sub, payload, "https://github.com/AmirRaptoR/Conveyor"); err != nil {
 				fmt.Fprintf(os.Stderr, "conveyor: hello push: %v\n", err)
 			}
-		}()
+		})
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
