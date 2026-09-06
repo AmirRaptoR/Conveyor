@@ -30,10 +30,10 @@ const region = html.slice(start, end);
 const sandbox = {};
 vm.createContext(sandbox);
 vm.runInContext(
-  region + "\nglobalThis.__pure = { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule };",
+  region + "\nglobalThis.__pure = { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, controlsForMode };",
   sandbox,
 );
-const { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule } = sandbox.__pure;
+const { focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, controlsForMode } = sandbox.__pure;
 
 test("focusKeyOf: a card and its .open link are different keys", () => {
   assert.equal(focusKeyOf({ kind: "card", id: "issue-44", control: "card" }), "card:issue-44:card");
@@ -98,4 +98,22 @@ test("startableRule: the first stage into anything but its declared next is refu
 
 test("startableRule: an empty stage list has no first stage to start out of", () => {
   assert.equal(startableRule("backlog", "refining", []), false);
+});
+
+// Compared field by field, not with assert.deepEqual on the whole object:
+// controlsForMode runs inside the vm sandbox, so an object it returns and an
+// object literal written in this file are cross-realm and never
+// reference-equal even with identical own properties.
+const controlFields = ["tick", "unblockAll", "diagnose", "handBack", "dragStart"];
+
+test("controlsForMode: observe offers none of the five mutating controls", () => {
+  const got = controlsForMode("observe");
+  for (const f of controlFields) assert.equal(got[f], false, `${f} in observe`);
+});
+
+test("controlsForMode: auto and manual both offer every control — only observe differs", () => {
+  for (const mode of ["auto", "manual"]) {
+    const got = controlsForMode(mode);
+    for (const f of controlFields) assert.equal(got[f], true, `${f} in ${mode}`);
+  }
 });

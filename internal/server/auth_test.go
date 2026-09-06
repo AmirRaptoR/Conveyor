@@ -132,4 +132,7 @@ func TestServingOpenOffLoopbackIsRefused(t *testing.T) {
 	if err := s.Run(ctx, ":0", ModeManual); err != nil && strings.Contains(err.Error(), "refusing to serve") {
 		t.Errorf("a configured board was still refused: %v", err)
 	}
+	// Run's poll goroutine lists once before it ever checks ctx.Done; let that
+	// finish before TempDir's cleanup, or its write races the RemoveAll.
+	waitFor(t, "the stray poll from an already-cancelled Run to finish", func() bool { return !s.polling.Load() })
 }

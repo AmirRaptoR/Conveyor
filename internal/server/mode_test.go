@@ -173,6 +173,10 @@ func TestObserveModeStillServesReadsAndOrder(t *testing.T) {
 	if code, _ := doReq(t, h, "POST", "/api/refresh", nil); code != http.StatusAccepted {
 		t.Errorf("POST /api/refresh in observe = %d, want 202", code)
 	}
+	// handleRefresh starts s.refresh in the background; wait for it so the
+	// test's TempDir cleanup does not race a goroutine still writing into it.
+	time.Sleep(20 * time.Millisecond) // let the goroutine actually start
+	waitFor(t, "the background refresh to finish", func() bool { return !s.polling.Load() })
 
 	order, _ := json.Marshal([]string{"s1:2", "s1:1"})
 	if code, _ := doReq(t, h, "PUT", "/api/order", order); code != http.StatusNoContent {
