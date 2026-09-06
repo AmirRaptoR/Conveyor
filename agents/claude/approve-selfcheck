@@ -198,6 +198,24 @@ scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS '[]' issue-7 false \
 chk "(8) a malformed marker is skipped, the well-formed one behind it wins" "$(run)" "20"
 chk "     and the kind is decision"                                        "$(kind)" "decision"
 
+# Two *well-formed* markers naming different pairs — the ordering the two
+# malformed-marker scenes above never exercise, since only one of their
+# entries ever parses. The newest one governs even when an older one also
+# parses and even when the older one is the one that matches the current pair.
+old_matches_new_doesnt='[{"createdAt":"2020-01-01T00:00:00Z","body":"<!-- conveyor:approve:conflict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb -->"},
+	{"createdAt":"2020-01-02T00:00:00Z","body":"<!-- conveyor:approve:conflict cccccccccccccccccccccccccccccccccccccccc dddddddddddddddddddddddddddddddddddddddd -->"}]'
+scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS '[]' issue-7 false \
+	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "$old_matches_new_doesnt"
+chk "(8) an older marker matching the current pair is not enough; the newest one governs" "$(run)" "20"
+chk "     never read as the old attempt (a worktree failure trying the new one, not a decision)" "$(kind)" "worktree"
+
+new_matches_old_doesnt='[{"createdAt":"2020-01-01T00:00:00Z","body":"<!-- conveyor:approve:conflict cccccccccccccccccccccccccccccccccccccccc dddddddddddddddddddddddddddddddddddddddd -->"},
+	{"createdAt":"2020-01-02T00:00:00Z","body":"<!-- conveyor:approve:conflict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb -->"}]'
+scene; pr 9 OPEN; labels; details false CONFLICTING SUCCESS '[]' issue-7 false \
+	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "$new_matches_old_doesnt"
+chk "(8) the newest marker matching the current pair is enough, whatever an older one says" "$(run)" "20"
+chk "     and the kind is decision"                                                         "$(kind)" "decision"
+
 # A different current head OID is a genuinely new conflict: it must not read
 # as the same attempt (must not ask decision). It cannot be driven further
 # than that here — a fresh attempt needs the worktree and remote gate 8's own

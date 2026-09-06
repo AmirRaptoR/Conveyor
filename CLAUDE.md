@@ -177,15 +177,18 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   mechanical rebase in the worktree review left behind, pushed with a lease.
   If that does not apply cleanly, and `CONFLICT_RESOLVE` has not disabled it,
   and the PR is this pipeline's own (not a fork, headed by its `issue-<ref>`
-  branch), one model run tries to merge the base in and resolve what
-  conflicts, in that same worktree — never a rebase there, since the final
-  merge squashes and a multi-commit `--continue` loop is more chances to lose
-  one. A `<!-- conveyor:approve:conflict <headOid> <baseOid> -->` marker
-  comment on the PR records a resolved-and-pushed attempt, so a conflict still
-  reported at that exact head and base is a person's, once, rather than a
-  model run repeated every poll; a genuinely new conflict (either OID moved)
-  gets a fresh attempt. Only marks `conflict` when the rebase and the model
-  attempt both fail, or when the attempt is not this pipeline's to make.
+  branch), one attempt merges the base into that same worktree — never a
+  rebase there, since the final merge squashes and a multi-commit `--continue`
+  loop is more chances to lose one. A model runs only if that merge actually
+  conflicts; a base that now merges cleanly is committed, tested and pushed
+  with no model run at all. A `<!-- conveyor:approve:conflict <headOid>
+  <baseOid> -->` marker comment on the PR records a resolved-and-pushed
+  attempt, so a conflict still reported at that exact head and base is a
+  person's, once, rather than a model run repeated every poll; a genuinely new
+  conflict (either OID moved) gets a fresh attempt. Marks `conflict` whenever
+  the rebase fails and the attempt after it does too — verification, the test
+  suite, the push, or recording the marker itself, same as the model actually
+  disagreeing — or when the attempt is not this pipeline's to make.
 - **A mark is one word and a paragraph.** The word (`decision`, `limit`,
   `turns`, `worktree`, `error`) is all a card shows and all a provider labels; the
   paragraph is one click away in the panel. Scripts own the vocabulary — the

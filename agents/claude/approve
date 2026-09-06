@@ -524,10 +524,31 @@ resolve_conflict() {
 		base_oid=$(git rev-parse "origin/$base_ref")
 
 		if git merge --quiet --no-edit "origin/$base_ref" >&2; then
-			# Merged cleanly: criterion 16, no model run at all.
+			# Merged cleanly: criterion 16, no model run at all. Captured exactly
+			# as the model-resolved path below captures it (criterion 23) — under
+			# this script's `set -e`, an unguarded run_tests would instead kill
+			# the whole run on a failing suite with its raw exit status and no
+			# result written at all.
+			local clean_test_rc=0
+			set +e
 			run_tests "$wt"
-			if ! git push origin "HEAD:$head_ref" 2>&1; then
-				blocked conflict "pushing the merge that resolved #$pr's conflict with $base_ref was rejected."
+			clean_test_rc=$?
+			set -e
+			if [[ "$clean_test_rc" -ne 0 ]]; then
+				blocked conflict "the test suite failed after merging $base_ref into #$pr's branch cleanly; nothing was pushed."
+			fi
+
+			local clean_push_out clean_push_rc=0
+			set +e
+			clean_push_out=$(git push origin "HEAD:$head_ref" 2>&1)
+			clean_push_rc=$?
+			set -e
+			if [[ "$clean_push_rc" -ne 0 ]]; then
+				if grep -qi 'non-fast-forward' <<<"$clean_push_out"; then
+					blocked conflict "pushing the merge that resolved #$pr's conflict with $base_ref was rejected as non-fast-forward."
+				fi
+				echo "pushing the merge that resolved #$pr's conflict with $base_ref failed: $clean_push_out" >&2
+				exit 10
 			fi
 			post_conflict_marker "$(git rev-parse HEAD)" "$base_oid"
 			echo "merged $base_ref into $head_ref cleanly for #$pr; no model run" >&2
