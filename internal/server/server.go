@@ -49,9 +49,15 @@ type State struct {
 	// Blocks is why each marked item is standing still, keyed by item id. The
 	// provider is the authority on *whether* an item is marked; this is the
 	// engine's own note on *why*, recovered from the run that marked it.
-	Blocks    map[string]Block `json:"blocks,omitempty"`
-	UpdatedAt time.Time        `json:"updatedAt"`
-	Polling   bool             `json:"polling"`
+	Blocks map[string]Block `json:"blocks,omitempty"`
+	// Times is how long each item has been in the stage it is in, keyed by
+	// item id — a sibling of Blocks, kept the same way: written the moment a
+	// transition lands an item somewhere new, recovered from run history for
+	// what this process did not do itself, pruned when the item leaves the
+	// board.
+	Times     map[string]ItemTime `json:"times,omitempty"`
+	UpdatedAt time.Time           `json:"updatedAt"`
+	Polling   bool                `json:"polling"`
 	// Agents is how each agent the sources call says it is doing — a usage
 	// limit, a quota, whatever its own status script chose to report. Empty
 	// when no agent provides one.
@@ -90,6 +96,20 @@ type Active struct {
 	Stage  string `json:"stage"`
 	ItemID string `json:"itemId"`
 	Title  string `json:"title"`
+	// StartedAt is when this transition's stage script began, so the board
+	// can say how long the run in flight has been running.
+	StartedAt time.Time `json:"startedAt"`
+}
+
+// ItemTime is when an item arrived in the stage it is currently in, as the
+// engine last knows it.
+//
+// Stage is recorded beside the instant so a stale entry — the item has moved
+// on since this was written — is detectable rather than silently attributed
+// to wherever the card sits now.
+type ItemTime struct {
+	Stage        string    `json:"stage"`
+	EnteredStage time.Time `json:"enteredStage"`
 }
 
 type StageView struct {
@@ -201,6 +221,11 @@ type Server struct {
 	// run history after a restart: the runs are the durable record, this is
 	// only the index into them that a board read cannot afford to rebuild.
 	blocks map[string]Block
+	// times is when each item arrived in the stage it is currently in, kept
+	// in memory and recovered from run history like blocks — the runs are
+	// the durable record, this is only the index into them a board read
+	// cannot afford to rebuild.
+	times map[string]ItemTime
 	// paused is the agents the scheduler is holding work back from, by name.
 	//
 	// Not persisted, deliberately: it is a fact about the outside world right
@@ -288,6 +313,7 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 		s.pushKeys = keys
 	}
 	s.blocks = map[string]Block{}
+	s.times = map[string]ItemTime{}
 	s.paused = map[string]PauseView{}
 	s.resting = map[string]bool{}
 	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
@@ -616,7 +642,9 @@ func (s *Server) refresh(ctx context.Context) {
 	// A mark cleared on the provider — a label removed by hand — takes its
 	// note with it. The provider is the authority on whether, always.
 	marked := map[string]bool{}
+	onBoard := make(map[string]bool, len(items))
 	for _, it := range items {
+		onBoard[it.ID] = true
 		if it.Blocked {
 			marked[it.ID] = true
 		}
@@ -624,6 +652,13 @@ func (s *Server) refresh(ctx context.Context) {
 	for id := range s.blocks {
 		if !marked[id] {
 			delete(s.blocks, id)
+		}
+	}
+	// An item that is no longer on the board — done and rolled off, or gone
+	// from the source entirely — has nothing left for its clock to measure.
+	for id := range s.times {
+		if !onBoard[id] {
+			delete(s.times, id)
 		}
 	}
 	s.mu.Unlock()
@@ -702,74 +737,116 @@ func (s *Server) askAgents(ctx context.Context) {
 	}
 }
 
-// recallBlocks fills in why the marked items are marked, for marks this process
-// did not make — everything on the board after a restart, and anything a person
-// labelled by hand.
+// recallBlocks fills in why the marked items are marked, for marks this
+// process did not make — everything on the board after a restart, and
+// anything a person labelled by hand — and, in the same pass, fills in when
+// any board item arrived in the stage it currently sits in, for entries this
+// process did not write itself.
 //
-// The runs are the durable record: the one that marked an item wrote its reason
-// to $CONVEYOR_RESULT, and CONTRACTS §6 pins that run against retention for
-// exactly this. One walk fills every gap at once, because walking it per item
-// would be one full history scan for each card on a stalled board.
+// The runs are the durable record: the one that marked an item wrote its
+// reason to $CONVEYOR_RESULT, and CONTRACTS §6 pins that run against
+// retention for exactly this; a successful move is the durable record of an
+// arrival, for the same reason. One walk fills every gap at once — for both
+// blocks and times — because walking it per item, or walking it twice, would
+// be one or two full history scans for each card on a stalled board.
 func (s *Server) recallBlocks(items []model.Item) {
 	s.mu.RLock()
-	want := map[string]bool{}
+	wantBlocks := map[string]bool{}
 	for _, it := range items {
 		if it.Blocked {
 			if _, known := s.blocks[it.ID]; !known {
-				want[it.ID] = true
+				wantBlocks[it.ID] = true
 			}
 		}
 	}
+	stageOf := make(map[string]string, len(items))
+	wantTimes := map[string]bool{}
+	for _, it := range items {
+		stageOf[it.ID] = it.Stage
+		t, known := s.times[it.ID]
+		if !known || t.Stage != it.Stage {
+			wantTimes[it.ID] = true
+		}
+	}
 	s.mu.RUnlock()
-	if len(want) == 0 {
+	if len(wantBlocks) == 0 && len(wantTimes) == 0 {
 		return
 	}
 
-	found := map[string]Block{}
+	foundBlocks := map[string]Block{}
+	foundTimes := map[string]ItemTime{}
 	s.walkRuns(func(m RunMeta) bool {
-		if m.Kind != "stage" || !want[m.ItemID] {
-			return true
+		if wantBlocks[m.ItemID] && m.Kind == "stage" {
+			switch m.Outcome {
+			case model.OutcomeBlocked, model.OutcomeFailure, model.OutcomeTimeout:
+				var data json.RawMessage
+				if b, err := os.ReadFile(filepath.Join(m.Dir, "result.json")); err == nil {
+					data = b
+				}
+				timeout := time.Duration(0)
+				if st, ok := s.cfg.Stage(m.To); ok {
+					timeout = st.Timeout.D()
+				}
+				mark := pipeline.Marked(m.To, m.Run, data, timeout, 0)
+				asked, session, questions := saidAt(m.Dir)
+				foundBlocks[m.ItemID] = Block{
+					Kind:      mark.Kind,
+					Reason:    mark.Reason,
+					Stage:     m.To,
+					RunID:     m.ID,
+					At:        m.FinishedAt,
+					Asked:     asked,
+					Session:   session,
+					Questions: questions,
+				}
+				delete(wantBlocks, m.ItemID)
+			}
 		}
-		switch m.Outcome {
-		case model.OutcomeBlocked, model.OutcomeFailure, model.OutcomeTimeout:
-		default:
-			return true // a success is not why it stopped
+		// Because the walk is newest-first, the first successful move that
+		// landed this item in its current stage *is* the latest entry into
+		// it — exactly the instant a card's age should be measured from.
+		if wantTimes[m.ItemID] && m.Kind == "move" && m.Outcome == model.OutcomeSuccess &&
+			m.From != m.To && m.To == stageOf[m.ItemID] {
+			foundTimes[m.ItemID] = ItemTime{Stage: m.To, EnteredStage: m.FinishedAt}
+			delete(wantTimes, m.ItemID)
 		}
-		var data json.RawMessage
-		if b, err := os.ReadFile(filepath.Join(m.Dir, "result.json")); err == nil {
-			data = b
-		}
-		timeout := time.Duration(0)
-		if st, ok := s.cfg.Stage(m.To); ok {
-			timeout = st.Timeout.D()
-		}
-		mark := pipeline.Marked(m.To, m.Run, data, timeout, 0)
-		asked, session, questions := saidAt(m.Dir)
-		found[m.ItemID] = Block{
-			Kind:      mark.Kind,
-			Reason:    mark.Reason,
-			Stage:     m.To,
-			RunID:     m.ID,
-			At:        m.FinishedAt,
-			Asked:     asked,
-			Session:   session,
-			Questions: questions,
-		}
-		delete(want, m.ItemID)
-		return len(want) > 0
+		return len(wantBlocks) > 0 || len(wantTimes) > 0
 	})
 
 	s.mu.Lock()
-	for id, b := range found {
+	for id, b := range foundBlocks {
 		if _, known := s.blocks[id]; !known {
 			s.blocks[id] = b
 		}
 	}
 	// Marked, and no run to explain it: someone put the label on by hand.
-	for id := range want {
+	for id := range wantBlocks {
 		if _, known := s.blocks[id]; !known {
 			s.blocks[id] = Block{Kind: "by hand",
 				Reason: "marked outside the pipeline; there is no run to explain it"}
+		}
+	}
+	// No matching move survives in retained history: an item onboarded
+	// straight into its stage, one whose move was swept by retention, or one
+	// whose stage changed some other way — a person relabelling it by hand.
+	// History that is not there is not invented, so a stale entry left over
+	// from before is dropped rather than kept naming a stage the item has
+	// since left: a wrong chip is worse than no chip.
+	//
+	// Both loops check the entry as it stands now, not as it stood when the
+	// scan above started: walkRuns runs unlocked, and a transition landing on
+	// this same item while it ran already wrote the correct entry through
+	// applyTransition. A scan that started before that write must not undo it
+	// on the strength of what it saw before the write happened — the same
+	// race the found-block merge above is already guarded against.
+	for id := range wantTimes {
+		if t, known := s.times[id]; !known || t.Stage != stageOf[id] {
+			delete(s.times, id)
+		}
+	}
+	for id, t := range foundTimes {
+		if cur, known := s.times[id]; !known || cur.Stage != stageOf[id] {
+			s.times[id] = t
 		}
 	}
 	s.mu.Unlock()
@@ -857,7 +934,7 @@ func (s *Server) transition(ctx context.Context, item model.Item, target string)
 
 // runOne performs one transition and keeps the board honest about it.
 func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
-	s.setActive(item.ID, &Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title})
+	s.setActive(item.ID, &Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title, StartedAt: time.Now()})
 	defer s.setActive(item.ID, nil)
 
 	// Read, not taken. An answer is spent when the run it was written for
@@ -900,15 +977,23 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// Written here rather than recovered later: this is the one moment the
 	// reason exists in full, and a run history sweep must not be what stands
 	// between an operator and why their board stopped.
+	now := time.Now()
 	asked := false
 	if tr.Blocked {
 		var session string
 		var questions json.RawMessage
 		asked, session, questions = saidAt(tr.RunDir)
 		s.blocks[tr.Item.ID] = Block{Kind: tr.Kind, Reason: tr.Reason, Stage: tr.Stage,
-			RunID: tr.RunID, At: time.Now(), Asked: asked, Session: session, Questions: questions}
+			RunID: tr.RunID, At: now, Asked: asked, Session: session, Questions: questions}
 	} else {
 		delete(s.blocks, tr.Item.ID)
+	}
+	// The item arrived somewhere new, so its clock starts fresh. A transition
+	// that leaves it in the stage it was already in — a re-run, a
+	// confirmation, a mark — did not arrive anywhere, and its existing entry,
+	// if it has one, is left untouched.
+	if tr.Item.Stage != tr.From {
+		s.times[tr.Item.ID] = ItemTime{Stage: tr.Item.Stage, EnteredStage: now}
 	}
 	// A no-op in the stage the item was already in is the script saying it has
 	// nothing to do yet — a pull request still settling, a check still running.
@@ -1000,6 +1085,10 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	st.Blocks = make(map[string]Block, len(s.blocks))
 	for id, b := range s.blocks {
 		st.Blocks[id] = b
+	}
+	st.Times = make(map[string]ItemTime, len(s.times))
+	for id, t := range s.times {
+		st.Times[id] = t
 	}
 	s.mu.RUnlock()
 	writeJSON(w, st)
