@@ -63,6 +63,8 @@
   .mark { font-size:13px; letter-spacing:.34em; text-transform:uppercase; font-weight:500; }
   .readout { display:flex; gap:16px; color:var(--dim); font-size:11px; letter-spacing:.06em; }
   .readout b { color:var(--ink); font-weight:500; font-variant-numeric:tabular-nums; }
+  .degraded { color:var(--run); }
+  .degraded b { color:var(--run); }
   .grow { flex:1; }
 
   .lamp { width:6px; height:6px; border-radius:50%; background:var(--faint); display:inline-block; }
@@ -284,6 +286,13 @@
   .src-chip .n { color:var(--ink); font-variant-numeric:tabular-nums; }
   .src-chip.broken .name { color:var(--stop); }
   .src-chip.broken .swatch { background:var(--stop); }
+  /* Degraded: still enrolled and expected to be listing, but the last
+     attempt failed, never happened, or is older than the stale threshold —
+     distinct from .broken, which is a source not being listed by design. */
+  .src-chip.degraded .name { color:var(--run); }
+  .src-chip.degraded .swatch { background:var(--run); }
+  .src-chip.degraded .n { color:var(--run); }
+  .src-chip .never { color:var(--run); }
 
   /* The agents' own report on themselves. A strip above the sources, because
      an agent over its usage limit stops every source at once, and that is the
@@ -449,6 +458,14 @@
   .faults h2 { margin:0 0 3px; font-size:11px; letter-spacing:.18em; text-transform:uppercase; color:var(--stop); font-weight:500; }
   .faults div { color:var(--dim); font-size:11.5px; line-height:1.7; }
   .faults b { color:var(--ink); font-weight:500; }
+
+  /* ---- warnings ------------------------------------------------------------
+     A runtime condition (a listing that failed, or one the provider itself
+     flagged), not a configuration error — caution amber rather than
+     .faults's stop red, and its own block rather than a merged list, so the
+     two tones stay distinguishable. */
+  .warnings { margin:0 22px; border-left:2px solid var(--run); background:var(--panel); padding:12px 16px; }
+  .warnings div { color:var(--dim); font-size:11.5px; line-height:1.7; }
 
   /* ---- inspection panel -------------------------------------------------- */
   .scrim {
@@ -788,6 +805,7 @@
 <div class="needs" id="needs"></div>
 <div id="agents"></div>
 <div id="sources"></div>
+<div id="warnings"></div>
 <div id="faults"></div>
 <div id="doctor"></div>
 <div class="rail-wrap">
@@ -877,6 +895,33 @@ function startableRule(from, into, stages) {
   if (!first || from !== first.name) return false;
   const stageDef = stages.find(s => s.name === from);
   return !!into && stageDef?.next === into;
+}
+
+// The stale threshold a source's own lastListedAt is measured against: twice
+// the configured poll interval, floored at 60s so a poll under a minute
+// (this repo's own test configs set poll: 100ms) does not call every source
+// stale between polls. pollNs absent or zero — an old server, or one that
+// never set it — falls back to twice the loader's own 5m default
+// (internal/config/config.go), never a bare 2× of nothing.
+function staleThresholdMs(pollNs) {
+  if (!pollNs) return 10 * 60 * 1000;
+  return Math.max(2 * (pollNs / 1e6), 60000);
+}
+
+// Whether one source is degraded, as of `nowMsVal` — every input a plain
+// value, so this is exercised with injected timestamps and a frozen clock
+// rather than by sleeping. A source carrying configuration problems is never
+// degraded: it is not being listed by design, and #faults already says so.
+// Before the first refresh completes (updatedAtMs falsy), nothing is
+// degraded — a board that has not polled yet is starting up, not broken.
+function sourceDegraded(s, updatedAtMs, pollNs, nowMsVal) {
+  if ((s.problems || []).length) return false;
+  if (!updatedAtMs) return false;
+  if (s.listError) return true;
+  if (!s.lastListedAt) return true;
+  const at = new Date(s.lastListedAt).getTime();
+  if (isNaN(at)) return true;
+  return nowMsVal - at > staleThresholdMs(pollNs);
 }
 // ---- end pure helpers -------------------------------------------------------
 
@@ -1035,6 +1080,14 @@ function draw() {
   const workingOn = id => active.find(a => a.itemId === id);
   blocks = state.blocks || {};
 
+  // Degraded describes a source, not the board: at least one refresh has
+  // completed and that source's own listing has failed, never happened, or
+  // is older than the stale threshold — see sourceDegraded above. Computed
+  // fresh from `state` on every draw, never accumulated, so a clean state
+  // right after a degraded one leaves nothing behind.
+  const updatedAtMs = state.updatedAt ? new Date(state.updatedAt).getTime() : 0;
+  const degradedSources = (state.sources || []).filter(s => sourceDegraded(s, updatedAtMs, state.pollNs, nowMs()));
+
   // Items arrive in the order the scheduler will work them, so the board does
   // not sort: it draws them in the order it is given. A card's position is the
   // claim it makes, and re-deriving that here would be a second copy of rules
@@ -1054,7 +1107,7 @@ function draw() {
   const ends = stages.filter(s => s.terminal);
 
   $("#rail").innerHTML =
-    flow.map(st => station(st, bucket[st.name] || [], active)).join("") +
+    flow.map(st => station(st, bucket[st.name] || [], active, degradedSources.length > 0)).join("") +
     ends.map(st => terminus(st, bucket[st.name] || [])).join("");
 
   // What each agent says about itself. The engine passes this through — which
@@ -1113,12 +1166,20 @@ function draw() {
   $("#sources").innerHTML = `<div class="sources">${
     (state.sources || []).map(s => {
       const broken = (s.problems || []).length > 0;
-      return `<span class="src-chip${broken ? " broken" : ""}" style="--src:${sourceColour(s.name)}"
-          title="${esc(s.workdir || "")}">
+      const degraded = !broken && degradedSources.includes(s);
+      // A broken source shows only its cannot-run badge — never additionally
+      // reported as degraded, stale or not-listing; that is what its own
+      // configuration problems already mean.
+      const freshness = broken ? "" : s.lastListedAt
+        ? durSpan(new Date(s.lastListedAt).getTime(), true, esc(`listed ${new Date(s.lastListedAt).toLocaleString()}`))
+        : `<span class="never">not listed yet</span>`;
+      const chipTitle = esc((s.workdir || "") + (degraded && s.listError ? ` — ${s.listError}` : ""));
+      return `<span class="src-chip${broken ? " broken" : ""}${degraded ? " degraded" : ""}" style="--src:${sourceColour(s.name)}"
+          title="${chipTitle}">
         <span class="swatch"></span>
         <span class="name">${esc(s.name)}</span>
-        <span class="n">${counts[s.name] || 0}</span>
-        ${broken ? `<span class="repo">cannot run</span>` : ""}
+        <span class="n">${degraded ? "?" : (counts[s.name] || 0)}</span>
+        ${broken ? `<span class="repo">cannot run</span>` : freshness ? `<span class="repo">${freshness}</span>` : ""}
       </span>`;
     }).join("") + storageChip
   }</div>`;
@@ -1135,15 +1196,30 @@ function draw() {
       <div><b>${esc(pf.runId)}</b>${pf.itemId ? ` (${esc(pf.itemId)})` : ""} — ${esc(pf.message)}</div>` : ""}
     </div>` : "";
 
+  // Runtime conditions the engine noticed while discovering work — a listing
+  // that errored, or a warning the provider itself returned — never a
+  // configuration error (that is .faults, above). Rendered whole: the
+  // engine's own `<source>: ` prefix is what attributes each one, so the
+  // page does not split, parse or re-key the string.
+  $("#warnings").innerHTML = (state.warnings || []).length ? `<div class="warnings">
+      ${state.warnings.map(w => `<div>${esc(w)}</div>`).join("")}
+    </div>` : "";
+
   $("#lamp").className = "lamp " + (active.length || state.polling ? "busy" : "idle");
   const when = state.updatedAt ? new Date(state.updatedAt).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}) : "—";
   const held = marked;
-  $("#line1").innerHTML = active.length === 1
+  // Named beside updated <time> so the line does not read fresh while
+  // discovery is broken — appended to whichever branch below renders, since
+  // that is the same masthead line regardless of what else is happening.
+  const degradedNote = degradedSources.length
+    ? ` &nbsp;·&nbsp; <span class="degraded">${degradedSources.length} source${degradedSources.length === 1 ? "" : "s"} not listing</span>`
+    : "";
+  $("#line1").innerHTML = (active.length === 1
     ? `<b>${esc(active[0].stage)}</b> running &middot; ${esc(active[0].itemId)}`
     : active.length
       ? `<b>${active.length}</b> running &middot; ${active.map(a => esc(a.stage)).join(", ")}`
       : `<b>${items.length}</b> items${asking.length ? `, <b>${asking.length}</b> need${asking.length === 1 ? "s" : ""} you`
-          : held ? `, <b>${held}</b> stopped` : ""} &nbsp;·&nbsp; updated ${when}`;
+          : held ? `, <b>${held}</b> stopped` : ""} &nbsp;·&nbsp; updated ${when}`) + degradedNote;
 
   document.querySelectorAll(".item").forEach(el => {
     const open = () => { if (!justDragged) inspect(el.dataset.id, el.dataset.title, el.dataset.stage); };
@@ -1334,7 +1410,13 @@ const railResize = new ResizeObserver(updateRailCtl);
 railResize.observe($("#line"));
 railResize.observe($("#rail"));
 
-function station(st, items, active) {
+// `degraded` is whether any source is degraded right now (draw()'s
+// board-wide count, not this station's own items) — a column can be empty
+// because its source's items vanished from discovery rather than because
+// there is genuinely no work, and a reader needs to be able to tell those
+// apart. Terminal columns (terminus(), below) never take this: they are a
+// ledger of closed work, not a claim about what is in flight.
+function station(st, items, active, degraded) {
   const live = active.some(a => a.stage === st.name);
   return `<section class="station${live ? " live" : ""}">
     <div class="plate">
@@ -1343,7 +1425,7 @@ function station(st, items, active) {
     </div>
     <div class="queue" data-stage="${esc(st.name)}">${
       items.length ? items.map((it, i) => card(it, active, i)).join("")
-                   : `<div class="slot">Nothing here</div>`}</div>
+                   : `<div class="slot">${degraded ? "Picture incomplete — discovery is degraded" : "Nothing here"}</div>`}</div>
   </section>`;
 }
 
