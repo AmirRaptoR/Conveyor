@@ -354,7 +354,7 @@ network — means adding a file named `*.test.mjs` anywhere in the tree, written
 against Node's own `node:test` and `node:assert` (nothing else is
 installed). The board ships as ES modules (`internal/server/web/*.js`, entered
 at `main.js`), so a test simply imports the file it is about:
-`pure_test.mjs` imports `pure.js` directly, since nothing there touches a DOM.
+`pure.test.mjs` imports `pure.js` directly, since nothing there touches a DOM.
 For anything that does, `internal/server/web/testutil.mjs` has `page()`, which
 installs a small hand-rolled DOM as globals and hands back a private copy of
 the board's whole module graph — one per call, so no test inherits another's
