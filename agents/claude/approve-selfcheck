@@ -36,12 +36,13 @@ cat >"$tmp/bin/gh" <<'STUB'
 scene="$SCENE"
 case "$1 $2" in
 "pr list")   what=prlist ;;
+"pr view")   what=prview ;;
 "issue view") what=labels_$3 ;;
 "api graphql") what=graphql ;;
 "api repos"*) what=timeline ;;
 "pr edit")   echo "unlabelled"; exit 0 ;;
 "pr comment") printf '%s\n' "$*" >>"$scene/comments_posted"; exit 0 ;;
-"pr merge")  echo "merged"; [[ -f "$scene/merge_fails" ]] && exit 1; touch "$scene/merged"; exit 0 ;;
+"pr merge")  echo "merged"; touch "$scene/merge_called"; [[ -f "$scene/merge_fails" ]] && exit 1; touch "$scene/merged"; exit 0 ;;
 *)
 	case "$1" in
 	api) what=timeline ;;
@@ -113,6 +114,7 @@ pr() { printf '[{"number":%s,"body":"Closes #7","state":"%s","url":"u"}]' "$1" "
 labels() { printf '%s' "${1:-[]}" >"$tmp/scene/labels_7"; printf '%s' "${2:-[]}" >"$tmp/scene/labels_9"; }
 # details <isDraft> <mergeable> <rollup> [threads-json] [headRefName]
 #         [isCrossRepository] [headRefOid] [baseRefOid] [comments-json]
+#         [isInMergeQueue] [autoMergeRequest-json]
 #
 # headRefOid/baseRefOid default to two distinct, well-formed 40-character hex
 # strings, so a scene that says nothing about the marker looks like a PR gate
@@ -124,10 +126,12 @@ details() {
 	# stay empty rather than being replaced by the default, which `:-` would do.
 	local head_ref="${5-issue-7}" cross="${6-false}" \
 		head_oid="${7-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
-		base_oid="${8-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" comments="${9-[]}"
+		base_oid="${8-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" comments="${9-[]}" \
+		queue="${10:-false}" automerge="${11-null}"
 	cat >"$tmp/scene/graphql" <<JSON
 {"isDraft":$1,"mergeable":"$2","headRefName":"$head_ref","headRefOid":"$head_oid",
  "baseRefName":"main","baseRefOid":"$base_oid","isCrossRepository":$cross,
+ "isInMergeQueue":$queue,"autoMergeRequest":$automerge,
  "commits":{"nodes":[{"commit":{"committedDate":"2020-01-01T00:00:00Z","statusCheckRollup":$rollup_field}}]},
  "comments":{"nodes":$comments},"reviews":{"nodes":[]},
  "reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":${4:-[]}}}
@@ -135,6 +139,13 @@ JSON
 	# The stub does not run --jq, so fixtures are written in post-jq form. For
 	# the timeline that is a bare timestamp, or nothing.
 	: >"$tmp/scene/timeline"
+	# Default post-merge view: the merge gate 14 is about to attempt actually
+	# lands, at the exact head this call just inspected. F06's scenes below
+	# overwrite this to simulate a moved head, a queued/auto-merge outcome, or
+	# a merge genuinely refused.
+	cat >"$tmp/scene/prview" <<JSON
+{"state":"MERGED","headRefOid":"$head_oid","isInMergeQueue":false,"autoMergeRequest":null}
+JSON
 }
 
 # --- 1. a gh call that fails is a blip, not a verdict -----------------------
@@ -290,8 +301,66 @@ chk "(14) a settled PR merges"                "$(run)" "0"
 chk "     and gh pr merge actually ran"       "$([[ -f "$tmp/scene/merged" ]] && echo merged)" "merged"
 
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS; touch "$tmp/scene/merge_fails"
+# A genuine refusal changes nothing: the head gh reports afterwards is the
+# same one that was inspected, and the PR is still open. Only then is a
+# failed `gh pr merge` actually a fault rather than a moved head.
+cat >"$tmp/scene/prview" <<'JSON'
+{"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"autoMergeRequest":null}
+JSON
 chk "a refused merge stops, never reads as merged" "$(run)" "20"
 chk "     and the kind is merge"              "$(kind)" "merge"
+
+# --- F06: the merge is bound to the commit that passed the gates -----------
+#
+# gh pr merge carries --match-head-commit for the exact SHA the second
+# check_gates_once just inspected. A push landing in the gap between that
+# inspection and the merge call moves the head; this must defer and recheck,
+# never merge past it and never mark a fault.
+echo "F06: merge bound to the inspected commit"
+
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
+# The head moved after the inspection, and --match-head-commit refuses it —
+# gh reports a failure exactly as it would for any other rejected merge, and
+# only the follow-up read tells the two apart.
+cat >"$tmp/scene/prview" <<'JSON'
+{"state":"OPEN","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","isInMergeQueue":false,"autoMergeRequest":null}
+JSON
+touch "$tmp/scene/merge_fails"
+chk "(F06) a head that moved between the read and the merge defers" "$(run)" "10"
+chk "     never reads as merged"              "$([[ -f "$tmp/scene/merged" ]] && echo merged || echo no)" "no"
+
+# The same moved-head case, but gh happens to report success anyway (a race
+# where the mismatch was not caught server-side) — the follow-up read is what
+# actually decides this, not gh's exit code.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
+cat >"$tmp/scene/prview" <<'JSON'
+{"state":"OPEN","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","isInMergeQueue":false,"autoMergeRequest":null}
+JSON
+chk "(F06) a moved head defers even when gh reports success" "$(run)" "10"
+
+# Accepted but not yet merged: the repository requires a merge queue, so
+# `gh pr merge` enqueues it (or enables auto-merge) and returns 0. This must
+# not be reported done, and must not re-issue gh pr merge on the next poll.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
+cat >"$tmp/scene/prview" <<'JSON'
+{"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":true,"autoMergeRequest":null}
+JSON
+chk "(F06) an accepted-but-queued merge defers, not done" "$(run)" "10"
+chk "     it did call gh pr merge, but never observed it merged" \
+	"$([[ -f "$tmp/scene/merge_called" ]] && echo called || echo no)" "called"
+
+# On the next poll, the PR is still queued at the top of the gate — this must
+# defer without ever reaching (or re-issuing) gh pr merge again.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS '[]' issue-7 false '' '' '[]' true
+touch "$tmp/scene/merge_fails" # if merge were re-issued, it would fail loudly
+chk "(F06) a PR already queued at the top of a poll defers without re-merging" "$(run)" "10"
+chk "     gh pr merge was never reached"       "$([[ -f "$tmp/scene/merge_called" ]] && echo called || echo no)" "no"
+
+# ...and the same for auto-merge already enabled.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS '[]' issue-7 false '' '' '[]' false '{"enabledAt":"2020-01-01T00:00:00Z"}'
+touch "$tmp/scene/merge_fails"
+chk "(F06) auto-merge already enabled defers without re-merging" "$(run)" "10"
+chk "     gh pr merge was never reached"       "$([[ -f "$tmp/scene/merge_called" ]] && echo called || echo no)" "no"
 
 # --- QUIET_SECONDS parsing --------------------------------------------------
 # A fresh clock, so 600 is the thing being tested and not the 2020 commit date.

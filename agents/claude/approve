@@ -55,7 +55,26 @@
 #      resolve -> exit 10
 #  12. an unresolved thread it already answered -> exit 20  (decision)
 #  13. now - base < QUIET_SECONDS            -> exit 10
-#  14. otherwise -> refetch 4-12, then merge -> exit 0
+#  14. otherwise -> refetch 4-12, then merge, bound to the exact commit that
+#      just passed every gate above:
+#        a. the PR is already queued to merge or already has auto-merge
+#           enabled (a queue/auto-merge this same script requested on an
+#           earlier poll, or one set by hand) -> exit 10, gh pr merge is not
+#           re-issued
+#        b. gh pr merge --match-head-commit <the second read's headRefOid>,
+#           then the PR is read once more, never trusted from gh's own exit
+#           code alone:
+#             - now MERGED                    -> exit 0 (drop worktree)
+#             - head has moved since the SHA just merged -> exit 10 (a moved
+#               head is new activity, not a fault; this covers both a
+#               --match-head-commit rejection and a push that landed in the
+#               gap regardless of what gh reported)
+#             - now queued or auto-merge-enabled -> exit 10, waiting for
+#               GitHub to actually finish it
+#             - gh reported failure and none of the above explains it -> exit
+#               20 (merge)
+#             - gh reported success but the PR is in none of the above states
+#               -> exit 10 (defer to the next poll rather than assume)
 #
 # Merge gates, all required: no hold, not a draft, no conflict, checks green,
 # no unresolved review threads, quiet for QUIET_SECONDS. Any activity resets
@@ -206,6 +225,8 @@ fetch_details() {
 					isDraft
 					mergeable
 					isCrossRepository
+					isInMergeQueue
+					autoMergeRequest { enabledAt }
 					headRefName
 					headRefOid
 					baseRefName
@@ -753,6 +774,20 @@ check_gates_once() {
 		exit 10
 	fi
 
+	# Gate 14a, reachable from any poll: a PR this same script enqueued (or one
+	# a person put in a queue or enabled auto-merge on by hand) is already
+	# accepted, and re-issuing `gh pr merge` here would either error on an
+	# already-queued PR or be redundant on one with auto-merge enabled. GitHub
+	# finishes it in its own time; this script only waits.
+	if [[ "$(jq -r '.isInMergeQueue' <<<"$details")" == "true" ]]; then
+		echo "PR #$pr is already queued to merge; waiting for GitHub to finish it" >&2
+		exit 10
+	fi
+	if jq -e '.autoMergeRequest != null' >/dev/null 2>&1 <<<"$details"; then
+		echo "PR #$pr already has auto-merge enabled; waiting for GitHub to finish it" >&2
+		exit 10
+	fi
+
 	local mergeable
 	mergeable=$(jq -r '.mergeable' <<<"$details")
 	if [[ "$mergeable" == "CONFLICTING" ]]; then
@@ -859,10 +894,56 @@ check_gates_once
 echo "re-checking immediately before merging, to close the window since the check above" >&2
 check_gates_once
 
-echo "merging PR #$pr" >&2
-merge_out=""
-if ! merge_out=$(gh pr merge "$pr" --repo "$REPO" --squash --delete-branch 2>&1); then
+# The exact commit the second check_gates_once just finished inspecting —
+# not an earlier read, and not re-fetched after: everything between here and
+# the merge call must be about this one SHA.
+head_oid=$(jq -r '.headRefOid' <<<"$details")
+if [[ -z "$head_oid" || "$head_oid" == "null" ]]; then
+	echo "PR #$pr's head commit is unexpectedly unknown right before merging; deferring" >&2
+	exit 10
+fi
+
+echo "merging PR #$pr at $head_oid" >&2
+merge_rc=0
+merge_out=$(gh pr merge "$pr" --repo "$REPO" --squash --delete-branch \
+	--match-head-commit "$head_oid" 2>&1) || merge_rc=$?
+
+# Never trusted from gh's exit code alone: `gh pr merge` returns 0 both for an
+# actual merge and for enqueuing (auto-merge enabled, or added to a required
+# merge queue — see `gh pr merge --help`), and a --match-head-commit
+# precondition failure is, from the exit code alone, indistinguishable from
+# any other rejected merge. One more read settles all of it.
+after=$(gh_json pr view "$pr" --repo "$REPO" \
+	--json state,headRefOid,isInMergeQueue,autoMergeRequest)
+after_state=$(jq -r '.state' <<<"$after")
+after_head=$(jq -r '.headRefOid' <<<"$after")
+
+if [[ "$after_state" == "MERGED" ]]; then
+	drop_worktree "$CONVEYOR_SOURCE" "$ref"
+	exit 0
+fi
+
+if [[ "$after_head" != "$head_oid" ]]; then
+	# The branch moved between the inspected read and this merge attempt — a
+	# --match-head-commit rejection reads this way, and so does any other push
+	# that landed in the gap regardless of what gh reported. New activity, not
+	# a fault: the quiet clock restarts on it next poll.
+	echo "PR #$pr's head moved from $head_oid to $after_head; deferring to recheck" >&2
+	exit 10
+fi
+
+if [[ "$(jq -r '.isInMergeQueue' <<<"$after")" == "true" ]] ||
+	jq -e '.autoMergeRequest != null' >/dev/null 2>&1 <<<"$after"; then
+	echo "PR #$pr is queued to merge (or has auto-merge enabled); waiting for GitHub to finish it" >&2
+	exit 10
+fi
+
+if [[ "$merge_rc" -ne 0 ]]; then
 	blocked merge "gh pr merge #$pr failed: $merge_out"
 fi
-drop_worktree "$CONVEYOR_SOURCE" "$ref"
-exit 0
+
+# gh reported success, the head has not moved, and the PR is neither merged
+# nor queued: an unexpected state. Deferring costs one more poll; treating it
+# as done without confirming it is the bug this gate exists to close.
+echo "gh pr merge #$pr reported success but the PR is not yet observed merged; deferring" >&2
+exit 10
