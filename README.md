@@ -103,20 +103,25 @@ and a second password store for one line of behaviour.
 ```yaml
 version: 1
 concurrency:
-  perSource: 1      # one item in flight per source — a source maps to a
-  global: 1         # worktree, and two agents in one checkout corrupt it
+  perSource: 1      # items in flight per source — safe above 1 too, since an
+  global: 1         # item works in its own worktree; see docs/CONTRACTS.md §5
 stages:
   - name: backlog                        # no script: a queue
   - name: refining
     script: refine    # every source must provide a script by this name
-    onSuccess: ready
-    onFailure: backlog
+    onSuccess: done   # explicit; would default to the next stage anyway.
+                       # There is no onFailure and no onBlocked: a refine that
+                       # stops wears a blocked mark where it stopped, and
+                       # resumes there once a person clears it.
   - name: done
     terminal: true
 sources:
   - name: mock
     provider: mock    # a folder under providers/
     workdir: .
+    scripts:
+      refine:
+        agent: mock   # resolves agents/mock/refine
 ```
 
 Only sources listed in the config are ever touched. There is no directory
