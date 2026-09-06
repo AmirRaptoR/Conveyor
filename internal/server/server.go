@@ -630,6 +630,7 @@ func (s *Server) refresh(ctx context.Context) {
 		}
 		items = append(items, res.Items...)
 	}
+	items = dedupeCrossSource(items, func(msg string) { warnings = append(warnings, msg) })
 
 	s.askAgents(ctx)
 	s.recallBlocks(items)
@@ -668,6 +669,28 @@ func (s *Server) refresh(ctx context.Context) {
 	}
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
+}
+
+// dedupeCrossSource enforces CONTRACTS.md §1's duplicate-id rule across the
+// whole poll, not merely within one source's own listing.
+// source.Client.validate already catches a source repeating its own id; this
+// catches two different sources emitting the same one. The server keys
+// working, blocks, times and the manual order by the bare id, and a second
+// source silently sharing it would have all of those disagree about which
+// item a given id names. First in configuration order wins, matching the
+// single-source rule, because items arrive here in that same order.
+func dedupeCrossSource(items []model.Item, warn func(string)) []model.Item {
+	winner := make(map[string]string, len(items)) // id -> the source that kept it
+	out := make([]model.Item, 0, len(items))
+	for _, it := range items {
+		if src, dup := winner[it.ID]; dup {
+			warn(fmt.Sprintf("%s: duplicate id %q also reported by %s; %s wins", it.Source, it.ID, src, src))
+			continue
+		}
+		winner[it.ID] = it.Source
+		out = append(out, it)
+	}
+	return out
 }
 
 // askAgents runs each agent's status script and collects what it says.

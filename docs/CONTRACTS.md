@@ -47,7 +47,11 @@ arrive in this shape.
 Rules the engine enforces:
 
 - Unknown `stage` → the item is rejected and logged, not silently dropped.
-- Duplicate `id` within one poll → first wins, the collision is logged.
+- Missing `ref` → the item is rejected and logged, the same as a missing `id`.
+- Duplicate `id` within one poll → first wins, the collision is logged. This is
+  enforced across every source's listing, not merely within one source's own —
+  the engine keys `working`, marks, timers and the manual order by the bare id,
+  and two sources cannot be trusted not to collide.
 - An item that disappears from a source is marked gone, not deleted, so its run
   history survives.
 - A marked item is never picked. That is the whole mechanism by which a stage
