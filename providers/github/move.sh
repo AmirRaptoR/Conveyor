@@ -136,8 +136,15 @@ Remove the \`$BLOCKED_LABEL\` label to hand this back to the pipeline; it resume
 	# without this each pass leaves another identical comment on the same issue.
 	# Compared against every comment, not just the newest: a reply underneath
 	# ours does not make the explanation new.
-	if gh issue view "$ref" --repo "$REPO" --json comments \
-		--jq '.comments[].body' 2>/dev/null | grep -qxF "$(head -1 <<<"$body")"; then
+	#
+	# Captured into a variable first, not piped straight into grep: under load,
+	# piping `gh issue view | grep -qxF` intermittently handed grep an empty
+	# read before gh had actually written anything, which read as "never said"
+	# and posted the same reason again. A command substitution waits for gh to
+	# finish before grep ever runs.
+	existing=$(gh issue view "$ref" --repo "$REPO" --json comments \
+		--jq '.comments[].body' 2>/dev/null || true)
+	if grep -qxF "$(head -1 <<<"$body")" <<<"$existing"; then
 		echo "the same reason is already commented on #$ref; not repeating it" >&2
 	else
 		gh issue comment "$ref" --repo "$REPO" --body "$body" >&2 ||
