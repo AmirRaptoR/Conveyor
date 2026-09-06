@@ -2162,11 +2162,14 @@ function refuse(id, why) {
 
 async function startItem(id, stage) {
   refusals.delete(id);
-  const res = await fetch(`/api/items/${encodeURIComponent(id)}/start`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ stage }),
-  });
+  let res;
+  try {
+    res = await fetch(`/api/items/${encodeURIComponent(id)}/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stage }),
+    });
+  } catch { refuse(id, `could not start ${id}`); return; }
   if (!res.ok) refuse(id, (await res.text()).trim() || `could not start ${id}`);
 }
 
