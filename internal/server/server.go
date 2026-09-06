@@ -55,8 +55,14 @@ type State struct {
 	// transition lands an item somewhere new, recovered from run history for
 	// what this process did not do itself, pruned when the item leaves the
 	// board.
-	Times     map[string]ItemTime `json:"times,omitempty"`
-	UpdatedAt time.Time           `json:"updatedAt"`
+	Times map[string]ItemTime `json:"times,omitempty"`
+	// TransitionErrors is the last infrastructure failure a transition hit
+	// for an item, keyed by id — an initial provider move that failed, an
+	// unknown source or stage. Distinct from Blocks: nothing here is a
+	// decision for a person, only a fact the board must not lose behind the
+	// next successful listing the way State.Warnings would.
+	TransitionErrors map[string]TransitionError `json:"transitionErrors,omitempty"`
+	UpdatedAt        time.Time                  `json:"updatedAt"`
 	Polling   bool                `json:"polling"`
 	// Agents is how each agent the sources call says it is doing — a usage
 	// limit, a quota, whatever its own status script chose to report. Empty
@@ -110,6 +116,16 @@ type Active struct {
 type ItemTime struct {
 	Stage        string    `json:"stage"`
 	EnteredStage time.Time `json:"enteredStage"`
+}
+
+// TransitionError is an infrastructure failure a transition hit for an item —
+// distinct from a mark: nothing here is a decision for a person, only a fact
+// that the last attempt did not get as far as running or moving anything, and
+// is due another one. Cleared the moment a later transition for the same item
+// succeeds.
+type TransitionError struct {
+	Reason string    `json:"reason"`
+	At     time.Time `json:"at"`
 }
 
 type StageView struct {
@@ -226,6 +242,14 @@ type Server struct {
 	// the durable record, this is only the index into them a board read
 	// cannot afford to rebuild.
 	times map[string]ItemTime
+	// transitionErrs is the last infrastructure error a transition hit for an
+	// item — an initial provider move that failed, an unknown source or
+	// stage — kept the same way blocks and times are: State.Warnings is
+	// replaced wholesale on every refresh, so a transition error recorded
+	// only there would vanish behind the next successful listing even though
+	// nothing about the item actually changed. Pruned when the item leaves
+	// the board, and cleared the moment a later transition for it succeeds.
+	transitionErrs map[string]TransitionError
 	// paused is the agents the scheduler is holding work back from, by name.
 	//
 	// Not persisted, deliberately: it is a fact about the outside world right
@@ -314,6 +338,7 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 	}
 	s.blocks = map[string]Block{}
 	s.times = map[string]ItemTime{}
+	s.transitionErrs = map[string]TransitionError{}
 	s.paused = map[string]PauseView{}
 	s.resting = map[string]bool{}
 	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
@@ -665,6 +690,11 @@ func (s *Server) refresh(ctx context.Context) {
 	for id := range s.times {
 		if !onBoard[id] {
 			delete(s.times, id)
+		}
+	}
+	for id := range s.transitionErrs {
+		if !onBoard[id] {
+			delete(s.transitionErrs, id)
 		}
 	}
 	s.mu.Unlock()
@@ -1036,11 +1066,15 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 	if tr == nil {
 		// An unknown source or stage: a config problem, not a transient one,
 		// and nothing ran — there is nothing to mark, move or spend an answer
-		// on. Surfacing it here at least gets it into the log; F03/F04's fuller
-		// treatment (a durable, board-visible transition error) is tracked
-		// separately.
+		// on. Recorded and rested the same way an initial move failure is
+		// (below), so the scheduler does not retry it on every wake, and the
+		// board keeps the reason past the next successful listing.
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "conveyor: %s: %v\n", item.ID, err)
+			s.mu.Lock()
+			s.transitionErrs[item.ID] = TransitionError{Reason: err.Error(), At: time.Now()}
+			s.resting[item.ID] = true
+			s.mu.Unlock()
 		}
 		return
 	}
@@ -1098,12 +1132,28 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	if tr.Item.Stage != tr.From {
 		s.times[tr.Item.ID] = ItemTime{Stage: tr.Item.Stage, EnteredStage: now}
 	}
+	// tr.Err is set on an infrastructure failure — an initial provider move
+	// that failed before any script ran (tr.Outcome == "") is the one F04
+	// specifically calls out, since there is no run and no mark to show for
+	// it otherwise. Recorded the same way Blocks is: kept until a later
+	// transition for this item succeeds, so a listing wholesale-replacing
+	// State.Warnings does not erase the only trace of it.
+	if tr.Err != nil {
+		s.transitionErrs[tr.Item.ID] = TransitionError{Reason: tr.Err.Error(), At: now}
+	} else {
+		delete(s.transitionErrs, tr.Item.ID)
+	}
 	// A no-op in the stage the item was already in is the script saying it has
 	// nothing to do yet — a pull request still settling, a check still running.
 	// Nothing about the board will answer it differently one second later, so
 	// it waits for the listing. Any other outcome is progress, and progress
 	// ends the deferral: the item is somewhere new, or marked, or due a retry.
-	if tr.Outcome == model.OutcomeNoop && tr.From == tr.Stage {
+	//
+	// An initial provider move that failed gets the same deferral and for the
+	// same reason: nothing ran, nothing changed, and retrying it on every
+	// scheduler wake instead of waiting for the next listing would hammer a
+	// provider that is already failing.
+	if (tr.Outcome == model.OutcomeNoop && tr.From == tr.Stage) || (tr.Outcome == "" && tr.Err != nil) {
 		s.resting[tr.Item.ID] = true
 	} else {
 		delete(s.resting, tr.Item.ID)
@@ -1194,6 +1244,10 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	st.Times = make(map[string]ItemTime, len(s.times))
 	for id, t := range s.times {
 		st.Times[id] = t
+	}
+	st.TransitionErrors = make(map[string]TransitionError, len(s.transitionErrs))
+	for id, e := range s.transitionErrs {
+		st.TransitionErrors[id] = e
 	}
 	s.mu.RUnlock()
 	writeJSON(w, st)
