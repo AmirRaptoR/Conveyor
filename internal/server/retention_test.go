@@ -181,6 +181,44 @@ func TestSweepPinsTheArrivalMoveSoARestartStillRecoversTheStageAge(t *testing.T)
 	}
 }
 
+// Pinning is evaluated against the board's current items only: an expired
+// run belonging to an item that has fallen off the board — closed, or gone
+// from the source entirely — is swept normally, because s.blocks/s.times are
+// themselves pruned to on-board items on every refresh.
+func TestSweepDoesNotPinRunsOfItemsNoLongerOnTheBoard(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	dir := writeTestRun(t, r.Root, "2020-01-01", "120000.000-stale", model.Run{
+		Source: "s1", ItemID: "s1:gone", Kind: "stage", Outcome: model.OutcomeBlocked, ExitCode: 20,
+	})
+	// Recovering a block for an item that is (for this moment) still on the
+	// board, then dropping it off the board the way refresh() would, leaves
+	// s.blocks empty again — exactly the state a truly gone item is in.
+	s.recallBlocks([]model.Item{{ID: "s1:gone", Source: "s1", Stage: "working", Blocked: true}})
+	delete(s.blocks, "s1:gone")
+
+	s.runSweep(io.Discard)
+
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("run of an off-board item was pinned instead of swept normally: %v", err)
+	}
+}
+
+// untilNextSweepAt paces the daily sweep off logs.sweepAt in the caller's own
+// location, never in the past.
+func TestUntilNextSweepAtPacesToTheNextOccurrence(t *testing.T) {
+	now := time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC)
+	if got := untilNextSweepAt("04:00", now); got != time.Hour {
+		t.Errorf("earlier today: got %s, want 1h", got)
+	}
+	if got := untilNextSweepAt("02:00", now); got != 23*time.Hour {
+		t.Errorf("already passed today: got %s, want 23h (tomorrow)", got)
+	}
+	if got := untilNextSweepAt("03:00", now); got != 24*time.Hour {
+		t.Errorf("exactly now: got %s, want 24h (tomorrow, never zero/negative)", got)
+	}
+}
+
 // /api/state carries how much the run store holds and how far back it
 // reaches, computed by walking file sizes rather than decoding any run's
 // meta.json.
