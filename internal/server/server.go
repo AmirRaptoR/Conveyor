@@ -1032,19 +1032,34 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 	// bad agent invocation: the answer is kept and the session dropped, because
 	// a resume that did not work names a conversation worth abandoning.
 	resume := s.answers.Get(item.ID)
-	tr, _ := s.eng.Advance(ctx, item.Source, &item, target, resume)
-	if tr != nil {
-		switch tr.Outcome {
-		case model.OutcomeFailure, model.OutcomeTimeout:
-			if resume.Answer != "" && resume.Session != "" {
-				_ = s.answers.Set(item.ID, model.Resume{Answer: resume.Answer})
-			}
-		default:
-			s.answers.Take(item.ID)
+	tr, err := s.eng.Advance(ctx, item.Source, &item, target, resume)
+	if tr == nil {
+		// An unknown source or stage: a config problem, not a transient one,
+		// and nothing ran — there is nothing to mark, move or spend an answer
+		// on. Surfacing it here at least gets it into the log; F03/F04's fuller
+		// treatment (a durable, board-visible transition error) is tracked
+		// separately.
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: %s: %v\n", item.ID, err)
 		}
-		s.applyTransition(tr)
-		s.hub.publish(event{Kind: "transition", Transition: tr})
+		return
 	}
+	switch {
+	case tr.Outcome == "":
+		// Unset only when nothing ran at all — the initial provider move
+		// failed before any script had the chance to consume the answer. It
+		// must survive to be handed to whichever run actually receives it.
+	case tr.Outcome == model.OutcomeFailure || tr.Outcome == model.OutcomeTimeout:
+		if resume.Answer != "" && resume.Session != "" {
+			_ = s.answers.Set(item.ID, model.Resume{Answer: resume.Answer})
+		}
+	default:
+		if _, err := s.answers.Take(item.ID, resume); err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: %s: could not record its answer as spent: %v\n", item.ID, err)
+		}
+	}
+	s.applyTransition(tr)
+	s.hub.publish(event{Kind: "transition", Transition: tr})
 }
 
 // applyTransition writes an item's new stage into the cache the moment it is
@@ -1352,17 +1367,23 @@ func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
 // see, waiting to be said into a conversation that was never re-asked.
 func (s *Server) answerThenUnblock(ctx context.Context, item model.Item, answer string) error {
 	answer = strings.TrimSpace(answer)
+	var resume model.Resume
 	if answer != "" {
 		s.mu.RLock()
 		sess := s.blocks[item.ID].Session
 		s.mu.RUnlock()
-		if err := s.answers.Set(item.ID, model.Resume{Answer: answer, Session: sess}); err != nil {
+		resume = model.Resume{Answer: answer, Session: sess}
+		if err := s.answers.Set(item.ID, resume); err != nil {
 			return err
 		}
 	}
 	if err := s.unblock(ctx, item); err != nil {
 		if answer != "" {
-			s.answers.Take(item.ID) // nothing consumed it; do not strand it
+			// Nothing will consume it: the mark is still in place, so no run
+			// is about to be handed this reply. Roll back exactly the value
+			// just set — never an unconditional delete, in case a person
+			// somehow answered again in the gap.
+			_, _ = s.answers.Take(item.ID, resume)
 		}
 		return err
 	}
