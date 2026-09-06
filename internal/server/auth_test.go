@@ -53,7 +53,23 @@ func TestEveryRouteIsBehindTheSameWall(t *testing.T) {
 		t.Errorf("POST /sw.js without credentials = %d, want 401", w.Code)
 	}
 
-	for _, path := range []string{"/", "/api/state", "/api/events", "/api/runs", "/api/push/key", "/index.html"} {
+	// Everything else, the board's own code included. The stylesheets and the
+	// ES modules index.html loads *are* the board — its rendering, its
+	// actions, the endpoints it calls — so they stay behind the password
+	// beside it; publicAsset gains no entry for them. Derived from the page
+	// rather than listed, so a stylesheet or module added later is covered
+	// here without editing this test (see pageAssets).
+	behindTheWall := append([]string{"/", "/api/state", "/api/events", "/api/runs", "/api/push/key", "/index.html"},
+		pageAssets(t)...)
+	for _, path := range behindTheWall {
+		if publicAsset[path] {
+			// The app shell (manifest, icons, worker) is public by design and
+			// asserted above. The board's own code must never join it.
+			if strings.HasSuffix(path, ".css") || (strings.HasSuffix(path, ".js") && path != "/sw.js") {
+				t.Errorf("%s is on the unauthenticated allowlist: the board's own code stays behind the password", path)
+			}
+			continue
+		}
 		reached = false
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, httptest.NewRequest("GET", path, nil))

@@ -64,14 +64,11 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	mux.HandleFunc("POST /api/push/unsubscribe", s.handlePushUnsubscribe)
 	mux.HandleFunc("POST /api/push/test", s.handlePushTest)
 
-	// Go's table has no entry for the manifest extension and would serve it
-	// as text; Chrome wants the manifest type before it offers to install.
-	_ = mime.AddExtensionType(".webmanifest", "application/manifest+json")
-	sub, err := fs.Sub(webFS, "web")
+	static, err := webHandler()
 	if err != nil {
 		return err
 	}
-	mux.Handle("/", http.FileServer(http.FS(sub)))
+	mux.Handle("/", static)
 
 	srv := &http.Server{Addr: addr, Handler: s.authed(mux)}
 	go func() { <-ctx.Done(); _ = srv.Close() }()
@@ -99,6 +96,21 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	// restarted engine claim an item whose old run has not actually stopped.
 	s.drain()
 	return nil
+}
+
+// webHandler serves the embedded web/ directory: the board's markup, the
+// stylesheets and the ES modules it links, and the app shell beside them. Its
+// own function rather than two lines inside Run so a test can drive exactly
+// what Run mounts instead of a second copy of it.
+func webHandler() (http.Handler, error) {
+	// Go's table has no entry for the manifest extension and would serve it
+	// as text; Chrome wants the manifest type before it offers to install.
+	_ = mime.AddExtensionType(".webmanifest", "application/manifest+json")
+	sub, err := fs.Sub(webFS, "web")
+	if err != nil {
+		return nil, err
+	}
+	return http.FileServer(http.FS(sub)), nil
 }
 
 // drainGrace bounds how long shutdown waits for in-flight transitions before
