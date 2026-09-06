@@ -278,35 +278,56 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 		script, ok = "", true // written into the run directory instead
 		env = src.Env
 	}
+
+	// res always ends up non-nil below unless the failure is one route() has
+	// no run record to route through at all (the run directory itself could
+	// not be created) — everything else, including a script that could not be
+	// started and a source that declares none, is a stage outcome like any
+	// other and must count toward maxAttempts rather than being retried
+	// forever uncounted or returned before an attempt is recorded.
+	var res *runner.Result
+	var runErr error
 	if !ok {
 		// resolveSources already recorded why, and Engine skips unhealthy
 		// sources — reaching here means one went bad after load.
-		tr.Outcome = model.OutcomeFailure
-		tr.Err = fmt.Errorf("source %q declares no script named %q", srcName, stage.Script)
-		return tr, tr.Err
+		msg := fmt.Sprintf("source %q declares no script named %q", srcName, stage.Script)
+		runErr = errors.New(msg)
+		res = &runner.Result{Run: model.Run{
+			Source: srcName, ItemID: item.ID, Kind: "stage", From: from, To: to,
+			Outcome: model.OutcomeFailure, Error: msg,
+		}}
+	} else {
+		res, runErr = e.runner.Run(ctx, runner.Spec{
+			Script:  script,
+			Inline:  stage.Run,
+			Kind:    "stage",
+			Workdir: e.cfg.Workdir(mustSource(e.cfg, srcName)),
+			Env:     env,
+			Source:  srcName,
+			Item:    item,
+			From:    from,
+			To:      to,
+			Timeout: timeout,
+			Stdin:   model.StageInput{Item: item, Stage: to, From: from, Answer: resume.Answer, Session: resume.Session},
+		})
+		if runErr != nil && res == nil {
+			// A genuine infrastructure failure before the script had any
+			// chance to run — its own run directory could not even be
+			// created. There is no run record to route through, so this
+			// cannot be counted as an attempt or marked; the caller is left
+			// to decide how to back off.
+			tr.Err = runErr
+			tr.Outcome = model.OutcomeFailure
+			return tr, runErr
+		}
 	}
 
-	res, err := e.runner.Run(ctx, runner.Spec{
-		Script:  script,
-		Inline:  stage.Run,
-		Kind:    "stage",
-		Workdir: e.cfg.Workdir(mustSource(e.cfg, srcName)),
-		Env:     env,
-		Source:  srcName,
-		Item:    item,
-		From:    from,
-		To:      to,
-		Timeout: timeout,
-		Stdin:   model.StageInput{Item: item, Stage: to, From: from, Answer: resume.Answer, Session: resume.Session},
-	})
-	if err != nil {
-		tr.Err = err
-		tr.Outcome = model.OutcomeFailure
-		return tr, err
-	}
 	tr.Outcome = res.Run.Outcome
 	tr.RunID = res.Run.ID
 	tr.RunDir = res.Run.Dir
+	if runErr != nil {
+		tr.Err = runErr
+	}
 
 	next, mark := e.route(stage, res, item.ID, tr)
 	tr.Next = next
@@ -324,17 +345,17 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 			return tr, err
 		}
 		tr.Item = *item
-		return tr, nil
+		return tr, runErr
 	}
 	if next == "" || next == to {
-		return tr, nil
+		return tr, runErr
 	}
 	if _, err := client.Move(ctx, item, next, source.Mark{}); err != nil {
 		tr.Err = err
 		return tr, err
 	}
 	tr.Item = *item
-	return tr, nil
+	return tr, runErr
 }
 
 // route decides what happens after a stage script exits: where the item goes,
@@ -410,7 +431,15 @@ func Marked(stage string, run model.Run, data json.RawMessage, timeout time.Dura
 			m.Kind = "error"
 		}
 		if m.Reason == "" {
-			m.Reason = fmt.Sprintf("%s failed (exit %d)", stage, run.ExitCode)
+			// run.Error is set when the script could not be run at all
+			// (missing, not executable, or the source declares none) —
+			// "exit -1" or "exit 0" would say nothing true about a script
+			// that never started, so this is preferred whenever it is set.
+			if run.Error != "" {
+				m.Reason = fmt.Sprintf("%s: %s", stage, run.Error)
+			} else {
+				m.Reason = fmt.Sprintf("%s failed (exit %d)", stage, run.ExitCode)
+			}
 			if attempts > 1 {
 				m.Reason += fmt.Sprintf(" on attempt %d", attempts)
 			}
