@@ -152,8 +152,8 @@ sources:
       name: github
       params:
         STAGE_LABELS: |
-          refining=status:refining
-          ready=status:ready
+          refining=conveyor:refining
+          ready=conveyor:ready
 
     # What this source IS — reaches every script it runs.
     env:
@@ -281,8 +281,8 @@ A provider is a folder under `providers/` holding one script per verb:
 
 ```
 providers/github/
-  list.sh      open issues -> items
-  move.sh      item stage -> a status:* label
+  list.sh      open issues, and closed ones it labelled -> items
+  move.sh      item stage -> a conveyor:* label
 ```
 
 The engine finds them by name, with or without an extension — `list.sh`,
@@ -303,12 +303,13 @@ sources:
     env:
       REPO: RaptoR-Soft/midgame
       # The source owns the provider<->stage mapping; the engine never sees a
-      # label. Stages with no entry simply have nothing written.
+      # label. Listing is opt-in: a stage with no entry here is a stage whose
+      # items are never labelled, so they drop off the board.
       STAGE_LABELS: |
-        refining=status:refining
-        ready=status:ready
-        in-progress=status:in-progress
-        blocked=status:blocked
+        refining=conveyor:refining
+        ready=conveyor:ready
+        in-progress=conveyor:in-progress
+        blocked=conveyor:blocked
 ```
 
 Credentials are not part of this: the script inherits the ambient environment,
