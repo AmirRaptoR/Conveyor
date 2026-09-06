@@ -57,6 +57,32 @@ type State struct {
 	// Active is every transition running right now. The board lights those
 	// stations; without it the page cannot tell work from stillness.
 	Active []Active `json:"active"`
+	// Storage is what the run store currently holds and how far back
+	// retention still reaches.
+	Storage StorageView `json:"storage"`
+	// PersistFault is a run whose own record could not be trusted — a full
+	// disk during its meta.json write — kept until a later run persists
+	// cleanly. Unlike Warnings, refresh never rebuilds this: a disk-full
+	// fault must survive to the next poll, not vanish within one interval.
+	PersistFault *PersistFault `json:"persistFault,omitempty"`
+	// PollNs is the configured poll interval, so the board can tell a stale
+	// listing from a fresh one without guessing at a constant of its own —
+	// the engine says what "stale" means, the same way it says everything
+	// else the page renders (CLAUDE.md: "the board never derives what the
+	// engine knows").
+	PollNs time.Duration `json:"pollNs"`
+}
+
+// PersistFault is one run whose own record-keeping failed — set from
+// runner.Result.PersistErr, which is what a failed meta.json write or
+// log.txt append leaves there instead of a record that looks like a clean
+// success.
+type PersistFault struct {
+	RunID   string    `json:"runId"`
+	ItemID  string    `json:"itemId,omitempty"`
+	Source  string    `json:"source,omitempty"`
+	Message string    `json:"message"`
+	At      time.Time `json:"at"`
 }
 
 // SlotsView is the concurrency state, as the scheduler sees it.
@@ -92,6 +118,10 @@ type Active struct {
 type ItemTime struct {
 	Stage        string    `json:"stage"`
 	EnteredStage time.Time `json:"enteredStage"`
+	// RunID is the move run that landed the item in Stage — the same run
+	// CONTRACTS §6 pins against retention so the stage-age chip never goes
+	// blank out from under a currently-listed item.
+	RunID string `json:"-"`
 }
 
 type StageView struct {
@@ -186,6 +216,16 @@ type SourceView struct {
 	Provider string   `json:"provider"`
 	Workdir  string   `json:"workdir"`
 	Problems []string `json:"problems,omitempty"`
+	// LastListedAt is the last listing that returned without error, RFC3339,
+	// omitted when this source has never been listed successfully — not a
+	// zero time, which would render as 1970 on the board.
+	LastListedAt string `json:"lastListedAt,omitempty"`
+	// ListError is the error from the latest listing attempt, empty when
+	// that attempt succeeded (or none has been made yet). It describes only
+	// the most recent attempt, not a high-water mark: a source that failed
+	// and then succeeded shows no error here, even though LastListedAt is
+	// what actually moved.
+	ListError string `json:"listError,omitempty"`
 }
 
 type Server struct {
@@ -208,6 +248,14 @@ type Server struct {
 	// the durable record, this is only the index into them a board read
 	// cannot afford to rebuild.
 	times map[string]ItemTime
+	// everSwept is whether the retention sweep has ever actually deleted a
+	// run. It is what tells a run ID that resolves to nothing apart from "it
+	// never existed" (404) from "it is gone because retention removed it"
+	// (410) — an arbitrary lookup cutoff used to conflate the two.
+	everSwept bool
+	// sweepHorizon is the oldest day the last sweep left standing, named in a
+	// 410 so an operator knows how far back retention still reaches.
+	sweepHorizon time.Time
 	// paused is the agents the scheduler is holding work back from, by name.
 	//
 	// Not persisted, deliberately: it is a fact about the outside world right
@@ -215,6 +263,15 @@ type Server struct {
 	// the agents' own status scripts. A pause recovered from disk would be a
 	// guess about a window that may have closed while the process was down.
 	paused map[string]PauseView
+	// listedAt is the last successful listing for each source, by name; a
+	// source absent from this map has never been listed. listErr is the
+	// latest attempt's error, present only when that attempt failed — a
+	// source can be in both maps at once (it listed successfully once, and
+	// has failed on every attempt since). Neither survives a restart, the
+	// same as paused: a just-started process has nothing to say yet about a
+	// source it has not listed.
+	listedAt map[string]time.Time
+	listErr  map[string]string
 
 	hub   *hub
 	order *store.Order
@@ -274,19 +331,25 @@ type Server struct {
 	// key file, and the board simply does not notify.
 	pushKeys *push.Keys
 	pushSubs *push.Store
+
+	// drainGrace bounds Run's shutdown wait, defaulted in New and overridden
+	// only by tests — there is no config key for it, the same way there is
+	// none for the runner's own gracePeriod.
+	drainGrace time.Duration
 }
 
 func New(cfg *config.Config, r *runner.Runner) *Server {
 	s := &Server{
-		cfg:     cfg,
-		run:     r,
-		eng:     pipeline.New(cfg, r),
-		hub:     newHub(),
-		order:   store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
-		answers: store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
-		tick:    make(chan struct{}, 1),
-		wake:    make(chan struct{}, 1),
-		ctx:     context.Background(),
+		cfg:        cfg,
+		run:        r,
+		eng:        pipeline.New(cfg, r),
+		hub:        newHub(),
+		order:      store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
+		answers:    store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
+		tick:       make(chan struct{}, 1),
+		wake:       make(chan struct{}, 1),
+		ctx:        context.Background(),
+		drainGrace: drainGrace,
 	}
 	s.pushSubs = push.OpenStore(filepath.Join(cfg.DataDir(), "push.json"))
 	if keys, err := push.LoadKeys(filepath.Join(cfg.DataDir(), "vapid.json")); err != nil {
@@ -298,7 +361,9 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 	s.times = map[string]ItemTime{}
 	s.paused = map[string]PauseView{}
 	s.resting = map[string]bool{}
-	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg)}
+	s.listedAt = map[string]time.Time{}
+	s.listErr = map[string]string{}
+	s.state = State{Stages: stageViews(cfg), Sources: sourceViews(cfg, nil, nil), PollNs: cfg.Poll.D()}
 
 	// Every log line reaches the browser as it is produced. This is the whole
 	// reason logs are a stream and not a file read at the end.
@@ -309,7 +374,47 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 		}
 		s.hub.publish(event{Kind: "log", RunID: runID, Line: &l})
 	}
+	// Every run this Runner executes — list, move, stage, doctor, status —
+	// reaches here, which is what lets one place notice a persistence fault
+	// without a check threaded through every call site that starts a run.
+	prevResult := r.OnResult
+	r.OnResult = func(res *runner.Result) {
+		if prevResult != nil {
+			prevResult(res)
+		}
+		s.notePersistFault(res)
+	}
 	return s
+}
+
+// notePersistFault sets or clears the board-visible sticky fault from one
+// run's outcome: a run whose meta.json write or log.txt append failed sets it
+// (naming the run that failed to record itself honestly); any other run
+// persisting means the disk is not, or is no longer, the problem, and clears
+// it. It is intentional that this is not scoped to one item or source — a
+// full disk is a fact about the run store, not about the run that happened to
+// notice it first.
+//
+// This reads res.PersistErr, not res.Run.Error: Run.Error keeps only the
+// first failure a run hit, so a run whose process failed to start *and*
+// whose log.txt append failed on the same full disk would carry the start
+// failure there, and a prefix check against it would miss the persistence
+// failure entirely — masking the fault instead of raising it, and silently
+// clearing a real one already on the board.
+func (s *Server) notePersistFault(res *runner.Result) {
+	if res == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if res.PersistErr != "" {
+		s.state.PersistFault = &PersistFault{
+			RunID: res.Run.ID, ItemID: res.Run.ItemID, Source: res.Run.Source,
+			Message: res.PersistErr, At: time.Now(),
+		}
+	} else {
+		s.state.PersistFault = nil
+	}
 }
 
 func stageViews(c *config.Config) []StageView {
@@ -320,10 +425,18 @@ func stageViews(c *config.Config) []StageView {
 	return out
 }
 
-func sourceViews(c *config.Config) []SourceView {
+// sourceViews builds the board's per-source view. listedAt and listErr carry
+// what refresh has learned about each source's listing so far — nil at
+// construction, before anything has been listed — keyed by source name.
+func sourceViews(c *config.Config, listedAt map[string]time.Time, listErr map[string]string) []SourceView {
 	out := make([]SourceView, len(c.Sources))
 	for i, s := range c.Sources {
-		out[i] = SourceView{Name: s.Name, Provider: s.Provider.Name, Workdir: c.Workdir(s), Problems: s.Problems}
+		v := SourceView{Name: s.Name, Provider: s.Provider.Name, Workdir: c.Workdir(s), Problems: s.Problems}
+		if t, ok := listedAt[s.Name]; ok {
+			v.LastListedAt = t.UTC().Format(time.RFC3339)
+		}
+		v.ListError = listErr[s.Name]
+		out[i] = v
 	}
 	return out
 }

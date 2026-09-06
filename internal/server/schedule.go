@@ -16,6 +16,12 @@ import (
 // many it started. Candidates whose source or target stage is already busy are
 // skipped rather than queued, so a slow stage never holds up a free one.
 func (s *Server) launch(ctx context.Context) int {
+	// Shutting down: nothing new starts, whatever the locks would otherwise
+	// permit. schedule's own ctx.Done() case returns it from the loop right
+	// after, but a claim made in the meantime would still need reaping.
+	if ctx.Err() != nil {
+		return 0
+	}
 	s.mu.RLock()
 	items := append([]model.Item(nil), s.state.Items...)
 	resting := make(map[string]bool, len(s.resting))
@@ -153,7 +159,7 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// confirmation, a mark — did not arrive anywhere, and its existing entry,
 	// if it has one, is left untouched.
 	if tr.Item.Stage != tr.From {
-		s.times[tr.Item.ID] = ItemTime{Stage: tr.Item.Stage, EnteredStage: now}
+		s.times[tr.Item.ID] = ItemTime{Stage: tr.Item.Stage, EnteredStage: now, RunID: tr.RunID}
 	}
 	// A no-op in the stage the item was already in is the script saying it has
 	// nothing to do yet — a pull request still settling, a check still running.
@@ -191,6 +197,11 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 // advance runs a single transition: the button, which works whether or not the
 // pipeline is running itself.
 func (s *Server) advance(ctx context.Context) bool {
+	// Shutting down: the button is the only mover in -watch mode, so this is
+	// the whole of what a drain waits for there, not an edge of it.
+	if ctx.Err() != nil {
+		return false
+	}
 	s.mu.RLock()
 	items := append([]model.Item(nil), s.state.Items...)
 	s.mu.RUnlock()
@@ -205,6 +216,11 @@ func (s *Server) advance(ctx context.Context) bool {
 	defer s.eng.Locks().Release(item.Source, target)
 	s.working.Store(item.ID, struct{}{})
 	defer s.working.Delete(item.ID)
+	// Counted the same way schedule's launches are, so a drain waiting on
+	// inFlight actually waits for this too — the only mover with -watch set,
+	// where schedule never launches anything at all.
+	s.inFlight.Add(1)
+	defer s.inFlight.Add(-1)
 	s.runOne(ctx, *item, target)
 	return true
 }

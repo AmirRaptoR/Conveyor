@@ -7,13 +7,30 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Run serves until ctx is done. auto drives the pipeline; without it the server
 // only ever reads.
 func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
+	// The board is a control plane: it starts agent runs, reorders work and
+	// hands marked items back. Reaching it is enough to drive every repository
+	// the config enrols, so an open one on a public interface is not a
+	// read-only inconvenience. This refuses rather than warns, because the
+	// mistake it prevents is silent and the fix is one command.
+	//
+	// Checked before anything below starts: the three loops read and write
+	// through ctx, not through this call's error return, so launching them
+	// ahead of a refusal left every one of them running regardless — on
+	// context.Background() if the caller never cancelled it, forever.
+	if !s.cfg.Auth.Enabled() && !loopback(addr) {
+		return fmt.Errorf("refusing to serve %s with no auth: configure auth.users "+
+			"(run `conveyor passwd <name>` for a line to paste) or bind a loopback address", addr)
+	}
+
 	s.ctx = ctx
 	// Three loops, and they are separate on purpose. Discovery must keep its
 	// interval while a 90-minute stage runs, so nothing that waits for work to
@@ -25,6 +42,7 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 		if d := s.cfg.RetryStalled.D(); d > 0 {
 			go s.stalled(ctx, d)
 		}
+		go s.sweep(ctx)
 	}
 
 	mux := http.NewServeMux()
@@ -55,16 +73,6 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	}
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
-	// The board is a control plane: it starts agent runs, reorders work and
-	// hands marked items back. Reaching it is enough to drive every repository
-	// the config enrols, so an open one on a public interface is not a
-	// read-only inconvenience. This refuses rather than warns, because the
-	// mistake it prevents is silent and the fix is one command.
-	if !s.cfg.Auth.Enabled() && !loopback(addr) {
-		return fmt.Errorf("refusing to serve %s with no auth: configure auth.users "+
-			"(run `conveyor passwd <name>` for a line to paste) or bind a loopback address", addr)
-	}
-
 	srv := &http.Server{Addr: addr, Handler: s.authed(mux)}
 	go func() { <-ctx.Done(); _ = srv.Close() }()
 	mode := "running: items advance on their own"
@@ -84,7 +92,39 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
+	// The HTTP listener is down the moment ctx is cancelled, but a transition
+	// already launched keeps running — a stage script, an agent, a git push.
+	// cmdServe releases the data-directory lock in a defer right after Run
+	// returns, so returning here before that work is done would let a
+	// restarted engine claim an item whose old run has not actually stopped.
+	s.drain()
 	return nil
+}
+
+// drainGrace bounds how long shutdown waits for in-flight transitions before
+// giving up and returning anyway. It must exceed the runner's own grace
+// period (30s): a script whose child ignores TERM is not reaped until the
+// runner's own SIGKILL lands, and draining any less than that would time out
+// on exactly the case it exists for.
+const drainGrace = 45 * time.Second
+
+// drain waits for every transition already claimed — schedule's launches,
+// handleStart, and the tick button's own advance — to finish, or gives up
+// after drainGrace and says what is still running rather than hanging
+// forever on a run that will not.
+func (s *Server) drain() {
+	deadline := time.Now().Add(s.drainGrace)
+	for s.inFlight.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := s.inFlight.Load(); n != 0 {
+		var running []string
+		for _, a := range s.activeList() {
+			running = append(running, a.ItemID)
+		}
+		fmt.Fprintf(os.Stderr, "conveyor: shutting down with %d transition(s) still running after %s: %s\n",
+			n, s.drainGrace, strings.Join(running, ", "))
+	}
 }
 
 // Addr normalises a listen address so `-addr 8080` works like `-addr :8080`.

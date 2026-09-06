@@ -16,7 +16,7 @@ let the model decide the flow.
 ## Status
 
 Working: `internal/{model,config,runner,source,pipeline}` and the CLI
-(`validate | list | run | tick`). `./conveyor tick -n 8 -c conveyor.example.yaml`
+(`validate | list | run | tick`). `./conveyor tick -n 10 -c conveyor.example.yaml`
 drains the mock pipeline in priority order and marks a blocked item in place.
 `providers/github/` runs against real repositories.
 
@@ -61,9 +61,6 @@ non-loopback address with no `auth.users` is refused**, because the board starts
 agent runs, reorders work and hands items back: reaching it is enough to drive
 every repository the config enrols.
 
-Not built yet: the log retention sweep (`logs.retention`, with the pinning rule
-in CONTRACTS §6). See `docs/DESIGN.md`.
-
 ## Invariants — do not break these
 
 - **stdout/stderr are logs and are never parsed.** Structured data comes back
@@ -99,6 +96,20 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   longer a killed run. And the checkout a *person* works in is never touched —
   uncommitted work can sit in it for a week and the pipeline neither notices nor
   cares.
+  Reclaim is a positive allowlist, never an inference from a clean status: a
+  path is touched — created into, emptied, or removed — only when it resolves
+  to exactly `<managed root>/<source>/<ref>` and carries the marker
+  `item_worktree` wrote into it when it created it. The primary checkout, an
+  external `git worktree`, a directory a person made, a symlink escaping the
+  managed root — none of that is ever Conveyor's, however clean or old it
+  looks. A branch already checked out somewhere else is refused, not
+  reclaimed: reclaiming a *clean* holder used to be the rule, and Git's own
+  refusal to remove the primary checkout — always clean, always listed in
+  `git worktree list` — is exactly what turned that refusal into the trigger
+  for `rm -rf` on it. The sweep that reclaims spent worktrees reads an
+  explicit lease instead — the owning process's PID, or the run's deadline,
+  written every time a stage picks the worktree up — because directory age
+  says nothing about whether an agent is still using it.
   `perSource` is therefore a throughput choice now, not a safety rule. It is
   still not unlimited: `refine` and `deploy` run in the source's own checkout.
   Worktrees are created by the adapter and removed by `approve` once a merge is

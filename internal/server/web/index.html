@@ -63,6 +63,8 @@
   .mark { font-size:13px; letter-spacing:.34em; text-transform:uppercase; font-weight:500; }
   .readout { display:flex; gap:16px; color:var(--dim); font-size:11px; letter-spacing:.06em; }
   .readout b { color:var(--ink); font-weight:500; font-variant-numeric:tabular-nums; }
+  .degraded { color:var(--run); }
+  .degraded b { color:var(--run); }
   .grow { flex:1; }
 
   .lamp { width:6px; height:6px; border-radius:50%; background:var(--faint); display:inline-block; }
@@ -284,6 +286,13 @@
   .src-chip .n { color:var(--ink); font-variant-numeric:tabular-nums; }
   .src-chip.broken .name { color:var(--stop); }
   .src-chip.broken .swatch { background:var(--stop); }
+  /* Degraded: still enrolled and expected to be listing, but the last
+     attempt failed, never happened, or is older than the stale threshold —
+     distinct from .broken, which is a source not being listed by design. */
+  .src-chip.degraded .name { color:var(--run); }
+  .src-chip.degraded .swatch { background:var(--run); }
+  .src-chip.degraded .n { color:var(--run); }
+  .src-chip .never { color:var(--run); }
 
   /* The agents' own report on themselves. A strip above the sources, because
      an agent over its usage limit stops every source at once, and that is the
@@ -373,6 +382,12 @@
   }
   .stop p { margin:0; color:var(--ink); font-size:12px; line-height:1.65; white-space:pre-wrap; }
   .stop .meta { margin-top:8px; color:var(--faint); font-size:10.5px; }
+  /* A failed handBack/sendAnswer inside the open panel: refuse() alone draws
+     onto the board card, which #panel and #scrim occlude while it is open. */
+  .stop .fault {
+    margin-top:10px; padding:7px 9px; border:1px solid color-mix(in srgb, var(--stop) 40%, var(--rule-soft));
+    border-radius:2px; color:var(--stop); font-size:11.5px; line-height:1.5;
+  }
   .stop.asks { border-left-color:var(--ask); }
   .stop.asks h3 { color:var(--ask); }
   .stop.waiting { border-left-color:var(--faint); }
@@ -443,6 +458,14 @@
   .faults h2 { margin:0 0 3px; font-size:11px; letter-spacing:.18em; text-transform:uppercase; color:var(--stop); font-weight:500; }
   .faults div { color:var(--dim); font-size:11.5px; line-height:1.7; }
   .faults b { color:var(--ink); font-weight:500; }
+
+  /* ---- warnings ------------------------------------------------------------
+     A runtime condition (a listing that failed, or one the provider itself
+     flagged), not a configuration error — caution amber rather than
+     .faults's stop red, and its own block rather than a merged list, so the
+     two tones stay distinguishable. */
+  .warnings { margin:0 22px; border-left:2px solid var(--run); background:var(--panel); padding:12px 16px; }
+  .warnings div { color:var(--dim); font-size:11.5px; line-height:1.7; }
 
   /* ---- inspection panel -------------------------------------------------- */
   .scrim {
@@ -741,6 +764,25 @@
     :root { --station: 200px; }
     .masthead { flex-wrap:wrap; gap:10px; }
   }
+
+  /* Offscreen but still read by assistive tech — unlike `display:none` or
+     `hidden`, which are removed from the accessibility tree entirely. */
+  .sr-only {
+    position:absolute; width:1px; height:1px; margin:-1px; padding:0;
+    overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0;
+  }
+
+  /* Keyboard/touch parity for the two drag gestures (#44): reorder within a
+     queue, and start an item out of the first stage. Buttons, not a drag
+     surface, so a keyboard user reaches them by Tab and a touch user by a
+     tap — the detail panel already has the room a card does not (see the
+     issue's technical notes). Not gated behind a hover or pointer media
+     query, and never smaller than the 44x44 CSS px a touch target needs. */
+  .pactions { display:flex; gap:8px; flex-wrap:wrap; padding:0 20px 14px; }
+  .pactions .ctl {
+    min-width:44px; min-height:44px; display:inline-flex; align-items:center;
+    justify-content:center;
+  }
 </style>
 </head>
 <body>
@@ -763,10 +805,11 @@
 <div class="needs" id="needs"></div>
 <div id="agents"></div>
 <div id="sources"></div>
+<div id="warnings"></div>
 <div id="faults"></div>
 <div id="doctor"></div>
 <div class="rail-wrap">
-  <div class="line" id="line"><div class="rail" id="rail"></div></div>
+  <div class="line" id="line"><div class="rail" id="rail" tabindex="-1"></div></div>
   <div class="railctl" id="railctl" hidden>
     <button class="railbtn" id="rail-left" aria-label="Scroll the line left">‹</button>
     <div class="railtrack" id="rail-track" role="scrollbar" aria-orientation="horizontal"
@@ -784,32 +827,125 @@
 <aside id="panel" aria-hidden="true">
   <div class="ahead">
     <div style="flex:1">
-      <h2 id="ptitle">—</h2>
+      <h2 id="ptitle" tabindex="-1">—</h2>
       <div class="sub" id="psub"></div>
     </div>
     <button class="ctl" id="close">Close</button>
   </div>
+  <div class="pactions" id="pactions"></div>
   <div class="upper" id="upper">
     <div id="stop"></div>
     <div class="report" id="report"></div>
-    <div class="history" id="history" aria-live="polite"></div>
+    <div class="history" id="history"></div>
   </div>
   <div class="todos" id="todos" hidden></div>
-  <div class="log" id="log" aria-live="polite"></div>
+  <div class="log" id="log"></div>
 </aside>
+<!-- Run-level status only: appended log lines never touch this, or a running
+     agent would announce every line it wrote (see setLogStatus/setHistoryStatus
+     and announce() in the script). Visually hidden, not display:none — an
+     off-screen live region is still read by assistive tech; a hidden one is not. -->
+<div id="announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
 
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => (s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-let state = null, openItemId = null, followRun = null;
+// ---- pure helpers -----------------------------------------------------------
+// Grouped and marked (see the matching comment below) so
+// internal/server/web/pure_test.mjs can pull this region's text out of the
+// file and evaluate it without a DOM library or a build step. Every function
+// here takes plain values, never a DOM node, on purpose: it is what makes
+// them testable under stock Node.
+
+// The identity of a focusable thing inside a subtree draw() replaces,
+// reduced to one comparable string. `desc` is `{kind, id, stage, control}` —
+// whichever of `id`/`stage` applies to that kind, `control` only for a card
+// (its own body versus the `.open` link). The same shape is built fresh by
+// looking at a live element (see focusDescriptor below) and by looking one
+// back up after a rebuild (findFocusTarget) — this is the thing the two
+// agree on.
+function focusKeyOf(desc) {
+  if (!desc) return "";
+  return `${desc.kind}:${desc.id ?? desc.stage ?? ""}:${desc.control ?? ""}`;
+}
+
+// One step of a keyboard/touch queue reorder: the index a card would land on
+// after moving `dir` (-1 up, +1 down) among `length` cards, or null when that
+// runs off either end. Refused there, never wrapped — matching the drag,
+// which cannot drop a card past the ends of its own queue either.
+function nextQueueIndex(index, length, dir) {
+  const target = index + dir;
+  if (target < 0 || target >= length) return null;
+  return target;
+}
+
+// A draw() requested while a card is mid-drag must leave the DOM alone: the
+// dragged node has to stay the live element the drop lands on (see wireDrag's
+// dragstart/dragend and the draw() guard that calls this). Its own function
+// so that decision is one line to test without simulating a real drag.
+function shouldDeferDraw(isDragging) { return !!isDragging; }
+
+// startable()'s whole rule, as a function of the stage list rather than the
+// module-level `state` global — `startable` below is a thin wrapper over
+// this so the rule itself carries no DOM or global-state dependency and can
+// be exercised with a plain array of `{name, next}`.
+function startableRule(from, into, stages) {
+  const first = stages[0];
+  if (!first || from !== first.name) return false;
+  const stageDef = stages.find(s => s.name === from);
+  return !!into && stageDef?.next === into;
+}
+
+// The stale threshold a source's own lastListedAt is measured against: twice
+// the configured poll interval, floored at 60s so a poll under a minute
+// (this repo's own test configs set poll: 100ms) does not call every source
+// stale between polls. pollNs absent or zero — an old server, or one that
+// never set it — falls back to twice the loader's own 5m default
+// (internal/config/config.go), never a bare 2× of nothing.
+function staleThresholdMs(pollNs) {
+  if (!pollNs) return 10 * 60 * 1000;
+  return Math.max(2 * (pollNs / 1e6), 60000);
+}
+
+// Whether one source is degraded, as of `nowMsVal` — every input a plain
+// value, so this is exercised with injected timestamps and a frozen clock
+// rather than by sleeping. A source carrying configuration problems is never
+// degraded: it is not being listed by design, and #faults already says so.
+// Before the first refresh completes (updatedAtMs falsy), nothing is
+// degraded — a board that has not polled yet is starting up, not broken.
+function sourceDegraded(s, updatedAtMs, pollNs, nowMsVal) {
+  if ((s.problems || []).length) return false;
+  if (!updatedAtMs) return false;
+  if (s.listError) return true;
+  if (!s.lastListedAt) return true;
+  const at = new Date(s.lastListedAt).getTime();
+  if (isNaN(at)) return true;
+  return nowMsVal - at > staleThresholdMs(pollNs);
+}
+// ---- end pure helpers -------------------------------------------------------
+
+let state = null, openItemId = null, openItemTitle = null, followRun = null;
 // Dragging ends in a click; without this, dropping a card also opens it.
 let dragging = null, justDragged = false;
+// A draw() that lands mid-drag defers instead of touching #rail (see draw()
+// and shouldDeferDraw above); the drag's own dragend runs the one redraw that
+// was owed once it is safe to rebuild again.
+let pendingRedraw = false;
 // Why each marked item is marked, keyed by item id — the engine's note, not the
 // provider's. See State.Blocks.
 let blocks = {};
 const clock = iso => { const d = new Date(iso);
   return isNaN(d) ? iso : d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}); };
+// The run store's own size, in the units a person reads it in — the board
+// says "2.3 GB", never a raw byte count.
+const fmtBytes = n => {
+  if (!n) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
+};
 
 // The board is served to phones over the network, where a skewed device
 // clock is an everyday thing. Every other timestamp here is absolute, so a
@@ -821,13 +957,18 @@ let skew = 0;
 const nowMs = () => Date.now() - skew;
 
 async function load() {
+  let res;
   try {
-    const res = await fetch("/api/state");
-    const served = Date.parse(res.headers.get("Date"));
-    if (!isNaN(served)) skew = Date.now() - served;
-    state = await res.json();
-    draw();
-  } catch { fault("disconnected"); }
+    res = await fetch("/api/state");
+  } catch { fault("disconnected"); return; }
+  // A 500 still answered the request — it is the server saying something is
+  // wrong, not the network failing to reach it, and the two must read
+  // differently or an operator chases a cable for a bug on the box.
+  if (!res.ok) { fault(`server error (HTTP ${res.status})`); return; }
+  const served = Date.parse(res.headers.get("Date"));
+  if (!isNaN(served)) skew = Date.now() - served;
+  state = await res.json();
+  draw();
 }
 
 function fault(msg) { $("#lamp").className = "lamp down"; $("#line1").textContent = msg; }
@@ -867,25 +1008,85 @@ function drawDoctor() {
 }
 
 async function startDoctor(apply) {
-  const res = await fetch("/api/doctor", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ apply }),
-  });
+  let res;
+  try {
+    res = await fetch("/api/doctor", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apply }),
+    });
+  } catch { fault("could not start the sweep: disconnected"); return; }
   if (res.status === 409) { alert("A sweep is already running."); return; }
+  if (!res.ok) { fault((await res.text()).trim() || `could not start the sweep (HTTP ${res.status})`); return; }
   loadDoctor();
+}
+
+// The identity of a focused card/`.more`/`.need` button, or of an agent's open
+// `<details>`, in a shape `findFocusTarget`/a `data-agent` lookup can find
+// again after the subtree it lives in is rebuilt. `el.closest` rather than a
+// straight `el.matches` because the actual event target inside a card can be
+// the `.open` link, and that distinction is the "which control" `restoreFocus`
+// needs.
+function focusDescriptor(el) {
+  if (!el) return null;
+  const card = el.closest?.(".item[data-id]");
+  if (card) return { kind: "card", id: card.dataset.id, control: el.closest(".open") ? "open" : "card" };
+  const more = el.closest?.(".more[data-stage]");
+  if (more) return { kind: "more", stage: more.dataset.stage };
+  const need = el.closest?.(".need[data-id]");
+  if (need) return { kind: "need", id: need.dataset.id };
+  return null;
+}
+
+// The element `focusDescriptor` would describe the same way, looked up again
+// after a rebuild — null when the thing it named is no longer on the board
+// (an item that moved out of view, a `.more` button a column no longer
+// shows), which is what tells the caller to fall back instead.
+function findFocusTarget(desc) {
+  if (!desc) return null;
+  if (desc.kind === "card") {
+    const card = document.querySelector(`.item[data-id="${CSS.escape(desc.id)}"]`);
+    if (!card) return null;
+    return desc.control === "open" ? (card.querySelector(".open") || card) : card;
+  }
+  if (desc.kind === "more") return document.querySelector(`.more[data-stage="${CSS.escape(desc.stage)}"]`);
+  if (desc.kind === "need") return document.querySelector(`.need[data-id="${CSS.escape(desc.id)}"]`);
+  return null;
 }
 
 let firstDraw = true;
 function draw() {
   if (!state) return;
+  // A draw() mid-drag would tear out the very node the drag is holding onto
+  // (see wireDrag) — deferred here, and run once, exactly, from dragend.
+  // `state` above is already current; only the rebuild waits.
+  if (shouldDeferDraw(dragging)) { pendingRedraw = true; return; }
   if (firstDraw) { firstDraw = false; queueMicrotask(openFromHash); }
+
+  // Interaction state that lives in a subtree #rail/#needs are about to throw
+  // away by innerHTML assignment: what had focus (a card, its `.open` link, a
+  // `.more` button, a `.need` button), and which agents' own `<details>` are
+  // open. `shown` (below) and the rail's own scrollLeft already survive this
+  // for the same reason — neither lives in the DOM this replaces.
+  const active0 = document.activeElement;
+  const focusDesc = active0 && active0.closest?.("#rail, #needs") ? focusDescriptor(active0) : null;
+  const openAgents = new Set(
+    [...document.querySelectorAll("#agents details[open]")].map(d => d.dataset.agent));
+
   const stages = state.stages || [], items = state.items || [];
   indexSources(state.sources);
   // A list, because stages run in parallel: one entry per transition in flight.
   const active = state.active || [];
   const workingOn = id => active.find(a => a.itemId === id);
   blocks = state.blocks || {};
+
+  // Degraded describes a source, not the board: at least one refresh has
+  // completed and that source's own listing has failed, never happened, or
+  // is older than the stale threshold — see sourceDegraded above. Computed
+  // fresh from `state` on every draw, never accumulated, so a clean state
+  // right after a degraded one leaves nothing behind.
+  const updatedAtMs = state.updatedAt ? new Date(state.updatedAt).getTime() : 0;
+  const degradedSources = (state.sources || []).filter(s => sourceDegraded(s, updatedAtMs, state.pollNs, nowMs()));
 
   // Items arrive in the order the scheduler will work them, so the board does
   // not sort: it draws them in the order it is given. A card's position is the
@@ -906,7 +1107,7 @@ function draw() {
   const ends = stages.filter(s => s.terminal);
 
   $("#rail").innerHTML =
-    flow.map(st => station(st, bucket[st.name] || [], active)).join("") +
+    flow.map(st => station(st, bucket[st.name] || [], active, degradedSources.length > 0)).join("") +
     ends.map(st => terminus(st, bucket[st.name] || [])).join("");
 
   // What each agent says about itself. The engine passes this through — which
@@ -930,7 +1131,7 @@ function draw() {
         <span class="say">${say}</span>
         ${hold ? `<span class="held">holding work back${hold.until ? ` until ${esc(clock(hold.until))}` : ""}</span>` : ""}
         ${a.resetsAt ? `<span class="resets">resets ${esc(clock(a.resetsAt))}</span>` : ""}
-        ${facts ? `<details><summary>details</summary><span class="facts">${facts}</span></details>` : ""}
+        ${facts ? `<details data-agent="${esc(a.name)}"><summary>details</summary><span class="facts">${facts}</span></details>` : ""}
       </span>`;
     }).join("")}</div>`;
 
@@ -953,34 +1154,72 @@ function draw() {
   // the colours are decoration, because nothing says which repo is which.
   const counts = {};
   for (const it of items) counts[it.source] = (counts[it.source] || 0) + 1;
+  // How much the run store holds and how far back retention still reaches —
+  // one figure, in the same strip as what is enrolled, because both answer
+  // "what does this board's disk footprint look like right now".
+  const storage = state.storage;
+  const storageChip = storage && storage.runs ? `<span class="src-chip storage" title="run store on disk">
+        <span class="n">${fmtBytes(storage.bytes)}</span>
+        <span class="repo">${storage.runs} run${storage.runs === 1 ? "" : "s"}${
+          storage.oldestDay ? ` retained since ${esc(storage.oldestDay)}` : ""}</span>
+      </span>` : "";
   $("#sources").innerHTML = `<div class="sources">${
     (state.sources || []).map(s => {
       const broken = (s.problems || []).length > 0;
-      return `<span class="src-chip${broken ? " broken" : ""}" style="--src:${sourceColour(s.name)}"
-          title="${esc(s.workdir || "")}">
+      const degraded = !broken && degradedSources.includes(s);
+      // A broken source shows only its cannot-run badge — never additionally
+      // reported as degraded, stale or not-listing; that is what its own
+      // configuration problems already mean.
+      const freshness = broken ? "" : s.lastListedAt
+        ? durSpan(new Date(s.lastListedAt).getTime(), true, esc(`listed ${new Date(s.lastListedAt).toLocaleString()}`))
+        : `<span class="never">not listed yet</span>`;
+      const chipTitle = esc((s.workdir || "") + (degraded && s.listError ? ` — ${s.listError}` : ""));
+      return `<span class="src-chip${broken ? " broken" : ""}${degraded ? " degraded" : ""}" style="--src:${sourceColour(s.name)}"
+          title="${chipTitle}">
         <span class="swatch"></span>
         <span class="name">${esc(s.name)}</span>
-        <span class="n">${counts[s.name] || 0}</span>
-        ${broken ? `<span class="repo">cannot run</span>` : ""}
+        <span class="n">${degraded ? "?" : (counts[s.name] || 0)}</span>
+        ${broken ? `<span class="repo">cannot run</span>` : freshness ? `<span class="repo">${freshness}</span>` : ""}
       </span>`;
-    }).join("")
+    }).join("") + storageChip
   }</div>`;
 
   const bad = (state.sources || []).filter(s => (s.problems || []).length);
-  $("#faults").innerHTML = bad.length ? `<div class="faults">
-      <h2>${bad.length} source${bad.length > 1 ? "s" : ""} cannot run</h2>
-      ${bad.map(s => `<div><b>${esc(s.name)}</b> — ${s.problems.map(esc).join("<br>")}</div>`).join("")}
+  // A persistence fault is not a source problem — it is a fact about the run
+  // store itself — but it is the same tone (red, sticky, needs a person) and
+  // belongs beside them rather than inventing a second strip for one line.
+  const pf = state.persistFault;
+  $("#faults").innerHTML = (bad.length || pf) ? `<div class="faults">
+      ${bad.length ? `<h2>${bad.length} source${bad.length > 1 ? "s" : ""} cannot run</h2>
+      ${bad.map(s => `<div><b>${esc(s.name)}</b> — ${s.problems.map(esc).join("<br>")}</div>`).join("")}` : ""}
+      ${pf ? `<h2>run store cannot record itself</h2>
+      <div><b>${esc(pf.runId)}</b>${pf.itemId ? ` (${esc(pf.itemId)})` : ""} — ${esc(pf.message)}</div>` : ""}
+    </div>` : "";
+
+  // Runtime conditions the engine noticed while discovering work — a listing
+  // that errored, or a warning the provider itself returned — never a
+  // configuration error (that is .faults, above). Rendered whole: the
+  // engine's own `<source>: ` prefix is what attributes each one, so the
+  // page does not split, parse or re-key the string.
+  $("#warnings").innerHTML = (state.warnings || []).length ? `<div class="warnings">
+      ${state.warnings.map(w => `<div>${esc(w)}</div>`).join("")}
     </div>` : "";
 
   $("#lamp").className = "lamp " + (active.length || state.polling ? "busy" : "idle");
   const when = state.updatedAt ? new Date(state.updatedAt).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}) : "—";
   const held = marked;
-  $("#line1").innerHTML = active.length === 1
+  // Named beside updated <time> so the line does not read fresh while
+  // discovery is broken — appended to whichever branch below renders, since
+  // that is the same masthead line regardless of what else is happening.
+  const degradedNote = degradedSources.length
+    ? ` &nbsp;·&nbsp; <span class="degraded">${degradedSources.length} source${degradedSources.length === 1 ? "" : "s"} not listing</span>`
+    : "";
+  $("#line1").innerHTML = (active.length === 1
     ? `<b>${esc(active[0].stage)}</b> running &middot; ${esc(active[0].itemId)}`
     : active.length
       ? `<b>${active.length}</b> running &middot; ${active.map(a => esc(a.stage)).join(", ")}`
       : `<b>${items.length}</b> items${asking.length ? `, <b>${asking.length}</b> need${asking.length === 1 ? "s" : ""} you`
-          : held ? `, <b>${held}</b> stopped` : ""} &nbsp;·&nbsp; updated ${when}`;
+          : held ? `, <b>${held}</b> stopped` : ""} &nbsp;·&nbsp; updated ${when}`) + degradedNote;
 
   document.querySelectorAll(".item").forEach(el => {
     const open = () => { if (!justDragged) inspect(el.dataset.id, el.dataset.title, el.dataset.stage); };
@@ -992,6 +1231,28 @@ function draw() {
   });
   document.querySelectorAll(".queue[data-stage]").forEach(wireQueue);
   updateRailCtl();
+
+  // Put open `<details>` back the way they were before #agents was replaced.
+  for (const name of openAgents) {
+    const d = document.querySelector(`#agents details[data-agent="${CSS.escape(name)}"]`);
+    if (d) d.open = true;
+  }
+  // Put focus back on the same logical element, by identity rather than by
+  // node reference — the node itself is gone, #rail/#needs were just rebuilt
+  // wholesale. Fallback (when the element named is no longer on the board,
+  // e.g. an item that changed stage or a `.more`/`.need` button that
+  // disappeared): the rail itself, so focus lands somewhere still on the
+  // board rather than resetting to the top of the document.
+  if (focusDesc) {
+    const target = findFocusTarget(focusDesc);
+    if (target) target.focus();
+    else if (!$("#rail").contains(document.activeElement)) $("#rail").focus();
+  }
+
+  // The panel's own action controls (move up/down, start) and stop notice
+  // read the same rebuilt #rail, so they are kept in step with every draw()
+  // rather than only when the panel first opens.
+  if (openItemId) { renderPanelActions(openItemId); refreshOpenStop(openItemId, false); }
 }
 
 // The rail's own horizontal scrollbar lives at its bottom edge, which on a
@@ -1149,7 +1410,13 @@ const railResize = new ResizeObserver(updateRailCtl);
 railResize.observe($("#line"));
 railResize.observe($("#rail"));
 
-function station(st, items, active) {
+// `degraded` is whether any source is degraded right now (draw()'s
+// board-wide count, not this station's own items) — a column can be empty
+// because its source's items vanished from discovery rather than because
+// there is genuinely no work, and a reader needs to be able to tell those
+// apart. Terminal columns (terminus(), below) never take this: they are a
+// ledger of closed work, not a claim about what is in flight.
+function station(st, items, active, degraded) {
   const live = active.some(a => a.stage === st.name);
   return `<section class="station${live ? " live" : ""}">
     <div class="plate">
@@ -1158,7 +1425,7 @@ function station(st, items, active) {
     </div>
     <div class="queue" data-stage="${esc(st.name)}">${
       items.length ? items.map((it, i) => card(it, active, i)).join("")
-                   : `<div class="slot">Nothing here</div>`}</div>
+                   : `<div class="slot">${degraded ? "Picture incomplete — discovery is degraded" : "Nothing here"}</div>`}</div>
   </section>`;
 }
 
@@ -1305,8 +1572,22 @@ function indexSources(sources) {
 }
 const sourceColour = name => hueOf.get(name) || "var(--faint)";
 
+// The card or `.need` button that opened the panel, as a focus descriptor
+// rather than a node reference — the node itself is routinely replaced by a
+// draw() while the panel sits open (see focusDescriptor/findFocusTarget), so
+// looking it up again by identity when the panel closes is what makes
+// "restore focus to the opener" mean anything after even one state update.
+let panelOpenerDesc = null;
+// One entry per item ever opened this session, keyed by id: the last block
+// signature `refreshOpenStop` rendered for it, so a draw() that changes
+// nothing about the mark does not blow away a reply someone is mid-typing —
+// see refreshOpenStop.
+const lastBlockSig = new Map();
+const blockSig = b => b ? `${b.kind}|${b.reason}|${b.at}` : "";
+
 async function inspect(id, title, stage) {
-  openItemId = id;
+  panelOpenerDesc = focusDescriptor(document.activeElement);
+  openItemId = id; openItemTitle = title;
   // No run is selected yet: an SSE line for whatever was open before this
   // must not paint into a panel that has moved on to a different item.
   followRun = null; logPending = false; logBuffer = [];
@@ -1314,13 +1595,14 @@ async function inspect(id, title, stage) {
   $("#psub").textContent = `${id} · ${stage}`;
   $("#panel").classList.add("open"); $("#panel").setAttribute("aria-hidden", "false");
   $("#scrim").classList.add("open");
+  // Moves focus into the panel; the title itself, since it says what was just
+  // opened rather than leading with the button that closes it again.
+  $("#ptitle").focus();
   setLogStatus("loading", "Loading…");
   $("#todos").innerHTML = ""; $("#todos").hidden = true;
-  $("#stop").innerHTML = stopNotice(id);
-  const hand = $("#stop").querySelector(".hand");
-  if (hand) hand.onclick = () => handBack(id, hand);
-  const askBtn = $("#stop").querySelector(".ask-btn");
-  if (askBtn) askBtn.onclick = () => openAsk(id, title);
+  lastBlockSig.delete(id);
+  refreshOpenStop(id, true);
+  renderPanelActions(id);
   // The report is derived from run history, so it exists for every item;
   // on one still moving it is the passage so far.
   const label = stageBy(stage)?.terminal ? "Final report" : "Report so far";
@@ -1328,6 +1610,88 @@ async function inspect(id, title, stage) {
   $("#report .rbtn").onclick = e => openReport(id, title, e.target);
   await loadHistory(id);
 }
+
+// Redraws `#stop` only when the mark actually changed — a poll that finds the
+// same mark still in place must not reset a reply someone is mid-typing in
+// the textarea `stopNotice` renders. `isInitialOpen` skips the "just
+// appeared" announcement on the render `inspect()` itself triggers; that one
+// is the panel opening, not a stop appearing on an item already open.
+function refreshOpenStop(id, isInitialOpen) {
+  const b = blocks[id];
+  const sig = blockSig(b);
+  if (!isInitialOpen && lastBlockSig.get(id) === sig) return;
+  const hadMarkBefore = !!lastBlockSig.get(id);
+  lastBlockSig.set(id, sig);
+  $("#stop").innerHTML = stopNotice(id);
+  const hand = $("#stop").querySelector(".hand");
+  if (hand) hand.onclick = () => handBack(id, hand);
+  const askBtn = $("#stop").querySelector(".ask-btn");
+  if (askBtn) askBtn.onclick = () => openAsk(id, openItemTitle);
+  if (!isInitialOpen && sig && !hadMarkBefore) {
+    announce(`${openItemTitle || id} stopped: ${b.kind || "blocked"}`);
+  }
+}
+
+// The keyboard/touch equivalents of the two drag gestures (#44), as ordinary
+// buttons in the panel rather than chrome on every card — the panel is
+// already the per-item surface a tap or a Tab reaches, and has the room a
+// 236px card does not. Re-rendered from draw() as well as from inspect() so
+// the buttons track the item's actual position and stage rather than the
+// snapshot from whenever the panel opened.
+function renderPanelActions(id) {
+  const box = $("#pactions");
+  const card = document.querySelector(`.item[data-id="${CSS.escape(id)}"]`);
+  if (!card) { box.innerHTML = ""; return; }
+  const title = card.dataset.title, stage = card.dataset.stage;
+  const parts = [];
+  const q = queueOf(card);
+  if (q) {
+    const items = queueEls(q);
+    const idx = items.indexOf(card);
+    parts.push(`<button class="ctl" data-act="up" ${idx <= 0 ? "disabled" : ""}
+        aria-label="Move ${esc(title)} up in ${esc(q)}">Move up</button>`);
+    parts.push(`<button class="ctl" data-act="down" ${idx < 0 || idx >= items.length - 1 ? "disabled" : ""}
+        aria-label="Move ${esc(title)} down in ${esc(q)}">Move down</button>`);
+  }
+  const first = (state?.stages || [])[0];
+  const into = stageBy(stage)?.next;
+  if (first && stage === first.name && startable(stage, into)) {
+    parts.push(`<button class="ctl" data-act="start" aria-label="Start ${esc(title)}">Start</button>`);
+  }
+  box.innerHTML = parts.join("");
+  box.querySelectorAll("[data-act]").forEach(btn => {
+    btn.onclick = () => {
+      if (btn.dataset.act === "start") startItem(id, into);
+      else moveItem(id, btn.dataset.act === "up" ? -1 : 1);
+    };
+  });
+}
+
+const queueEls = stage => [...document.querySelectorAll(`.queue[data-stage="${CSS.escape(stage)}"] .item`)];
+
+// Mutates the DOM the same way `ondrop`'s `insertBefore` does, then goes
+// through the same `saveOrder()` the drag uses — never `justDragged`, which
+// exists only to suppress the click a drop generates and would otherwise
+// swallow the very next Enter/Space on this card.
+function moveItem(id, dir) {
+  const card = document.querySelector(`.item[data-id="${CSS.escape(id)}"]`);
+  if (!card) return;
+  const stage = queueOf(card);
+  if (!stage) return;
+  const items = queueEls(stage);
+  const from = items.indexOf(card);
+  const to = nextQueueIndex(from, items.length, dir);
+  if (to === null) return;
+  card.parentNode.insertBefore(card, dir < 0 ? items[to] : items[to].nextSibling);
+  saveOrder();
+  renderPanelActions(id);
+  announce(`${card.dataset.title || id} moved to position ${to + 1} of ${items.length} in ${stage}`);
+}
+
+// The one polite live region left once #log and #history stop being
+// `aria-live` (see #44): a keyboard/touch reorder, a run-level status change,
+// and a stop appearing on the item already open all land here instead.
+function announce(text) { $("#announcer").textContent = text; }
 
 // The final report, in a modal: rendered, with the markdown one press away as
 // a copy, a file, or the browser's own print-to-PDF. Derived fresh on every
@@ -1400,10 +1764,45 @@ async function openReport(id, title, btn) {
 // them to you: a header, the question, options with what each means, and a
 // line for anything else. The answers go back as one reply into the
 // conversation that asked, via the same endpoint the textarea uses.
+
+// A native modal <dialog> keeps *outside* elements from taking focus, but
+// verified against a real browser it does not cycle Tab back to its own
+// first control — Tab off the last focusable inside it lands on <body>
+// instead of wrapping, which is indistinguishable from "escaped the dialog"
+// for a keyboard user. Trapped explicitly instead, on every Tab press while
+// the dialog is open, so it also holds across `show()`'s own re-renders
+// between questions (a fresh set of focusables each time, read fresh here).
+function trapTabIn(dlg) {
+  return e => {
+    if (e.key !== "Tab") return;
+    const focusable = [...dlg.querySelectorAll(
+      'input:not(:disabled), button:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')];
+    if (!focusable.length) return;
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  };
+}
+$("#ask").addEventListener("keydown", trapTabIn($("#ask")));
+
+// The `.ask-btn` that opened the dialog, restored on close — captured as
+// whatever currently holds focus, which is that button itself for a real
+// click or a keyboard activation. The `close` event (not a `dlg.close()`
+// call site) is what catches every way the dialog can end: Cancel, Send
+// answers, Escape's native dismissal, and the scrim.
+let askOpener = null;
 function openAsk(id, title) {
   const qs = questionsOf(blocks[id]);
   if (!qs) return;
+  askOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const dlg = $("#ask");
+  // `{ once: true }`: exactly one of these per open/close cycle, added fresh
+  // right before this dialog opens, so nothing accumulates across repeated
+  // openAsk() calls on the same shared `#ask` element.
+  dlg.addEventListener("close", () => {
+    if (askOpener && document.contains(askOpener)) askOpener.focus();
+    askOpener = null;
+  }, { once: true });
   const answers = [];
   let i = 0;
   const show = () => {
@@ -1447,6 +1846,13 @@ function openAsk(id, title) {
       const note = box ? box.value.trim() : "";
       sendAnswer(id, answers.join("\n") + (note ? `\n\n${note}` : ""));
     };
+    // The dialog replaces its own innerHTML between questions (this is that
+    // re-render), which drops whatever inside it held focus — a native modal
+    // <dialog> keeps Tab from reaching anything *outside* it, but nothing
+    // stops focus from landing nowhere in particular after its own content is
+    // swapped out from under it. Put it back on the first real control every
+    // time this runs, not only on the first question.
+    (form.querySelector('input[name="o"]') || form.querySelector(".askother"))?.focus();
   };
   show();
   dlg.showModal();
@@ -1454,13 +1860,23 @@ function openAsk(id, title) {
 
 async function sendAnswer(id, answer) {
   const btn = document.querySelector("#stop .ask-btn");
+  const label = btn ? btn.textContent : "";
   if (btn) { btn.disabled = true; btn.textContent = "Sending…"; }
-  const res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ answer }),
-  });
-  if (!res.ok) { refuse(id, (await res.text()).trim() || `could not answer ${id}`); return; }
+  let res, msg;
+  try {
+    res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer }),
+    });
+  } catch { msg = `could not answer ${id}: disconnected`; }
+  if (res && !res.ok) msg = (await res.text()).trim() || `could not answer ${id}`;
+  if (msg) {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    refuse(id, msg);
+    panelFault(msg);
+    return;
+  }
   $("#stop").innerHTML = "";
 }
 
@@ -1562,8 +1978,9 @@ function stopNotice(id) {
       ${at && !isNaN(at) ? `stopped ${esc(at.toLocaleString())}` : ""}
       ${b.runId ? ` &middot; run ${esc(b.runId)}` : ""}
     </div>
+    <div class="fault" hidden></div>
     ${qs ? `<button class="ask-btn">Answer ${qs.length === 1 ? "the question" : `${qs.length} questions`}</button>` : ""}
-    <textarea class="answer" rows="3" spellcheck="true"
+    <textarea class="answer" rows="3" spellcheck="true" aria-label="Reply"
       placeholder="${qs ? "Anything to add beside the answers above, or reply here instead."
                        : t === "asks" ? "Your answer. The agent takes it up in the conversation that stopped."
                        : "Reply if there is something to say; leave it empty to just hand the item back."}"></textarea>
@@ -1575,6 +1992,7 @@ function stopNotice(id) {
 function setHistoryStatus(kind, text) {
   $("#history").innerHTML =
     `<div class="slot${kind === "error" ? " err" : kind === "loading" ? " loading" : ""}">${esc(text)}</div>`;
+  announce(text);
 }
 
 // A failed history fetch leaves no run to select — the log would otherwise
@@ -1653,6 +2071,7 @@ function runDuration(r) {
 function setLogStatus(kind, text) {
   const log = $("#log");
   log.innerHTML = `<div class="status${kind === "error" ? " err" : kind === "loading" ? " loading" : ""}">${esc(text)}</div>`;
+  announce(text);
 }
 
 // SSE lines for the followed run that arrive while its own fetch is still in
@@ -1662,6 +2081,38 @@ function setLogStatus(kind, text) {
 // `logGen` scopes logPending/logBuffer to whichever showRun() call is current,
 // so a superseded call finishing late cannot clear a newer call's buffer.
 let logGen = 0, logPending = false, logBuffer = [];
+
+// A live run can emit far more than a browser should keep as DOM nodes.
+// MAX_LOG_LINES bounds how many stay rendered; the oldest are discarded as
+// new ones arrive, and a single marker node (never one per discard) says how
+// many. The full log is never lost — it is still on disk, and reloading this
+// run through the paged GET /api/runs/{id} API reaches it.
+const MAX_LOG_LINES = 5000;
+let logDiscarded = 0, logMarker = null;
+
+function trimLog(log) {
+  const floor = logMarker ? 1 : 0;
+  while (log.childElementCount > MAX_LOG_LINES + floor) {
+    const victim = log.children[logMarker ? 1 : 0];
+    if (!victim) break;
+    log.removeChild(victim);
+    logDiscarded++;
+  }
+  if (logDiscarded > 0) {
+    if (!logMarker) {
+      logMarker = document.createElement("div");
+      logMarker.className = "ln status";
+      log.insertBefore(logMarker, log.firstChild);
+    }
+    // Not "reload to see them all": the default GET /api/runs/{id} a reload
+    // makes returns only the last 2000 lines, which is fewer than what a DOM
+    // already past MAX_LOG_LINES is showing — a plain reload would lose more
+    // than it recovers. The lines are not gone (log.txt has them, and the
+    // paged API can reach them with ?offset=), but nothing here pages for
+    // them yet, so the marker must not promise that a reload does.
+    logMarker.textContent = `… ${logDiscarded} earlier line(s) dropped from this view to bound memory; still complete in the run's own log …`;
+  }
+}
 
 async function showRun(id) {
   followRun = id;
@@ -1683,6 +2134,16 @@ async function showRun(id) {
     // same run again while this was in flight — nothing of this response
     // belongs on screen any more.
     if (stale()) return;
+    if (res.status === 410) {
+      // Genuinely honest but coarse (CONTRACTS §6): this cannot prove *this*
+      // run was swept rather than never existing, only that runs before the
+      // horizon are gone — never to be confused with the old 500-run lookup
+      // cutoff, which just meant "we didn't look far enough".
+      const body = await res.json().catch(() => ({}));
+      setLogStatus("error", `Removed by retention on ${body.horizon || "an earlier date"}.`);
+      logPending = false;
+      return;
+    }
     if (!res.ok) {
       setLogStatus("error", `Could not load this run (HTTP ${res.status}).`);
       logPending = false;
@@ -1699,12 +2160,15 @@ async function showRun(id) {
   if (stale()) return;
   const log = $("#log");
   log.innerHTML = "";
+  // A newly opened run starts its DOM cap fresh — the marker and count both
+  // belonged to whichever run was open before.
+  logDiscarded = 0; logMarker = null;
   // Reset before replaying: a run with no TodoWrite call of its own should
   // not keep showing whichever run was open before it. renderLine repopulates
   // this as it walks the lines (and any buffered lines appendBuffered adds
   // after), so it ends on that run's own latest state.
   $("#todos").innerHTML = ""; $("#todos").hidden = true;
-  for (const line of lines) log.appendChild(renderLine(line));
+  for (const line of lines) { log.appendChild(renderLine(line)); trimLog(log); }
   logPending = false;
   appendBuffered(lines);
   if (!log.childElementCount) setLogStatus("empty", "No output.");
@@ -1731,7 +2195,7 @@ function appendBuffered(snapshotLines) {
     }
     if (match) { overlap = m; break; }
   }
-  for (let i = overlap; i < buf.length; i++) log.appendChild(renderLine(buf[i]));
+  for (let i = overlap; i < buf.length; i++) { log.appendChild(renderLine(buf[i])); trimLog(log); }
 }
 
 // An agent writes markdown and calls tools; showing that as one monospace blob
@@ -1818,12 +2282,28 @@ function updateTodos(list) {
 function closePanel() {
   $("#panel").classList.remove("open"); $("#panel").setAttribute("aria-hidden", "true");
   $("#scrim").classList.remove("open");
-  openItemId = null; followRun = null;
+  if (openItemId) lastBlockSig.delete(openItemId);
+  openItemId = null; openItemTitle = null; followRun = null;
   logPending = false; logBuffer = [];
+  // Back to whichever card or `.need` button opened the panel, by identity —
+  // looked up fresh rather than a stored node, since a draw() while the panel
+  // was open has very likely already replaced it (see focusDescriptor).
+  // Nothing named if that element is no longer on the board at all.
+  const opener = findFocusTarget(panelOpenerDesc);
+  panelOpenerDesc = null;
+  if (opener) opener.focus();
 }
 $("#close").onclick = closePanel;
 $("#scrim").onclick = closePanel;
-addEventListener("keydown", e => { if (e.key === "Escape") closePanel(); });
+// The `#ask` dialog sits in front of the panel and closes itself on Escape
+// (native <dialog> behaviour) — this listener must leave that alone, or the
+// panel behind it closes too and the criterion "Escape closes only the
+// dialog" breaks the moment this handler also fires for the same keypress.
+addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  if ($("#ask").open) return;
+  closePanel();
+});
 
 $("#rail-left").onclick = () => scrollRail(-1);
 $("#rail-right").onclick = () => scrollRail(1);
@@ -1841,11 +2321,7 @@ addEventListener("resize", updateRailCtl);
 // card by card.
 const queueOf = el => el.closest(".queue[data-stage]")?.dataset.stage;
 const stageBy = name => (state?.stages || []).find(st => st.name === name);
-const startable = (from, into) => {
-  const first = (state?.stages || [])[0];
-  if (!first || from !== first.name) return false;
-  return !!into && stageBy(from)?.next === into;
-};
+const startable = (from, into) => startableRule(from, into, state?.stages || []);
 
 // A refusal belongs on the card that was dropped, not in a console: an operator
 // who sees nothing happen concludes the board is broken.
@@ -1858,11 +2334,14 @@ function refuse(id, why) {
 
 async function startItem(id, stage) {
   refusals.delete(id);
-  const res = await fetch(`/api/items/${encodeURIComponent(id)}/start`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ stage }),
-  });
+  let res;
+  try {
+    res = await fetch(`/api/items/${encodeURIComponent(id)}/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stage }),
+    });
+  } catch { refuse(id, `could not start ${id}`); return; }
   if (!res.ok) refuse(id, (await res.text()).trim() || `could not start ${id}`);
 }
 
@@ -1896,6 +2375,10 @@ function wireDrag(el) {
     dragging = null;
     justDragged = true;
     setTimeout(() => justDragged = false, 0);
+    // The one redraw owed for everything a draw() during the drag deferred
+    // (see shouldDeferDraw) — `state` is already whatever the last of those
+    // calls set it to, so this catches the board up in a single rebuild.
+    if (pendingRedraw) { pendingRedraw = false; draw(); }
   };
   // A card in another column is not a drop target of its own: the column is.
   // Letting the event through to it is what makes dropping onto a full backlog's
@@ -1943,11 +2426,36 @@ async function saveOrder() {
     console.warn("refusing to save an empty order");
     return;
   }
-  await fetch("/api/order", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(ids),
-  });
+  let res;
+  try {
+    res = await fetch("/api/order", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(ids),
+    });
+  } catch {
+    // The drag already moved the card in the DOM (el.ondrop's insertBefore);
+    // a save that never reached the server has to be undone the same way a
+    // rejected one is — draw() is the rollback, state is still what the
+    // server last confirmed.
+    fault("could not save the new order: disconnected");
+    draw();
+    return;
+  }
+  if (!res.ok) {
+    fault(`could not save the new order: ${(await res.text()).trim() || `HTTP ${res.status}`}`);
+    draw();
+  }
+}
+
+// refuse() draws its message onto the board card, which #panel and #scrim
+// occlude while the panel is open — the one channel a panel-borne failure
+// needs beside it. The box is part of stopNotice()'s own markup (see the
+// `.fault` div there), so it survives exactly as long as the stop notice
+// that owns it: cleared by the next real redraw of #stop, never on a timer.
+function panelFault(msg) {
+  const box = document.querySelector("#stop .fault");
+  if (box) { box.textContent = msg; box.hidden = false; }
 }
 
 // Clearing a mark is a provider write, so the control says so while it lands:
@@ -1956,13 +2464,23 @@ async function saveOrder() {
 async function handBack(id, btn) {
   const box = document.querySelector("#stop .answer");
   const answer = box ? box.value.trim() : "";
+  const label = btn ? btn.textContent : "";
   if (btn) { btn.disabled = true; btn.textContent = answer ? "answering" : "handing back"; }
-  const res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ answer }),
-  });
-  if (!res.ok) { refuse(id, (await res.text()).trim() || `could not unblock ${id}`); return; }
+  let res, msg;
+  try {
+    res = await fetch(`/api/items/${encodeURIComponent(id)}/unblock`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer }),
+    });
+  } catch { msg = `could not unblock ${id}: disconnected`; }
+  if (res && !res.ok) msg = (await res.text()).trim() || `could not unblock ${id}`;
+  if (msg) {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+    refuse(id, msg);
+    panelFault(msg);
+    return;
+  }
   // The panel was showing a stop that no longer exists.
   $("#stop").innerHTML = "";
 }
@@ -1981,10 +2499,23 @@ $("#unblock-all").onclick = async e => {
   }
   if (!confirm(`Clear the mark on ${n} item${n === 1 ? "" : "s"}? Each goes straight back into the line.`
     + (asking ? `\n\n${asking} waiting on an answer from you ${asking === 1 ? "is" : "are"} left alone.` : ""))) return;
-  e.target.disabled = true;
-  e.target.textContent = "handing back…";
-  await fetch("/api/unblock", { method:"POST" });
-  setTimeout(() => e.target.disabled = false, 2000);
+  const btn = e.target, label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "handing back…";
+  let res, msg;
+  try {
+    res = await fetch("/api/unblock", { method:"POST" });
+  } catch { msg = "could not clear marks: disconnected"; }
+  if (res && !res.ok) msg = (await res.text()).trim() || "could not clear marks";
+  if (msg) {
+    // A rejection never reaches the timer below, so the re-enable that
+    // matters here cannot depend on it — restored at once instead.
+    btn.disabled = false;
+    btn.textContent = label;
+    fault(msg);
+    return;
+  }
+  setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 2000);
 };
 
 $("#diagnose").onclick = () => {
@@ -1997,7 +2528,13 @@ $("#diagnose").onclick = () => {
   startDoctor(false);
 };
 
-$("#refresh").onclick = () => fetch("/api/refresh", { method:"POST" });
+$("#refresh").onclick = async () => {
+  let res;
+  try {
+    res = await fetch("/api/refresh", { method:"POST" });
+  } catch { fault("could not refresh: disconnected"); return; }
+  if (!res.ok) fault((await res.text()).trim() || `could not refresh (HTTP ${res.status})`);
+};
 
 // ---- the app on a device -------------------------------------------------
 // Installing is the browser's gesture; this only registers the worker that
@@ -2076,10 +2613,23 @@ function openFromHash() {
 }
 addEventListener("hashchange", openFromHash);
 $("#tick").onclick = async e => {
-  e.target.disabled = true;
-  const res = await fetch("/api/tick", { method:"POST" });
-  if (res.status === 409) $("#line1").textContent = "a tick is already in flight";
-  setTimeout(() => e.target.disabled = false, 1500);
+  const btn = e.target;
+  btn.disabled = true;
+  let res;
+  try {
+    res = await fetch("/api/tick", { method:"POST" });
+  } catch {
+    btn.disabled = false;
+    fault("could not tick: disconnected");
+    return;
+  }
+  if (res.status === 409) { $("#line1").textContent = "a tick is already in flight"; }
+  else if (!res.ok) {
+    btn.disabled = false;
+    fault((await res.text()).trim() || `could not tick (HTTP ${res.status})`);
+    return;
+  }
+  setTimeout(() => btn.disabled = false, 1500);
 };
 
 const es = new EventSource("/api/events");
@@ -2093,6 +2643,7 @@ es.onmessage = ev => {
     const log = $("#log");
     const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
     log.appendChild(renderLine(e.line));
+    trimLog(log);
     if (pinned) log.scrollTop = log.scrollHeight;
     return;
   }

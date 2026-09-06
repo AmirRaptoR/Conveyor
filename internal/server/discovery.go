@@ -192,6 +192,15 @@ func (s *Server) refresh(ctx context.Context) {
 
 	var items []model.Item
 	var warnings []string
+	// Accumulated during the loop below and applied only once, inside the
+	// same lock that assigns Items/Warnings/UpdatedAt — so /api/state can
+	// never serve a fresh lastListedAt beside the previous poll's items.
+	// Two of the three ways to skip a source below (config problems, no
+	// engine client) leave both maps untouched for that source: neither is
+	// an attempt, so there is no outcome to record — the absence itself is
+	// what the board reads as "never listed".
+	listedNow := map[string]time.Time{}
+	failedNow := map[string]string{}
 
 	s.mu.Lock()
 	s.state.Polling = true
@@ -209,8 +218,10 @@ func (s *Server) refresh(ctx context.Context) {
 		res, err := client.List(ctx)
 		if err != nil {
 			warnings = append(warnings, src.Name+": "+err.Error())
+			failedNow[src.Name] = err.Error()
 			continue
 		}
+		listedNow[src.Name] = time.Now()
 		for _, w := range res.Warnings {
 			warnings = append(warnings, src.Name+": "+w.String())
 		}
@@ -219,14 +230,27 @@ func (s *Server) refresh(ctx context.Context) {
 
 	s.askAgents(ctx)
 	s.recallBlocks(items)
+	storage := s.storageUse()
 
 	s.mu.Lock()
+	// Both fields describe the latest attempt, not a high-water mark: a
+	// success clears the previous failure, and a later failure sets it again
+	// without disturbing the lastListedAt a prior success already wrote.
+	for name, t := range listedNow {
+		s.listedAt[name] = t
+		delete(s.listErr, name)
+	}
+	for name, e := range failedNow {
+		s.listErr[name] = e
+	}
 	s.state.Items = items
 	s.state.Warnings = warnings
-	s.state.Sources = sourceViews(s.cfg)
+	s.state.Sources = sourceViews(s.cfg, s.listedAt, s.listErr)
 	s.state.Order = s.order.IDs()
 	s.state.UpdatedAt = time.Now()
 	s.state.Polling = false
+	s.state.Storage = storage
+	s.state.PollNs = s.cfg.Poll.D()
 	// The listing every deferred stage was waiting for. Whatever it exited 10
 	// over has had a poll interval to change.
 	clear(s.resting)
@@ -398,7 +422,7 @@ func (s *Server) recallBlocks(items []model.Item) {
 		// it — exactly the instant a card's age should be measured from.
 		if wantTimes[m.ItemID] && m.Kind == "move" && m.Outcome == model.OutcomeSuccess &&
 			m.From != m.To && m.To == stageOf[m.ItemID] {
-			foundTimes[m.ItemID] = ItemTime{Stage: m.To, EnteredStage: m.FinishedAt}
+			foundTimes[m.ItemID] = ItemTime{Stage: m.To, EnteredStage: m.FinishedAt, RunID: m.ID}
 			delete(wantTimes, m.ItemID)
 		}
 		return len(wantBlocks) > 0 || len(wantTimes) > 0

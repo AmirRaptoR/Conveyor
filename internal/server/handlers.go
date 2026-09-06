@@ -49,6 +49,13 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 // running is dropped rather than queued, because two agents in one worktree is
 // exactly what perSource exists to prevent.
 func (s *Server) handleTick(w http.ResponseWriter, r *http.Request) {
+	// Shutting down: button's own goroutine has already returned or is about
+	// to, so a tick queued here would never be read. Say so rather than
+	// accepting a gesture that does nothing.
+	if s.ctx.Err() != nil {
+		http.Error(w, "conveyor is shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	select {
 	case s.tick <- struct{}{}:
 		w.WriteHeader(http.StatusAccepted)
@@ -127,6 +134,12 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Shutting down: refuse rather than claim an item whose run would outlive
+	// the engine that started it.
+	if s.ctx.Err() != nil {
+		http.Error(w, "conveyor is shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	// Claim before launching, exactly as the scheduler does: a check followed
 	// by a goroutine leaves a gap the next pass can decide the same thing in.
 	if !s.eng.Locks().TryAcquire(item.Source, target) {

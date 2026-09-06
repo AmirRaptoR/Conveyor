@@ -79,39 +79,143 @@ else
 fi
 cd "$tmp/repo"
 
-# 9b. the sweep: spent worktrees go, everything with anything in it stays.
+# 9b. the sweep: spent worktrees go, everything with anything in it stays, and
+# an active lease outweighs recency in both directions.
 spent=$(item_worktree demo 60)          # nothing beyond the base, will go cold
-(cd "$spent" && git reset --quiet --hard origin/main)
 work=$(item_worktree demo 61)           # has a commit of its own
-(cd "$work" && echo keep > k.txt && git add -A && git commit --quiet -m mine)
 dirty=$(item_worktree demo 62)          # uncommitted changes
+leased=$(item_worktree demo 63)         # spent, but a live lease still holds it
+(cd "$spent" && git reset --quiet --hard origin/main)
+(cd "$work" && echo keep > k.txt && git add -A && git commit --quiet -m mine)
 echo scratch > "$dirty/wip.txt"
-warm=$(item_worktree demo 63)           # spent, but touched just now
-(cd "$warm" && git reset --quiet --hard origin/main)
-# age the three that should be considered; leave `warm` warm.
-touch -d "3 hours ago" "$spent" "$work" "$dirty"
+(cd "$leased" && git reset --quiet --hard origin/main)
+
+# Simulate the runs that made spent/work/dirty having already finished: their
+# leases are gone, the same as a real stage script that has since exited.
+# `leased`'s lease is left as item_worktree wrote it — this script's own PID,
+# which is alive for the rest of the run.
+rm -f "$(_worktree_gitdir "$spent")/conveyor-lease"
+rm -f "$(_worktree_gitdir "$work")/conveyor-lease"
+rm -f "$(_worktree_gitdir "$dirty")/conveyor-lease"
+touch -d "3 hours ago" "$spent" "$work" "$dirty" "$leased"
+
 sweep_worktrees demo 2>/dev/null
-chk "a spent worktree is swept"          "$([[ -d "$spent" ]] && echo present || echo gone)" "gone"
-chk "an unpushed commit is not swept"    "$([[ -d "$work" ]] && echo present)" "present"
-chk "uncommitted work is not swept"      "$([[ -d "$dirty" ]] && echo present)" "present"
-chk "a warm worktree is left alone"      "$([[ -d "$warm" ]] && echo present)" "present"
-chk "the item being worked is kept"      "$(sweep_worktrees demo 63 2>/dev/null; [[ -d "$warm" ]] && echo present)" "present"
+chk "a spent worktree with no lease is swept"       "$([[ -d "$spent" ]] && echo present || echo gone)" "gone"
+chk "an unpushed commit is not swept, lease or not" "$([[ -d "$work" ]] && echo present)" "present"
+chk "uncommitted work is not swept, lease or not"   "$([[ -d "$dirty" ]] && echo present)" "present"
+chk "a live lease is not swept, whatever its age"   "$([[ -d "$leased" ]] && echo present)" "present"
+chk "the item being worked is kept" \
+	"$(sweep_worktrees demo 63 2>/dev/null; [[ -d "$leased" ]] && echo present)" "present"
 
-# 10. a branch already checked out somewhere else. Git allows it in exactly one
-# worktree, and an earlier run that made its own directory is the common case.
-elsewhere="$tmp/held"
-git worktree add --quiet -B taken "$elsewhere" origin/main
-p5=$(item_worktree demo 50 taken 2>/dev/null)
-chk "a clean holder is reclaimed" "$p5" "$WORKTREES/demo/50"
-chk "the holder is gone"          "$([[ -d "$elsewhere" ]] && echo present || echo gone)" "gone"
+# The same worktree, once its lease names a dead PID past its deadline, is
+# swept even though its mtime is touched to right now — recency does not save
+# it either way, only the lease does.
+gd=$(_worktree_gitdir "$leased")
+printf '%s %s\n' 999999 "$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)" >"$gd/conveyor-lease"
+touch "$leased"
+sweep_worktrees demo 2>/dev/null
+chk "a dead lease past its deadline is swept" "$([[ -d "$leased" ]] && echo present || echo gone)" "gone"
 
-# and when the holder has work in it, that work is what we continue in.
-elsewhere2="$tmp/held2"
-git worktree add --quiet -B taken2 "$elsewhere2" origin/main
-echo wip > "$elsewhere2/wip.txt"
-p6=$(item_worktree demo 51 taken2 2>/dev/null)
-chk "a dirty holder is used, not destroyed" "$p6" "$elsewhere2"
-chk "its work survives"                     "$([[ -f "$elsewhere2/wip.txt" ]] && echo yes)" "yes"
+# 10. a branch checked out elsewhere is refused, never reclaimed. A "clean
+# holder" used to be treated as disposable, and the primary checkout is always
+# clean and always listed in `git worktree list` — which is what turned Git's
+# own refusal to remove it into the trigger for `rm -rf` on the reproduction
+# this issue fixes.
+export CONVEYOR_RESULT="$tmp/held.json"
+git -C "$tmp/repo" checkout --quiet -b review-branch
+echo secret.env >>"$tmp/repo/.gitignore"
+echo top-secret >"$tmp/repo/secret.env"
+git -C "$tmp/repo" add .gitignore && git -C "$tmp/repo" commit --quiet -m gitignore
+
+: >"$CONVEYOR_RESULT"
+out=""
+rc=0; out=$(cd "$tmp/repo" && item_worktree demo 71 review-branch 2>/dev/null) || rc=$?
+chk "a branch held by the primary checkout is refused" "$rc" "20"
+chk "nothing is printed to use as a workdir"            "$out" ""
+chk "the mark names the branch"                         "$(jq -r '.reason | test("review-branch")' "$CONVEYOR_RESULT")" "true"
+chk "and the holding path"                              "$(jq -r '.reason | test("'"$tmp"'/repo")' "$CONVEYOR_RESULT")" "true"
+chk "the primary checkout's tracked file survives"      "$([[ -f "$tmp/repo/file.txt" ]] && echo yes)" "yes"
+chk "its .git survives"                                 "$([[ -d "$tmp/repo/.git" ]] && echo yes)" "yes"
+chk "and its ignored file survives"                     "$([[ -f "$tmp/repo/secret.env" ]] && echo yes)" "yes"
+
+# a local-only commit on that branch is untouched by the refusal.
+git -C "$tmp/repo" commit --quiet --allow-empty -m 'local only, never pushed'
+local_sha=$(git -C "$tmp/repo" rev-parse HEAD)
+: >"$CONVEYOR_RESULT"
+rc=0; (cd "$tmp/repo" && item_worktree demo 71 review-branch >/dev/null 2>&1) || rc=$?
+chk "the refusal is the same with a local-only commit" "$rc" "20"
+chk "the commit is still reachable afterward" "$(git -C "$tmp/repo" rev-parse HEAD)" "$local_sha"
+
+# a dirty primary checkout is refused exactly the same way — clean is not what
+# makes a checkout Conveyor's to use, so being dirty does not change anything.
+echo dirty >"$tmp/repo/file.txt"
+: >"$CONVEYOR_RESULT"
+out=""
+rc=0; out=$(cd "$tmp/repo" && item_worktree demo 71 review-branch 2>/dev/null) || rc=$?
+chk "a dirty primary checkout is refused too"   "$rc" "20"
+chk "still nothing printed to use as a workdir" "$out" ""
+git -C "$tmp/repo" checkout --quiet -- file.txt
+
+# an external `git worktree`, made outside the managed root, is refused and
+# left standing with its contents.
+elsewhere="$tmp/held-external"
+git -C "$tmp/repo" worktree add --quiet -B external-branch "$elsewhere" origin/main
+echo work >"$elsewhere/mine.txt"
+: >"$CONVEYOR_RESULT"
+rc=0; (cd "$tmp/repo" && item_worktree demo 72 external-branch >/dev/null 2>&1) || rc=$?
+chk "an external worktree is refused"  "$rc" "20"
+chk "and it is left exactly as it was" "$([[ -f "$elsewhere/mine.txt" ]] && echo yes)" "yes"
+
+# a branch held by another item's own managed worktree — the refusal names
+# both paths and neither directory is removed.
+held_item=$(item_worktree demo 73)
+(cd "$held_item" && git checkout --quiet -b shared-branch)
+: >"$CONVEYOR_RESULT"
+rc=0; (cd "$tmp/repo" && item_worktree demo 74 shared-branch >/dev/null 2>&1) || rc=$?
+chk "a branch held by another managed worktree is refused" "$rc" "20"
+chk "the reason names the holder"            "$(jq -r ".reason | test(\"$held_item\")" "$CONVEYOR_RESULT")" "true"
+chk "and this item's own path"               "$(jq -r '.reason | test("demo/74")' "$CONVEYOR_RESULT")" "true"
+chk "the holder still exists"                "$([[ -d "$held_item" ]] && echo yes)" "yes"
+chk "the requester's path was never created" "$([[ -e "$WORKTREES/demo/74" ]] && echo present || echo gone)" "gone"
+cd "$tmp/repo" && git checkout --quiet main
+
+# a directory a person made at the exact path Conveyor would use is not
+# Conveyor's, no matter how it looks. item_worktree refuses it outright;
+# drop_worktree and sweep_worktrees leave it alone and say so on stderr.
+mkdir -p "$WORKTREES/demo/75"
+echo mine >"$WORKTREES/demo/75/hello.txt"
+: >"$CONVEYOR_RESULT"
+rc=0; (cd "$tmp/repo" && item_worktree demo 75 >/dev/null 2>&1) || rc=$?
+chk "an unowned path at the managed location is refused" "$rc" "20"
+chk "and it is untouched" "$(cat "$WORKTREES/demo/75/hello.txt")" "mine"
+drop_worktree demo 75 2>/dev/null
+chk "drop_worktree leaves an unowned path alone" "$([[ -f "$WORKTREES/demo/75/hello.txt" ]] && echo yes)" "yes"
+sweep_worktrees demo 2>/dev/null
+chk "sweep_worktrees leaves an unowned path alone too" "$([[ -f "$WORKTREES/demo/75/hello.txt" ]] && echo yes)" "yes"
+rm -rf "$WORKTREES/demo/75"
+
+# a symlink at the managed path pointing outside the managed root is not ours
+# either: the target is intact after all three operations.
+escape_target="$tmp/escape-target"
+mkdir -p "$escape_target"
+echo escaped >"$escape_target/keep.txt"
+ln -s "$escape_target" "$WORKTREES/demo/76"
+: >"$CONVEYOR_RESULT"
+rc=0; (cd "$tmp/repo" && item_worktree demo 76 >/dev/null 2>&1) || rc=$?
+chk "a symlink escaping the managed root is refused" "$rc" "20"
+drop_worktree demo 76 2>/dev/null
+sweep_worktrees demo 2>/dev/null
+chk "the symlink target survives all three" "$(cat "$escape_target/keep.txt")" "escaped"
+rm -f "$WORKTREES/demo/76"
+
+# a source name or ref with a space in it is handled without being split — the
+# worktree is created at the literal path and the ownership check accepts it.
+sp=$(cd "$tmp/repo" && item_worktree "demo space" "ref one")
+chk "a space in source/ref creates the literal path" "$sp" "$WORKTREES/demo space/ref one"
+chk "it is a real checkout" "$(cd "$sp" && git rev-parse --is-inside-work-tree)" "true"
+chk "asking again returns the same path" "$(cd "$tmp/repo" && item_worktree "demo space" "ref one")" "$sp"
+drop_worktree "demo space" "ref one"
+chk "it can be dropped too" "$([[ -e "$sp" ]] && echo present || echo gone)" "gone"
 
 # 11. resume: a worktree a dead run left dirty is carried on from, not refused.
 # The brief is what the adapter appends to its prompt, so it has to contain the

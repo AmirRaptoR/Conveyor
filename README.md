@@ -13,9 +13,10 @@ your repositories leaves the machine. A work item is whatever a script emits, so
 GitHub issues, Azure PBIs, Jira tickets or a text file are all just different
 `list` scripts.
 
-> **Status: early.** The engine runs end to end against mocks — config, runner,
-> sources and the transition table are working and tested. There is no web UI and
-> no GitHub source yet. See [docs/DESIGN.md](docs/DESIGN.md) for the build order.
+> **Status: working.** The engine runs end to end against mocks and against
+> real repositories — config, runner, sources and the transition table are
+> tested, `conveyor serve` renders the board, and `providers/github/` runs
+> against real issues. See [docs/DESIGN.md](docs/DESIGN.md) for what remains.
 
 ## How it works
 
@@ -32,9 +33,9 @@ one is a queue where items rest. Exit codes are the whole control flow:
 | Code | Meaning | Engine does |
 | --- | --- | --- |
 | `0` | Success | Advance to `onSuccess` |
-| `10` | No-op | Leave the item where it is |
-| `20` | Blocked — needs a human | Route to `onBlocked` |
-| anything else | Failure | Route to `onFailure`, count an attempt |
+| `10` | No-op | Leave the item where it is; not retried until the next listing |
+| `20` | Blocked — needs a human | Mark the item blocked in place, with a reason |
+| anything else | Failure | Mark the item blocked in place, counting an attempt against `maxAttempts` |
 
 Because a stage is just an executable, a stage can be a headless AI agent, a test
 suite, a deploy, or a shell one-liner. Claude Code, Codex and opencode are all
@@ -50,7 +51,7 @@ go build -o conveyor ./cmd/conveyor
 # -c keeps your own conveyor.yaml, if you have one, out of the way
 ./conveyor validate -c conveyor.example.yaml   # check config, print the graph
 ./conveyor list     -c conveyor.example.yaml   # run every source's list script
-./conveyor tick     -c conveyor.example.yaml -n 8 -v
+./conveyor tick     -c conveyor.example.yaml -n 10 -v
 ```
 
 `conveyor.yaml` is the working config and is deliberately untracked;
@@ -65,8 +66,9 @@ providers: ~/codes/Conveyor/providers
 
 Without the key, `providers/` is looked for beside the config file.
 
-You should see items advance in priority order, one blocked item routed out of
-the pipeline, and then `nothing to do`.
+You should see the furthest-along item go first each pass — priority only
+decides between items at the same depth — one item end up marked blocked in
+place in `refining`, and then `nothing to do`.
 
 ### Serving the board
 
@@ -103,20 +105,25 @@ and a second password store for one line of behaviour.
 ```yaml
 version: 1
 concurrency:
-  perSource: 1      # one item in flight per source — a source maps to a
-  global: 1         # worktree, and two agents in one checkout corrupt it
+  perSource: 1      # items in flight per source — safe above 1 too, since an
+  global: 1         # item works in its own worktree; see docs/CONTRACTS.md §5
 stages:
   - name: backlog                        # no script: a queue
   - name: refining
     script: refine    # every source must provide a script by this name
-    onSuccess: ready
-    onFailure: backlog
+    onSuccess: done   # explicit; would default to the next stage anyway.
+                       # There is no onFailure and no onBlocked: a refine that
+                       # stops wears a blocked mark where it stopped, and
+                       # resumes there once a person clears it.
   - name: done
     terminal: true
 sources:
   - name: mock
     provider: mock    # a folder under providers/
     workdir: .
+    scripts:
+      refine:
+        agent: mock   # resolves agents/mock/refine
 ```
 
 Only sources listed in the config are ever touched. There is no directory
@@ -145,8 +152,8 @@ sources:
       name: github
       params:
         STAGE_LABELS: |
-          refining=status:refining
-          ready=status:ready
+          refining=conveyor:refining
+          ready=conveyor:ready
 
     # What this source IS — reaches every script it runs.
     env:
@@ -274,8 +281,8 @@ A provider is a folder under `providers/` holding one script per verb:
 
 ```
 providers/github/
-  list.sh      open issues -> items
-  move.sh      item stage -> a status:* label
+  list.sh      open issues, and closed ones it labelled -> items
+  move.sh      item stage -> a conveyor:* label
 ```
 
 The engine finds them by name, with or without an extension — `list.sh`,
@@ -296,12 +303,13 @@ sources:
     env:
       REPO: RaptoR-Soft/midgame
       # The source owns the provider<->stage mapping; the engine never sees a
-      # label. Stages with no entry simply have nothing written.
+      # label. Listing is opt-in: a stage with no entry here is a stage whose
+      # items are never labelled, so they drop off the board.
       STAGE_LABELS: |
-        refining=status:refining
-        ready=status:ready
-        in-progress=status:in-progress
-        blocked=status:blocked
+        refining=conveyor:refining
+        ready=conveyor:ready
+        in-progress=conveyor:in-progress
+        blocked=conveyor:blocked
 ```
 
 Credentials are not part of this: the script inherits the ambient environment,
@@ -323,6 +331,33 @@ One contract for every script, in full in
 Logs and data are separate channels on purpose. An AI stage script writes
 megabytes of prose to stdout; treating that as a data channel is how this kind of
 system breaks.
+
+## Running the checks
+
+```bash
+./check
+```
+
+is the one command: `go build`, `go vet`, `go test`, `go test -race`, every
+self-check suite in the tree, `bash -n` over every shell script under
+`agents/` and `providers/`, and `conveyor validate` against the example
+config — in that order, stopping at the first failure and naming it.
+`.github/workflows/check.yml` runs this same script on push and pull request
+against `main`, so CI and local are never two things to keep in sync.
+
+Self-check suites are found by name, not listed: anything called `selfcheck`
+or `selfcheck.sh`, or ending `-selfcheck`/`-selfcheck.sh`, anywhere in the
+tree. Add one and `./check` picks it up on its own.
+
+Adding a browser-free UI interaction test — no browser, no npm install, no
+network — means adding a file named `*.test.mjs` anywhere in the tree, written
+against Node's own `node:test` and `node:assert` (nothing else is
+installed). `internal/server/web/testutil.mjs` has a small helper,
+`loadFunctions`, that pulls a named function straight out of `index.html`'s
+inline script and evaluates it in a sandbox with `node:vm` — no DOM, no
+build step — so a pure function in the board's UI can be tested exactly as
+written; `internal/server/web/format_duration.test.mjs` is a working example.
+`./check` runs every `*.test.mjs` file it finds under `node --test`.
 
 ## Design notes
 
