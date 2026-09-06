@@ -65,8 +65,11 @@ func usage() {
   list      [-source NAME]              run list scripts, print items
   run       -source N -item ID -stage S move one item into a stage and run it
   tick      [-source NAME] [-n N]       one scheduling pass: pick and advance
-  serve     [-addr :8080] [-watch]      run the pipeline; board, live logs,
-                                        run history. -watch observes only
+  serve     [-addr :8080] [-mode M]     run the pipeline; board, live logs,
+            [-watch]                    run history. -mode is auto (default),
+                                        manual (tick button only) or observe
+                                        (nothing ever advances). -watch is an
+                                        alias for -mode=observe
   passwd    <name>                      hash a password for the config's
                                         auth.users block
   
@@ -381,20 +384,48 @@ func outcomeErr(o model.Outcome) error {
 func cmdServe(args []string) error {
 	c := newFlags("serve")
 	addr := c.fs.String("addr", ":8080", "listen address")
+	modeFlag := c.fs.String("mode", "auto", "auto | manual | observe")
 	// A pipeline that needs a button pressed is not a pipeline. Serving runs it;
-	// -watch is for looking at a board without touching the repositories.
-	watch := c.fs.Bool("watch", false, "observe only: never advance an item")
+	// -watch is for looking at a board without touching the repositories. Kept
+	// as an alias for -mode=observe, which is what its own help text and
+	// CLAUDE.md have always promised.
+	watch := c.fs.Bool("watch", false, "observe only: never advance an item (alias for -mode=observe)")
 	cfg, r, ctx, stop, err := c.load(args)
 	if err != nil {
 		return err
 	}
 	defer stop()
-	release, err := own(cfg, r, !*watch)
+
+	mode, err := server.ParseMode(*modeFlag)
+	if err != nil {
+		return err
+	}
+	if *watch {
+		if isSet(c.fs, "mode") && mode != server.ModeObserve {
+			return fmt.Errorf("-watch and -mode=%s were both given; -watch always means observe", *modeFlag)
+		}
+		mode = server.ModeObserve
+		fmt.Fprintln(os.Stderr, "conveyor: -watch selects -mode=observe")
+	}
+
+	release, err := own(cfg, r, mode.Settles())
 	if err != nil {
 		return err
 	}
 	defer release()
-	return server.New(cfg, r).Run(ctx, server.Addr(*addr), !*watch)
+	return server.New(cfg, r).Run(ctx, server.Addr(*addr), mode)
+}
+
+// isSet reports whether name was actually passed on the command line, as
+// opposed to holding its default.
+func isSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 // cmdPasswd mints one line for the config's auth.users block.
