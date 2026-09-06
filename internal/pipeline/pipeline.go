@@ -267,6 +267,17 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 		return tr, nil
 	}
 
+	// A recovery re-entry into the very stage the item is already in (F04):
+	// if the last run of this stage for this item already succeeded and only
+	// its outgoing move never got confirmed, the stage does not run again —
+	// only the move is retried. Re-running a stage script that already did
+	// its work is the side effect this exists to stop.
+	if to == from {
+		if pending, ok := runner.PendingMove(e.runner.Root, item.ID, to); ok {
+			return e.resumePendingMove(ctx, client, item, tr, pending)
+		}
+	}
+
 	src := mustSource(e.cfg, srcName)
 	script, ok := src.Paths[stage.Script]
 	timeout := timeoutFor(src, stage)
@@ -350,12 +361,67 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	if next == "" || next == to {
 		return tr, runErr
 	}
+	// Recorded against this run before the write is even attempted: if the
+	// process dies between here and the move landing, the next recovery pass
+	// still finds NextStage set and knows the script does not need re-running
+	// — only the move does.
+	res.Run.NextStage = next
+	_ = runner.WriteMeta(&res.Run)
 	if _, err := client.Move(ctx, item, next, source.Mark{}); err != nil {
 		tr.Err = err
 		return tr, err
 	}
+	res.Run.MoveConfirmed = true
+	_ = runner.WriteMeta(&res.Run)
 	tr.Item = *item
 	return tr, runErr
+}
+
+// maxMoveAttempts bounds how many times resumePendingMove retries an
+// outgoing write that keeps failing after its stage already succeeded,
+// before marking the item so a person decides. Not configuration — a
+// provider write either recovers in a poll or two or it needs a person,
+// and this is the same order of magnitude as the rest of the engine's
+// fixed retry constants (CLAUDE.md: RESUME_MAX_ATTEMPTS).
+const maxMoveAttempts = 3
+
+// resumePendingMove retries only the outgoing move a previous, successful run
+// of this stage left unconfirmed (F04) — never the stage script itself.
+func (e *Engine) resumePendingMove(ctx context.Context, client *source.Client, item *model.Item, tr *Transition, pending model.Run) (*Transition, error) {
+	tr.Outcome = model.OutcomeSuccess
+	tr.RunID = pending.ID
+	tr.RunDir = pending.Dir
+	next := pending.NextStage
+
+	if _, err := client.Move(ctx, item, next, source.Mark{}); err != nil {
+		pending.MoveAttempts++
+		tr.Attempts = pending.MoveAttempts
+		tr.Err = err
+		if pending.MoveAttempts >= maxMoveAttempts {
+			mark := source.Mark{Blocked: true, Kind: "error",
+				Reason: fmt.Sprintf("%s: the stage finished but moving it on to %s kept failing: %s", pending.To, next, err)}
+			if _, mErr := client.Move(ctx, item, pending.To, mark); mErr == nil {
+				tr.Item = *item
+				tr.Blocked = true
+				tr.Reason = mark.Reason
+				tr.Kind = mark.Kind
+				// Marked: this pending move is settled one way or another,
+				// so it must not be found and retried again.
+				pending.MoveConfirmed = true
+				_ = runner.WriteMeta(&pending)
+				return tr, err
+			}
+			// The mark itself could not be written either; leave the
+			// pending record as is and let the next poll try again.
+		}
+		_ = runner.WriteMeta(&pending)
+		return tr, err
+	}
+	pending.MoveConfirmed = true
+	_ = runner.WriteMeta(&pending)
+	tr.Item = *item
+	tr.Next = next
+	return tr, nil
 }
 
 // route decides what happens after a stage script exits: where the item goes,
