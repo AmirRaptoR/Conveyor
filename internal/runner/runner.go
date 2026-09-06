@@ -136,14 +136,18 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	defer logFile.Close()
 
 	var (
-		mu    sync.Mutex
-		lines []LogLine
+		mu          sync.Mutex
+		lines       []LogLine
+		logWriteErr error
 	)
 	emit := func(stream, text string) {
 		now := time.Now()
-		fmt.Fprintf(logFile, "%s %-6s %s\n", now.UTC().Format("15:04:05.000"), stream, text)
+		_, werr := fmt.Fprintf(logFile, "%s %-6s %s\n", now.UTC().Format("15:04:05.000"), stream, text)
 		line := LogLine{At: now, Stream: stream, Text: capLine(text)}
 		mu.Lock()
+		if werr != nil && logWriteErr == nil {
+			logWriteErr = werr
+		}
 		lines = append(lines, line)
 		if len(lines) > maxLogLines {
 			lines = lines[len(lines)-maxLogLines:]
@@ -156,8 +160,20 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	// persist writes meta.json and, on failure, makes that failure part of the
 	// run's own record instead of a record that looks like a clean success —
 	// a full disk must never be silently indistinguishable from nothing going
-	// wrong at all.
+	// wrong at all. A failed append to log.txt gets the same treatment; it
+	// cannot be logged through the same broken file, so it goes to the
+	// process's own stderr instead.
 	persist := func() {
+		mu.Lock()
+		lwErr := logWriteErr
+		mu.Unlock()
+		if lwErr != nil {
+			msg := fmt.Sprintf("append log.txt: %v", lwErr)
+			if run.Error == "" {
+				run.Error = msg
+			}
+			fmt.Fprintln(os.Stderr, "conveyor: "+msg)
+		}
 		if err := writeMeta(&run, dir); err != nil {
 			msg := fmt.Sprintf("persist meta.json: %v", err)
 			if run.Error == "" {
