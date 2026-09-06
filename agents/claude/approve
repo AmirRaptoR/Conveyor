@@ -85,6 +85,7 @@ set -euo pipefail
 source "$(dirname "$0")/_stream"
 source "$(dirname "$0")/../_blocked"
 source "$(dirname "$0")/../_worktree"
+source "$(dirname "$0")/../_pr"
 
 : "${REPO:?REPO is required (set it in the source env: block)}"
 : "${PROMPT:?PROMPT is required (set it in this script params: block)}"
@@ -148,20 +149,29 @@ gh_do() {
 wearing() { jq -e --arg l "$1" 'any(.[]; . == $l)' >/dev/null 2>&1 <<<"$2"; }
 
 # The PR is found by closing reference, never by `gh pr list --search`, which
-# matches substrings anywhere in the PR and silently takes the first hit
-# (agents/claude/review:34 has this weakness today; this script must not copy
-# it). --state all so a PR that has already merged, or one abandoned in an
-# earlier round of rework, is still visible to the checks below.
+# matches substrings anywhere in the PR and silently takes the first hit.
+# --state all so a PR that has already merged, or one abandoned in an earlier
+# round of rework, is still visible to the checks below. The matching rule
+# itself — pr_match_filter, from agents/_pr — is the one every caller of
+# closing_prs shares too, so this script and _pr can never disagree about
+# what counts as "closes #ref".
 discover_pr() {
-	local all matches active n_all n_active
+	local all matches active n_all n_match n_active
 	all=$(gh_json pr list --repo "$REPO" --state all --limit 100 \
-		--json number,body,state,url)
-	matches=$(jq --arg ref "$ref" \
-		'[.[] | select(.body != null) | select(.body |
-			test("\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\b:?\\s*#" + $ref + "\\b"; "i"))]' \
-		<<<"$all")
-	n_all=$(jq 'length' <<<"$matches")
-	if [[ "$n_all" -eq 0 ]]; then
+		--json number,body,state,headRefName,url)
+	matches=$(pr_match_filter "$ref" <<<"$all")
+
+	n_all=$(jq 'length' <<<"$all")
+	n_match=$(jq 'length' <<<"$matches")
+	# gh's own page cap: a full page with no match in it might be hiding one
+	# behind, the same as agents/_pr's closing_prs — unavailable, not none,
+	# because reporting "no PR" here would mark the item for a person to
+	# reconcile work that may well already have a PR.
+	if [[ "$n_all" -ge 100 && "$n_match" -eq 0 ]]; then
+		echo "gh pr list for #$ref returned a full page with no match; it may be truncated" >&2
+		exit 10
+	fi
+	if [[ "$n_match" -eq 0 ]]; then
 		blocked input "no pull request closes issue #$ref, so there is nothing to approve."
 	fi
 

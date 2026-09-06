@@ -42,9 +42,18 @@ if [[ -n "${REPO:-}" ]]; then
 this item; Diagnose clears it once they close."
 	fi
 
-	existing=$(open_pr "$ref")
-	if [[ -n "$existing" ]]; then
-		head=$(gh pr view "$existing" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null || true)
+	pr_lookup "$ref" open
+	case "$PR_STATUS" in
+	unavailable)
+		echo "could not tell whether #$ref already has an open pull request; deferring rather than risk opening a second one" >&2
+		exit 10
+		;;
+	several)
+		blocked decision "more than one open pull request appears to close issue #$ref; resolve which one is correct before this can proceed."
+		;;
+	one)
+		existing=$PR_NUMBER
+		head=$PR_HEAD
 		echo "PR #$existing exists — this is a rework pass"
 		rework="
 This item already has pull request #${existing}, which a reviewer sent back.
@@ -52,7 +61,8 @@ Read the review first:
   gh pr view ${existing} --repo ${REPO} --comments
 Address that feedback on the existing branch and push to the same PR. Do not
 open a second one, and do not restart the work from scratch."
-	fi
+		;;
+	esac
 fi
 
 # This item's own directory. The repository the human works in is never touched
@@ -160,14 +170,26 @@ if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 fi
 
 # The provider is the record, never the agent's claim: if no PR references the
-# item, the work did not land whatever the transcript said.
+# item, the work did not land whatever the transcript said. Found by closing
+# reference, the same shared rule as everywhere else — never `gh pr list
+# --search`, which matches a number anywhere in any PR's text.
 if [[ -n "${REPO:-}" ]]; then
-	pr=$(gh pr list --repo "$REPO" --state open --search "$ref" --json number --jq '.[0].number' 2>/dev/null)
-	if [[ -z "$pr" ]]; then
+	pr_lookup "$ref" open
+	case "$PR_STATUS" in
+	unavailable)
+		echo "could not confirm whether the agent's work landed a pull request for #$ref; deferring rather than reporting nothing landed" >&2
+		exit 10
+		;;
+	several)
+		blocked decision "more than one open pull request now closes issue #$ref; resolve which one is correct before this can proceed."
+		;;
+	none)
 		blocked no-output "the agent finished but no open pull request references #$ref, so \
 nothing landed. Read this run's log for what it did — a run cut short by a usage \
 limit looks exactly like this."
-	fi
+		;;
+	esac
+	pr=$PR_NUMBER
 	echo "opened PR #$pr"
 fi
 exit $rc

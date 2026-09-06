@@ -165,6 +165,26 @@ chk "     and the kind is input"             "$(kind)" "input"
 scene; printf '[{"number":9,"body":"related to #7","state":"OPEN","url":"u"}]' >"$tmp/scene/prlist"
 chk "a mention is not a closing reference"   "$(run)" "20"
 
+# A closing keyword inside a fenced code block is a template's example, not a
+# live instruction — the same rule agents/_pr's pr_match_filter applies, since
+# discover_pr shares it.
+scene; printf '[{"number":9,"body":"```\\nCloses #7\\n```","state":"OPEN","url":"u"}]' >"$tmp/scene/prlist"
+chk "a fenced closing keyword does not match" "$(run)" "20"
+chk "     and the kind is input"              "$(kind)" "input"
+
+# A PR opened from this item's own issue-<ref> branch is a match even with no
+# closing keyword in its body at all — gate 4 (already merged) reaches it
+# with no other fixture needed, which is enough to prove discover_pr counted
+# it as a match at all.
+scene; printf '[{"number":9,"body":"no keyword here","state":"MERGED","headRefName":"issue-7","url":"u"}]' >"$tmp/scene/prlist"
+chk "the item's own branch name matches with no keyword" "$(run)" "0"
+
+# gh's own page cap: a full page with no match in it might be hiding one
+# behind, so this defers rather than reporting "no PR closes the issue".
+scene
+jq -n '[range(100) | {number: ., body: "unrelated", state: "OPEN", url: "u"}]' >"$tmp/scene/prlist"
+chk "a full page with no match defers, not none" "$(run)" "10"
+
 # --- 4/5. the PR is already finished ---------------------------------------
 scene; pr 9 MERGED
 chk "(4) an already-merged PR passes through" "$(run)" "0"
