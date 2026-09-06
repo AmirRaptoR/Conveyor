@@ -897,13 +897,18 @@ let skew = 0;
 const nowMs = () => Date.now() - skew;
 
 async function load() {
+  let res;
   try {
-    const res = await fetch("/api/state");
-    const served = Date.parse(res.headers.get("Date"));
-    if (!isNaN(served)) skew = Date.now() - served;
-    state = await res.json();
-    draw();
-  } catch { fault("disconnected"); }
+    res = await fetch("/api/state");
+  } catch { fault("disconnected"); return; }
+  // A 500 still answered the request — it is the server saying something is
+  // wrong, not the network failing to reach it, and the two must read
+  // differently or an operator chases a cable for a bug on the box.
+  if (!res.ok) { fault(`server error (HTTP ${res.status})`); return; }
+  const served = Date.parse(res.headers.get("Date"));
+  if (!isNaN(served)) skew = Date.now() - served;
+  state = await res.json();
+  draw();
 }
 
 function fault(msg) { $("#lamp").className = "lamp down"; $("#line1").textContent = msg; }
