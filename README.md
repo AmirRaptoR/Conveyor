@@ -337,7 +337,9 @@ sources:
 ```
 
 Credentials are not part of this: the script inherits the ambient environment,
-so `gh`'s existing auth works and no token belongs in a committed config.
+so `gh`'s existing auth works and no token belongs in a committed config. See
+docs/CONTRACTS.md's section on what a stage script's credentials actually
+reach — a worktree isolates a checkout, not credentials or host access.
 
 `providers/github/selfcheck.sh` exercises both scripts against a stubbed `gh`
 and in dry-run, touching no network and no repository.

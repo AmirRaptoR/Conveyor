@@ -118,6 +118,36 @@ func TestCrossSiteMutationIsRefused(t *testing.T) {
 	}
 }
 
+// The host and cross-origin checks are the cheap ones, and they run before
+// Basic Auth ever derives a key: a cross-site or bad-Host request carrying
+// valid credentials is refused without spending a single PBKDF2 derivation,
+// so a flood of either cannot buy CPU by attaching a real password.
+func TestCheapChecksRunBeforePasswordVerification(t *testing.T) {
+	cfg, r, _, _, _, _ := modePipeline(t)
+	cfg.Auth = config.Auth{Users: map[string]string{"amir": hashed(t, "s")}}
+	s, h := newModeServer(t, cfg, r, ModeAuto)
+	s.listenHost = "127.0.0.1"
+	s.refresh(s.ctx)
+
+	auth := map[string]string{"Authorization": "Basic " + basic("amir", "s")}
+	code := doReqHost(t, h, "PUT", "/api/order", "localhost",
+		merge(auth, map[string]string{"Sec-Fetch-Site": "cross-site"}), []byte(`["s1:1"]`))
+	if code != http.StatusForbidden {
+		t.Fatalf("cross-site request with valid credentials = %d, want 403", code)
+	}
+	if n := s.verify.derivations; n != 0 {
+		t.Errorf("a refused cross-site request caused %d derivation(s), want 0", n)
+	}
+
+	code = doReqHost(t, h, "PUT", "/api/order", "evil.example.com", auth, []byte(`["s1:1"]`))
+	if code != http.StatusForbidden {
+		t.Fatalf("bad-Host request with valid credentials = %d, want 403", code)
+	}
+	if n := s.verify.derivations; n != 0 {
+		t.Errorf("a refused bad-Host request caused %d derivation(s), want 0", n)
+	}
+}
+
 // Same-origin requests, and requests with neither header at all (every
 // curl/CLI caller), are not refused by the cross-origin check — they reach
 // their handler and get whatever status that handler decides.
