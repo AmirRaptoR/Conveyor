@@ -279,8 +279,7 @@ type Server struct {
 	// collision worktrees exist to prevent — and whichever exited first had its
 	// outcome routed as though it were the other's.
 	working sync.Map // itemID -> struct{}, held for the life of a transition
-	// resting is the items a stage asked to be left alone until the next
-	// listing, by ID.
+	// resting is the items left alone until the next listing, by ID.
 	//
 	// Exit 10 means "leave the item where it is, try again next poll"
 	// (CONTRACTS §2). It was being answered with "try again now": a finished
@@ -291,6 +290,12 @@ type Server struct {
 	// hundred runs an hour, every one of them a real API call. The circuit
 	// breaker in schedule capped each burst and then let the next one start,
 	// which is why this looked like a warning rather than a fault.
+	//
+	// The same mechanism now also holds an item back after an infrastructure
+	// failure that ran nothing at all — an initial provider move that failed,
+	// or an unknown source or stage (F04): retrying those on every scheduler
+	// wake instead of waiting for the next listing would hammer an already-
+	// failing provider once per poll interval rather than once per listing.
 	//
 	// Every listing clears it wholesale, because a listing IS the next poll.
 	// So does the tick button: that gesture means "look again now", and

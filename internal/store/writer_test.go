@@ -109,6 +109,37 @@ func TestOrderSetPropagatesWriteFailure(t *testing.T) {
 	}
 }
 
+// The write itself can succeed and the rename that publishes it can still
+// fail (the target is a directory, a cross-device link, whatever the
+// filesystem objects to) — that must be covered distinctly from a write that
+// never got as far as a temp file, and must leave memory just as untouched.
+func TestOrderSetPropagatesRenameFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "order.json")
+	// The rename target is a directory, so the rename itself fails even
+	// though writing the temp file next to it succeeds.
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	o := OpenOrder(path)
+	if err := o.Set([]string{"a:1"}); err == nil {
+		t.Fatal("Set whose rename fails returned a nil error")
+	}
+	if got := o.IDs(); len(got) != 0 {
+		t.Errorf("ids = %v after a failed rename, want unchanged (empty)", got)
+	}
+	// No stray temp file left behind for a crash to find later.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "order.json" {
+			t.Errorf("leftover entry %q after a failed rename", e.Name())
+		}
+	}
+}
+
 // Answers.Set: the same guarantee — persisted before it is visible, and a
 // failed write changes nothing in memory.
 func TestAnswersSetPropagatesWriteFailure(t *testing.T) {
