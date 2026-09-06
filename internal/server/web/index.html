@@ -2344,10 +2344,23 @@ $("#unblock-all").onclick = async e => {
   }
   if (!confirm(`Clear the mark on ${n} item${n === 1 ? "" : "s"}? Each goes straight back into the line.`
     + (asking ? `\n\n${asking} waiting on an answer from you ${asking === 1 ? "is" : "are"} left alone.` : ""))) return;
-  e.target.disabled = true;
-  e.target.textContent = "handing back…";
-  await fetch("/api/unblock", { method:"POST" });
-  setTimeout(() => e.target.disabled = false, 2000);
+  const btn = e.target, label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "handing back…";
+  let res, msg;
+  try {
+    res = await fetch("/api/unblock", { method:"POST" });
+  } catch { msg = "could not clear marks: disconnected"; }
+  if (res && !res.ok) msg = (await res.text()).trim() || "could not clear marks";
+  if (msg) {
+    // A rejection never reaches the timer below, so the re-enable that
+    // matters here cannot depend on it — restored at once instead.
+    btn.disabled = false;
+    btn.textContent = label;
+    fault(msg);
+    return;
+  }
+  setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 2000);
 };
 
 $("#diagnose").onclick = () => {
