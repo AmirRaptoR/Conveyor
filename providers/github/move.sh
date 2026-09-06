@@ -33,6 +33,35 @@ have=$(gh issue view "$ref" --repo "$REPO" --json labels --jq '.labels[].name')
 trim() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 wearing() { grep -qxF "$1" <<<"$have"; }
 
+# STAGE_LABELS is "stage=label" per line, parsed as data: each line is split
+# once on its first '=' with bash's own string operators, never spliced into a
+# sed or grep pattern. A stage name containing '/', '.' or '[' broke the old
+# `sed -n "s/^...${to}.../"` lookup outright — '/' collides with the command's
+# own delimiter, and an unbalanced '[' is an invalid bracket expression — and a
+# custom LABEL_PREFIX with the same characters matched more (or less) than its
+# literal text under grep's own regex mode.
+declare -A stage_label=()
+mapping_values=()
+while IFS= read -r line; do
+	line=$(trim <<<"$line")
+	[[ -z "$line" || "$line" != *=* ]] && continue
+	key=$(trim <<<"${line%%=*}")
+	val=$(trim <<<"${line#*=}")
+	[[ -z "$key" ]] && continue
+	stage_label["$key"]="$val"
+	[[ -n "$val" ]] && mapping_values+=("$val")
+done <<<"${STAGE_LABELS:-}"
+
+# A label is in the namespace only if it begins with the prefix — a literal
+# comparison, not a substring search and not a regex, so a label that merely
+# contains the prefix (a repository's own "team-conveyor:keep") is left alone,
+# and a prefix containing regex metacharacters (".", "[") matches only itself.
+owned=()
+while IFS= read -r label; do
+	[[ -z "$label" ]] && continue
+	[[ "$label" == "${LABEL_PREFIX}"* ]] && owned+=("$label")
+done <<<"$have"
+
 # Every label this provider manages: the right-hand side of every mapping, plus
 # anything the issue is already wearing that begins with the prefix.
 #
@@ -47,13 +76,12 @@ wearing() { grep -qxF "$1" <<<"$have"; }
 # here would set and clear the same label in one call.
 managed=$(
 	{
-		printf '%s\n' "${STAGE_LABELS:-}" | sed -n 's/^[^=]*=//p'
-		printf '%s\n' "$have" | grep -F "$LABEL_PREFIX" || true
-	} | trim | grep -v "^${BLOCKED_LABEL}\(:\| \|$\)" | sort -u || true
+		printf '%s\n' "${mapping_values[@]+"${mapping_values[@]}"}"
+		printf '%s\n' "${owned[@]+"${owned[@]}"}"
+	} | grep -v "^${BLOCKED_LABEL}\(:\| \|$\)" | sort -u || true
 )
 # The one this stage wants.
-want=$(printf '%s\n' "${STAGE_LABELS:-}" |
-	sed -n "s/^[[:space:]]*${to}[[:space:]]*=//p" | trim | head -1)
+want="${stage_label[$to]:-}"
 
 args=()
 while IFS= read -r label; do

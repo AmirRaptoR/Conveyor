@@ -307,5 +307,59 @@ check "and the new one is added" \
 check "a label outside the prefix is left alone" \
 	"no" "$(grep -q -- "--remove-label bug" <<<"$out" && echo yes || echo no)"
 
+# --- F10: ownership is starts-with, not substring ---------------------------
+#
+# grep -F "$LABEL_PREFIX" matches the namespace anywhere in the label, not just
+# at its start, so a repository's own "team-conveyor:keep" was swept into the
+# managed set and removed on the next move. This reproduces that and pins the
+# fix to a literal starts-with test.
+echo "label ownership (starts-with, not substring)"
+saved_labels=$STAGE_LABELS
+saved_prefix=${LABEL_PREFIX:-}
+
+export STAGE_LABELS='implementing=conveyor:implementing'
+export LABEL_PREFIX="conveyor:"
+export LABELS="team-conveyor:keep"
+check "a label merely containing the prefix is left alone" \
+	"" \
+	"$(echo '{"item":{"ref":"41"},"stage":"backlog"}' | dry)"
+
+export LABELS=$'team-conveyor:keep\nconveyor:implementing'
+check "a label actually starting with the prefix is still removed" \
+	"gh issue edit 41 --repo owner/repo --remove-label conveyor:implementing" \
+	"$(echo '{"item":{"ref":"41"},"stage":"backlog"}' | dry)"
+
+# A custom prefix with regex metacharacters must match only literally: '.'
+# does not stand for "any character" and '[x]' is not a character class.
+export STAGE_LABELS=""
+export LABEL_PREFIX='conv.yor[x]:'
+export LABELS=$'convXyor[x]:a\nconv.yor[x]:a'
+check "a regex-special prefix matches only literally" \
+	"gh issue edit 41 --repo owner/repo --remove-label conv.yor[x]:a" \
+	"$(echo '{"item":{"ref":"41"},"stage":"backlog"}' | dry)"
+
+export STAGE_LABELS=$saved_labels
+export LABEL_PREFIX=$saved_prefix
+
+# The mapping itself must be parsed as data: a stage name with '/', '.' or '['
+# used to be spliced into a sed pattern, where '.' and an unbalanced '[' are
+# regex metacharacters rather than literal text.
+echo "stage names as data (no sed interpolation)"
+saved_labels=$STAGE_LABELS
+export STAGE_LABELS='feat/review=status:feat-review
+a.b=status:dot
+c[d]=status:bracket'
+export LABELS=""
+check "a stage name containing / resolves" \
+	"gh issue edit 41 --repo owner/repo --add-label status:feat-review" \
+	"$(echo '{"item":{"ref":"41"},"stage":"feat/review"}' | dry)"
+check "a stage name containing . resolves literally" \
+	"gh issue edit 41 --repo owner/repo --add-label status:dot" \
+	"$(echo '{"item":{"ref":"41"},"stage":"a.b"}' | dry)"
+check "a stage name containing [ resolves" \
+	"gh issue edit 41 --repo owner/repo --add-label status:bracket" \
+	"$(echo '{"item":{"ref":"41"},"stage":"c[d]"}' | dry)"
+export STAGE_LABELS=$saved_labels
+
 [[ $fail -eq 0 ]] && echo "all checks passed" || echo "FAILURES"
 exit $fail
