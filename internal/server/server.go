@@ -292,19 +292,25 @@ type Server struct {
 	// key file, and the board simply does not notify.
 	pushKeys *push.Keys
 	pushSubs *push.Store
+
+	// drainGrace bounds Run's shutdown wait, defaulted in New and overridden
+	// only by tests — there is no config key for it, the same way there is
+	// none for the runner's own gracePeriod.
+	drainGrace time.Duration
 }
 
 func New(cfg *config.Config, r *runner.Runner) *Server {
 	s := &Server{
-		cfg:     cfg,
-		run:     r,
-		eng:     pipeline.New(cfg, r),
-		hub:     newHub(),
-		order:   store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
-		answers: store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
-		tick:    make(chan struct{}, 1),
-		wake:    make(chan struct{}, 1),
-		ctx:     context.Background(),
+		cfg:        cfg,
+		run:        r,
+		eng:        pipeline.New(cfg, r),
+		hub:        newHub(),
+		order:      store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
+		answers:    store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
+		tick:       make(chan struct{}, 1),
+		wake:       make(chan struct{}, 1),
+		ctx:        context.Background(),
+		drainGrace: drainGrace,
 	}
 	s.pushSubs = push.OpenStore(filepath.Join(cfg.DataDir(), "push.json"))
 	if keys, err := push.LoadKeys(filepath.Join(cfg.DataDir(), "vapid.json")); err != nil {
@@ -424,7 +430,39 @@ func (s *Server) Run(ctx context.Context, addr string, auto bool) error {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
+	// The HTTP listener is down the moment ctx is cancelled, but a transition
+	// already launched keeps running — a stage script, an agent, a git push.
+	// cmdServe releases the data-directory lock in a defer right after Run
+	// returns, so returning here before that work is done would let a
+	// restarted engine claim an item whose old run has not actually stopped.
+	s.drain()
 	return nil
+}
+
+// drainGrace bounds how long shutdown waits for in-flight transitions before
+// giving up and returning anyway. It must exceed the runner's own grace
+// period (30s): a script whose child ignores TERM is not reaped until the
+// runner's own SIGKILL lands, and draining any less than that would time out
+// on exactly the case it exists for.
+const drainGrace = 45 * time.Second
+
+// drain waits for every transition already claimed — schedule's launches,
+// handleStart, and the tick button's own advance — to finish, or gives up
+// after drainGrace and says what is still running rather than hanging
+// forever on a run that will not.
+func (s *Server) drain() {
+	deadline := time.Now().Add(s.drainGrace)
+	for s.inFlight.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := s.inFlight.Load(); n != 0 {
+		var running []string
+		for _, a := range s.activeList() {
+			running = append(running, a.ItemID)
+		}
+		fmt.Fprintf(os.Stderr, "conveyor: shutting down with %d transition(s) still running after %s: %s\n",
+			n, s.drainGrace, strings.Join(running, ", "))
+	}
 }
 
 // poll re-lists every source on the configured interval, and does nothing
@@ -861,6 +899,12 @@ func (s *Server) recallBlocks(items []model.Item) {
 // many it started. Candidates whose source or target stage is already busy are
 // skipped rather than queued, so a slow stage never holds up a free one.
 func (s *Server) launch(ctx context.Context) int {
+	// Shutting down: nothing new starts, whatever the locks would otherwise
+	// permit. schedule's own ctx.Done() case returns it from the loop right
+	// after, but a claim made in the meantime would still need reaping.
+	if ctx.Err() != nil {
+		return 0
+	}
 	s.mu.RLock()
 	items := append([]model.Item(nil), s.state.Items...)
 	resting := make(map[string]bool, len(s.resting))
@@ -1036,6 +1080,11 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 // advance runs a single transition: the button, which works whether or not the
 // pipeline is running itself.
 func (s *Server) advance(ctx context.Context) bool {
+	// Shutting down: the button is the only mover in -watch mode, so this is
+	// the whole of what a drain waits for there, not an edge of it.
+	if ctx.Err() != nil {
+		return false
+	}
 	s.mu.RLock()
 	items := append([]model.Item(nil), s.state.Items...)
 	s.mu.RUnlock()
@@ -1050,6 +1099,11 @@ func (s *Server) advance(ctx context.Context) bool {
 	defer s.eng.Locks().Release(item.Source, target)
 	s.working.Store(item.ID, struct{}{})
 	defer s.working.Delete(item.ID)
+	// Counted the same way schedule's launches are, so a drain waiting on
+	// inFlight actually waits for this too — the only mover with -watch set,
+	// where schedule never launches anything at all.
+	s.inFlight.Add(1)
+	defer s.inFlight.Add(-1)
 	s.runOne(ctx, *item, target)
 	return true
 }
@@ -1108,6 +1162,13 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 // running is dropped rather than queued, because two agents in one worktree is
 // exactly what perSource exists to prevent.
 func (s *Server) handleTick(w http.ResponseWriter, r *http.Request) {
+	// Shutting down: button's own goroutine has already returned or is about
+	// to, so a tick queued here would never be read. Say so rather than
+	// accepting a gesture that does nothing.
+	if s.ctx.Err() != nil {
+		http.Error(w, "conveyor is shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	select {
 	case s.tick <- struct{}{}:
 		w.WriteHeader(http.StatusAccepted)
@@ -1186,6 +1247,12 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Shutting down: refuse rather than claim an item whose run would outlive
+	// the engine that started it.
+	if s.ctx.Err() != nil {
+		http.Error(w, "conveyor is shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	// Claim before launching, exactly as the scheduler does: a check followed
 	// by a goroutine leaves a gap the next pass can decide the same thing in.
 	if !s.eng.Locks().TryAcquire(item.Source, target) {
