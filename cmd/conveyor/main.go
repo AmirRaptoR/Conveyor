@@ -42,6 +42,8 @@ func main() {
 		err = cmdTick(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "probe":
+		err = cmdProbe(os.Args[2:])
 	case "passwd":
 		err = cmdPasswd(os.Args[2:])
 	case "-h", "--help", "help":
@@ -70,6 +72,13 @@ func usage() {
                                         manual (tick button only) or observe
                                         (nothing ever advances). -watch is an
                                         alias for -mode=observe
+  probe     [-addr ADDR] [-wait D]      post-deploy check: request the board
+            [-origin URL]... [-notify] through every auth.origins entry (and
+                                        any -origin), retrying up to -wait;
+                                        exits non-zero if any is unreachable.
+                                        Run after a deploy's restart, never
+                                        by the deploy script itself — see
+                                        README
   passwd    <name>                      hash a password for the config's
                                         auth.users block
   
