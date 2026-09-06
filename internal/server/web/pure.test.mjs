@@ -1,7 +1,7 @@
 // Exercises the pure logic in pure.js — no DOM, no npm install, no network.
 // Run with:
 //
-//   node --test internal/server/web/pure_test.mjs
+//   node --test internal/server/web/pure.test.mjs
 //
 // The module is imported, not sliced out of a larger file, so this test
 // exercises exactly what the server serves. See pure.js's own comment on that

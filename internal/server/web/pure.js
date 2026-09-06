@@ -1,6 +1,6 @@
 // ---- pure helpers -----------------------------------------------------------
 // Grouped and marked (see the matching comment below) so
-// internal/server/web/pure_test.mjs can pull this region's text out of the
+// internal/server/web/pure.test.mjs can pull this region's text out of the
 // file and evaluate it without a DOM library or a build step. Every function
 // here takes plain values, never a DOM node, on purpose: it is what makes
 // them testable under stock Node.
