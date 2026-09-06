@@ -14,6 +14,23 @@ source "$here/_deadline"
 fail=0
 chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
 
+# _selfcheck_unwritable <dir> <label> — chmod 500 and PROVE it actually blocks
+# a write before any check relies on that. Running as root ignores the mode
+# bits, and a check that silently passes there is worse than one that is
+# absent — so this skips loudly, naming itself, instead of asserting a
+# fixed outcome that never happened.
+_selfcheck_unwritable() {
+	local dir=$1 label=$2
+	chmod 500 "$dir"
+	if : 2>/dev/null >"$dir/.selfcheck-rw-probe"; then
+		rm -f "$dir/.selfcheck-rw-probe"
+		chmod 700 "$dir"
+		echo "SKIP $label: $dir is still writable after chmod 500 (running as root?)"
+		return 1
+	fi
+	return 0
+}
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 export WORKTREES="$tmp/worktrees"
@@ -260,17 +277,52 @@ chk "HEAD is unchanged by adoption"           "$(git -C "$adopt" rev-parse HEAD)
 fail_wt=$(item_worktree demo-adopt-ro 81)
 fail_gd=$(_worktree_gitdir "$fail_wt")
 rm -f "$fail_gd/conveyor-owner"
-chmod 500 "$fail_gd"
-err=$(mktemp)
-out=$(cd "$tmp/repo" && item_worktree demo-adopt-ro 81 2>"$err")
-chk "adoption still returns the path when the marker cannot be written" "$out" "$fail_wt"
-chk "the failed write is reported on stderr" "$(grep -c 'could not write ownership marker' "$err")" "1"
-chk "and no marker exists" "$([[ -f "$fail_gd/conveyor-owner" ]] && echo present || echo none)" "none"
-chmod 700 "$fail_gd"
-out=$(cd "$tmp/repo" && item_worktree demo-adopt-ro 81 2>/dev/null)
-chk "a later call proves it again once the git dir is writable" "$out" "$fail_wt"
-chk "and writes the marker then" "$([[ -f "$fail_gd/conveyor-owner" ]] && echo present || echo none)" "present"
-rm -f "$err"
+if _selfcheck_unwritable "$fail_gd" "adoption marker-write-failure checks"; then
+	err=$(mktemp)
+	out=$(cd "$tmp/repo" && item_worktree demo-adopt-ro 81 2>"$err")
+	chk "adoption still returns the path when the marker cannot be written" "$out" "$fail_wt"
+	chk "the failed write is reported on stderr" "$(grep -c 'could not write ownership marker' "$err")" "1"
+	chk "and no marker exists" "$([[ -f "$fail_gd/conveyor-owner" ]] && echo present || echo none)" "none"
+	chmod 700 "$fail_gd"
+	out=$(cd "$tmp/repo" && item_worktree demo-adopt-ro 81 2>/dev/null)
+	chk "a later call proves it again once the git dir is writable" "$out" "$fail_wt"
+	chk "and writes the marker then" "$([[ -f "$fail_gd/conveyor-owner" ]] && echo present || echo none)" "present"
+	rm -f "$err"
+fi
+
+# the same guarantee holds at creation, not only adoption: a marker or lease
+# write that fails while a *fresh* worktree is being made must not cost the
+# caller the path it just created. Exercised with inherit_errexit forced on,
+# which is what actually makes a bare failing statement fatal under
+# `set -euo pipefail` — without it this check could not tell a guarded call
+# (agents/_worktree's item_worktree:339-342) from a bare one, since command
+# substitution does not inherit errexit by default.
+cwt=$(item_worktree demo-create-ro 95)
+cwt_gd=$(_worktree_gitdir "$cwt")
+# Simulate the moment creation's own first write happens: neither file exists
+# yet, so writing one is a *new* file and needs the directory itself to be
+# writable — overwriting the marker item_worktree already left behind here
+# would need only the file's own permission and prove nothing.
+rm -f "$cwt_gd/conveyor-owner" "$cwt_gd/conveyor-lease"
+if _selfcheck_unwritable "$cwt_gd" "creation write-guard checks"; then
+	cerr=$(mktemp)
+	rc=0
+	(
+		shopt -s inherit_errexit
+		set -euo pipefail
+		gd="$cwt_gd"
+		_worktree_write_marker demo-create-ro 95 "$cwt" ||
+			echo "conveyor: could not write ownership marker in $gd for $cwt" >&2
+		_worktree_write_lease "$cwt" ||
+			echo "conveyor: could not write lease in $gd for $cwt" >&2
+		echo reached-end
+	) >"$cerr" 2>&1 || rc=$?
+	chk "a failed write at creation does not abort under set -e" "$rc" "0"
+	chk "both writes are attempted despite the first failing" "$(grep -c 'reached-end' "$cerr")" "1"
+	chk "both failures are reported on stderr" "$(grep -c 'could not write' "$cerr")" "2"
+	chmod 700 "$cwt_gd"
+	rm -f "$cerr"
+fi
 
 # sweep_worktrees adopts through the same test, applied in its own loop
 # rather than item_worktree's reuse path — a clean, fully-pushed, unleased one

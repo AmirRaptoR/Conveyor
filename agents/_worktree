@@ -248,7 +248,7 @@ _worktree_lease_live() {
 # anything except its cause. These files run under bash, but they are sourced,
 # and whoever sources them next may not be.
 item_worktree() {
-	local source=$1 ref=$2 branch=${3:-} wt base held
+	local source=$1 ref=$2 branch=${3:-} wt base held gd
 
 	wt="$(worktree_root)/${source}/${ref}"
 
@@ -336,8 +336,16 @@ item's worktree ($wt); refusing to touch another checkout to reclaim it."
 	# to `cd` into nothing, and the error it then reports is about whatever it
 	# tried next rather than about the checkout it never got.
 	[[ -d "$wt" ]] || return 1
-	_worktree_write_marker "$source" "$ref" "$wt"
-	_worktree_write_lease "$wt"
+	# A failed write here (a git dir made unwritable underneath a fresh
+	# worktree) must not cost the caller the path it just made: the same
+	# "answer is the proof, not the bookkeeping" rule _worktree_owned applies
+	# to adoption applies here too. Reported on stderr, never turned into a
+	# missing workdir under the adapters' `set -euo pipefail`.
+	gd=$(_worktree_gitdir "$wt") || gd="$wt"
+	_worktree_write_marker "$source" "$ref" "$wt" ||
+		echo "conveyor: could not write ownership marker in $gd for $wt" >&2
+	_worktree_write_lease "$wt" ||
+		echo "conveyor: could not write lease in $gd for $wt" >&2
 	printf '%s' "$wt"
 }
 
