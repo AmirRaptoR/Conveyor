@@ -25,6 +25,10 @@ type Item struct {
 	Assignee  string `json:"assignee,omitempty"`
 	CreatedAt string `json:"createdAt,omitempty"`
 	UpdatedAt string `json:"updatedAt,omitempty"`
+	// FinishedAt is when the source considers this item finished; empty if it
+	// does not say. Provider-supplied, like CreatedAt and UpdatedAt: a source
+	// with no notion of finishing simply sends nothing.
+	FinishedAt string `json:"finishedAt,omitempty"`
 
 	// Blocked is a mark on the item, not a place it goes. An item that needs a
 	// human stays in the stage it stopped in and wears this; the source reports
