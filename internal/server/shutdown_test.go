@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -470,5 +471,115 @@ func TestNoTransitionClaimsAnItemAfterCancellation(t *testing.T) {
 	s.handleTick(w2, httptest.NewRequest("POST", "/api/tick", nil))
 	if w2.Code != http.StatusServiceUnavailable {
 		t.Errorf("handleTick after cancellation = %d, want %d", w2.Code, http.StatusServiceUnavailable)
+	}
+}
+
+// A listen error is a return path too: Run must not leave its loops running
+// on the caller's context, which the caller has no reason to cancel because
+// Run itself failed. Binding the address first is what forces ListenAndServe
+// to fail synchronously, before any loop has a chance to do real work.
+func TestErrorPathDrainsToo(t *testing.T) {
+	cfg, r, _ := pipelineFor(t)
+
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	addr := taken.Addr().String()
+
+	s := New(cfg, r)
+	s.drainGrace = 5 * time.Second
+
+	if err := s.Run(context.Background(), addr, false); err == nil {
+		t.Fatal("Run on an address already in use returned no error")
+	}
+
+	if n := s.shutdownWork.Load(); n != 0 {
+		t.Errorf("shutdownWork = %d once Run's listen error returned, want 0 — a loop is still running", n)
+	}
+	if n := s.inFlight.Load(); n != 0 {
+		t.Errorf("inFlight = %d once Run's listen error returned, want 0", n)
+	}
+}
+
+// The request-tracking wrapper is its own function so a test can drive it
+// directly, the same idiom as webHandler and authed: order.json, answers.json
+// and push.json are all written synchronously inside a handler, so drain must
+// wait for the handler's own lifetime, not just for a transition it launched.
+func TestTrackedWaitsForInFlightRequests(t *testing.T) {
+	cfg, r, _ := pipelineFor(t)
+	s := New(cfg, r)
+	s.drainGrace = 5 * time.Second
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	h := s.tracked(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	go h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
+	<-started
+
+	drained := make(chan struct{})
+	go func() { s.drain(); close(drained) }()
+
+	select {
+	case <-drained:
+		t.Fatal("drain returned while the handler was still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case <-drained:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain did not return once the handler finished")
+	}
+}
+
+// The give-up message must not name a transition that does not exist: with
+// drainGrace short and the only outstanding work a non-transition worker
+// (spawn, not a launched transition), the message can only say how much work
+// is outstanding, never "still running: " followed by an empty list.
+func TestGiveUpMessageNamesNonTransitionWorkHonestly(t *testing.T) {
+	cfg, r, _ := pipelineFor(t)
+	s := New(cfg, r)
+	s.drainGrace = 100 * time.Millisecond
+
+	block := make(chan struct{})
+	defer close(block)
+	s.spawn(func() { <-block })
+
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = stderrW
+
+	done := make(chan struct{})
+	go func() { s.drain(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		os.Stderr = old
+		t.Fatal("drain did not give up after its grace")
+	}
+
+	os.Stderr = old
+	stderrW.Close()
+	buf := make([]byte, 4096)
+	n, _ := stderrR.Read(buf)
+	msg := string(buf[:n])
+
+	if strings.Contains(msg, "transition(s)") {
+		t.Errorf("stderr = %q names a transition, but none were outstanding", msg)
+	}
+	if !strings.Contains(msg, "task(s) still running") {
+		t.Errorf("stderr = %q, want it to say how much non-transition work is outstanding", msg)
 	}
 }
