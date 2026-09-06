@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -170,5 +171,116 @@ func TestNoTimeoutMeansNoDeadline(t *testing.T) {
 	res := run(t, `exit 0`, 0)
 	if got, ok := res.Run.Env["CONVEYOR_DEADLINE"]; ok {
 		t.Errorf("CONVEYOR_DEADLINE = %q for a stage with no timeout, want it unset", got)
+	}
+}
+
+// Result.Log has no production consumer (grep-confirmed: only this package's
+// tests read it), so bounding it to a tail cannot break a caller. log.txt on
+// disk must still carry everything.
+func TestResultLogIsBoundedToLast1000Lines(t *testing.T) {
+	res := run(t, `for i in $(seq 1 100000); do echo "line $i"; done`, time.Minute)
+	if len(res.Log) != 1000 {
+		t.Fatalf("len(Log) = %d, want 1000", len(res.Log))
+	}
+	if res.Log[0].Text != "line 99001" {
+		t.Errorf("first kept line = %q, want line 99001 (the tail)", res.Log[0].Text)
+	}
+	if res.Log[999].Text != "line 100000" {
+		t.Errorf("last kept line = %q, want line 100000", res.Log[999].Text)
+	}
+	b, err := os.ReadFile(filepath.Join(res.Run.Dir, "log.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(b), "\n"); n != 100000 {
+		t.Errorf("log.txt has %d lines, want all 100000 on disk", n)
+	}
+}
+
+// A single line over 64 KiB must not blow up memory or the SSE stream, but
+// log.txt is the durable record and gets it whole.
+func TestOversizedLineIsCappedInMemoryNotOnDisk(t *testing.T) {
+	res := run(t, `head -c 100000 /dev/zero | tr '\0' 'a'; echo`, time.Minute)
+	var long *LogLine
+	for i := range res.Log {
+		if len(res.Log[i].Text) > 0 && res.Log[i].Stream == "stdout" {
+			long = &res.Log[i]
+		}
+	}
+	if long == nil {
+		t.Fatal("no stdout line captured")
+	}
+	if len(long.Text) > 64*1024+200 {
+		t.Fatalf("in-memory line is %d bytes, want capped near 64 KiB", len(long.Text))
+	}
+	if !strings.Contains(long.Text, "truncated") {
+		t.Errorf("capped line has no truncation marker: %q", long.Text[:80])
+	}
+	b, err := os.ReadFile(filepath.Join(res.Run.Dir, "log.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(b), "a"); n < 100000 {
+		t.Errorf("log.txt only has %d a's, want the full 100000-byte line on disk", n)
+	}
+}
+
+// meta.json is written to a temp file and renamed into place, so a run that
+// dies mid-write leaves the previous meta.json intact rather than truncated.
+func TestMetaJSONWriteIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	run := &model.Run{ID: "r1", Outcome: model.OutcomeRunning}
+	if err := writeMeta(run, dir); err != nil {
+		t.Fatalf("writeMeta: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "meta.json" {
+			t.Errorf("stray file left behind: %s (temp file not cleaned up / renamed)", e.Name())
+		}
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got model.Run
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "r1" {
+		t.Errorf("ID = %q, want r1", got.ID)
+	}
+}
+
+// A meta.json write that fails (a full disk) must not look like a clean
+// success: the run's error is set and an engine log line names it.
+func TestPersistenceFailureIsReportedNotSilentlyDropped(t *testing.T) {
+	root := t.TempDir()
+	r := New(root)
+	res, err := r.Run(context.Background(), Spec{
+		// Makes its own run directory read-only before exiting, so the final
+		// meta.json write — which happens after the script's own work is
+		// done — fails exactly like a full disk would.
+		Script:  script(t, `dir=$(dirname "$CONVEYOR_RESULT"); echo working; chmod 500 "$dir"`),
+		Kind:    "stage", Workdir: t.TempDir(), Timeout: time.Minute, Source: "test",
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(res.Run.Dir, 0o755) })
+	if res.Run.Error == "" {
+		t.Error("Run.Error is empty, want the persistence failure named")
+	}
+	foundEngineLine := false
+	for _, l := range res.Log {
+		if l.Stream == "engine" && strings.Contains(l.Text, "meta.json") {
+			foundEngineLine = true
+		}
+	}
+	if !foundEngineLine {
+		t.Errorf("no engine log line naming the meta.json failure; log = %+v", res.Log)
 	}
 }
