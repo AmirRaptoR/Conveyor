@@ -228,10 +228,13 @@ in CONTRACTS §6). See `docs/DESIGN.md`.
   orphaned its old label forever: nothing took it off, and listing takes the
   first mapped label it finds, so an item landed in a stage nobody put it in.
 - **`list` asks for open and closed issues separately**, so a repository that
-  has finished more issues than `LIMIT` still lists its open work, and closed
-  ones are ordered by `closedAt` so the done column reads newest-finished first
-  (the engine keeps terminal items in listing order). The board draws ten and
-  offers the rest ten at a time.
+  has finished more issues than `LIMIT` still lists its open work, and each
+  closed issue carries the `closedAt` it was fetched with as `finishedAt`.
+  `pipeline.Order` is what actually reads the done column newest-first: a
+  terminal item skips the manual-order and `priority` rungs entirely and sorts
+  by `finishedAt` descending instead, which is also what merges every source's
+  closed work into one ledger rather than one newest-first block per
+  repository. The board draws ten and offers the rest ten at a time.
 - **`list` reads closed issues it labelled, and only those.** A finished item is
   a closed issue — the pull request says `Closes #N` — so listing open ones
   alone left the last stages empty: an item did not arrive in `done`, it
