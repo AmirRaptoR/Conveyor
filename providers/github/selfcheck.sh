@@ -34,10 +34,15 @@ in-progress=status:in-progress'
 
 # --- list.sh: provider shape -> item shape ---------------------------------
 mkdir -p "$tmp/stub"
+# list.sh asks gh for open and closed issues in two separate calls, so the
+# stub has to answer each with only that state's issues — same as the real
+# API. Answering both calls with the whole fixture double-listed every issue
+# that a mapped label or the open state let through, which masked failures in
+# every check below that selects a single issue by ref: two identical lines
+# for its field never equal the single value being checked for.
 cat >"$tmp/stub/gh" <<'STUB'
 #!/usr/bin/env bash
-cat <<'JSON'
-[
+data='[
  {"state":"OPEN","number":7,"title":"Checkout hangs","body":"spinner",
   "labels":[{"name":"bug"},{"name":"priority:p0"},{"name":"status:refining"}],
   "url":"https://example.test/7","assignees":[{"login":"amir"}]},
@@ -46,7 +51,7 @@ cat <<'JSON'
  {"state":"OPEN","number":11,"title":"Needs a decision","body":"",
   "labels":[{"name":"status:in-progress"},{"name":"blocked"}],
   "url":"https://example.test/11","assignees":[]},
- {"state":"OPEN","number":13,"title":"Mine, not the pipeline's","body":"",
+ {"state":"OPEN","number":13,"title":"Mine, not the pipeline'"'"'s","body":"",
   "labels":[{"name":"conveyor:ignore"},{"name":"status:ready"}],
   "url":"https://example.test/13","assignees":[]},
  {"state":"OPEN","number":19,"title":"Handed to the pipeline","body":"",
@@ -54,15 +59,19 @@ cat <<'JSON'
   "url":"https://example.test/19","assignees":[]},
  {"number":15,"title":"Shipped and closed","body":"","state":"CLOSED",
   "labels":[{"name":"status:ready"}],
-  "url":"https://example.test/15","assignees":[]},
+  "url":"https://example.test/15","assignees":[],"closedAt":"2026-08-30T12:00:00Z"},
  {"number":17,"title":"Closed years ago, never ours","body":"","state":"CLOSED",
   "labels":[{"name":"bug"}],
   "url":"https://example.test/17","assignees":[]},
  {"number":21,"title":"Tagged, then closed by hand","body":"","state":"CLOSED",
   "labels":[{"name":"conveyor"}],
   "url":"https://example.test/21","assignees":[]}
-]
-JSON
+]'
+case "$*" in
+	*"--state open"*)   jq '[.[] | select(.state == "OPEN")]' <<<"$data" ;;
+	*"--state closed"*) jq '[.[] | select(.state == "CLOSED")]' <<<"$data" ;;
+	*)                  echo "$data" ;;
+esac
 STUB
 chmod +x "$tmp/stub/gh"
 
@@ -114,6 +123,12 @@ check "IGNORE_LABELS is read by nothing" \
 
 check "a closed issue this pipeline labelled is still listed" \
 	"ready" "$(jq -r '.[] | select(.ref == "15") | .stage' "$tmp/out.json")"
+# finishedAt is the engine's word for when the source considers an item done,
+# projected from closedAt — the first timestamp any listing has ever carried.
+check "a closed issue's item carries finishedAt from closedAt" \
+	"2026-08-30T12:00:00Z" "$(jq -r '.[] | select(.ref == "15") | .finishedAt' "$tmp/out.json")"
+check "an open issue's item carries an empty finishedAt" \
+	"" "$(jq -r '.[] | select(.ref == "7") | .finishedAt' "$tmp/out.json")"
 check "a closed issue it never labelled is left in history" \
 	"" "$(jq -r '.[] | select(.ref == "17") | .ref' "$tmp/out.json")"
 # The onboarding tag opens the door; it does not reopen a closed issue. A stage
@@ -235,8 +250,7 @@ echo "label namespace"
 ready=conveyor:ready'
 	cat >"$tmp/stub/gh" <<'STUB'
 #!/usr/bin/env bash
-cat <<'JSON'
-[
+data='[
  {"number":21,"title":"Stopped","body":"","state":"OPEN",
   "labels":[{"name":"conveyor:refining"},{"name":"conveyor:blocked"}],
   "url":"https://example.test/21","assignees":[]},
@@ -246,8 +260,12 @@ cat <<'JSON'
  {"number":25,"title":"Handed over","body":"","state":"OPEN",
   "labels":[{"name":"conveyor"}],
   "url":"https://example.test/25","assignees":[]}
-]
-JSON
+]'
+case "$*" in
+	*"--state open"*)   jq '[.[] | select(.state == "OPEN")]' <<<"$data" ;;
+	*"--state closed"*) jq '[.[] | select(.state == "CLOSED")]' <<<"$data" ;;
+	*)                  echo "$data" ;;
+esac
 STUB
 	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/ns.json" \
 		./list.sh 2>/dev/null

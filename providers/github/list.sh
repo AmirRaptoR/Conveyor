@@ -110,7 +110,11 @@ echo "listing issues in $REPO" >&2
 				labels:      $names,
 				# null, not 0: "unranked" and "most urgent" must stay distinct.
 				priority:    ([$names[] | capture("^priority:p(?<n>[0-3])$") | .n | tonumber] | .[0]),
-				assignee:    (.assignees | map(.login) | .[0] // "")
+				assignee:    (.assignees | map(.login) | .[0] // ""),
+				# finishedAt is the engines word for when a source considers an
+				# item done; an open issue has none. closedAt is GitHubs own
+				# vocabulary, only meaningful once an issue is actually closed.
+				finishedAt:  (if ((.state // "OPEN") | ascii_downcase) == "closed" then (.closedAt // "") else "" end)
 			}
 		)' >"$CONVEYOR_RESULT"
 
