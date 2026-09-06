@@ -174,10 +174,13 @@ test("draw: while a source is degraded, the masthead names how many", async () =
   assert.match(p.el("#line1").innerHTML, /1 source not listing/);
 });
 
-test("draw: before the first refresh completes, no source is degraded and the masthead carries no note", async () => {
+test("draw: before the first refresh completes, no source is degraded, the masthead carries no note, and every column's empty text is today's", async () => {
   const p = page();
   await withState(p, baseState({ updatedAt: undefined, sources: [{ name: "s1", provider: "fake", workdir: "/repo" }] }));
   assert.doesNotMatch(p.el("#line1").innerHTML, /not listing/);
+  assert.doesNotMatch(p.el("#sources").innerHTML, /degraded/);
+  assert.match(p.el("#rail").innerHTML, /Nothing here/);
+  assert.doesNotMatch(p.el("#rail").innerHTML, /Picture incomplete/);
 });
 
 // ---- #sources chip ------------------------------------------------------------
