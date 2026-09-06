@@ -68,7 +68,7 @@ func New() *Prober {
 
 // probeOnce requests <url>/ with no credentials and no Origin header, and
 // classifies the response.
-func (p *Prober) probeOnce(ctx context.Context, url string) Verdict {
+func (p *Prober) ProbeOnce(ctx context.Context, url string) Verdict {
 	ctx, cancel := context.WithTimeout(ctx, p.RequestTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/", nil)
@@ -126,18 +126,30 @@ func (p *Prober) Wait(ctx context.Context, urls []string, deadline time.Duration
 			if v, ok := last[u]; ok && v.Pass {
 				continue
 			}
-			v := p.probeOnce(ctx, u)
+			v := p.ProbeOnce(ctx, u)
 			last[u] = v
 			if !v.Pass {
 				allPass = false
 			}
 		}
-		if allPass || ctx.Err() != nil || !time.Now().Before(giveUpAt) {
+		if allPass {
 			break
+		}
+		// Sleep no longer than what is left of the deadline: a plain
+		// time.After(p.Interval) would overshoot -wait by up to a whole
+		// interval on every round, which for a short -wait against a long
+		// default interval means "give up" arrives far later than asked.
+		remaining := time.Until(giveUpAt)
+		if remaining <= 0 || ctx.Err() != nil {
+			break
+		}
+		sleep := p.Interval
+		if remaining < sleep {
+			sleep = remaining
 		}
 		select {
 		case <-ctx.Done():
-		case <-time.After(p.Interval):
+		case <-time.After(sleep):
 		}
 	}
 	out := make([]Verdict, len(urls))

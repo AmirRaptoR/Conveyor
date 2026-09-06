@@ -37,7 +37,7 @@ func TestProbeOnceClassifiesEachStatus(t *testing.T) {
 			defer srv.Close()
 
 			p := New()
-			v := p.probeOnce(context.Background(), srv.URL)
+			v := p.ProbeOnce(context.Background(), srv.URL)
 			if v.Pass != tc.wantPass {
 				t.Fatalf("Pass = %v, want %v (verdict: %+v)", v.Pass, tc.wantPass, v)
 			}
@@ -60,7 +60,7 @@ func TestProbeOnceReportsTransportError(t *testing.T) {
 	srv.Close() // nothing is listening there any more
 
 	p := New()
-	v := p.probeOnce(context.Background(), url)
+	v := p.ProbeOnce(context.Background(), url)
 	if v.Pass {
 		t.Fatalf("Pass = true against a closed connection, want false")
 	}
@@ -94,7 +94,7 @@ func TestProbeOnceSendsNoCredentials(t *testing.T) {
 	defer srv.Close()
 
 	p := New()
-	v := p.probeOnce(context.Background(), srv.URL)
+	v := p.ProbeOnce(context.Background(), srv.URL)
 	if !v.Pass {
 		t.Fatalf("verdict: %+v", v)
 	}
@@ -169,7 +169,7 @@ func TestProbeOnceDoesNotFollowRedirects(t *testing.T) {
 	defer redirecting.Close()
 
 	p := New()
-	v := p.probeOnce(context.Background(), redirecting.URL)
+	v := p.ProbeOnce(context.Background(), redirecting.URL)
 	if v.Pass {
 		t.Fatal("Pass = true; a 3xx must fail")
 	}
