@@ -1709,7 +1709,13 @@ function trimLog(log) {
       logMarker.className = "ln status";
       log.insertBefore(logMarker, log.firstChild);
     }
-    logMarker.textContent = `… ${logDiscarded} earlier line(s) dropped from view; reload this run to see them all …`;
+    // Not "reload to see them all": the default GET /api/runs/{id} a reload
+    // makes returns only the last 2000 lines, which is fewer than what a DOM
+    // already past MAX_LOG_LINES is showing — a plain reload would lose more
+    // than it recovers. The lines are not gone (log.txt has them, and the
+    // paged API can reach them with ?offset=), but nothing here pages for
+    // them yet, so the marker must not promise that a reload does.
+    logMarker.textContent = `… ${logDiscarded} earlier line(s) dropped from this view to bound memory; still complete in the run's own log …`;
   }
 }
 
