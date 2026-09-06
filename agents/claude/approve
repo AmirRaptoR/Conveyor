@@ -595,13 +595,10 @@ continues the same merge rather than starting over."
 
 	# Verify the tree itself before trusting it (criterion 19): the model can
 	# claim success without actually having removed every conflict marker.
-	local unmerged
-	unmerged=$(git ls-files --unmerged)
-	if [[ -n "$unmerged" ]]; then
-		local paths
-		paths=$(awk '{print $4}' <<<"$unmerged" | sort -u | tr '\n' ' ')
-		blocked conflict "the agent finished but #$pr's merge still has unresolved paths: $paths"
-	fi
+	# Checked on the working tree first, before staging — git add on a file
+	# that still reads "both modified" always clears its unmerged index
+	# entries regardless of what is in it, so a leftover marker line only
+	# ls-files --unmerged would ever miss it.
 	local f bad=()
 	for f in "${conflicted[@]}"; do
 		[[ -f "$f" ]] || continue
@@ -612,8 +609,21 @@ continues the same merge rather than starting over."
 	fi
 
 	git add -- "${conflicted[@]}"
+
+	# The staging above resolves every path this run knew to be conflicted;
+	# anything still unmerged afterwards is a path outside that set — the
+	# model touched a file that was not part of the original conflict, or
+	# introduced one of its own — and is worth a person's eyes before landing.
+	local unmerged
+	unmerged=$(git ls-files --unmerged)
+	if [[ -n "$unmerged" ]]; then
+		local paths
+		paths=$(awk '{print $4}' <<<"$unmerged" | sort -u | tr '\n' ' ')
+		blocked conflict "the agent finished but #$pr's merge still has unresolved paths: $paths"
+	fi
+
 	local commit_out
-	if ! commit_out=$(git commit --quiet -m "Merge $base_ref into $head_ref to resolve conflicts for #$ref" 2>&1); then
+	if ! commit_out=$(git commit --quiet -m "Merge origin/$base_ref into $head_ref to resolve conflicts for #$ref" 2>&1); then
 		blocked conflict "committing the resolved conflict for #$pr failed: $commit_out"
 	fi
 
