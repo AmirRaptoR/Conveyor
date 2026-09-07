@@ -752,3 +752,73 @@ sources:
 		}
 	}
 }
+
+// The route a config actually takes is not the order its stages were written
+// in. `onSuccess` unset falls through to the next stage declared, but an
+// explicit one may point anywhere — so a stage inserted before `done` while
+// the stage above it still says `onSuccess: done` is written into the line and
+// never entered by anything.
+func TestAStageNothingRoutesIntoIsNotOnTheLine(t *testing.T) {
+	cfg, err := loadYAML(t, `
+version: 1
+stages:
+  - name: start
+    onSuccess: finish
+  - name: skipped
+    script: do
+    onSuccess: finish
+  - name: finish
+    terminal: true
+sources:
+  - name: s1
+    provider: github
+    scripts:
+      do: {agent: claude}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reached := map[string]bool{}
+	for cur := cfg.Stages[0].Name; cur != "" && !reached[cur]; {
+		reached[cur] = true
+		st, ok := cfg.Stage(cur)
+		if !ok {
+			break
+		}
+		cur = st.OnSuccess
+	}
+	if reached["skipped"] {
+		t.Error("skipped is reachable; the fixture no longer reproduces the bug")
+	}
+	if !reached["start"] || !reached["finish"] {
+		t.Errorf("reached = %v, want the two stages actually on the line", reached)
+	}
+}
+
+// And the ordinary case: an omitted onSuccess falls through to the next stage
+// declared, so a plain list of stages is a line without anyone saying so.
+func TestAnOmittedOnSuccessFallsThroughToTheNextStage(t *testing.T) {
+	cfg, err := loadYAML(t, `
+version: 1
+stages:
+  - name: one
+  - name: two
+    script: do
+  - name: three
+    terminal: true
+sources:
+  - name: s1
+    provider: github
+    scripts:
+      do: {agent: claude}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range [][2]string{{"one", "two"}, {"two", "three"}, {"three", ""}} {
+		st, _ := cfg.Stage(c[0])
+		if st.OnSuccess != c[1] {
+			t.Errorf("%s onSuccess = %q, want %q", c[0], st.OnSuccess, c[1])
+		}
+	}
+}
