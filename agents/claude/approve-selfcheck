@@ -36,9 +36,14 @@ cat >"$tmp/bin/gh" <<'STUB'
 scene="$SCENE"
 case "$1 $2" in
 "pr list")   what=prlist ;;
-"pr view")   what=prview ;;
 "issue view") what=labels_$3 ;;
-"api graphql") what=graphql; printf '%s\n' "$*" >>"$scene/graphql_calls" ;;
+"api graphql")
+	# Two distinct queries share this one verb: fetch_details' pre-merge read
+	# (asks for isDraft, among much else) and the post-merge confirmation read
+	# (does not — it is four fields, none of them isDraft). Routed by content
+	# rather than call order, so a scene need not care how many times each ran.
+	if [[ "$*" == *isDraft* ]]; then what=graphql; else what=confirm; fi
+	printf '%s\n' "$*" >>"$scene/graphql_calls" ;;
 "api repos"*) what=timeline ;;
 "pr edit")   echo "unlabelled"; exit 0 ;;
 "pr comment") printf '%s\n' "$*" >>"$scene/comments_posted"; exit 0 ;;
@@ -143,7 +148,7 @@ JSON
 	# lands, at the exact head this call just inspected. F06's scenes below
 	# overwrite this to simulate a moved head, a queued/auto-merge outcome, or
 	# a merge genuinely refused.
-	cat >"$tmp/scene/prview" <<JSON
+	cat >"$tmp/scene/confirm" <<JSON
 {"state":"MERGED","headRefOid":"$head_oid","isInMergeQueue":false,"autoMergeRequest":null}
 JSON
 }
@@ -320,11 +325,31 @@ scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
 chk "(14) a settled PR merges"                "$(run)" "0"
 chk "     and gh pr merge actually ran"       "$([[ -f "$tmp/scene/merged" ]] && echo merged)" "merged"
 
+# A confirmation read that itself fails is not the same as "not merged yet":
+# the merge was already issued, and only the read that would say what happened
+# to it is what broke. It defers (10) rather than marking, and stderr — the
+# one place this is visible, since stdout/stderr are logs and never parsed —
+# names both that the merge was already issued and the SHA it was issued at,
+# so this is never mistaken for the ordinary "still quiet" case in the log.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS; touch "$tmp/scene/fail_confirm"
+: >"$CONVEYOR_RESULT"
+echo '{"item":{"ref":"7","title":"an item"}}' |
+	SCENE="$tmp/scene" REPO=o/n PROMPT="fix it" CONVEYOR_SOURCE=s1 \
+		QUIET_SECONDS="${QUIET:-0}" CONFLICT_RESOLVE="${CONFLICT_RESOLVE:-}" \
+		"$here/approve" >/dev/null 2>"$tmp/confirm_stderr"
+confirm_rc=$?
+chk "a failed confirmation read defers"           "$confirm_rc" "10"
+chk "     and it is not marked"                   "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+chk "     and stderr names the merge as already issued" \
+	"$(grep -c 'already issued' "$tmp/confirm_stderr")" "1"
+chk "     naming the head it was issued at" \
+	"$(grep -o 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "$tmp/confirm_stderr" | sort -u | wc -l | tr -d ' ')" "1"
+
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS; touch "$tmp/scene/merge_fails"
 # A genuine refusal changes nothing: the head gh reports afterwards is the
 # same one that was inspected, and the PR is still open. Only then is a
 # failed `gh pr merge` actually a fault rather than a moved head.
-cat >"$tmp/scene/prview" <<'JSON'
+cat >"$tmp/scene/confirm" <<'JSON'
 {"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"autoMergeRequest":null}
 JSON
 chk "a refused merge stops, never reads as merged" "$(run)" "20"
@@ -342,7 +367,7 @@ scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
 # The head moved after the inspection, and --match-head-commit refuses it —
 # gh reports a failure exactly as it would for any other rejected merge, and
 # only the follow-up read tells the two apart.
-cat >"$tmp/scene/prview" <<'JSON'
+cat >"$tmp/scene/confirm" <<'JSON'
 {"state":"OPEN","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","isInMergeQueue":false,"autoMergeRequest":null}
 JSON
 touch "$tmp/scene/merge_fails"
@@ -353,7 +378,7 @@ chk "     never reads as merged"              "$([[ -f "$tmp/scene/merged" ]] &&
 # where the mismatch was not caught server-side) — the follow-up read is what
 # actually decides this, not gh's exit code.
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
-cat >"$tmp/scene/prview" <<'JSON'
+cat >"$tmp/scene/confirm" <<'JSON'
 {"state":"OPEN","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","isInMergeQueue":false,"autoMergeRequest":null}
 JSON
 chk "(F06) a moved head defers even when gh reports success" "$(run)" "10"
@@ -362,7 +387,7 @@ chk "(F06) a moved head defers even when gh reports success" "$(run)" "10"
 # `gh pr merge` enqueues it (or enables auto-merge) and returns 0. This must
 # not be reported done, and must not re-issue gh pr merge on the next poll.
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
-cat >"$tmp/scene/prview" <<'JSON'
+cat >"$tmp/scene/confirm" <<'JSON'
 {"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":true,"autoMergeRequest":null}
 JSON
 chk "(F06) an accepted-but-queued merge defers, not done" "$(run)" "10"

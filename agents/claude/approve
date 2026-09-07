@@ -953,9 +953,36 @@ merge_out=$(gh pr merge "$pr" --repo "$REPO" --squash --delete-branch \
 # actual merge and for enqueuing (auto-merge enabled, or added to a required
 # merge queue — see `gh pr merge --help`), and a --match-head-commit
 # precondition failure is, from the exit code alone, indistinguishable from
-# any other rejected merge. One more read settles all of it.
-after=$(gh_json pr view "$pr" --repo "$REPO" \
-	--json state,headRefOid,isInMergeQueue,autoMergeRequest)
+# any other rejected merge. One more read settles all of it — over GraphQL,
+# not `pr view --json`: isInMergeQueue exists only there (fetch_details above
+# already asks for it that way). A REST `--json` list is where this exact read
+# used to ask for it instead, which `gh` rejects outright, so the branch below
+# — the entire point of the read — was never reached.
+#
+# Not gh_json: a failure here must not read as "not merged yet" — the merge
+# was already issued, at $head_oid, and that is what the message says while
+# still deferring rather than marking, since gh's own exit code already
+# proved nothing about whether the merge landed.
+after_raw=$(gh api graphql -f query='
+	query($owner:String!, $name:String!, $number:Int!) {
+		repository(owner:$owner, name:$name) {
+			pullRequest(number:$number) {
+				state
+				headRefOid
+				isInMergeQueue
+				autoMergeRequest { enabledAt }
+			}
+		}
+	}' -F owner="$owner" -F name="$name" -F number="$pr" \
+	--jq '.data.repository.pullRequest' 2>&1) || {
+	echo "confirming the merge of PR #$pr (already issued at $head_oid) failed: $after_raw" >&2
+	exit 10
+}
+if ! jq -e . >/dev/null 2>&1 <<<"$after_raw"; then
+	echo "confirming the merge of PR #$pr (already issued at $head_oid) returned something that is not JSON: $after_raw" >&2
+	exit 10
+fi
+after="$after_raw"
 after_state=$(jq -r '.state' <<<"$after")
 after_head=$(jq -r '.headRefOid' <<<"$after")
 
