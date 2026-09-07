@@ -14,6 +14,23 @@ source "$here/_deadline"
 fail=0
 chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
 
+# _selfcheck_unwritable <dir> <label> — chmod 500 and PROVE it actually blocks
+# a write before any check relies on that. Running as root ignores the mode
+# bits, and a check that silently passes there is worse than one that is
+# absent — so this skips loudly, naming itself, instead of asserting a
+# fixed outcome that never happened.
+_selfcheck_unwritable() {
+	local dir=$1 label=$2
+	chmod 500 "$dir"
+	if : 2>/dev/null >"$dir/.selfcheck-rw-probe"; then
+		rm -f "$dir/.selfcheck-rw-probe"
+		chmod 700 "$dir"
+		echo "SKIP $label: $dir is still writable after chmod 500 (running as root?)"
+		return 1
+	fi
+	return 0
+}
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 export WORKTREES="$tmp/worktrees"
@@ -187,6 +204,8 @@ echo mine >"$WORKTREES/demo/75/hello.txt"
 : >"$CONVEYOR_RESULT"
 rc=0; (cd "$tmp/repo" && item_worktree demo 75 >/dev/null 2>&1) || rc=$?
 chk "an unowned path at the managed location is refused" "$rc" "20"
+chk "the reason is the generic one, not a version-boundary story" \
+	"$(jq -r '.reason | test("was not created by Conveyor")' "$CONVEYOR_RESULT")" "true"
 chk "and it is untouched" "$(cat "$WORKTREES/demo/75/hello.txt")" "mine"
 drop_worktree demo 75 2>/dev/null
 chk "drop_worktree leaves an unowned path alone" "$([[ -f "$WORKTREES/demo/75/hello.txt" ]] && echo yes)" "yes"
@@ -214,8 +233,216 @@ sp=$(cd "$tmp/repo" && item_worktree "demo space" "ref one")
 chk "a space in source/ref creates the literal path" "$sp" "$WORKTREES/demo space/ref one"
 chk "it is a real checkout" "$(cd "$sp" && git rev-parse --is-inside-work-tree)" "true"
 chk "asking again returns the same path" "$(cd "$tmp/repo" && item_worktree "demo space" "ref one")" "$sp"
+
+# stripping its marker reproduces exactly what a pre-#33 worktree looked like;
+# adoption still finds it at the literal (unsanitised) path, on the sanitised
+# branch, and does not mark the item.
+sp_gd=$(_worktree_gitdir "$sp")
+rm -f "$sp_gd/conveyor-owner"
+: >"$CONVEYOR_RESULT"
+sp2=$(cd "$tmp/repo" && item_worktree "demo space" "ref one")
+chk "a space in ref is adopted at the literal path" "$sp2" "$sp"
+chk "on the sanitised branch"                       "$(cd "$sp" && git branch --show-current)" "issue-ref-one"
+chk "adoption does not mark the item"               "$(cat "$CONVEYOR_RESULT")" ""
+
 drop_worktree "demo space" "ref one"
 chk "it can be dropped too" "$([[ -e "$sp" ]] && echo present || echo gone)" "gone"
+
+# 10b. adoption (#60): a worktree that predates the conveyor-owner marker is
+# not automatically unowned — a narrow proof (right path, linked worktree of
+# this repo, on branch issue-<ref>) is enough, and item_worktree, sweep and
+# drop all treat it the same way _worktree_owned always has: as ours.
+adopt=$(item_worktree demo-adopt 80)
+adopt_gd=$(_worktree_gitdir "$adopt")
+head_before=$(git -C "$adopt" rev-parse HEAD)
+echo scratch >"$adopt/keep-me.txt"
+echo 'a local edit' >>"$adopt/file.txt"
+rm -f "$adopt_gd/conveyor-owner"
+
+: >"$CONVEYOR_RESULT"
+reused=$(cd "$tmp/repo" && item_worktree demo-adopt 80)
+chk "an unmarked but provable worktree is reused, not refused" "$reused" "$adopt"
+chk "adoption does not mark the item"                          "$(cat "$CONVEYOR_RESULT")" ""
+chk "the marker now exists with source and ref, one per line" \
+	"$(cat "$adopt_gd/conveyor-owner")" "$(printf 'demo-adopt\n80')"
+chk "a second call takes the already-marked path" \
+	"$(cd "$tmp/repo" && item_worktree demo-adopt 80)" "$adopt"
+chk "an uncommitted change survives adoption" "$(grep -c 'a local edit' "$adopt/file.txt")" "1"
+chk "an untracked file survives adoption"     "$(cat "$adopt/keep-me.txt")" "scratch"
+chk "HEAD is unchanged by adoption"           "$(git -C "$adopt" rev-parse HEAD)" "$head_before"
+
+# the answer is the proof, not the bookkeeping: a git dir that cannot be
+# written to still gets the path back, and the failure is reported rather
+# than turned into a mark.
+fail_wt=$(item_worktree demo-adopt-ro 81)
+fail_gd=$(_worktree_gitdir "$fail_wt")
+rm -f "$fail_gd/conveyor-owner"
+if _selfcheck_unwritable "$fail_gd" "adoption marker-write-failure checks"; then
+	err=$(mktemp)
+	out=$(cd "$tmp/repo" && item_worktree demo-adopt-ro 81 2>"$err")
+	chk "adoption still returns the path when the marker cannot be written" "$out" "$fail_wt"
+	chk "the failed write is reported on stderr" "$(grep -c 'could not write ownership marker' "$err")" "1"
+	chk "and no marker exists" "$([[ -f "$fail_gd/conveyor-owner" ]] && echo present || echo none)" "none"
+	chmod 700 "$fail_gd"
+	out=$(cd "$tmp/repo" && item_worktree demo-adopt-ro 81 2>/dev/null)
+	chk "a later call proves it again once the git dir is writable" "$out" "$fail_wt"
+	chk "and writes the marker then" "$([[ -f "$fail_gd/conveyor-owner" ]] && echo present || echo none)" "present"
+	rm -f "$err"
+fi
+
+# the same guarantee holds at creation, not only adoption: a marker or lease
+# write that fails while a *fresh* worktree is being made must not cost the
+# caller the path it just created. Exercised with inherit_errexit forced on,
+# which is what actually makes a bare failing statement fatal under
+# `set -euo pipefail` — without it this check could not tell a guarded call
+# (agents/_worktree's item_worktree:339-342) from a bare one, since command
+# substitution does not inherit errexit by default.
+cwt=$(item_worktree demo-create-ro 95)
+cwt_gd=$(_worktree_gitdir "$cwt")
+# Simulate the moment creation's own first write happens: neither file exists
+# yet, so writing one is a *new* file and needs the directory itself to be
+# writable — overwriting the marker item_worktree already left behind here
+# would need only the file's own permission and prove nothing.
+rm -f "$cwt_gd/conveyor-owner" "$cwt_gd/conveyor-lease"
+if _selfcheck_unwritable "$cwt_gd" "creation write-guard checks"; then
+	cerr=$(mktemp)
+	rc=0
+	(
+		shopt -s inherit_errexit
+		set -euo pipefail
+		gd="$cwt_gd"
+		_worktree_write_marker demo-create-ro 95 "$cwt" ||
+			echo "conveyor: could not write ownership marker in $gd for $cwt" >&2
+		_worktree_write_lease "$cwt" ||
+			echo "conveyor: could not write lease in $gd for $cwt" >&2
+		echo reached-end
+	) >"$cerr" 2>&1 || rc=$?
+	chk "a failed write at creation does not abort under set -e" "$rc" "0"
+	chk "both writes are attempted despite the first failing" "$(grep -c 'reached-end' "$cerr")" "1"
+	chk "both failures are reported on stderr" "$(grep -c 'could not write' "$cerr")" "2"
+	chmod 700 "$cwt_gd"
+	rm -f "$cerr"
+fi
+
+# sweep_worktrees adopts through the same test, applied in its own loop
+# rather than item_worktree's reuse path — a clean, fully-pushed, unleased one
+# is swept, not refused as unowned.
+swp=$(item_worktree demo-sweep-adopt 91)
+swp_gd=$(_worktree_gitdir "$swp")
+rm -f "$swp_gd/conveyor-owner" "$swp_gd/conveyor-lease"
+touch -d "3 hours ago" "$swp"
+err=$(mktemp)
+sweep_worktrees demo-sweep-adopt 2>"$err"
+chk "the sweep does not call an unmarked-but-provable path unowned" \
+	"$(grep -c 'refusing to sweep unowned path' "$err")" "0"
+chk "and sweeps it, since it is clean and fully pushed" "$([[ -d "$swp" ]] && echo present || echo gone)" "gone"
+rm -f "$err"
+
+# adopted does not mean swept — the sweep's other guards still decide, so an
+# adopted-but-dirty worktree is marked ours and left standing.
+swp2=$(item_worktree demo-sweep-adopt 92)
+swp2_gd=$(_worktree_gitdir "$swp2")
+rm -f "$swp2_gd/conveyor-owner" "$swp2_gd/conveyor-lease"
+echo dirty >"$swp2/wip.txt"
+touch -d "3 hours ago" "$swp2"
+sweep_worktrees demo-sweep-adopt 2>/dev/null
+chk "an adopted but dirty worktree is not swept" "$([[ -d "$swp2" ]] && echo present)" "present"
+chk "it is adopted anyway"                       "$([[ -f "$swp2_gd/conveyor-owner" ]] && echo present)" "present"
+
+# drop_worktree adopts and removes an unmarked-but-provable worktree instead
+# of refusing it as unowned.
+drp=$(item_worktree demo-drop-adopt 93)
+drp_gd=$(_worktree_gitdir "$drp")
+rm -f "$drp_gd/conveyor-owner"
+err=$(mktemp)
+drop_worktree demo-drop-adopt 93 2>"$err"
+chk "drop_worktree does not call an unmarked-but-provable path unowned" \
+	"$(grep -c 'refusing to remove unowned path' "$err")" "0"
+chk "and removes it" "$([[ -e "$drp" ]] && echo present || echo gone)" "gone"
+rm -f "$err"
+
+# still refused, every case leaving the directory untouched and writing no
+# marker: a plain directory git resolves to an *enclosing* repository is not a
+# linked worktree (its git dir is that repository's own, not a `worktrees/`
+# entry under it).
+mkdir -p "$WORKTREES/encl"
+git init --quiet "$WORKTREES/encl"
+git -C "$WORKTREES/encl" config user.email a@b.c && git -C "$WORKTREES/encl" config user.name t
+touch "$WORKTREES/encl/root.txt" && git -C "$WORKTREES/encl" add -A && git -C "$WORKTREES/encl" commit --quiet -m root
+mkdir -p "$WORKTREES/encl/85"
+: >"$CONVEYOR_RESULT"
+rc=0; (cd "$tmp/repo" && item_worktree encl 85 >/dev/null 2>&1) || rc=$?
+chk "a directory resolving to an enclosing repo is refused" "$rc" "20"
+chk "with the generic wording" "$(jq -r '.reason | test("was not created by Conveyor")' "$CONVEYOR_RESULT")" "true"
+chk "and no marker is written" "$([[ -f "$WORKTREES/encl/.git/conveyor-owner" ]] && echo present || echo none)" "none"
+
+# a linked worktree at the managed path belonging to a *different* repository.
+git init --quiet --bare "$tmp/other-origin.git"
+git clone --quiet "$tmp/other-origin.git" "$tmp/other-repo"
+git -C "$tmp/other-repo" config user.email a@b.c && git -C "$tmp/other-repo" config user.name t
+git -C "$tmp/other-repo" symbolic-ref HEAD refs/heads/main
+echo one >"$tmp/other-repo/file.txt" && git -C "$tmp/other-repo" add -A && git -C "$tmp/other-repo" commit --quiet -m first
+git -C "$tmp/other-repo" push --quiet -u origin main
+git -C "$tmp/other-repo" worktree add --quiet -B issue-86 "$WORKTREES/demo-diffrepo/86" origin/main
+: >"$CONVEYOR_RESULT"
+rc=0; (cd "$tmp/repo" && item_worktree demo-diffrepo 86 >/dev/null 2>&1) || rc=$?
+chk "a linked worktree of a different repository is refused" "$rc" "20"
+chk "with the generic wording, not the version-boundary one" \
+	"$(jq -r '.reason | test("was not created by Conveyor")' "$CONVEYOR_RESULT")" "true"
+chk "and no marker is written" \
+	"$([[ -f "$(_worktree_gitdir "$WORKTREES/demo-diffrepo/86")/conveyor-owner" ]] && echo present || echo none)" "none"
+
+# the primary checkout, were it to sit at the managed path, is refused the
+# same generic way — its git dir equals its common dir, so it is not linked.
+git clone --quiet "$tmp/origin.git" "$WORKTREES/demo-primary/87"
+git -C "$WORKTREES/demo-primary/87" config user.email a@b.c
+git -C "$WORKTREES/demo-primary/87" config user.name t
+: >"$CONVEYOR_RESULT"
+rc=0; (cd "$tmp/repo" && item_worktree demo-primary 87 >/dev/null 2>&1) || rc=$?
+chk "a primary checkout at the managed path is refused" "$rc" "20"
+chk "with the generic wording" "$(jq -r '.reason | test("was not created by Conveyor")' "$CONVEYOR_RESULT")" "true"
+chk "and no marker is written" "$([[ -f "$WORKTREES/demo-primary/87/.git/conveyor-owner" ]] && echo present || echo none)" "none"
+
+# a linked worktree of the right repository at the right path but on a
+# different branch, a rework worktree tracking a differently-named pull
+# request branch included: the mark names the version boundary and the
+# branch actually held, next to the branch adoption wanted.
+git -C "$tmp/repo" worktree add --quiet -B other-topic-branch "$WORKTREES/demo-branch/88" origin/main
+: >"$CONVEYOR_RESULT"
+rc=0; (cd "$tmp/repo" && item_worktree demo-branch 88 >/dev/null 2>&1) || rc=$?
+chk "a linked worktree on the wrong branch is refused" "$rc" "20"
+chk "the mark says the ownership marker is missing" \
+	"$(jq -r '.reason | test("no conveyor-owner marker")' "$CONVEYOR_RESULT")" "true"
+chk "and names the branch it is actually on" \
+	"$(jq -r '.reason | test("other-topic-branch")' "$CONVEYOR_RESULT")" "true"
+chk "next to the branch adoption wanted" \
+	"$(jq -r '.reason | test("issue-88")' "$CONVEYOR_RESULT")" "true"
+chk "and no marker is written" \
+	"$([[ -f "$(_worktree_gitdir "$WORKTREES/demo-branch/88")/conveyor-owner" ]] && echo present || echo none)" "none"
+
+# a linked worktree of the right repository at the right path with a detached
+# HEAD: still refused, and the mark says so instead of naming a branch.
+git -C "$tmp/repo" worktree add --quiet --detach "$WORKTREES/demo-detached/89" origin/main
+: >"$CONVEYOR_RESULT"
+rc=0; (cd "$tmp/repo" && item_worktree demo-detached 89 >/dev/null 2>&1) || rc=$?
+chk "a linked worktree with a detached HEAD is refused" "$rc" "20"
+chk "the mark says the ownership marker is missing" \
+	"$(jq -r '.reason | test("no conveyor-owner marker")' "$CONVEYOR_RESULT")" "true"
+chk "and calls out the detached HEAD" "$(jq -r '.reason | test("detached HEAD")' "$CONVEYOR_RESULT")" "true"
+chk "and no marker is written" \
+	"$([[ -f "$(_worktree_gitdir "$WORKTREES/demo-detached/89")/conveyor-owner" ]] && echo present || echo none)" "none"
+
+# adoption fails closed: called from a directory that is not a git repository
+# at all, the same worktree that would otherwise be adopted is refused.
+mkdir -p "$tmp/not-a-repo"
+noref=$(cd "$tmp/repo" && item_worktree noref-src 90)
+noref_gd=$(_worktree_gitdir "$noref")
+rm -f "$noref_gd/conveyor-owner"
+: >"$CONVEYOR_RESULT"
+rc=0; (cd "$tmp/not-a-repo" && item_worktree noref-src 90 >/dev/null 2>&1) || rc=$?
+chk "adoption fails closed when the caller has no repository" "$rc" "20"
+chk "and no marker is written" "$([[ -f "$noref_gd/conveyor-owner" ]] && echo present || echo none)" "none"
+cd "$tmp/repo"
 
 # 11. resume: a worktree a dead run left dirty is carried on from, not refused.
 # The brief is what the adapter appends to its prompt, so it has to contain the
