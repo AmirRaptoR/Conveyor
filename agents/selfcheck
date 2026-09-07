@@ -515,9 +515,14 @@ chk "PATH survives being sourced" "$PATH" "$before"
 # 10. the time budget. The agent's deadline is derived from the engine's, so a
 # stage timeout changed in conveyor.yaml moves both and neither can go stale.
 export CONVEYOR_RESULT="$tmp/result.json"
-brief=$(CONVEYOR_DEADLINE=$(date -u -d '+35 minutes' +%Y-%m-%dT%H:%M:%SZ) WRAP_UP_GRACE=300 deadline_brief)
-want_soft=$(date -u -d '+30 minutes' +'%H:%M UTC')
-want_hard=$(date -u -d '+35 minutes' +'%H:%M UTC')
+# The instant is read once and every expectation derived from it. Reading the
+# clock separately for the input and for what it should print fails whenever a
+# minute ticks over between the two calls — roughly one run in sixty, which is
+# a test that cries wolf rather than one that catches anything.
+at=$(date -u -d '+35 minutes' +%s)
+brief=$(CONVEYOR_DEADLINE=$(date -u -d "@$at" +%Y-%m-%dT%H:%M:%SZ) WRAP_UP_GRACE=300 deadline_brief)
+want_soft=$(date -u -d "@$((at - 300))" +'%H:%M UTC')
+want_hard=$(date -u -d "@$at" +'%H:%M UTC')
 chk "the brief names the engine's kill time" "$(grep -c "killed at" <<<"$brief")" "1"
 chk "and the hard deadline itself"           "$(grep -c "$want_hard" <<<"$brief")" "1"
 chk "and a wrap-up one grace earlier"        "$(grep -c "$want_soft" <<<"$brief")" "1"
@@ -530,7 +535,9 @@ chk "no deadline, no brief" "$(CONVEYOR_DEADLINE= deadline_brief | wc -c)" "0"
 chk "an unreadable one is the same" "$(CONVEYOR_DEADLINE=whenever deadline_brief | wc -c)" "0"
 
 # A grace wider than the stage would put the wrap-up before the run began.
-brief=$(CONVEYOR_DEADLINE=$(date -u -d '+2 minutes' +%Y-%m-%dT%H:%M:%SZ) WRAP_UP_GRACE=600 deadline_brief)
-chk "a grace wider than the stage still reads" "$(grep -c "$(date -u -d '+2 minutes' +'%H:%M UTC')" <<<"$brief")" "2"
+at=$(date -u -d '+2 minutes' +%s)
+brief=$(CONVEYOR_DEADLINE=$(date -u -d "@$at" +%Y-%m-%dT%H:%M:%SZ) WRAP_UP_GRACE=600 deadline_brief)
+chk "a grace wider than the stage still reads" \
+	"$(grep -c "$(date -u -d "@$at" +'%H:%M UTC')" <<<"$brief")" "2"
 
 exit $fail
