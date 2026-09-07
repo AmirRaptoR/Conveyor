@@ -99,3 +99,67 @@ open_pr() {
 	pr_lookup "$1" open
 	[[ "$PR_STATUS" == "one" ]] && printf '%s' "$PR_NUMBER"
 }
+
+# item_landed <ref> — asks GitHub's own record of what closed the issue,
+# never a list to page through: Issue.closedByPullRequestsReferences. Sets
+# $LANDED to exactly one of yes / no / unavailable, and always sets
+# $ISSUE_STATE to the issue's own OPEN/CLOSED (empty on unavailable) — a
+# caller telling apart "nothing landed because it is still open" from
+# "nothing landed even though it is closed" needs that, and it comes free
+# with the one call this makes.
+#
+# "yes" requires both that the issue is CLOSED and that at least one pull
+# request GitHub recorded as closing it has merged: true; on yes, $LANDED_PR
+# is that pull request's number, for the log. A closed issue whose only
+# closer was closed unmerged is "no", so is a closed issue with no closer at
+# all, so is an open issue — the ordinary, expected answer for most items
+# that reach this call, and not a thing to defer on.
+#
+# This is not a second way to choose a pull request to work on — pr_lookup
+# above, filtered through pr_match_filter, stays the one lookup for that.
+# This only ever answers "did this item's work already land".
+#
+# One call, server-side, so it cannot be defeated by a repository with more
+# merged pull requests than a listing page holds — the reason this is not
+# `gh pr list --state merged`. Any failure of that call — non-zero exit,
+# output that is not JSON, a payload carrying an `errors` array — sets
+# unavailable and prints why on stderr, the same rule closing_prs already
+# applies: unavailable must never read as a verdict.
+item_landed() {
+	local ref=$1 owner=${REPO%%/*} name=${REPO#*/} out
+	LANDED=unavailable LANDED_PR="" ISSUE_STATE=""
+	if ! out=$(gh api graphql -f query='
+		query($owner: String!, $name: String!, $number: Int!) {
+			repository(owner: $owner, name: $name) {
+				issue(number: $number) {
+					state
+					closedByPullRequestsReferences(first: 10, includeClosedPrs: true, userLinkedOnly: false) {
+						nodes { number state merged url }
+					}
+				}
+			}
+		}' -F owner="$owner" -F name="$name" -F number="$ref" 2>&1); then
+		echo "gh api graphql (issue #$ref closing references) failed: $out" >&2
+		return 0
+	fi
+	if ! jq -e . >/dev/null 2>&1 <<<"$out"; then
+		echo "gh api graphql (issue #$ref closing references) returned something that is not JSON: $out" >&2
+		return 0
+	fi
+	if jq -e '.errors' >/dev/null 2>&1 <<<"$out"; then
+		echo "gh api graphql (issue #$ref closing references) returned errors: $(jq -c '.errors' <<<"$out")" >&2
+		return 0
+	fi
+	ISSUE_STATE=$(jq -r '.data.repository.issue.state // empty' <<<"$out")
+	if [[ "$ISSUE_STATE" != "CLOSED" ]]; then
+		LANDED=no
+		return 0
+	fi
+	LANDED_PR=$(jq -r '[.data.repository.issue.closedByPullRequestsReferences.nodes[]
+		| select(.merged == true)][0].number // empty' <<<"$out")
+	if [[ -n "$LANDED_PR" ]]; then
+		LANDED=yes
+	else
+		LANDED=no
+	fi
+}

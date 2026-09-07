@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# Drives agents/claude/implement's and agents/claude/review's preflights, and
+# implement's postcondition, against a stubbed `gh` and a stubbed `claude` —
+# the "has this item already landed" check from #75. Runs no real model;
+# builds a real worktree only for the one scene that needs to reach
+# implement's postcondition (a throwaway bare repo, never this one).
+#
+#   agents/claude/landed-selfcheck
+#
+# item_landed itself (agents/_pr's new lookup) is covered exhaustively by
+# agents/_pr-selfcheck; what is checked here is each adapter's own policy
+# around it — exit 0 on yes, defer on unavailable, and the choice between
+# `asks` and `blocked` when the issue is closed with nothing merged behind it.
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/bin" "$tmp/scene"
+export PATH="$tmp/bin:$PATH"
+export REPO="owner/repo"
+export CONVEYOR_SOURCE="demo"
+export PROMPT="do the work"
+export SCENE="$tmp/scene"
+export CONVEYOR_RESULT="$tmp/result.json"
+
+# The stub answers `gh pr list` and `gh api graphql` from fixtures the scene
+# writes; anything else is a fixture the scene did not expect and fails loudly
+# rather than guessing.
+cat >"$tmp/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+scene="$SCENE"
+case "$1 $2" in
+"pr list")     what=prlist ;;
+"api graphql") what=graphql ;;
+*) echo "stub gh: unhandled: $*" >&2; exit 97 ;;
+esac
+[[ -f "$scene/fail_$what" ]] && { echo "stub gh: $what failed" >&2; exit 1; }
+if [[ -f "$scene/$what" ]]; then cat "$scene/$what"; else echo "stub gh: no fixture for $what" >&2; exit 98; fi
+STUB
+chmod +x "$tmp/bin/gh"
+
+# `git` is never expected to run for a preflight scene that stops before the
+# worktree — stubbed to fail loudly instead of left off PATH, so a regression
+# that does reach it is a clear failure here rather than a real invocation.
+cat >"$tmp/bin/git" <<'STUB'
+#!/usr/bin/env bash
+echo "stub git: unexpected call from a preflight that should stop first: $*" >&2
+exit 99
+STUB
+chmod +x "$tmp/bin/git"
+
+# `claude` likewise, for the same scenes — refuses and leaves a marker, so a
+# scene can assert the model never started rather than merely happening not
+# to fail. Replaced with a real (if uneventful) stub for the one scene below
+# that legitimately needs the model to run.
+stub_claude_refuses() {
+	rm -f "$tmp/bin/claude"
+	cat >"$tmp/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+scene="$SCENE"
+touch "$scene/claude_called"
+echo "stub claude: unexpected call from a preflight that should stop first: $*" >&2
+exit 99
+STUB
+	chmod +x "$tmp/bin/claude"
+}
+claude_called() { [[ -f "$tmp/scene/claude_called" ]] && echo yes || echo no; }
+
+scene() { rm -f "$tmp/scene"/*; stub_claude_refuses; }
+prlist() { printf '%s' "$1" >"$tmp/scene/prlist"; }
+graphql() { printf '%s' "$1" >"$tmp/scene/graphql"; }
+fail_graphql() { touch "$tmp/scene/fail_graphql"; }
+
+closed_merged='{"data":{"repository":{"issue":{"state":"CLOSED",
+	"closedByPullRequestsReferences":{"nodes":[{"number":29,"state":"MERGED","merged":true,"url":"u"}]}}}}}'
+closed_unmerged='{"data":{"repository":{"issue":{"state":"CLOSED",
+	"closedByPullRequestsReferences":{"nodes":[]}}}}}'
+open_issue='{"data":{"repository":{"issue":{"state":"OPEN",
+	"closedByPullRequestsReferences":{"nodes":[]}}}}}'
+
+payload() { jq -n --arg ref "$1" '{item:{ref:$ref,title:"an item",description:"",url:"u"}}'; }
+
+run_implement() {
+	: >"$CONVEYOR_RESULT"
+	local rc=0
+	payload "$1" | "$here/implement" >"$tmp/out" 2>"$tmp/err" || rc=$?
+	echo "$rc"
+}
+run_review() {
+	: >"$CONVEYOR_RESULT"
+	local rc=0
+	payload "$1" | "$here/review" >"$tmp/out" 2>"$tmp/err" || rc=$?
+	echo "$rc"
+}
+
+# --- implement: an already-landed item costs no model run -------------------
+scene; graphql "$closed_merged"
+rc=$(run_implement 25)
+chk "implement exits 0 on a landed item" "$rc" "0"
+chk "  and never touches the mark file" "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+chk "  and never starts the model" "$(claude_called)" "no"
+
+# --- implement: the lookup failing defers rather than guesses ---------------
+scene; fail_graphql
+rc=$(run_implement 25)
+chk "implement exits 10 when the lookup is unavailable" "$rc" "10"
+chk "  and never starts the model" "$(claude_called)" "no"
+
+# --- review: an already-landed item has nothing left to review -------------
+scene; prlist '[]'; graphql "$closed_merged"
+rc=$(run_review 25)
+chk "review exits 0 on a landed item" "$rc" "0"
+chk "  and never touches the mark file" "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+chk "  and never starts the model" "$(claude_called)" "no"
+
+# --- review: an open issue with no PR closing it is still a plain block -----
+scene; prlist '[]'; graphql "$open_issue"
+rc=$(run_review 25)
+chk "review still blocks input when the issue is open and no PR closes it" "$rc" "20"
+chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "false"
+chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "input"
+chk "  and never starts the model" "$(claude_called)" "no"
+
+# --- implement's postcondition: an issue closed by hand with nothing merged
+# behind it is a question, not a bulk-clearable condition — the same shape of
+# permanent state a merged PR is, just with the opposite answer. Reaching this
+# needs the model to actually run (however uneventfully), so unlike the scenes
+# above this one builds a real worktree, off a throwaway bare repo — never
+# this one. The refusing `git` stub was only for the scenes that must never
+# reach a worktree; this scene needs the real one back on PATH.
+rm -f "$tmp/bin/git"
+git init --quiet --bare "$tmp/origin.git"
+git clone --quiet "$tmp/origin.git" "$tmp/srcrepo"
+git -C "$tmp/srcrepo" config user.email a@b.c
+git -C "$tmp/srcrepo" config user.name t
+git -C "$tmp/srcrepo" symbolic-ref HEAD refs/heads/main
+echo one >"$tmp/srcrepo/file.txt"
+git -C "$tmp/srcrepo" add -A
+git -C "$tmp/srcrepo" commit --quiet -m first
+git -C "$tmp/srcrepo" push --quiet -u origin main
+git -C "$tmp/srcrepo" remote set-head origin -a >/dev/null 2>&1 || true
+export WORKTREES="$tmp/worktrees"
+
+# The real `claude`: a clean, uneventful run that writes nothing to
+# $CONVEYOR_RESULT — the agent looked and found nothing to do, same as the
+# transcript quesshi:25 actually left.
+rm -f "$tmp/bin/claude"
+cat >"$tmp/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+echo '{"type":"result","is_error":false,"subtype":"success","num_turns":1,"result":"nothing to implement"}'
+exit 0
+STUB
+chmod +x "$tmp/bin/claude"
+
+rm -f "$tmp/scene"/*
+prlist '[]'
+graphql "$closed_unmerged"
+: >"$CONVEYOR_RESULT"
+rc=0
+(cd "$tmp/srcrepo" && payload 25 | "$here/implement" >"$tmp/out" 2>"$tmp/err") || rc=$?
+chk "implement asks on a closed issue with nothing merged" "$rc" "20"
+chk "  the mark is a question, not a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "true"
+chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "no-output"
+
+if [[ $fail -eq 0 ]]; then echo "all checks passed"; else echo "SOME CHECKS FAILED"; fi
+exit $fail

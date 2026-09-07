@@ -17,15 +17,21 @@ mkdir -p "$tmp/bin"
 export PATH="$tmp/bin:$PATH"
 export REPO="owner/repo"
 
-# The stub answers `gh pr list` from a fixture file the scene sets, and fails
-# the call outright when $tmp/scene/fail exists.
-scene() { rm -f "$tmp/list" "$tmp/fail"; }
+# The stub answers `gh pr list` and `gh api graphql` from fixture files the
+# scene sets, and fails either call outright when its own fail-flag exists.
+scene() { rm -f "$tmp/list" "$tmp/fail" "$tmp/graphql" "$tmp/fail_graphql"; }
 list() { printf '%s' "$1" >"$tmp/list"; }
+graphql() { printf '%s' "$1" >"$tmp/graphql"; }
 cat >"$tmp/bin/gh" <<STUB
 #!/usr/bin/env bash
 if [[ "\$1 \$2" == "pr list" ]]; then
 	[[ -f "$tmp/fail" ]] && { echo "stub gh: pr list failed" >&2; exit 1; }
 	if [[ -f "$tmp/list" ]]; then cat "$tmp/list"; else echo "stub gh: no fixture for pr list" >&2; exit 98; fi
+	exit 0
+fi
+if [[ "\$1 \$2" == "api graphql" ]]; then
+	[[ -f "$tmp/fail_graphql" ]] && { echo "stub gh: graphql failed" >&2; exit 1; }
+	if [[ -f "$tmp/graphql" ]]; then cat "$tmp/graphql"; else echo "stub gh: no fixture for graphql" >&2; exit 98; fi
 	exit 0
 fi
 echo "stub gh: unhandled: \$*" >&2
@@ -99,6 +105,54 @@ scene; list '[]'
 chk "open_pr is empty on none"                "$(open_pr 7)" ""
 scene; touch "$tmp/fail"
 chk "open_pr is empty on unavailable too"     "$(open_pr 7)" ""
+
+# --- item_landed: "has this item landed", never a second way to pick a PR --
+# One call — Issue.closedByPullRequestsReferences — never a list to page
+# through.
+
+# a closed issue whose closer merged: yes, and the merged PR's number is kept.
+scene; graphql '{"data":{"repository":{"issue":{"state":"CLOSED",
+	"closedByPullRequestsReferences":{"nodes":[{"number":29,"state":"MERGED","merged":true,"url":"u"}]}}}}}'
+item_landed 25
+chk "a closed issue with a merged closer is yes" "$LANDED" "yes"
+chk "  the merged PR's number is kept"           "$LANDED_PR" "29"
+chk "  and the issue state too"                  "$ISSUE_STATE" "CLOSED"
+
+# a closed issue whose only closer was closed without merging: no.
+scene; graphql '{"data":{"repository":{"issue":{"state":"CLOSED",
+	"closedByPullRequestsReferences":{"nodes":[{"number":9,"state":"CLOSED","merged":false,"url":"u"}]}}}}}'
+item_landed 25
+chk "a closed issue with an unmerged closer is no" "$LANDED" "no"
+chk "  no PR number is kept"                      "$LANDED_PR" ""
+
+# a closed issue with no closing PR at all: no.
+scene; graphql '{"data":{"repository":{"issue":{"state":"CLOSED",
+	"closedByPullRequestsReferences":{"nodes":[]}}}}}'
+item_landed 25
+chk "a closed issue with no closer is no" "$LANDED" "no"
+
+# an open issue: no, whatever its closing references say.
+scene; graphql '{"data":{"repository":{"issue":{"state":"OPEN",
+	"closedByPullRequestsReferences":{"nodes":[]}}}}}'
+item_landed 25
+chk "an open issue is no"        "$LANDED" "no"
+chk "  and the issue state shows it's open" "$ISSUE_STATE" "OPEN"
+
+# the call fails outright: unavailable, never a verdict.
+scene; touch "$tmp/fail_graphql"
+item_landed 25
+chk "a failed graphql call is unavailable" "$LANDED" "unavailable"
+chk "  never read as no"                   "$([[ "$LANDED" == "no" ]] && echo yes || echo no)" "no"
+
+# a non-JSON response: unavailable.
+scene; graphql 'not json'
+item_landed 25
+chk "a non-JSON graphql response is unavailable" "$LANDED" "unavailable"
+
+# a payload carrying an errors array: unavailable, same as any other failure.
+scene; graphql '{"errors":[{"message":"Could not resolve to a Repository"}]}'
+item_landed 25
+chk "a graphql errors array is unavailable" "$LANDED" "unavailable"
 
 if [[ $fail -eq 0 ]]; then echo "all checks passed"; else echo "SOME CHECKS FAILED"; fi
 exit $fail
