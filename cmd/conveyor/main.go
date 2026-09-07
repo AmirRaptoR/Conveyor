@@ -172,18 +172,50 @@ func cmdValidate(args []string) error {
 	defer stop()
 
 	fmt.Printf("ok  %s\n", *c.cfgPath)
-	var parts []string
-	for _, s := range cfg.Stages {
-		n := s.Name
+	// The route, followed, rather than the stages in the order they were
+	// written. Those are not the same thing — `onSuccess` unset falls through
+	// to the next stage declared, but an explicit one may point anywhere — and
+	// printing the declaration order with arrows between the names asserted a
+	// chain the config did not have. A stage inserted before `done` while the
+	// stage above it still said `onSuccess: done` read here as part of the
+	// line and was never entered by anything.
+	mark := func(s config.Stage) string {
 		switch {
 		case s.Runs():
-			n += "*"
+			return s.Name + "*"
 		case s.Terminal:
-			n += "."
+			return s.Name + "."
 		}
-		parts = append(parts, n)
+		return s.Name
+	}
+	var parts []string
+	seen := map[string]bool{}
+	for cur := cfg.Stages[0].Name; cur != "" && !seen[cur]; {
+		seen[cur] = true
+		st, ok := cfg.Stage(cur)
+		if !ok {
+			break
+		}
+		parts = append(parts, mark(*st))
+		cur = st.OnSuccess // already defaulted at load to the next stage declared
 	}
 	fmt.Printf("    stages: %s\n", strings.Join(parts, " -> "))
+	// Anything the walk did not reach. A listing can still put an item
+	// straight into one — a provider maps its own labels to stages — but no
+	// stage routes into it, so nothing the pipeline itself does will ever
+	// arrive there, and that is nearly always a stage somebody added without
+	// pointing the one above it at it.
+	var orphans []string
+	for _, s := range cfg.Stages {
+		if !seen[s.Name] {
+			orphans = append(orphans, s.Name)
+		}
+	}
+	if len(orphans) > 0 {
+		fmt.Printf("    NOT ON THE LINE: %s — no stage's onSuccess reaches %s\n",
+			strings.Join(orphans, ", "),
+			map[bool]string{true: "them", false: "it"}[len(orphans) > 1])
+	}
 	fmt.Printf("    %d source(s), concurrency %d global / %d per stage / %d per source\n",
 		len(cfg.Sources), cfg.Concurrency.Global, cfg.Concurrency.PerStage, cfg.Concurrency.PerSource)
 	// The limits that actually bind. `global` counts transitions; these count

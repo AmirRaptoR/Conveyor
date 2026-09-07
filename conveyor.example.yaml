@@ -166,7 +166,7 @@ stages:
       #!/usr/bin/env bash
       cat >/dev/null    # the item arrives as JSON on stdin; ignore it here
       echo "$CONVEYOR_SOURCE #$CONVEYOR_ITEM_REF is done"
-    onSuccess: done
+    onSuccess: cleaning-up
 
   - name: cleaning-up
     # Buttons a person may press on a card sitting in this stage. Pressing one
