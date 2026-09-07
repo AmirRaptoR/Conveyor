@@ -187,10 +187,14 @@ version: 1
 concurrency:
   perSource: 1      # items in flight per source — safe above 1 too, since an
   global: 1         # item works in its own worktree; see docs/CONTRACTS.md §5
+resources:          # what the work actually consumes. A transition is never
+  claude: 1         # the scarce thing: an account's quota is, and it is shared
+  ssh-prod: 5       # by every stage and repository that reaches for it.
 stages:
   - name: backlog                        # no script: a queue
   - name: refining
     script: refine    # every source must provide a script by this name
+    resources: [claude]  # one of these is taken for the whole transition
     onSuccess: done   # explicit; would default to the next stage anyway.
                        # There is no onFailure and no onBlocked: a refine that
                        # stops wears a blocked mark where it stopped, and
@@ -353,7 +357,26 @@ draft, no conflict, checks green, no unresolved review threads, and quiet for
 which a comment can change the outcome.
 
 It never sleeps: an item resting in a script stage has that script re-run every
-poll, so waiting is exit 10, not a blocked process holding a slot.
+poll, so waiting is exit 10, not a blocked process holding a slot. While it
+waits the card shows a live countdown — the script says what it is waiting for
+and until when (`agents/_blocked:waits`), and the engine only draws it.
+
+A person can end the wait without ending the gate. The stage declares an
+action, the board draws it as a button, and pressing it hands one word to the
+next run:
+
+```yaml
+- name: approving
+  script: approve
+  actions:
+    - name: merge-now
+      label: Merge now
+```
+
+`approve` reads `merge-now` as "stop giving review more room" and nothing else:
+every other rule — not a draft, no conflict, checks green, no unresolved
+threads — still has to pass. An action cannot move an item, choose a stage or
+skip a script; it hands a word to the script, which decides what it means.
 
 This gate is a workflow control, not a security boundary: `approve` runs with
 the same repository credentials as `implement` and `review`, and an agent
@@ -397,6 +420,13 @@ sources:
         in-progress=conveyor:in-progress
         blocked=conveyor:blocked
 ```
+
+An item that stops wears one label, `conveyor:blocked`, and *why* it stopped is
+written into a marked section at the top of the issue body — rewritten in place
+each time, removed when the mark goes, and read straight back by the next
+listing. That is what the board shows: it is the only account of a stop that is
+still true after a restart, after log retention has swept the run, and for a
+mark this pipeline never made.
 
 Credentials are not part of this: the script inherits the ambient environment,
 so `gh`'s existing auth works and no token belongs in a committed config. See

@@ -6,13 +6,13 @@
 # Not a verb: `provider:` resolves only list and move, so a third file here can
 # never be mistaken for a stage script — the same precedent selfcheck.sh sets.
 #
-# Labels are created lazily today, in two places and only when they are first
-# needed: move.sh writes a stage label the first time an item reaches that
-# stage, and a `$BLOCKED_LABEL: <kind>` label the first time a script stops that
-# way. That works, and it means the first stop of a new kind in a new repository
-# is also the first time anyone finds out whether the label write succeeds. This
-# is the one-shot version, so onboarding a repository is one command rather than
-# a discovery spread over a week.
+# move.sh does create a missing label when it turns out it needs one, so a
+# stage added to the config after a repository was onboarded still works. That
+# is a recovery, not a plan: it means the first item into a new stage is also
+# the first time anyone finds out whether the label write succeeds, and it
+# creates the label with a generic colour and description. This is the one-shot
+# version, so onboarding a repository is one command rather than a discovery
+# spread over a week.
 #
 # Idempotent: an existing label is not an error, and neither its colour nor its
 # description is overwritten. Someone may have recoloured a label on purpose,
@@ -29,12 +29,6 @@ BLOCKED_LABEL="${BLOCKED_LABEL:-${LABEL_PREFIX}blocked}"
 # namespace word with its separator taken off. Same fact, one definition —
 # computing it differently here is how the two drift apart.
 ONBOARD_LABEL="${LABEL_PREFIX%[^[:alnum:]]}"
-
-# The kinds the shipped scripts stop with. agents/_blocked documents the first
-# five; the rest are approve's. A kind not listed here still works — move.sh
-# creates its label on first use — so this list being incomplete costs nothing
-# but the one-shot.
-KINDS=(decision limit worktree no-output input timeout error human-review checks conflict merge)
 
 made=0 kept=0
 
@@ -72,13 +66,11 @@ while IFS= read -r line; do
 	label "$name" 1D76DB "Conveyor: $stage"
 done <<<"$STAGE_LABELS"
 
-# The mark, and one label per kind of stop. Same colour and the same description
-# wording move.sh:118-119 writes, so the one-shot and the lazy path cannot
-# produce two different-looking labels for the same kind.
-label "$BLOCKED_LABEL" D93F0B "Conveyor: blocked"
-for kind in "${KINDS[@]}"; do
-	label "$BLOCKED_LABEL: $kind" d4a72c \
-		"Blocked: $kind. Remove the $BLOCKED_LABEL label to hand it back."
-done
+# The mark. One label, and no per-kind labels beside it: which kind of stop it
+# was rides in the section move.sh writes into the issue body, next to the
+# reason it belongs to. There used to be a label per kind, which put the same
+# fact in a third place and made "everything blocked" two queries instead of
+# one; move.sh takes any left over off the next time it writes.
+label "$BLOCKED_LABEL" D93F0B "Conveyor: blocked — read the reason at the top of the issue"
 
 echo "$made created, $kept already there"

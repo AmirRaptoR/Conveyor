@@ -47,6 +47,12 @@ type Item struct {
 	// is blocked, not why. A run's own recorded reason always wins; see
 	// CONTRACTS.md §6 and internal/server's recallBlocks.
 	BlockReason string `json:"blockReason,omitempty"`
+	// BlockKind is the same stop in one word, when the listing can say it —
+	// the provider read it back off whatever it wrote when the mark went on.
+	// Same standing as BlockReason: the item's own account of why it stopped,
+	// which is the only account that survives a restart, a retention sweep,
+	// and a mark set outside this process.
+	BlockKind string `json:"blockKind,omitempty"`
 
 	// Raw is provider passthrough: opaque to the engine, handed back to
 	// scripts untouched.
@@ -167,9 +173,16 @@ type StageInput struct {
 	// person answered: the reply they typed, and the conversation to say it in.
 	// An adapter that can resume uses both; one that cannot uses the answer
 	// alone and starts fresh, which still beats asking the same question twice.
-	Answer  string         `json:"answer,omitempty"`
-	Session string         `json:"session,omitempty"`
-	Config  map[string]any `json:"config,omitempty"`
+	Answer  string `json:"answer,omitempty"`
+	Session string `json:"session,omitempty"`
+	// Manual is the name of an action a person pressed on the board, armed
+	// for exactly this run and spent by it. It is how a human overrides a
+	// wait the script would otherwise sit out — "merge now" rather than
+	// "quiet for ten more minutes" — without the engine knowing what any of
+	// those words mean. Declared per stage in `actions:` so the board knows
+	// which buttons to draw; opaque to the engine beyond that, like Answer.
+	Manual string         `json:"manual,omitempty"`
+	Config map[string]any `json:"config,omitempty"`
 }
 
 // Resume is what a person said, and where the agent should say it.
@@ -183,6 +196,28 @@ type StageInput struct {
 type Resume struct {
 	Answer  string `json:"answer,omitempty"`
 	Session string `json:"session,omitempty"`
+	// Manual is an action a person pressed, armed for the next run of that
+	// item's stage and spent by it. Kept here rather than in a store of its
+	// own because it is the same fact in the same shape — something a person
+	// said, held until the run that was waiting for it actually happens, and
+	// then gone.
+	Manual string `json:"manual,omitempty"`
+}
+
+// Waiting is a script saying what it is waiting for, and until when.
+//
+// Written into $CONVEYOR_RESULT beside a `noop` exit: "nothing to do yet, and
+// here is the moment that changes". The engine stores it and hands it to the
+// board, which draws the countdown; it never reads Why and never acts on
+// Until. A stage that waits for something with no deadline — a review, a
+// person — simply gives no Until, and the board says what it is waiting for
+// without a clock.
+//
+// It exists because a resting item is otherwise indistinguishable from a
+// stuck one: both sit still, and only the script knows which.
+type Waiting struct {
+	Until time.Time `json:"until,omitempty"`
+	Why   string    `json:"why,omitempty"`
 }
 
 // DoctorInput is the JSON piped to a doctor script's stdin: one marked item,

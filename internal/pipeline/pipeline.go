@@ -31,22 +31,30 @@ import (
 //   - perStage bounds how many items sit in one stage at a time. One means the
 //     pipeline behaves like a real line — a station works a single item, and
 //     the next waits — while different stations run at once.
-//   - global caps the total, because every slot is an agent and they are not
-//     free.
+//   - global caps the total number of transitions.
+//   - resources bound the scarce things the work actually consumes, by name:
+//     one account's quota, one deploy host, one database. This is the axis
+//     that means anything, because a transition is not what runs out. `global`
+//     counts every transition equally, so the number had to be chosen for the
+//     agents and a stage that only reads an API queued behind them for no
+//     reason; a stage naming no resource is now bounded by nothing but
+//     `global`, which is where the cheap work belongs.
 //
-// A transition needs a slot on all three, and takes none unless it can have
+// A transition needs a slot on every axis, and takes none unless it can have
 // them all: holding one while waiting for another is how two schedulers
 // deadlock each other.
 type Locks struct {
-	mu        sync.Mutex
-	bySource  map[string]int
-	byStage   map[string]int
-	perSource int
-	perStage  int
-	global    chan struct{}
+	mu          sync.Mutex
+	bySource    map[string]int
+	byStage     map[string]int
+	byResource  map[string]int
+	perSource   int
+	perStage    int
+	perResource map[string]int
+	global      chan struct{}
 }
 
-func NewLocks(global, perStage, perSource int) *Locks {
+func NewLocks(global, perStage, perSource int, resources map[string]int) *Locks {
 	if global < 1 {
 		global = 1
 	}
@@ -56,25 +64,60 @@ func NewLocks(global, perStage, perSource int) *Locks {
 	if perSource < 1 {
 		perSource = 1
 	}
+	limits := make(map[string]int, len(resources))
+	for k, v := range resources {
+		if v < 1 {
+			v = 1
+		}
+		limits[k] = v
+	}
 	return &Locks{
-		bySource:  map[string]int{},
-		byStage:   map[string]int{},
-		perSource: perSource,
-		perStage:  perStage,
-		global:    make(chan struct{}, global),
+		bySource:    map[string]int{},
+		byStage:     map[string]int{},
+		byResource:  map[string]int{},
+		perSource:   perSource,
+		perStage:    perStage,
+		perResource: limits,
+		global:      make(chan struct{}, global),
 	}
 }
 
-// TryAcquire takes a slot on all three axes, or reports false without blocking.
+// full reports the first axis that would refuse this transition, or "".
+// Caller holds l.mu.
+func (l *Locks) full(src, stage string, resources []string) string {
+	if l.bySource[src] >= l.perSource {
+		return "source " + src
+	}
+	if l.byStage[stage] >= l.perStage {
+		return "stage " + stage
+	}
+	for _, r := range resources {
+		// A resource with no declared limit is refused rather than treated as
+		// unlimited. Config validation already rejects one, so reaching here
+		// means the config changed under a running engine, and "unlimited" is
+		// the wrong way to be wrong about a thing somebody named because it
+		// was scarce.
+		limit, ok := l.perResource[r]
+		if !ok || l.byResource[r] >= limit {
+			return "resource " + r
+		}
+	}
+	return ""
+}
+
+// TryAcquire takes a slot on every axis, or reports false without blocking.
 // Never blocks, so a busy source is skipped rather than queueing work behind it.
-func (l *Locks) TryAcquire(src, stage string) bool {
+func (l *Locks) TryAcquire(src, stage string, resources ...string) bool {
 	l.mu.Lock()
-	if l.bySource[src] >= l.perSource || l.byStage[stage] >= l.perStage {
+	if l.full(src, stage, resources) != "" {
 		l.mu.Unlock()
 		return false
 	}
 	l.bySource[src]++
 	l.byStage[stage]++
+	for _, r := range resources {
+		l.byResource[r]++
+	}
 	l.mu.Unlock()
 
 	select {
@@ -82,10 +125,7 @@ func (l *Locks) TryAcquire(src, stage string) bool {
 		return true
 	default:
 		// The global cap is full; give back what was taken rather than hold it.
-		l.mu.Lock()
-		l.bySource[src]--
-		l.byStage[stage]--
-		l.mu.Unlock()
+		l.give(src, stage, resources)
 		return false
 	}
 }
@@ -93,24 +133,41 @@ func (l *Locks) TryAcquire(src, stage string) bool {
 // Busy reports whether a transition would be refused right now. Advisory: the
 // scheduler uses it to skip candidates cheaply, and TryAcquire remains the
 // only authority.
-func (l *Locks) Busy(src, stage string) bool {
+func (l *Locks) Busy(src, stage string, resources ...string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.bySource[src] >= l.perSource || l.byStage[stage] >= l.perStage
+	return l.full(src, stage, resources) != ""
 }
 
-func (l *Locks) Release(src, stage string) {
+// Holding names the axis that would refuse this transition, for a board that
+// has to say why nothing started. Empty when nothing would refuse it.
+func (l *Locks) Holding(src, stage string, resources ...string) string {
 	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.full(src, stage, resources)
+}
+
+func (l *Locks) Release(src, stage string, resources ...string) {
+	l.give(src, stage, resources)
+	select {
+	case <-l.global:
+	default:
+	}
+}
+
+func (l *Locks) give(src, stage string, resources []string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.bySource[src] > 0 {
 		l.bySource[src]--
 	}
 	if l.byStage[stage] > 0 {
 		l.byStage[stage]--
 	}
-	l.mu.Unlock()
-	select {
-	case <-l.global:
-	default:
+	for _, r := range resources {
+		if l.byResource[r] > 0 {
+			l.byResource[r]--
+		}
 	}
 }
 
@@ -121,9 +178,27 @@ func (l *Locks) Release(src, stage string) {
 // are unworkable, or a slot was taken and never given back. The first two can
 // be read off /api/state; the third could not be seen at all.
 func (l *Locks) Snapshot() (bySource, byStage map[string]int, global, globalMax, perSource, perStage int) {
+	bySource, byStage, _, global, globalMax, perSource, perStage = l.snapshot()
+	return
+}
+
+// Resources reports each declared resource as held/limit, including the ones
+// nothing is currently using — a limit nobody can see is a limit nobody can
+// reason about when the board is not starting anything.
+func (l *Locks) Resources() map[string][2]int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	bySource, byStage = map[string]int{}, map[string]int{}
+	out := make(map[string][2]int, len(l.perResource))
+	for name, limit := range l.perResource {
+		out[name] = [2]int{l.byResource[name], limit}
+	}
+	return out
+}
+
+func (l *Locks) snapshot() (bySource, byStage, byResource map[string]int, global, globalMax, perSource, perStage int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	bySource, byStage, byResource = map[string]int{}, map[string]int{}, map[string]int{}
 	for k, v := range l.bySource {
 		if v != 0 {
 			bySource[k] = v
@@ -134,7 +209,12 @@ func (l *Locks) Snapshot() (bySource, byStage map[string]int, global, globalMax,
 			byStage[k] = v
 		}
 	}
-	return bySource, byStage, len(l.global), cap(l.global), l.perSource, l.perStage
+	for k, v := range l.byResource {
+		if v != 0 {
+			byResource[k] = v
+		}
+	}
+	return bySource, byStage, byResource, len(l.global), cap(l.global), l.perSource, l.perStage
 }
 
 // Attempts counts consecutive failures per item AND stage so maxAttempts can
@@ -203,7 +283,7 @@ type Engine struct {
 func New(cfg *config.Config, r *runner.Runner) *Engine {
 	e := &Engine{
 		cfg: cfg, runner: r,
-		locks:    NewLocks(cfg.Concurrency.Global, cfg.Concurrency.PerStage, cfg.Concurrency.PerSource),
+		locks:    NewLocks(cfg.Concurrency.Global, cfg.Concurrency.PerStage, cfg.Concurrency.PerSource, cfg.Resources),
 		attempts: NewAttempts(),
 		clients:  map[string]*source.Client{},
 	}
@@ -289,6 +369,12 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 		script, ok = "", true // written into the run directory instead
 		env = src.Env
 	}
+	// A person pressed a button, and this is the run it was armed for. In the
+	// environment as well as on stdin because the scripts that read it are
+	// shell, and one `[[ -n "$CONVEYOR_MANUAL" ]]` beats parsing stdin twice.
+	if resume.Manual != "" {
+		env = mergeEnv(env, map[string]string{"CONVEYOR_MANUAL": resume.Manual})
+	}
 
 	// res always ends up non-nil below unless the failure is one route() has
 	// no run record to route through at all (the run directory itself could
@@ -319,7 +405,8 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 			From:    from,
 			To:      to,
 			Timeout: timeout,
-			Stdin:   model.StageInput{Item: item, Stage: to, From: from, Answer: resume.Answer, Session: resume.Session},
+			Stdin: model.StageInput{Item: item, Stage: to, From: from,
+				Answer: resume.Answer, Session: resume.Session, Manual: resume.Manual},
 		})
 		if runErr != nil && res == nil {
 			// A genuine infrastructure failure before the script had any

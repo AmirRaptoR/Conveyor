@@ -14,7 +14,10 @@
 #   QUIET_SECONDS    how long the PR must be quiet before it merges (default
 #                     600). A non-integer or negative value falls back to the
 #                     default and says so on stderr. 0 is valid, so the gate
-#                     can be exercised without waiting.
+#                     can be exercised without waiting. A person may skip the
+#                     remaining silence with the `merge-now` action, which the
+#                     stage has to declare in `actions:` for the board to
+#                     offer it.
 #   PROMPT           what to tell the model when addressing review threads.
 #   CONFLICT_RESOLVE exactly "0" restores the old behaviour of marking every
 #                     conflict a plain rebase could not fix; any other value,
@@ -54,7 +57,11 @@
 #  11. an unresolved thread it has not answered -> address, test, push, reply,
 #      resolve -> exit 10
 #  12. an unresolved thread it already answered -> exit 20  (decision)
-#  13. now - base < QUIET_SECONDS            -> exit 10
+#  13. now - base < QUIET_SECONDS            -> exit 10, with a countdown for
+#      the board (agents/_blocked:waits) — unless a person pressed the
+#      `merge-now` action, which skips this gate and only this one: every rule
+#      above it still had to pass, so "merge now" means "stop giving review
+#      more room", never "merge whatever state it is in"
 #  14. otherwise -> refetch 4-12, then merge, bound to the exact commit that
 #      just passed every gate above:
 #        a. the PR is already queued to merge or already has auto-merge
@@ -925,10 +932,20 @@ check_gates_once() {
 	now=$(date -u +%s)
 	elapsed=$((now - base))
 	if ((elapsed < QUIET)); then
-		echo "PR #$pr has been quiet for ${elapsed}s of ${QUIET}s required; not yet" >&2
-		exit 10
+		# The one gate a person may open by hand. It is a *wait*, not a check:
+		# every rule above this one still had to pass, so "merge now" means
+		# "stop giving review more room", never "merge whatever state it is
+		# in". Skipping a green, unconflicted, unreviewed-thread-free PR's
+		# remaining silence is a judgement a person is entitled to make.
+		if manual_action merge-now; then
+			echo "PR #$pr has been quiet for only ${elapsed}s of ${QUIET}s, but merge-now was pressed" >&2
+		else
+			waits "waiting for pull request #$pr to stay quiet for ${QUIET}s; any activity restarts the clock" \
+				"$((base + QUIET))"
+		fi
+	else
+		echo "PR #$pr has been quiet for ${elapsed}s (>= ${QUIET}s required)" >&2
 	fi
-	echo "PR #$pr has been quiet for ${elapsed}s (>= ${QUIET}s required)" >&2
 }
 
 check_gates_once

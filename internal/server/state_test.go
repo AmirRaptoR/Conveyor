@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -289,28 +290,67 @@ func TestAListingSuppliedReasonIsShownWithNoRunToExplainIt(t *testing.T) {
 	}
 }
 
-// A recovered run-history reason always wins over a listing-supplied one — a
-// listing's reason exists only to cover the gap where no run explains the
-// mark at all.
-func TestARunHistoryReasonBeatsAListingSuppliedOne(t *testing.T) {
+// The listing's account of a mark beats run history, because the provider
+// reads it off the item itself: the GitHub adapter writes the reason into a
+// marked section of the issue body and reads that same section back, so it is
+// this poll's truth. Run history is history — the newest stop of that stage
+// may have been cleared and replaced since, and showing it sends the reader
+// to a log that explains nothing.
+func TestTheListingsOwnReasonBeatsRunHistory(t *testing.T) {
 	cfg, r := boardFor(t)
 	s := New(cfg, r)
-	day := filepath.Join(r.Root, "2026-08-28", "120000.000-bbbb")
-	if err := os.MkdirAll(day, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	meta := `{"id":"120000.000-bbbb","source":"s1","itemId":"s1:1","kind":"stage",
-	          "to":"working","outcome":"blocked","exitCode":20}`
-	if err := os.WriteFile(filepath.Join(day, "meta.json"), []byte(meta), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(day, "result.json"), []byte(`{"blocked":true,"reason":"the checkout is dirty"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeBlockedRun(t, r.Root, "s1:1", "working", `{"blocked":true,"reason":"an older stop, since cleared"}`)
 	s.recallBlocks([]model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true,
-		BlockReason: "a listing-supplied reason that should be ignored"}})
+		BlockKind: "status", BlockReason: "why it is actually stopped right now"}})
+	if got := s.blocks["s1:1"].Reason; got != "why it is actually stopped right now" {
+		t.Errorf("reason = %q, want the listing's own reason", got)
+	}
+	if got := s.blocks["s1:1"].Kind; got != "status" {
+		t.Errorf("kind = %q, want the listing's own kind", got)
+	}
+}
+
+// Run history still answers when the listing says nothing — a provider with
+// nowhere to record a reason, or a mark whose reason predates the section
+// move.sh now writes.
+func TestRunHistoryStillAnswersWhenTheListingSaysNothing(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	writeBlockedRun(t, r.Root, "s1:1", "working", `{"blocked":true,"reason":"the checkout is dirty"}`)
+	s.recallBlocks([]model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true}})
 	if got := s.blocks["s1:1"].Reason; got != "the checkout is dirty" {
-		t.Errorf("reason = %q, want the run's own reason to win", got)
+		t.Errorf("reason = %q, want the run's own reason", got)
+	}
+}
+
+// A run of a stage the item has since left explains nothing about why it is
+// stopped now. The walk is newest-first over the whole store, so without this
+// the newest failure anywhere answered for a mark it had nothing to do with.
+func TestAMarkIsNotExplainedByARunOfADifferentStage(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	writeBlockedRun(t, r.Root, "s1:1", "some-other-stage", `{"blocked":true,"reason":"a failure three stages ago"}`)
+	s.recallBlocks([]model.Item{{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true}})
+	if got := s.blocks["s1:1"].Reason; strings.Contains(got, "three stages ago") {
+		t.Errorf("reason = %q, want the other stage's run to be ignored", got)
+	}
+}
+
+// writeBlockedRun files one finished stage run that marked an item, as the
+// runner would have.
+func writeBlockedRun(t *testing.T, root, itemID, stage, result string) {
+	t.Helper()
+	dir := filepath.Join(root, "2026-08-28", "120000.000-"+stage)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := fmt.Sprintf(`{"id":"120000.000-%s","source":"s1","itemId":%q,"kind":"stage",
+	          "to":%q,"outcome":"blocked","exitCode":20}`, stage, itemID, stage)
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "result.json"), []byte(result), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 

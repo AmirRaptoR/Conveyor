@@ -31,11 +31,14 @@ arrive in this shape.
   "blocked": false,             // a MARK, not a stage. true means a human must
                                 // decide, and the item stays exactly where it
                                 // is. The scheduler never picks a marked item.
-  "blockReason": null,          // optional. A reason for `blocked` the LISTING
-                                // itself supplies — for a mark no run in this
-                                // pipeline produced, so there is nothing to
-                                // recover from run history (§6). A recovered
-                                // run reason always wins when there is one.
+  "blockReason": null,          // optional, and preferred over run history:
+                                // the LISTING reads it back off the item
+                                // itself, so it is this poll's truth and it
+                                // survives a restart and a retention sweep.
+                                // Run history answers only when the listing
+                                // says nothing, and only a run of the stage
+                                // the item is actually in (§6).
+  "blockKind": null,            // optional. The same stop in one word.
   "priority": 2,                // 0 = most urgent. null = unranked.
   "assignee": null,
   "createdAt": "2026-08-20T10:00:00Z",
@@ -63,6 +66,20 @@ Rules the engine enforces:
   that asked for a human stops being re-run: nothing carries the item out of the
   line, so nothing has to decide where to put it back.
 
+**The item's own status is the truth about the item, and a listing must not
+argue with it.** A source that has a notion of finished — GitHub closes an
+issue — reports what that status says, not what its own bookkeeping says. A
+pull request merged by hand closes the issue with no stage of this pipeline
+having moved anything; the item is finished, and reporting it in the stage its
+labels still name (marked, because the two disagree) produces a card nobody can
+ever clear. It is worse than useless: the mark cannot pass, because the thing
+that would clear it has already happened. Report the terminal stage, and
+reconcile whatever the provider records so the next listing derives the same
+answer without the special case. The mirror image is the same rule: an item
+whose status says it is *not* finished does not sit in a terminal stage on the
+strength of a label, and a source that has a notion of *abandoned* — closed as
+not planned — reports nothing at all for it, because it is not work any more.
+
 ## 2. The script contract
 
 One contract for every script the engine runs. No exceptions — an extension
@@ -73,7 +90,7 @@ author learns it once.
 | | |
 | --- | --- |
 | `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "blocked": false, "config": {...}}`, plus `"answer"` and `"session"` when this run follows a stop a person answered (§5a). For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "terminalStages": ["done"], "config": {...}}` — `terminalStages` is which of `stages` are terminal, so a list script can tell a finished item from one that merely stopped without keeping its own copy of the stage graph in source `env:` |
-| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, `CONVEYOR_DEADLINE` (§4b), plus everything in the source's `env:` block |
+| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, `CONVEYOR_DEADLINE` (§4b), `CONVEYOR_MANUAL` when a person armed one of this stage's `actions:` for this run (§5b), plus everything in the source's `env:` block |
 
 **Output** is split deliberately:
 
@@ -142,10 +159,15 @@ leave it inconsistent. Receives
 `{"item":…, "stage": "<target>", "from": "<current>", "blocked": <bool>,
 "blockedReason": "…", "blockedKind": "…"}`.
 
-How a provider records the kind is its own business: the GitHub adapter writes a
-second label beside the mark, `blocked: <kind>`, creating it if the repository
-has never seen that kind of stop before. The plain mark stays exactly what it
-was, so "everything blocked" is still one query and one label to remove.
+How a provider records the reason and the kind is its own business, but it must
+be somewhere the *item itself* carries, not somewhere only this process knows:
+the GitHub adapter writes them into a marked section at the top of the issue
+body, rewritten in place on every mark and removed when the mark goes. That is
+what `list` reads back into `blockReason`/`blockKind`, and what lets a board
+say why an item stopped after a restart, after a retention sweep, and for a
+mark nothing in this pipeline made. One mark label and no more: the kind was a
+second label once, which put the same fact in a third place and made
+"everything blocked" two queries.
 
 Both facts go every time, and `blocked` is always present. There is no separate
 verb for the mark: a mark is provider state, and this is how provider state gets
@@ -343,7 +365,35 @@ concurrency:
   perSource: 2      # items in flight per source
   perStage:  2      # items in flight in one stage
   global:    4      # items in flight anywhere
+
+resources:          # what the work consumes, and how much of it there is
+  claude:   1
+  codex:    2
+  ssh-prod: 5
+
+stages:
+  - name: in-progress
+    script: implement
+    resources: [claude]
 ```
+
+**The scarce thing is never "a transition".** It is one account's quota, one
+deploy host, one staging database — and those are shared across every stage and
+every repository that reaches for them, which is exactly what `perSource`,
+`perStage` and `global` cannot express. Counting transitions meant the number
+had to be chosen for the agent runs, so a stage that only reads the GitHub API
+queued behind them for no reason at all.
+
+A stage lists what its work consumes; a transition takes one of each before it
+starts and gives them back when it ends, and it takes **all or none** — holding
+one while waiting for another is how two schedulers deadlock each other. A stage
+naming nothing is bounded only by `global`, which is the right answer for the
+cheap ones. A name with no limit under `resources:` is a load error, because a
+silently unlimited resource is the failure the mechanism exists to prevent.
+
+The same stage is Claude in one repository and Codex in the next, so a source
+may replace the list for its own version of a script (`scripts.<name>.resources`);
+`[]` there says it spends nothing, which is not the same as saying nothing.
 
 `perSource` above 1 is safe only because an item works in **its own git
 worktree**, not in the source's checkout — see `agents/_worktree`. Two agents in
@@ -432,7 +482,10 @@ Three exceptions, and they matter:
   needs to read afterwards.
 - **The most recent failed, blocked or timeout run of an item that is still
   marked is never deleted.** Retention must never delete the evidence for the
-  thing currently asking for attention.
+  thing currently asking for attention. A run only ever explains a mark in the
+  stage it ran in: the history walk is newest-first across the whole store, so
+  without that restriction the newest failure anywhere answered for a mark it
+  had nothing to do with, and the card sent its reader to an unrelated log.
 - **The most recent successful move that landed a currently-listed item in the
   stage it currently occupies is never deleted.** Sweeping it would blank the
   stage-age chip for an item still sitting right there.
@@ -467,16 +520,33 @@ it names none, the run record supplies one. The engine never interprets the
 word, only its shape: too long or punctuated and it is dropped, because it is
 about to become a label on someone's issue tracker.
 
-**The mark carries its reason.** The provider is the authority on *whether* an
-item is marked; *why* is the engine's own note, taken from the run that marked
-it and recovered from run history after a restart. A red card that cannot say
+**The mark carries its reason, and the item carries the mark.** The provider is
+the authority on *whether* an item is marked, and it should be the authority on
+*why* too: a provider that can record the reason against the item writes it
+there when the mark goes on and reads it back on the next listing
+(`blockReason`/`blockKind`, §1). That is what the board shows, because it is
+the only account that is still true after a restart, after retention has swept
+the run, and for a mark this pipeline never made. A red card that cannot say
 what it is waiting for sends the reader to the logs, which is the trip the mark
-exists to save. A mark someone applied by hand has no run behind it, and says so
-— unless the listing itself supplied a reason (`blockReason` on the item, §1),
-for a mark this pipeline decided on during listing rather than during a stage
-run (a closed issue found sitting in a non-terminal stage, say). A recovered
-run-history reason always wins when one exists; the listing's reason is only
-the fallback for the gap where no run explains the mark at all.
+exists to save.
+
+Run history is the fallback, not the source. It answers when the listing says
+nothing — a provider with nowhere to record a reason, a mark set by hand — and
+only a run of the stage the item is *in*: the walk is newest-first across the
+whole store, and without that restriction the newest failed run anywhere
+explained a mark it had nothing to do with. When both exist and disagree, the
+listing wins; the run is still worth reading for what only it knows — whether
+the stop was a question, the session that asked it, the options it offered —
+but only while the two are describing the same stop.
+
+**A script may say what it is waiting for.** Exiting 10 with
+`{"waiting": {"until": "<RFC 3339>", "why": "…"}}` in `$CONVEYOR_RESULT` says
+"nothing to do yet, and here is what would change that". The engine stores it
+against the item and hands it to the board, which draws a live countdown; it
+reads neither field and acts on neither. `until` is optional — plenty of waits
+have no deadline — and a wait without one says what it is for and draws no
+clock. It exists because a resting item and a stuck one look identical
+otherwise: both sit still, and only the script that stopped knows which.
 
 **A stop is either a question or a condition**, and the script says which. A
 condition — out of quota, a dirty checkout, a network that was down — may have
@@ -543,3 +613,32 @@ rediscovery but never costs the answer.
 
 An answer is spent when it is handed over. A second run of the same stage is not
 a second reply to one question.
+
+## 5b. Actions: the manual override
+
+A stage may declare buttons:
+
+```yaml
+- name: approving
+  script: approve
+  actions:
+    - name: merge-now
+      label: Merge now
+      confirm: Merge without waiting out the quiet period?
+```
+
+Pressing one arms a single word for **the next run of that stage for that
+item** — delivered in `$CONVEYOR_MANUAL` and as `"manual"` on stdin, and spent
+by that run — and clears the item's deferral so the run happens now rather than
+at the next listing.
+
+That is the whole of it, and the smallness is the point. An action cannot move
+an item, choose a stage, or skip a script: it hands one word to the script,
+which decides what — if anything — it means. A gate a person can open stays a
+gate the script still owns. `approve` reads `merge-now` and takes it to mean
+"stop giving review more room"; every other rule in that gate still has to
+pass, so a person cannot press a red build into main. The engine never learns
+what any action means, exactly as it never learns what a `kind` means.
+
+Pairs with the waiting report in §6: one says what the script is waiting for,
+the other lets a person say "not any more".

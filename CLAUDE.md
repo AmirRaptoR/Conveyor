@@ -153,9 +153,54 @@ every repository the config enrols.
   waiting on a quiet pull request filed fourteen hundred runs an hour, each a
   real API call. The circuit breaker in `schedule` capped each burst and let
   the next one start, so it read as a warning rather than a fault.
+- **A limit is about a resource, never about a transition.** `resources:` names
+  the scarce things — one account's quota, one deploy host, one staging
+  database — and a stage lists which it spends; a transition takes one of each
+  before it starts, all or none, and gives them back when it ends.
+  `global`/`perStage`/`perSource` count transitions, which meant the number had
+  to be chosen for the agent runs and a stage that only reads the GitHub API
+  queued behind them for nothing. A stage naming no resource is bounded only by
+  `global`. A resource named with no limit declared is a load error, and an
+  undeclared one is refused at the lock rather than treated as unlimited: a
+  silently unlimited resource is the failure this exists to prevent. The same
+  stage is Claude in one repo and Codex in the next, so a source's
+  `scripts.<name>.resources` replaces the stage's list; `[]` there means "spends
+  nothing", which is not the same as saying nothing.
+- **A script says what it is waiting for; a person says "not any more".** Exit
+  10 with `{"waiting": {"until": …, "why": …}}` draws a live countdown on the
+  card — a resting item and a stuck one look identical otherwise. A stage
+  declares `actions:`, the board draws them as buttons, and pressing one arms
+  one word for the next run of that stage (`$CONVEYOR_MANUAL`, and `manual` on
+  stdin) and clears the deferral so it happens now. That word is the whole of
+  the manual override: it cannot move an item, choose a stage or skip a script.
+  `approve` reads `merge-now` as "stop giving review more room" and *only*
+  that — every other gate still has to pass, so nobody presses a red build
+  into main.
 - **The scheduler claims a slot before it launches.** Checking whether a slot is
   free and then starting a goroutine leaves a gap in which the next pass decides
   the same thing again. `Engine.Advance` does not lock; its caller must.
+- **The item's status is the truth about the item.** A closed-as-completed
+  GitHub issue is finished, whatever stage label it is still wearing, and
+  `list.sh` reports it in the terminal stage and reconciles the labels through
+  `move.sh` rather than keeping a second copy of that script's rules. It used
+  to be marked in place instead — "closed while still in `approving`" — which
+  produced a red card nobody could ever clear, because the thing that would
+  clear it (the PR becoming open again) had already happened and cannot
+  un-happen. A pull request merged by hand is the ordinary way to get there.
+  The mirror image is the same rule: an open issue wearing the terminal stage
+  label is *not* finished and is marked so a person reconciles it, and an issue
+  closed as not planned is not work any more and leaves the board entirely.
+- **A mark is one label and a section in the issue body.** `conveyor:blocked`,
+  and nothing beside it — the `conveyor:blocked: <kind>` label is gone, because
+  it put the same fact in a third place and made "everything blocked" two
+  queries. The kind and the reason go into a `<!-- conveyor:block … -->`
+  section at the top of the issue: rewritten in place on every mark, removed
+  when the mark goes, and read straight back by `list.sh` into `blockReason` /
+  `blockKind`. That is what the board shows. Run history is the *fallback*, not
+  the source, and only a run of the stage the item is actually in — the walk is
+  newest-first across the whole store, so without that restriction a three-day
+  old `in-progress` failure was displayed as the reason a card was stuck in
+  `approving`. The old append-only comment is gone with it.
 - **Blocked is a mark on the item, not a stage it moves to.** An item that
   stopped stays in the stage it stopped in and wears a mark the provider writes
   in its own vocabulary (a `blocked` label on GitHub). The scheduler never picks

@@ -67,6 +67,10 @@ type State struct {
 	// the question this board gets asked most, and a held slot is the one cause
 	// that leaves no other trace.
 	Slots SlotsView `json:"slots"`
+	// Waiting is what each resting item said it is waiting for. The engine
+	// neither reads Why nor acts on Until; it is here so a card can draw a
+	// live countdown instead of looking stopped.
+	Waiting map[string]model.Waiting `json:"waiting,omitempty"`
 	// Active is every transition running right now. The board lights those
 	// stations; without it the page cannot tell work from stillness.
 	Active []Active `json:"active"`
@@ -110,6 +114,10 @@ type SlotsView struct {
 	GlobalMax int            `json:"globalMax"`
 	PerSource int            `json:"perSource"`
 	PerStage  int            `json:"perStage"`
+	// Resources is every declared resource as [held, limit] — including the
+	// ones nothing is using, because a limit nobody can see is a limit nobody
+	// can reason about on a board that has stopped starting things.
+	Resources map[string][2]int `json:"resources,omitempty"`
 	// Running is how many transitions are actually in flight. It should equal
 	// Global; anything else is a slot taken and not given back, which stops the
 	// board dead while every item still reads as free.
@@ -170,6 +178,18 @@ type StageView struct {
 	Next     string `json:"next,omitempty"`
 	Runs     bool   `json:"runs"`
 	Terminal bool   `json:"terminal"`
+	// Actions are the buttons a person may press on a card in this stage.
+	// The board draws exactly these and nothing else, and the endpoint
+	// accepts exactly what the board could have offered.
+	Actions []ActionView `json:"actions,omitempty"`
+}
+
+// ActionView is one manual override a stage offers.
+type ActionView struct {
+	Name  string `json:"name"`
+	Label string `json:"label"`
+	// Confirm, when set, is asked before the action is armed.
+	Confirm string `json:"confirm,omitempty"`
 }
 
 // Block is why an item stopped, and where to read the rest of it.
@@ -401,7 +421,14 @@ type Server struct {
 	// The tick button's own clear ignores this: "look again now" overrides
 	// every deferral regardless of when it was set.
 	restingAt map[string]time.Time
-	tick      chan struct{} // one buffered slot: ticks never queue up
+	// waiting is what a resting item said it is waiting for, and until when —
+	// model.Waiting off that run's own $CONVEYOR_RESULT. A resting item and a
+	// stuck one look identical on a board otherwise: both sit still, and only
+	// the script that stopped knows which it is. Set and cleared with the
+	// deferral itself, because a countdown that outlives the thing it was
+	// counting down to is worse than no countdown.
+	waiting map[string]model.Waiting
+	tick    chan struct{} // one buffered slot: ticks never queue up
 	// wake asks the scheduler to look again. One buffered slot, because the
 	// question is always the same one — what can move now — and a queue of it
 	// would be a queue of duplicates.
@@ -484,6 +511,8 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 	s.paused = map[string]PauseView{}
 	s.resting = map[string]bool{}
 	s.restingAt = map[string]time.Time{}
+	s.waiting = map[string]model.Waiting{}
+	s.waiting = map[string]model.Waiting{}
 	s.confirmedAt = map[string]time.Time{}
 	s.sourceGen = map[string]time.Time{}
 	s.answerInfo = map[string]AnswerView{}
@@ -553,7 +582,15 @@ func (s *Server) notePersistFault(res *runner.Result) {
 func stageViews(c *config.Config) []StageView {
 	out := make([]StageView, len(c.Stages))
 	for i, st := range c.Stages {
-		out[i] = StageView{Name: st.Name, Script: st.Script, Next: st.OnSuccess, Runs: st.Runs(), Terminal: st.Terminal}
+		v := StageView{Name: st.Name, Script: st.Script, Next: st.OnSuccess, Runs: st.Runs(), Terminal: st.Terminal}
+		for _, a := range st.Actions {
+			label := a.Label
+			if label == "" {
+				label = a.Name
+			}
+			v.Actions = append(v.Actions, ActionView{Name: a.Name, Label: label, Confirm: a.Confirm})
+		}
+		out[i] = v
 	}
 	return out
 }

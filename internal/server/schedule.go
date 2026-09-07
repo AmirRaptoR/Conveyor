@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/model"
@@ -16,10 +17,10 @@ import (
 type claimRefusal int
 
 const (
-	claimAccepted claimRefusal = iota
-	claimItemBusy              // this item already has a transition in flight
-	claimSlotBusy              // the (source, stage) slot has none free
-	claimAgentPaused           // the stage's agent is over quota and overridePause is false
+	claimAccepted    claimRefusal = iota
+	claimItemBusy                 // this item already has a transition in flight
+	claimSlotBusy                 // the (source, stage) slot has none free
+	claimAgentPaused              // the stage's agent is over quota and overridePause is false
 )
 
 // claim is the only place s.working is populated. Every dispatch path — the
@@ -51,7 +52,7 @@ func (s *Server) claim(item model.Item, target string, overridePause bool) claim
 	if _, already := s.working.LoadOrStore(item.ID, struct{}{}); already {
 		return claimItemBusy
 	}
-	if !s.eng.Locks().TryAcquire(item.Source, target) {
+	if !s.eng.Locks().TryAcquire(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...) {
 		s.working.Delete(item.ID)
 		return claimSlotBusy
 	}
@@ -103,6 +104,7 @@ func (s *Server) launch(ctx context.Context) int {
 	// re-picking the same candidate and never terminates.
 	fullSrc := map[string]bool{}
 	fullStage := map[string]bool{}
+	fullResource := map[string]bool{}
 	// Items claimAndLaunch has already turned away this pass — a race with a
 	// manual start, not a full axis, so it excludes only this one candidate
 	// rather than every item sharing its source or stage.
@@ -113,11 +115,14 @@ func (s *Server) launch(ctx context.Context) int {
 		for _, it := range items {
 			target, ok := pipeline.Target(s.cfg, &it)
 			if !ok || fullSrc[it.Source] || fullStage[target] || busy[it.ID] ||
-				s.eng.Locks().Busy(it.Source, target) {
+				s.eng.Locks().Busy(it.Source, target, s.cfg.ResourcesFor(it.Source, target)...) {
 				continue
 			}
 			if staleSrc[it.Source] {
 				continue // its items are its last-good listing, not this poll's
+			}
+			if spends(s.cfg.ResourcesFor(it.Source, target), fullResource) {
+				continue // something it needs is already all in use
 			}
 			// Whose quota this would spend, and whether they have any. Checked
 			// here and not in Pick, because it is a fact about the world right
@@ -144,8 +149,18 @@ func (s *Server) launch(ctx context.Context) int {
 		// double-launch this item.
 		switch s.claimAndLaunch(ctx, *item, target, false) {
 		case claimSlotBusy:
-			fullSrc[item.Source] = true
-			fullStage[target] = true
+			// Which axis refused decides how much of the listing this rules
+			// out. A full source or stage rules out everything routed there;
+			// a full resource rules out everything that spends it, which may
+			// be a different set entirely — an agent's quota is shared across
+			// every repository and stage that names it.
+			switch held := s.eng.Locks().Holding(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...); {
+			case strings.HasPrefix(held, "resource "):
+				fullResource[strings.TrimPrefix(held, "resource ")] = true
+			default:
+				fullSrc[item.Source] = true
+				fullStage[target] = true
+			}
 			continue
 		case claimItemBusy, claimAgentPaused:
 			busy[item.ID] = true
@@ -165,8 +180,18 @@ func (s *Server) transition(ctx context.Context, item model.Item, target string)
 	defer s.wakeUp()
 	defer s.inFlight.Add(-1)
 	defer s.working.Delete(item.ID)
-	defer s.eng.Locks().Release(item.Source, target)
+	defer s.eng.Locks().Release(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...)
 	s.runOne(ctx, item, target)
+}
+
+// spends reports whether any of these resources is in the exhausted set.
+func spends(resources []string, full map[string]bool) bool {
+	for _, r := range resources {
+		if full[r] {
+			return true
+		}
+	}
+	return false
 }
 
 // runOne performs one transition and keeps the board honest about it.
@@ -206,7 +231,11 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 		// must survive to be handed to whichever run actually receives it.
 	case tr.Outcome == model.OutcomeFailure || tr.Outcome == model.OutcomeTimeout:
 		if resume.Answer != "" && resume.Session != "" {
-			_ = s.answers.Set(item.ID, model.Resume{Answer: resume.Answer})
+			// The session is dropped and everything else a person said is
+			// kept: a resume that did not work names a conversation worth
+			// abandoning, but the reply and the button they pressed were
+			// never actually acted on and should reach the run that is.
+			_ = s.answers.Set(item.ID, model.Resume{Answer: resume.Answer, Manual: resume.Manual})
 		}
 	default:
 		spent, err := s.answers.Take(item.ID, resume)
@@ -291,9 +320,18 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	if (tr.Outcome == model.OutcomeNoop && tr.From == tr.Stage) || (tr.Outcome == "" && tr.Err != nil) {
 		s.resting[tr.Item.ID] = true
 		s.restingAt[tr.Item.ID] = now
+		// What it said it is waiting for, if it said anything. Set and
+		// cleared together with the deferral, so a countdown can never
+		// outlive the wait it was counting down to.
+		if wt, ok := waitingAt(tr.RunDir); ok {
+			s.waiting[tr.Item.ID] = wt
+		} else {
+			delete(s.waiting, tr.Item.ID)
+		}
 	} else {
 		delete(s.resting, tr.Item.ID)
 		delete(s.restingAt, tr.Item.ID)
+		delete(s.waiting, tr.Item.ID)
 	}
 	s.mu.Unlock()
 
@@ -340,7 +378,7 @@ func (s *Server) advance(ctx context.Context) bool {
 	if s.claim(*item, target, true) != claimAccepted {
 		return false
 	}
-	defer s.eng.Locks().Release(item.Source, target)
+	defer s.eng.Locks().Release(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...)
 	defer s.working.Delete(item.ID)
 	// Counted the same way schedule's launches are, so a drain waiting on
 	// inFlight actually waits for this too — the only mover with -watch set,

@@ -129,6 +129,120 @@ echo '{"terminalStages":["ready"]}' |
 check "IGNORE_LABELS is read by nothing" \
 	"$(jq -cS . "$tmp/out.json")" "$(jq -cS . "$tmp/named.json")"
 
+# --- a flaky call does not cost the whole listing ---------------------------
+#
+# GitHub answers 503 now and then. One of those used to fail the script, and a
+# failed listing marks the source stale: nothing routed through that repository
+# was dispatched until a later poll succeeded. The listing stays all-or-nothing
+# — a partial union would read as "those items are gone" — so the retry sits at
+# the one call that actually flakes.
+echo "list.sh (a flaky gh)"
+cat >"$tmp/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+n=$(cat "$ATTEMPTS" 2>/dev/null || echo 0)
+n=$((n + 1)); echo "$n" >"$ATTEMPTS"
+if [[ "$*" == *"--state open"* && "$n" -le "${FAIL_FIRST:-0}" ]]; then
+	echo "HTTP 503: 503 Service Unavailable (https://api.github.com/graphql)" >&2
+	exit 1
+fi
+case "$*" in
+	*"--state open"*)
+		echo '[{"state":"OPEN","number":51,"title":"Survived a 503","body":"",
+		        "labels":[{"name":"status:refining"}],
+		        "url":"https://example.test/51","assignees":[]}]' ;;
+	*) echo '[]' ;;
+esac
+STUB
+chmod +x "$tmp/stub/gh"
+export ATTEMPTS="$tmp/attempts"
+
+: >"$ATTEMPTS"
+echo '{"terminalStages":["ready"]}' |
+	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/flaky.json" \
+		FAIL_FIRST=1 GH_ATTEMPTS=3 ./list.sh 2>/dev/null
+check "a transient failure is retried, not fatal" \
+	"refining" "$(jq -r '.[] | select(.ref == "51") | .stage' "$tmp/flaky.json")"
+
+# Bounded: a repository that is genuinely unreachable fails the listing rather
+# than retrying forever, so the engine can mark the source stale and say so.
+: >"$ATTEMPTS"
+rc=0
+echo '{"terminalStages":["ready"]}' |
+	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/never.json" \
+		FAIL_FIRST=99 GH_ATTEMPTS=2 ./list.sh >/dev/null 2>&1 || rc=$?
+check "a call that never succeeds fails the listing" "yes" "$([[ $rc -ne 0 ]] && echo yes || echo no)"
+check "     after exactly the attempts it was given" "2" "$(cat "$ATTEMPTS")"
+
+# --- the issue status is the truth about the item ---------------------------
+#
+# A pull request merged by hand closes the issue without this pipeline moving
+# anything. The item used to be marked in place for it, and the mark could
+# never be cleared: a merged PR never becomes open again, so nothing would ever
+# hand it back, and the board filled with red cards for work that had shipped.
+# The status settles it now — and the labels are reconciled to match, through
+# move.sh rather than a second copy of its rules.
+echo "list.sh (status is the truth)"
+cat >"$tmp/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+data='[
+ {"state":"CLOSED","stateReason":"COMPLETED","number":41,"title":"Merged by hand",
+  "body":"","labels":[{"name":"status:in-progress"}],
+  "url":"https://example.test/41","assignees":[],"closedAt":"2026-09-01T00:00:00Z"},
+ {"state":"CLOSED","stateReason":"NOT_PLANNED","number":43,"title":"Abandoned",
+  "body":"","labels":[{"name":"status:in-progress"}],
+  "url":"https://example.test/43","assignees":[],"closedAt":"2026-09-01T00:00:00Z"},
+ {"state":"OPEN","stateReason":"REOPENED","number":45,"title":"Reopened after shipping",
+  "body":"","labels":[{"name":"status:ready"}],
+  "url":"https://example.test/45","assignees":[]},
+ {"state":"CLOSED","stateReason":"COMPLETED","number":47,"title":"Finished properly",
+  "body":"","labels":[{"name":"status:ready"}],
+  "url":"https://example.test/47","assignees":[],"closedAt":"2026-09-02T00:00:00Z"}
+]'
+case "$*" in
+	*"issue edit"*)     echo "RECONCILED: gh $*" >>"$RECONCILED" ;;
+	*"--state open"*)   jq '[.[] | select(.state == "OPEN")]' <<<"$data" ;;
+	*"--state closed"*) jq '[.[] | select(.state == "CLOSED")]' <<<"$data" ;;
+	*"--json labels,body"*)
+		jq -n --arg l "status:in-progress" '{labels: [{name: $l}], body: ""}' ;;
+	*)                  echo "$data" ;;
+esac
+STUB
+chmod +x "$tmp/stub/gh"
+export RECONCILED="$tmp/reconciled"
+: >"$RECONCILED"
+echo '{"stages":["backlog","in-progress","ready"],"terminalStages":["ready"]}' |
+	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/truth.json" \
+		./list.sh 2>/dev/null
+
+check "closed as completed is finished, whatever label it wears" \
+	"ready" "$(jq -r '.[] | select(.ref == "41") | .stage' "$tmp/truth.json")"
+check "     and is not marked" \
+	"false" "$(jq -r '.[] | select(.ref == "41") | .blocked' "$tmp/truth.json")"
+# The end of the line is the pipeline's own first terminal stage, read off the
+# stage order it was handed — not a name this script keeps a copy of.
+check "     landing in the first terminal stage in pipeline order" \
+	"ready" "$(jq -r '.[] | select(.ref == "47") | .stage' "$tmp/truth.json")"
+# Closed as anything but completed is abandoned: off the board entirely. Not
+# marked, not counted, and no stage is ever run against it again.
+check "closed as not planned leaves the board" \
+	"" "$(jq -r '.[] | select(.ref == "43") | .ref' "$tmp/truth.json")"
+# Open while labelled done is the mirror image, and it is not silently
+# believed either way: the item keeps its stage and is marked for a person.
+check "open in a terminal stage keeps its stage" \
+	"ready" "$(jq -r '.[] | select(.ref == "45") | .stage' "$tmp/truth.json")"
+check "     and is marked" \
+	"true" "$(jq -r '.[] | select(.ref == "45") | .blocked' "$tmp/truth.json")"
+check "     with a reason naming the contradiction" \
+	"yes" "$(jq -r '.[] | select(.ref == "45") | .blockReason' "$tmp/truth.json" | grep -q 'not finished' && echo yes || echo no)"
+# The labels catch up, so the next listing derives the same answer from the
+# labels alone and this reconciliation happens once per item, not every poll.
+check "a mismatched label is reconciled through move.sh" \
+	"yes" "$(grep -q -- "--add-label status:ready" "$RECONCILED" && echo yes || echo no)"
+check "an item whose labels already agree is left alone" \
+	"" "$(grep -c "issue edit 47" "$RECONCILED" | grep -v '^0$' || true)"
+check "reconcile never reaches the engine" \
+	"null" "$(jq -r '.[0].reconcile' "$tmp/truth.json")"
+
 check "a closed issue this pipeline labelled is still listed" \
 	"ready" "$(jq -r '.[] | select(.ref == "15") | .stage' "$tmp/out.json")"
 # finishedAt is the engine's word for when the source considers an item done,
@@ -237,12 +351,18 @@ STUB
 # move.sh asks GitHub for the issue's current labels, so the stub answers that.
 # $LABELS is the set the fake issue is wearing for each case below.
 echo "move.sh (dry run)"
-cat >"$tmp/stub/gh" <<'STUB'
+# $LABELS is one label per line ("blocked: limit" is one label, not two) and
+# $BODY is the issue body; the stub assembles the JSON move.sh actually reads.
+issue_view_stub() {
+	cat >"$tmp/stub/gh" <<'STUB'
 #!/usr/bin/env bash
-# One label per line: "blocked: limit" is one label, not two.
-if [[ -n "$LABELS" ]]; then printf '%s\n' "$LABELS"; fi
+jq -n --arg l "${LABELS:-}" --arg b "${BODY:-}" \
+	'{labels: ($l | split("\n") | map(select(. != "")) | map({name: .})), body: $b}'
 STUB
-chmod +x "$tmp/stub/gh"
+	chmod +x "$tmp/stub/gh"
+}
+issue_view_stub
+export BODY=""
 
 dry() { PATH="$tmp/stub:$PATH" CONVEYOR_DRY_RUN=1 ./move.sh 2>&1 | grep -oP '(?<=DRY RUN: ).*' || true; }
 
@@ -275,18 +395,19 @@ check "a set mark is not set twice" \
 	"" \
 	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true}' | dry)"
 
-# The kind rides beside the mark, never instead of it: "everything blocked" has
-# to stay one query and one label to remove.
+# The kind used to be a label of its own beside the mark. It is not any more —
+# it rides in the body section with the reason it belongs to — but a repository
+# that ran the old code is still wearing them, so they come off wherever found.
 export LABELS="status:in-progress"
-check "a kind adds its own label beside the mark" \
-	"gh issue edit 9 --repo owner/repo --add-label blocked --add-label blocked: decision" \
-	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedKind":"decision"}' | dry | head -1)"
+check "a kind adds no label of its own" \
+	"gh issue edit 9 --repo owner/repo --add-label blocked --body-file <body>" \
+	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedKind":"decision","blockedReason":"pick one"}' | dry | head -1)"
 export LABELS=$'status:in-progress\nblocked\nblocked: limit'
-check "a different kind replaces the old one" \
-	"gh issue edit 9 --repo owner/repo --remove-label blocked: limit --add-label blocked: decision" \
-	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedKind":"decision"}' | dry | head -1)"
+check "an old kind label is taken off" \
+	"yes" \
+	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedKind":"decision","blockedReason":"pick one"}' | dry | grep -q -- "--remove-label blocked: limit" && echo yes || echo no)"
 export LABELS=$'status:in-progress\nblocked\nblocked: limit'
-check "clearing the mark takes the kind with it" \
+check "clearing the mark takes the old kind label with it" \
 	"gh issue edit 9 --repo owner/repo --remove-label status:in-progress --remove-label blocked --remove-label blocked: limit" \
 	"$(echo '{"item":{"ref":"9"},"stage":"backlog"}' | dry | head -1)"
 
@@ -294,44 +415,123 @@ export LABELS=$'status:in-progress\nblocked'
 check "entering a stage clears the mark" \
 	"gh issue edit 9 --repo owner/repo --remove-label blocked" \
 	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":false}' | dry)"
-export LABELS="status:in-progress"
-check "a reason is commented when the mark goes on" \
-	"gh issue comment 9 --repo owner/repo --body <reason>" \
-	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedReason":"needs a product call"}' | dry | tail -1)"
+# --- move.sh: the reason is a field on the item -----------------------------
+#
+# It used to be a comment, which is append-only: an hourly stall retry clearing
+# marks and letting them come straight back left another identical comment on
+# the same issue every pass, and the reason that matters is the current one.
+# It is one section of the body now — rewritten in place, gone when the mark
+# goes — so there is nothing to repeat and nothing to suppress.
+echo "move.sh (why, as a field)"
 
-# --- move.sh: the reason is said once ---------------------------------------
-# Not in dry run: this path asks GitHub what it already said, so the stub has to
-# answer two different questions. The hourly stall retry clears marks and lets
-# them come back, so without this every pass leaves another identical comment.
-echo "move.sh (repeat suppression)"
+# Not dry: the file is what carries the body, so this path runs for real
+# against a stub that records rather than writes.
+cat >"$tmp/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$*" == *"--json"* ]]; then
+	jq -n --arg l "${LABELS:-}" --arg b "${BODY:-}" \
+		'{labels: ($l | split("\n") | map(select(. != "")) | map({name: .})), body: $b}'
+	exit 0
+fi
+while [[ $# -gt 0 ]]; do
+	if [[ "$1" == "--body-file" ]]; then cat "$2" >"$WROTE"; fi
+	shift
+done
+STUB
+chmod +x "$tmp/stub/gh"
+wrote() { WROTE="$tmp/wrote" PATH="$tmp/stub:$PATH" ./move.sh 2>/dev/null; cat "$tmp/wrote"; }
+export WROTE="$tmp/wrote"
+
+export LABELS="status:in-progress"
+export BODY="The spec.
+
+Second paragraph."
+: >"$tmp/wrote"
+out=$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedKind":"decision","blockedReason":"pick a --> or b"}' | wrote)
+check "the reason lands in the body, above the spec" \
+	"yes" "$(grep -q '^> pick a --> or b$' <<<"$out" && echo yes || echo no)"
+check "the spec itself survives" \
+	"yes" "$(grep -q '^Second paragraph.$' <<<"$out" && echo yes || echo no)"
+# The marker carries the same fact as base64 JSON, so list.sh reads back
+# exactly what was written — a reason containing "-->" included, which is
+# why it is encoded rather than written into the comment as it stands.
+check "the marker round-trips the reason exactly" \
+	"pick a --> or b" \
+	"$(grep -oP '(?<=<!-- conveyor:block )[A-Za-z0-9+/=]+' <<<"$out" | base64 -d | jq -r .reason)"
+check "and the kind with it" \
+	"decision" \
+	"$(grep -oP '(?<=<!-- conveyor:block )[A-Za-z0-9+/=]+' <<<"$out" | base64 -d | jq -r .kind)"
+
+# Rewritten in place: the same stop said twice is one section, not two.
+export BODY="$out"
+: >"$tmp/wrote"
+again=$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedKind":"decision","blockedReason":"pick a --> or b"}' | wrote)
+check "an unchanged reason rewrites nothing" "" "$again"
+
+export BODY="$out"
+: >"$tmp/wrote"
+changed=$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedKind":"limit","blockedReason":"out of quota"}' | wrote)
+check "a different reason replaces the section rather than adding one" \
+	"1" "$(grep -c '^<!-- conveyor:block ' <<<"$changed")"
+
+# Clearing the mark takes the section with it, and leaves the spec alone.
+export LABELS=$'status:in-progress\nblocked'
+export BODY="$out"
+: >"$tmp/wrote"
+cleared=$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":false}' | wrote)
+check "unblocking removes the section" \
+	"The spec.
+
+Second paragraph." "$cleared"
+
+issue_view_stub
+export BODY=""
+
+# --- a label that does not exist yet ---------------------------------------
+#
+# A stage added to the config after a repository was onboarded names a label
+# that repository has never seen, and `gh issue edit --add-label` fails outright
+# on one. That marked the item with an `error` the moment it reached the new
+# stage, which is a confusing way to be told to run onboard.sh.
+echo "move.sh (a label the repo does not have yet)"
 cat >"$tmp/stub/gh" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
-	*"--json comments"*) cat "$COMMENTS" ;;
-	*"--json labels"*)   if [[ -n "$LABELS" ]]; then printf '%s\n' "$LABELS"; fi ;;
-	*)                   echo "CALLED: gh $*" ;;
+	*"--json"*)
+		jq -n --arg l "${LABELS:-}" --arg b "${BODY:-}" \
+			'{labels: ($l | split("\n") | map(select(. != "")) | map({name: .})), body: $b}' ;;
+	*"label create"*)
+		echo "CREATED: $3" >>"$CALLS"; exit 0 ;;
+	*"issue edit"*)
+		n=$(cat "$EDITS" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >"$EDITS"
+		if [[ "$n" -le "${EDIT_FAILS:-0}" ]]; then
+			echo "could not add label: 'status:new' not found" >&2; exit 1
+		fi
+		echo "EDITED" >>"$CALLS" ;;
 esac
 STUB
 chmod +x "$tmp/stub/gh"
+export CALLS="$tmp/calls" EDITS="$tmp/edits"
+saved_labels=$STAGE_LABELS
+export STAGE_LABELS='new=status:new'
+export LABELS="" BODY=""
 
-wet() { PATH="$tmp/stub:$PATH" ./move.sh 2>&1 | grep -E '^(CALLED|the same reason)' || true; }
-export LABELS="status:in-progress"
-marking='{"item":{"ref":"9"},"stage":"in-progress","blocked":true,"blockedReason":"the checkout is dirty"}'
+: >"$CALLS"; : >"$EDITS"
+echo '{"item":{"ref":"61"},"stage":"new"}' | PATH="$tmp/stub:$PATH" EDIT_FAILS=1 ./move.sh 2>/dev/null
+check "the missing label is created" "yes" "$(grep -q "^CREATED: status:new" "$CALLS" && echo yes || echo no)"
+check "and the edit is retried once it exists" "yes" "$(grep -q "^EDITED" "$CALLS" && echo yes || echo no)"
+check "     exactly twice, never in a loop" "2" "$(cat "$EDITS")"
 
-export COMMENTS="$tmp/none"; echo -n "" >"$tmp/none"
-check "a first mark says why" \
-	"yes" "$(echo "$marking" | wet | grep -q 'gh issue comment' && echo yes || echo no)"
+# A failure nothing created explains is a failure. Retrying an identical call
+# that broke for some other reason is how a provider write becomes a rate limit.
+: >"$CALLS"; : >"$EDITS"
+rc=0
+echo '{"item":{"ref":"61"},"stage":"new"}' | PATH="$tmp/stub:$PATH" EDIT_FAILS=9 ./move.sh >/dev/null 2>&1 || rc=$?
+check "a failure no missing label explains is still a failure" "yes" "$([[ $rc -ne 0 ]] && echo yes || echo no)"
+check "     and it did not retry forever" "2" "$(cat "$EDITS")"
 
-export COMMENTS="$tmp/said"
-printf '**Blocked** — the checkout is dirty\n' >"$tmp/said"
-check "the same reason is not commented twice" \
-	"the same reason is already commented on #9; not repeating it" \
-	"$(echo "$marking" | wet | grep '^the same reason')"
-
-export COMMENTS="$tmp/other"
-printf '**Blocked** — something else entirely\n' >"$tmp/other"
-check "a different reason is still said" \
-	"yes" "$(echo "$marking" | wet | grep -q 'gh issue comment' && echo yes || echo no)"
+export STAGE_LABELS=$saved_labels
+issue_view_stub
 
 # --- the label namespace ----------------------------------------------------
 #
@@ -386,11 +586,7 @@ STUB
 # prefix means a label this pipeline wrote is one it can still remove.
 # The namespace section above rewrote the shared stub to answer `issue list`;
 # move.sh asks it for `issue view --json labels`, so put that one back.
-cat >"$tmp/stub/gh" <<'STUB'
-#!/usr/bin/env bash
-if [[ -n "$LABELS" ]]; then printf '%s\n' "$LABELS"; fi
-STUB
-chmod +x "$tmp/stub/gh"
+issue_view_stub
 
 export LABELS=$'bug\nconveyor:refining'
 saved_labels=$STAGE_LABELS

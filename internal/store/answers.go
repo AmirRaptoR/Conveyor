@@ -59,7 +59,11 @@ func (a *Answers) Set(id string, r model.Resume) error {
 	defer a.writeMu.Unlock()
 
 	next := a.snapshot()
-	if r.Answer == "" && r.Session == "" {
+	// Empty in every field is a caller saying "nothing is armed for this
+	// item", which is a delete. Manual counts: an action a person pressed is
+	// held here for the same reason a reply is — something they said, kept
+	// until the run that was waiting for it happens, then gone.
+	if r == (model.Resume{}) {
 		delete(next, id)
 	} else {
 		next[id] = r

@@ -44,6 +44,13 @@ set -euo pipefail
 list_input=$(cat)
 [[ -n "$list_input" ]] || list_input='{}'
 terminal_stages=$(jq -c '.terminalStages // []' <<<"$list_input")
+# Where a closed-as-completed issue belongs, whatever label it is wearing: the
+# first terminal stage in the pipeline's own stage order. `stages` arrives in
+# that order, so this is "the end of the line" and not a guess. Empty when the
+# pipeline declares no terminal stage at all, in which case the reconciliation
+# below stands down rather than inventing a destination.
+done_stage=$(jq -r 'first(.stages[]? | select(. as $s | ($ARGS.named.t | index($s)))) // ""' \
+	--argjson t "$terminal_stages" <<<"$list_input")
 DEFAULT_STAGE="${DEFAULT_STAGE:-backlog}"
 LABEL_PREFIX="${LABEL_PREFIX:-conveyor:}"
 BLOCKED_LABEL="${BLOCKED_LABEL:-${LABEL_PREFIX}blocked}"
@@ -119,10 +126,37 @@ dedup_by_number='reduce .[] as $x ({seen: {}, out: []};
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+# GitHub answers 503 now and then, and one of those used to cost the whole
+# listing: set -e failed the script, the engine marked the source stale, and
+# nothing routed through that repository was dispatched until the next poll
+# succeeded. The listing is all-or-nothing on purpose — a partial union would
+# read as "those items are gone" — so the retry is here, at the one call that
+# actually flakes, rather than a partial result being accepted upstream.
+gh_issues() {
+	local attempt=1 out
+	while :; do
+		# stderr through a file, not 2>&1: gh writes progress there on calls
+		# that succeed, and folding it into stdout would hand jq a JSON
+		# document with a line of English in front of it.
+		if out=$(gh issue list --repo "$REPO" "$@" \
+			--json number,title,body,labels,url,assignees,state,stateReason,closedAt \
+			2>"$work/gh.err"); then
+			printf '%s' "$out"
+			return 0
+		fi
+		if ((attempt >= ${GH_ATTEMPTS:-3})); then
+			echo "gh issue list $* failed after $attempt attempts: $(cat "$work/gh.err")" >&2
+			return 1
+		fi
+		echo "gh issue list $* failed (attempt $attempt): $(cat "$work/gh.err")" >&2
+		sleep $((attempt * 2))
+		attempt=$((attempt + 1))
+	done
+}
+
 : >"$work/open.jsonl"
 for label in "${enroll_labels[@]}"; do
-	gh issue list --repo "$REPO" --state open --label "$label" --limit "${LIMIT:-200}" \
-		--json number,title,body,labels,url,assignees,state,closedAt |
+	gh_issues --state open --label "$label" --limit "${LIMIT:-200}" |
 		jq -c '.[]' >>"$work/open.jsonl"
 done
 
@@ -130,34 +164,62 @@ done
 # which is what dedup_by_number's "first occurrence wins" is defined against.
 jq -s -c "$dedup_by_number | .[]" "$work/open.jsonl" >"$work/items.jsonl"
 
-gh issue list --repo "$REPO" --state closed \
-	--limit "${CLOSED_FETCH_LIMIT:-1000}" \
-	--json number,title,body,labels,url,assignees,state,closedAt |
+gh_issues --state closed --limit "${CLOSED_FETCH_LIMIT:-1000}" |
 	jq -c --argjson n "${CLOSED_LIMIT:-100}" \
 		'sort_by(.closedAt) | reverse | .[0:$n] | .[]' >>"$work/items.jsonl"
 
 jq -s --arg source "$CONVEYOR_SOURCE" \
 		--arg default "$DEFAULT_STAGE" \
+		--arg done "$done_stage" \
 		--arg blocked "$BLOCKED_LABEL" \
 		--arg onboard "$ONBOARD_LABEL" \
 		--argjson map "$label_to_stage" \
 		--argjson terminal "$terminal_stages" '
+		# The section move.sh writes into an issue body: why it stopped, in a
+		# form both a person and this script can read. The open marker carries
+		# base64 JSON so the reason comes back exactly as it was written, "-->"
+		# and all; the blockquote under it is the copy a person sees.
+		def strip_block: sub("(?s)<!-- conveyor:block .*?<!-- /conveyor:block -->\n*"; "");
+		def block_said:
+			(capture("<!-- conveyor:block (?<b>[A-Za-z0-9+/=]+) -->")
+				| .b | @base64d | fromjson) // {};
 		map(
 			(.labels | map(.name)) as $names
 			| ([$names[] | $map[.] // empty] | .[0]) as $mapped
 			| (((.state // "OPEN") | ascii_downcase) == "closed") as $isClosed
-			# A closed issue keeping a mapped stage that is not terminal stopped
-			# mid-flight rather than finished — a person closed it, or it was
-			# closed some other way than this pipeline completing it — so it is
-			# marked in place rather than silently treated as done. The pipeline
-			# must not fabricate a completion it did not perform.
-			| ($isClosed and $mapped != null and (($terminal | index($mapped)) == null)) as $closedNonTerminal
+			| ((.stateReason // "") | ascii_downcase) as $why
+			| (.body // "") as $body
 			# Opt-in, and these are the three ways in: the pipeline put
 			# it here, a person handed it over, or it stopped.
 			| select($mapped != null
 				or ($names | index($onboard)) != null
 				or ($names | index($blocked)) != null)
 			| select((($isClosed | not)) or $mapped != null)
+			# **The issue status is the truth about the item.** Closed as
+			# anything but completed is abandoned: off the board entirely,
+			# not marked, not counted, no stage ever run against it again.
+			| select(($isClosed and ($why == "not_planned" or $why == "duplicate")) | not)
+			# Closed as completed is finished, whatever stage label it is
+			# still wearing. A pull request merged by hand closes the issue
+			# without this pipeline moving anything, and the item used to be
+			# marked in place for it — a mark nothing could clear, since a
+			# merged PR never becomes open again. Reconciled below, so the
+			# label catches up with the status rather than outliving it.
+			| ($isClosed and $done != "") as $finished
+			# The mirror image: open, but wearing a terminal stage label. It
+			# is not finished, whatever the label says. Marked where it
+			# stands rather than dragged back to the start — an item that
+			# reached the end of the line has had work done on it, and
+			# deciding how much of that still stands is for a person to say.
+			| (($isClosed | not) and $mapped != null
+				and ($terminal | index($mapped)) != null) as $reopened
+			# And the fallback, for a pipeline that declares no terminal stage
+			# at all: there is nowhere to send a finished item, so a closed
+			# issue in a stage that is not the end of the line is reported as
+			# having stopped there rather than as work this pipeline did.
+			| ($isClosed and $done == "" and $mapped != null
+				and (($terminal | index($mapped)) == null)) as $closedNonTerminal
+			| (if $finished then $done else ($mapped // $default) end) as $stage
 			| ({
 				id:          "\($source):\(.number)",
 				ref:         (.number | tostring),
@@ -165,12 +227,19 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 				# First mapped label wins. An issue wearing two status labels is
 				# already broken; picking deterministically beats erroring, and
 				# the next move.sh clears the loser.
-				stage:       ($mapped // $default),
+				stage:       $stage,
 				title:       .title,
 				# The mark rides beside the stage, never instead of it: this is
-				# what keeps an unblocked issue resuming where it stopped.
-				blocked:     (($names | index($blocked) != null) or $closedNonTerminal),
-				description: (.body // ""),
+				# what keeps an unblocked issue resuming where it stopped. A
+				# finished item wears no mark whatever its labels say — the
+				# status settled it.
+				blocked:     (if $finished then false
+				              elif $reopened or $closedNonTerminal then true
+				              else ($names | index($blocked)) != null end),
+				# The block section is stripped: it is this pipeline talking to
+				# a person, not part of the specification, and an agent handed
+				# the prompt must not read its own last stop as a requirement.
+				description: ($body | strip_block),
 				url:         .url,
 				labels:      $names,
 				# null, not 0: "unranked" and "most urgent" must stay distinct.
@@ -180,9 +249,40 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 				# item done; an open issue has none. closedAt is GitHubs own
 				# vocabulary, only meaningful once an issue is actually closed.
 				finishedAt:  (if $isClosed then (.closedAt // "") else "" end)
-			} + (if $closedNonTerminal then
-				{blockReason: "closed on GitHub while still in stage \"\($mapped)\", which is not terminal; a person should reconcile it."}
-			else {} end))
-		)' "$work/items.jsonl" >"$CONVEYOR_RESULT"
+			} + (if $reopened then
+				{blockKind: "status",
+				 blockReason: "open on GitHub while labelled \"\($mapped)\", the end of the line: it was reopened, or it was never actually closed. Its status says it is not finished."}
+			elif $closedNonTerminal then
+				{blockKind: "status",
+				 blockReason: "closed on GitHub while still in stage \"\($mapped)\", which is not terminal; a person should reconcile it."}
+			else
+				# Why it stopped, read straight off the item. The board no
+				# longer depends on a run-history walk to say it, and it
+				# survives a restart, a retention sweep and a mark somebody
+				# set by hand.
+				({blockKind: ($body | block_said | .kind // ""),
+				  blockReason: ($body | block_said | .reason // "")}
+					| with_entries(select(.value != "")))
+			end)
+			# What the labels would have to say for this listing to be
+			# reproducible. Only ever set when they do not already say it.
+			+ (if $stage != ($mapped // $default) then {reconcile: $stage} else {} end))
+		)' "$work/items.jsonl" >"$work/listed.json"
+
+# The labels catch up with the status, using the one script that writes labels
+# rather than a second copy of its rules here. Rare — an item needs it once,
+# after which its labels say what its status says — and never fatal: a listing
+# that could not reconcile is still a correct listing, because every field
+# above was derived from the status and not from the label.
+if jq -e 'any(.reconcile != null)' "$work/listed.json" >/dev/null; then
+	while IFS=$'\t' read -r n stage; do
+		echo "issue #$n is $stage by its status but not by its labels; reconciling" >&2
+		jq -cn --arg r "$n" --arg s "$stage" '{item: {ref: $r}, stage: $s, blocked: false}' |
+			"$(dirname "${BASH_SOURCE[0]}")/move.sh" ||
+			echo "could not reconcile #$n; the listing stands regardless" >&2
+	done < <(jq -r '.[] | select(.reconcile) | "\(.ref)\t\(.reconcile)"' "$work/listed.json")
+fi
+
+jq 'map(del(.reconcile))' "$work/listed.json" >"$CONVEYOR_RESULT"
 
 echo "listed $(jq length "$CONVEYOR_RESULT") item(s) (tag an issue $ONBOARD_LABEL to hand it over)" >&2

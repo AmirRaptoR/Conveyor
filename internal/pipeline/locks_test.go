@@ -5,7 +5,7 @@ import "testing"
 // A source maps to a git worktree: two agents in one checkout corrupt each
 // other, so this holds no matter how the other axes are set.
 func TestOneItemPerSource(t *testing.T) {
-	l := NewLocks(10, 10, 1)
+	l := NewLocks(10, 10, 1, nil)
 	if !l.TryAcquire("midgame", "refining") {
 		t.Fatal("first acquire refused")
 	}
@@ -20,7 +20,7 @@ func TestOneItemPerSource(t *testing.T) {
 
 // The point of the change: different sources work different stages at once.
 func TestDifferentSourcesRunDifferentStages(t *testing.T) {
-	l := NewLocks(4, 1, 1)
+	l := NewLocks(4, 1, 1, nil)
 	for _, c := range []struct{ src, stage string }{
 		{"midgame", "refining"}, {"quesshi", "in-progress"}, {"caravan", "testing"},
 	} {
@@ -33,7 +33,7 @@ func TestDifferentSourcesRunDifferentStages(t *testing.T) {
 // A station works one item at a time, so a second source wanting the same
 // stage waits even though its own worktree is free.
 func TestPerStageBound(t *testing.T) {
-	l := NewLocks(10, 1, 1)
+	l := NewLocks(10, 1, 1, nil)
 	if !l.TryAcquire("midgame", "refining") {
 		t.Fatal("first acquire refused")
 	}
@@ -47,7 +47,7 @@ func TestPerStageBound(t *testing.T) {
 }
 
 func TestPerStageAboveOne(t *testing.T) {
-	l := NewLocks(10, 2, 1)
+	l := NewLocks(10, 2, 1, nil)
 	if !l.TryAcquire("a", "refining") || !l.TryAcquire("b", "refining") {
 		t.Fatal("perStage 2 refused a second item")
 	}
@@ -59,7 +59,7 @@ func TestPerStageAboveOne(t *testing.T) {
 // Global caps the total however the other axes are set, because every slot is
 // an agent.
 func TestGlobalCap(t *testing.T) {
-	l := NewLocks(2, 10, 1)
+	l := NewLocks(2, 10, 1, nil)
 	if !l.TryAcquire("a", "one") || !l.TryAcquire("b", "two") {
 		t.Fatal("global 2 refused the first two")
 	}
@@ -71,7 +71,7 @@ func TestGlobalCap(t *testing.T) {
 // Taking one axis while refused another would leave a slot held by nothing,
 // and two schedulers doing that deadlock each other.
 func TestRefusedAcquireTakesNothing(t *testing.T) {
-	l := NewLocks(1, 10, 1)
+	l := NewLocks(1, 10, 1, nil)
 	if !l.TryAcquire("a", "one") {
 		t.Fatal("first acquire refused")
 	}
@@ -93,7 +93,7 @@ func TestRefusedAcquireTakesNothing(t *testing.T) {
 // the source axis was a boolean, so a raised limit would have been silently
 // ignored and the config would have lied.
 func TestPerSourceCountsInsteadOfLatching(t *testing.T) {
-	l := NewLocks(10, 10, 2)
+	l := NewLocks(10, 10, 2, nil)
 
 	if !l.TryAcquire("repo", "a") || !l.TryAcquire("repo", "b") {
 		t.Fatal("two items of one source must both start when perSource is 2")
@@ -113,5 +113,72 @@ func TestPerSourceCountsInsteadOfLatching(t *testing.T) {
 	}
 	if l.TryAcquire("repo", "d") {
 		t.Error("releasing one slot freed two")
+	}
+}
+
+// A resource is the axis that means something: the scarce thing is never "a
+// transition", it is one account's quota or one deploy host. Two stages in two
+// different repositories both spending `claude` contend with each other, which
+// neither perSource nor perStage can express.
+func TestAResourceIsSharedAcrossSourcesAndStages(t *testing.T) {
+	l := NewLocks(10, 5, 5, map[string]int{"claude": 1, "ssh-prod": 2})
+	if !l.TryAcquire("midgame", "review", "claude") {
+		t.Fatal("the first claude run should start")
+	}
+	if l.TryAcquire("quesshi", "in-progress", "claude") {
+		t.Fatal("a second claude run should be refused, in any repository and any stage")
+	}
+	// And a stage naming nothing is not throttled by it at all: that is the
+	// whole point of naming the resource rather than counting transitions.
+	if !l.TryAcquire("quesshi", "approving") {
+		t.Fatal("a stage spending no resource should not queue behind claude")
+	}
+	l.Release("midgame", "review", "claude")
+	if !l.TryAcquire("quesshi", "in-progress", "claude") {
+		t.Fatal("releasing claude should let the next run take it")
+	}
+}
+
+// Holding names the axis, so the board can say what work is actually waiting
+// for rather than "the source or the stage is busy" — which, for a resource
+// held by another repository entirely, is not true of either.
+func TestHoldingNamesTheAxisThatRefused(t *testing.T) {
+	l := NewLocks(10, 1, 1, map[string]int{"claude": 1})
+	l.TryAcquire("midgame", "review", "claude")
+	if got := l.Holding("quesshi", "in-progress", "claude"); got != "resource claude" {
+		t.Errorf("Holding = %q, want the resource named", got)
+	}
+	if got := l.Holding("midgame", "elsewhere"); got != "source midgame" {
+		t.Errorf("Holding = %q, want the source named", got)
+	}
+	if got := l.Holding("other", "review"); got != "stage review" {
+		t.Errorf("Holding = %q, want the stage named", got)
+	}
+}
+
+// All axes or none. A transition that takes a resource and is then refused a
+// stage slot must give the resource back, or one refusal leaks a quota nobody
+// is spending and the board quietly stops starting that kind of work.
+func TestARefusedTransitionGivesEverythingBack(t *testing.T) {
+	l := NewLocks(10, 1, 5, map[string]int{"claude": 1})
+	if !l.TryAcquire("midgame", "review", "claude") {
+		t.Fatal("the first should start")
+	}
+	if l.TryAcquire("quesshi", "review", "claude") {
+		t.Fatal("perStage=1 should refuse the second")
+	}
+	l.Release("midgame", "review", "claude")
+	if got := l.Resources()["claude"]; got[0] != 0 {
+		t.Errorf("claude held = %d after one run finished and one was refused, want 0", got[0])
+	}
+}
+
+// A resource nobody declared a limit for is refused, not treated as
+// unlimited: somebody named it because it was scarce, and "unlimited" is the
+// wrong way to be wrong about that.
+func TestAnUndeclaredResourceIsRefused(t *testing.T) {
+	l := NewLocks(10, 5, 5, nil)
+	if l.TryAcquire("midgame", "review", "claude") {
+		t.Fatal("a resource with no declared limit should be refused")
 	}
 }

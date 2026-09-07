@@ -189,3 +189,16 @@
 .terminus .queue { border-top-color:var(--rule-soft); }
 .terminus .plate { border-color:color-mix(in srgb, var(--ok) 45%, var(--rule)); }
 .terminus .name { color:var(--ok); }
+
+/* A countdown, drawn like the age chip beside it but reading the other way:
+   what this item is waiting for rather than how long it has been here. Quiet
+   on purpose — a waiting item is working, not stopped, and a board where
+   normal states shout is a board whose real faults do not. */
+.item .wait {
+  color: var(--faint);
+  border: 1px solid color-mix(in srgb, var(--faint) 40%, transparent);
+  border-radius: 999px;
+  padding: 0 .4em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}

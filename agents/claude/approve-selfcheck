@@ -153,6 +153,7 @@ run() {
 	echo '{"item":{"ref":"7","title":"an item"}}' |
 		SCENE="$tmp/scene" REPO=o/n PROMPT="fix it" CONVEYOR_SOURCE=s1 \
 			QUIET_SECONDS="${QUIET:-0}" CONFLICT_RESOLVE="${CONFLICT_RESOLVE:-}" \
+			CONVEYOR_MANUAL="${CONVEYOR_MANUAL:-}" \
 			"$here/approve" >/dev/null 2>&1
 	rc=$?
 	echo "$rc"
@@ -361,6 +362,32 @@ scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
 date -u +%Y-%m-%dT%H:%M:%SZ >"$tmp/scene/timeline"
 chk "(13) a PR that just arrived waits"       "$(QUIET=600 run)" "10"
 chk "     and did not merge"                  "$([[ -f "$tmp/scene/merged" ]] && echo merged || echo no)" "no"
+# A resting item and a stuck one look identical on a board — both sit still —
+# so the wait says what it is waiting for and when it ends, and the card draws
+# the countdown. The engine reads neither field.
+chk "     and says what it is waiting for"    \
+	"$(jq -r '.waiting.why // ""' "$CONVEYOR_RESULT" | grep -c 'stay quiet')" "1"
+chk "     and until when"                     \
+	"$(jq -r '.waiting.until // ""' "$CONVEYOR_RESULT" | grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T')" "1"
+
+# The one gate a person may open by hand. Everything above it still had to
+# pass: merge-now means "stop giving review more room", not "merge whatever
+# state it is in".
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
+date -u +%Y-%m-%dT%H:%M:%SZ >"$tmp/scene/timeline"
+chk "(13) merge-now skips the remaining silence" "$(QUIET=600 CONVEYOR_MANUAL=merge-now run)" "0"
+chk "     and it actually merged"             "$([[ -f "$tmp/scene/merged" ]] && echo merged)" "merged"
+
+# And only that gate. A failing check is not a wait, and no button gets past it.
+scene; pr 9 OPEN; labels; details false MERGEABLE FAILURE
+date -u +%Y-%m-%dT%H:%M:%SZ >"$tmp/scene/timeline"
+chk "(13) merge-now does not get past a failed check" "$(QUIET=600 CONVEYOR_MANUAL=merge-now run)" "20"
+chk "     and did not merge"                  "$([[ -f "$tmp/scene/merged" ]] && echo merged || echo no)" "no"
+
+# An action the script does not know is simply not its business.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
+date -u +%Y-%m-%dT%H:%M:%SZ >"$tmp/scene/timeline"
+chk "(13) an unknown action changes nothing"  "$(QUIET=600 CONVEYOR_MANUAL=something-else run)" "10"
 
 # A page it cannot see all of is deferred, never merged past.
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
