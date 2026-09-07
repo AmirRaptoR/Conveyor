@@ -107,21 +107,36 @@ dedup_by_number='reduce .[] as $x ({seen: {}, out: []};
 	if (.seen[$x.number | tostring] // false) then .
 	else {seen: (.seen + {($x.number | tostring): true}), out: (.out + [$x])} end) | .out'
 
-open_issues='[]'
-for label in "${enroll_labels[@]}"; do
-	page=$(gh issue list --repo "$REPO" --state open --label "$label" --limit "${LIMIT:-200}" \
-		--json number,title,body,labels,url,assignees,state,closedAt)
-	open_issues=$(jq -c -n --argjson a "$open_issues" --argjson b "$page" '$a + $b')
-done
-open_issues=$(jq -c "$dedup_by_number" <<<"$open_issues")
+# The issues travel through files, one JSON object per line, and never through
+# argv. Linux caps a *single* argument at MAX_ARG_STRLEN — 128 KiB, however
+# much total ARG_MAX is left — so accumulating the listing in a shell variable
+# and handing it to `jq --argjson` failed with "Argument list too long" as soon
+# as a repository outgrew that: jq never exec'd, the script exited 126, and the
+# source listed nothing. Issue bodies are whole specifications here, so this is
+# ordinary size, not an extreme: one enrolled repo's hundred most recently
+# closed issues serialise to 560 KB. Only the small, bounded values below
+# (the stage map, the source name) still ride on the command line.
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
 
-closed_issues=$(gh issue list --repo "$REPO" --state closed \
+: >"$work/open.jsonl"
+for label in "${enroll_labels[@]}"; do
+	gh issue list --repo "$REPO" --state open --label "$label" --limit "${LIMIT:-200}" \
+		--json number,title,body,labels,url,assignees,state,closedAt |
+		jq -c '.[]' >>"$work/open.jsonl"
+done
+
+# Appending in label order keeps the union in the order the calls happened,
+# which is what dedup_by_number's "first occurrence wins" is defined against.
+jq -s -c "$dedup_by_number | .[]" "$work/open.jsonl" >"$work/items.jsonl"
+
+gh issue list --repo "$REPO" --state closed \
 	--limit "${CLOSED_FETCH_LIMIT:-1000}" \
 	--json number,title,body,labels,url,assignees,state,closedAt |
-	jq --argjson n "${CLOSED_LIMIT:-100}" 'sort_by(.closedAt) | reverse | .[0:$n]')
+	jq -c --argjson n "${CLOSED_LIMIT:-100}" \
+		'sort_by(.closedAt) | reverse | .[0:$n] | .[]' >>"$work/items.jsonl"
 
-jq -n --argjson open "$open_issues" --argjson closed "$closed_issues" '$open + $closed' |
-	jq --arg source "$CONVEYOR_SOURCE" \
+jq -s --arg source "$CONVEYOR_SOURCE" \
 		--arg default "$DEFAULT_STAGE" \
 		--arg blocked "$BLOCKED_LABEL" \
 		--arg onboard "$ONBOARD_LABEL" \
@@ -168,6 +183,6 @@ jq -n --argjson open "$open_issues" --argjson closed "$closed_issues" '$open + $
 			} + (if $closedNonTerminal then
 				{blockReason: "closed on GitHub while still in stage \"\($mapped)\", which is not terminal; a person should reconcile it."}
 			else {} end))
-		)' >"$CONVEYOR_RESULT"
+		)' "$work/items.jsonl" >"$CONVEYOR_RESULT"
 
 echo "listed $(jq length "$CONVEYOR_RESULT") item(s) (tag an issue $ONBOARD_LABEL to hand it over)" >&2

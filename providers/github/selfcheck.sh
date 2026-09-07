@@ -189,6 +189,50 @@ STUB
 		"9001" "$(jq -r '.[] | select(.stage == "refining") | .ref' "$tmp/deep.json")"
 ) || fail=1
 
+# --- F11: a listing bigger than one command-line argument still lists -------
+#
+# The issue payload never travels through argv. Linux caps a *single* argument
+# at MAX_ARG_STRLEN — 128 KiB, whatever total ARG_MAX is left — so handing the
+# accumulated JSON to `jq --argjson` died with "Argument list too long" as soon
+# as a repository's issues outgrew that: one real repo's hundred most recently
+# closed issues serialise to 560 KB. jq never exec'd, the script exited 126 and
+# the source listed nothing, so a whole board stalled because a repository was
+# busy. Both directions are checked, because the open side blew up in a
+# different place from the closed one: the open accumulator crossed the cap
+# part-way through the per-label union, the closed side on its single blob.
+echo "listing past the argv limit"
+(
+	export STAGE_LABELS='refining=status:refining'
+	# The bodies are built inside jq rather than passed to it: a stub that
+	# needs argv to describe the payload cannot test getting off argv.
+	cat >"$tmp/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+*"--state open"*)
+	jq -n '[{number:9001,title:"fat and open",body:("x" * 200000),state:"OPEN",
+	         labels:[{name:"status:refining"}],url:"u",assignees:[]}]'
+	;;
+*"--state closed"*)
+	jq -n '[{number:9002,title:"fat and closed",body:("x" * 200000),state:"CLOSED",
+	         labels:[{name:"status:refining"}],url:"u",assignees:[],
+	         closedAt:"2026-08-30T12:00:00Z"}]'
+	;;
+*) echo "stub gh: unhandled: $*" >&2; exit 97 ;;
+esac
+STUB
+	echo '{"terminalStages":["refining"]}' |
+		PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/fat.json" \
+			./list.sh 2>/dev/null
+	check "an open issue too big for argv is listed" \
+		"9001" "$(jq -r '.[] | select(.ref == "9001") | .ref' "$tmp/fat.json")"
+	check "a closed issue too big for argv is listed" \
+		"9002" "$(jq -r '.[] | select(.ref == "9002") | .ref' "$tmp/fat.json")"
+	# The union still deduplicates: every enrolling label's call answered with
+	# the same open issue, and it must appear once.
+	check "the oversized open issue is listed once, not once per label" \
+		"1" "$(jq '[.[] | select(.ref == "9001")] | length' "$tmp/fat.json")"
+) || fail=1
+
 # --- move.sh: stage -> label writes ----------------------------------------
 # move.sh asks GitHub for the issue's current labels, so the stub answers that.
 # $LABELS is the set the fake issue is wearing for each case below.
