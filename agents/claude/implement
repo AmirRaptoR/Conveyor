@@ -34,6 +34,24 @@ url=$(jq -r '.item.url // ""' <<<"$payload")
 rework=""
 head=""
 if [[ -n "${REPO:-}" ]]; then
+	# Before the dependency check, before the worktree, long before the model:
+	# the provider's own record of what closed the issue, never the agent's
+	# claim. An item whose issue is already closed by a merged pull request is
+	# done, whatever brought this run back to it — quesshi:25 was one run an
+	# hour, forever, of an agent saying exactly that and being marked a
+	# failure anyway.
+	item_landed "$ref"
+	case "$LANDED" in
+	unavailable)
+		echo "could not tell whether #$ref already landed; deferring rather than risk redoing work already done" >&2
+		exit 10
+		;;
+	yes)
+		echo "issue #$ref is already closed by merged pull request #$LANDED_PR; nothing to implement"
+		exit 0
+		;;
+	esac
+
 	# Before the worktree and long before the model: an item sequenced behind
 	# an open issue is not startable, and finding that out is not worth a run.
 	waiting=$(open_dependencies "$body")
@@ -184,6 +202,25 @@ if [[ -n "${REPO:-}" ]]; then
 		blocked decision "more than one open pull request now closes issue #$ref; resolve which one is correct before this can proceed."
 		;;
 	none)
+		# No *open* PR is not the same as nothing landed: it may already have
+		# merged. The provider's own record of what closed the issue settles
+		# it, the same lookup the preflight above already asked.
+		item_landed "$ref"
+		case "$LANDED" in
+		unavailable)
+			echo "could not confirm whether the agent's work landed a pull request for #$ref; deferring rather than reporting nothing landed" >&2
+			exit 10
+			;;
+		yes)
+			echo "issue #$ref is already closed by merged pull request #$LANDED_PR; the work landed"
+			exit 0
+			;;
+		esac
+		if [[ "$ISSUE_STATE" == "CLOSED" ]]; then
+			asks no-output "issue #$ref is closed but no merged pull request references it, \
+so nothing has landed. Check whether it was closed by hand; if the work still needs doing, \
+reopen it, or answer here with what to do next."
+		fi
 		blocked no-output "the agent finished but no open pull request references #$ref, so \
 nothing landed. Read this run's log for what it did — a run cut short by a usage \
 limit looks exactly like this."
