@@ -22,6 +22,53 @@ here=$(cd "$(dirname "$0")" && pwd)
 fail=0
 chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
 
+# The guard against this issue's class of bug: a --json field valid in one gh
+# dialect (GraphQL) asked for in another (REST) — isInMergeQueue on `pr view`
+# was exactly that, and the stub above cannot catch it because it dispatches
+# by verb alone and answers from a fixture regardless of which fields were
+# asked for. Checked against the real gh's own field list per verb, captured
+# before PATH is shadowed below, same as real_git further down. `gh <verb>
+# --json` with no value needs no repository, no network and no auth — it
+# exits 1 and prints its authoritative field list to stderr.
+#
+# A call site's verb and its --json list can be on different physical lines
+# (approve:957-958's was, over a `\` continuation), so continuations are
+# joined first; a static line-by-line grep would miss exactly the site this
+# issue is about.
+real_gh=$(command -v gh || true)
+declare -A _json_fields_cache # verb ("pr view") -> real gh's own field list for it
+check_json_fields() {
+	if [[ -z "$real_gh" ]]; then
+		echo "skip json-field guard: gh is not installed"
+		return
+	fi
+	local joined line trimmed verb1 verb2 verb fields available f invalid
+	joined=$(awk '{ if (sub(/\\[[:space:]]*$/, "")) { printf "%s ", $0; next } else { print } }' "$here/approve")
+	while IFS= read -r line; do
+		trimmed="${line#"${line%%[![:space:]]*}"}"
+		[[ "$trimmed" == \#* ]] && continue # a comment mentioning --json, not a call
+		[[ "$line" =~ (pr|issue)[[:space:]]+(list|view)[^\#]*--json[[:space:]]+([A-Za-z0-9_,]+) ]] || continue
+		verb1="${BASH_REMATCH[1]}" verb2="${BASH_REMATCH[2]}" fields="${BASH_REMATCH[3]}"
+		verb="$verb1 $verb2"
+		if [[ -z "${_json_fields_cache[$verb]+set}" ]]; then
+			_json_fields_cache[$verb]=$("$real_gh" "$verb1" "$verb2" --json 2>&1)
+		fi
+		available="${_json_fields_cache[$verb]}"
+		invalid=""
+		IFS=',' read -ra flist <<<"$fields"
+		for f in "${flist[@]}"; do
+			grep -qx "  $f" <<<"$available" || invalid+="$f "
+		done
+		if [[ -n "$invalid" ]]; then
+			echo "FAIL json-field guard: ${invalid% } not valid for '$verb' --json (agents/claude/approve)"
+			fail=1
+		else
+			echo "ok   json-field guard: $fields valid for '$verb' --json"
+		fi
+	done <<<"$joined"
+}
+check_json_fields
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/scene"
@@ -36,9 +83,14 @@ cat >"$tmp/bin/gh" <<'STUB'
 scene="$SCENE"
 case "$1 $2" in
 "pr list")   what=prlist ;;
-"pr view")   what=prview ;;
 "issue view") what=labels_$3 ;;
-"api graphql") what=graphql; printf '%s\n' "$*" >>"$scene/graphql_calls" ;;
+"api graphql")
+	# Two distinct queries share this one verb: fetch_details' pre-merge read
+	# (asks for isDraft, among much else) and the post-merge confirmation read
+	# (does not — it is four fields, none of them isDraft). Routed by content
+	# rather than call order, so a scene need not care how many times each ran.
+	if [[ "$*" == *isDraft* ]]; then what=graphql; else what=confirm; fi
+	printf '%s\n' "$*" >>"$scene/graphql_calls" ;;
 "api repos"*) what=timeline ;;
 "pr edit")   echo "unlabelled"; exit 0 ;;
 "pr comment") printf '%s\n' "$*" >>"$scene/comments_posted"; exit 0 ;;
@@ -143,7 +195,7 @@ JSON
 	# lands, at the exact head this call just inspected. F06's scenes below
 	# overwrite this to simulate a moved head, a queued/auto-merge outcome, or
 	# a merge genuinely refused.
-	cat >"$tmp/scene/prview" <<JSON
+	cat >"$tmp/scene/confirm" <<JSON
 {"state":"MERGED","headRefOid":"$head_oid","isInMergeQueue":false,"autoMergeRequest":null}
 JSON
 }
@@ -320,11 +372,31 @@ scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
 chk "(14) a settled PR merges"                "$(run)" "0"
 chk "     and gh pr merge actually ran"       "$([[ -f "$tmp/scene/merged" ]] && echo merged)" "merged"
 
+# A confirmation read that itself fails is not the same as "not merged yet":
+# the merge was already issued, and only the read that would say what happened
+# to it is what broke. It defers (10) rather than marking, and stderr — the
+# one place this is visible, since stdout/stderr are logs and never parsed —
+# names both that the merge was already issued and the SHA it was issued at,
+# so this is never mistaken for the ordinary "still quiet" case in the log.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS; touch "$tmp/scene/fail_confirm"
+: >"$CONVEYOR_RESULT"
+echo '{"item":{"ref":"7","title":"an item"}}' |
+	SCENE="$tmp/scene" REPO=o/n PROMPT="fix it" CONVEYOR_SOURCE=s1 \
+		QUIET_SECONDS="${QUIET:-0}" CONFLICT_RESOLVE="${CONFLICT_RESOLVE:-}" \
+		"$here/approve" >/dev/null 2>"$tmp/confirm_stderr"
+confirm_rc=$?
+chk "a failed confirmation read defers"           "$confirm_rc" "10"
+chk "     and it is not marked"                   "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+chk "     and stderr names the merge as already issued" \
+	"$(grep -c 'already issued' "$tmp/confirm_stderr")" "1"
+chk "     naming the head it was issued at" \
+	"$(grep -o 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "$tmp/confirm_stderr" | sort -u | wc -l | tr -d ' ')" "1"
+
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS; touch "$tmp/scene/merge_fails"
 # A genuine refusal changes nothing: the head gh reports afterwards is the
 # same one that was inspected, and the PR is still open. Only then is a
 # failed `gh pr merge` actually a fault rather than a moved head.
-cat >"$tmp/scene/prview" <<'JSON'
+cat >"$tmp/scene/confirm" <<'JSON'
 {"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"autoMergeRequest":null}
 JSON
 chk "a refused merge stops, never reads as merged" "$(run)" "20"
@@ -342,7 +414,7 @@ scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
 # The head moved after the inspection, and --match-head-commit refuses it —
 # gh reports a failure exactly as it would for any other rejected merge, and
 # only the follow-up read tells the two apart.
-cat >"$tmp/scene/prview" <<'JSON'
+cat >"$tmp/scene/confirm" <<'JSON'
 {"state":"OPEN","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","isInMergeQueue":false,"autoMergeRequest":null}
 JSON
 touch "$tmp/scene/merge_fails"
@@ -353,7 +425,7 @@ chk "     never reads as merged"              "$([[ -f "$tmp/scene/merged" ]] &&
 # where the mismatch was not caught server-side) — the follow-up read is what
 # actually decides this, not gh's exit code.
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
-cat >"$tmp/scene/prview" <<'JSON'
+cat >"$tmp/scene/confirm" <<'JSON'
 {"state":"OPEN","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","isInMergeQueue":false,"autoMergeRequest":null}
 JSON
 chk "(F06) a moved head defers even when gh reports success" "$(run)" "10"
@@ -362,7 +434,7 @@ chk "(F06) a moved head defers even when gh reports success" "$(run)" "10"
 # `gh pr merge` enqueues it (or enables auto-merge) and returns 0. This must
 # not be reported done, and must not re-issue gh pr merge on the next poll.
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
-cat >"$tmp/scene/prview" <<'JSON'
+cat >"$tmp/scene/confirm" <<'JSON'
 {"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":true,"autoMergeRequest":null}
 JSON
 chk "(F06) an accepted-but-queued merge defers, not done" "$(run)" "10"
