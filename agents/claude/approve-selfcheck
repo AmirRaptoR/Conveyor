@@ -22,6 +22,53 @@ here=$(cd "$(dirname "$0")" && pwd)
 fail=0
 chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
 
+# The guard against this issue's class of bug: a --json field valid in one gh
+# dialect (GraphQL) asked for in another (REST) — isInMergeQueue on `pr view`
+# was exactly that, and the stub above cannot catch it because it dispatches
+# by verb alone and answers from a fixture regardless of which fields were
+# asked for. Checked against the real gh's own field list per verb, captured
+# before PATH is shadowed below, same as real_git further down. `gh <verb>
+# --json` with no value needs no repository, no network and no auth — it
+# exits 1 and prints its authoritative field list to stderr.
+#
+# A call site's verb and its --json list can be on different physical lines
+# (approve:957-958's was, over a `\` continuation), so continuations are
+# joined first; a static line-by-line grep would miss exactly the site this
+# issue is about.
+real_gh=$(command -v gh || true)
+declare -A _json_fields_cache # verb ("pr view") -> real gh's own field list for it
+check_json_fields() {
+	if [[ -z "$real_gh" ]]; then
+		echo "skip json-field guard: gh is not installed"
+		return
+	fi
+	local joined line trimmed verb1 verb2 verb fields available f invalid
+	joined=$(awk '{ if (sub(/\\[[:space:]]*$/, "")) { printf "%s ", $0; next } else { print } }' "$here/approve")
+	while IFS= read -r line; do
+		trimmed="${line#"${line%%[![:space:]]*}"}"
+		[[ "$trimmed" == \#* ]] && continue # a comment mentioning --json, not a call
+		[[ "$line" =~ (pr|issue)[[:space:]]+(list|view)[^\#]*--json[[:space:]]+([A-Za-z0-9_,]+) ]] || continue
+		verb1="${BASH_REMATCH[1]}" verb2="${BASH_REMATCH[2]}" fields="${BASH_REMATCH[3]}"
+		verb="$verb1 $verb2"
+		if [[ -z "${_json_fields_cache[$verb]+set}" ]]; then
+			_json_fields_cache[$verb]=$("$real_gh" "$verb1" "$verb2" --json 2>&1)
+		fi
+		available="${_json_fields_cache[$verb]}"
+		invalid=""
+		IFS=',' read -ra flist <<<"$fields"
+		for f in "${flist[@]}"; do
+			grep -qx "  $f" <<<"$available" || invalid+="$f "
+		done
+		if [[ -n "$invalid" ]]; then
+			echo "FAIL json-field guard: ${invalid% } not valid for '$verb' --json (agents/claude/approve)"
+			fail=1
+		else
+			echo "ok   json-field guard: $fields valid for '$verb' --json"
+		fi
+	done <<<"$joined"
+}
+check_json_fields
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/scene"
