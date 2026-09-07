@@ -28,7 +28,9 @@ kind=$(jq -r '.blockedKind // ""' <<<"$payload")
 # list, which is already stale by the second move of the same tick: the engine
 # moves an item into a stage and out of it between two polls, so a cached label
 # set makes the second move skip a removal and leave the issue wearing both.
-have=$(gh issue view "$ref" --repo "$REPO" --json labels --jq '.labels[].name')
+view=$(gh issue view "$ref" --repo "$REPO" --json labels,body)
+have=$(jq -r '.labels[].name' <<<"$view")
+body=$(jq -r '.body // ""' <<<"$view")
 
 trim() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 wearing() { grep -qxF "$1" <<<"$have"; }
@@ -72,8 +74,8 @@ done <<<"$have"
 # label this pipeline wrote is a label this pipeline can take off, whether or
 # not it is still in the config.
 #
-# The mark and its kind are excluded: they are handled below, and removing them
-# here would set and clear the same label in one call.
+# The mark is excluded: it is handled below, and removing it here would set and
+# clear the same label in one call.
 managed=$(
 	{
 		printf '%s\n' "${mapping_values[@]+"${mapping_values[@]}"}"
@@ -95,13 +97,10 @@ fi
 
 # The mark, last, so the stage labels above read as one unchanged block.
 #
-# Two labels, not one. `blocked` alone stays the mark, so "everything blocked"
-# is still one query and one label to remove; `blocked: <kind>` says which kind
-# of stop it was, which is what makes a list of them worth scanning. The kind
-# label is derived from the mark's name, so renaming BLOCKED_LABEL renames both.
-want_kind=""
-[[ "$blocked" == "true" && -n "$kind" ]] && want_kind="$BLOCKED_LABEL: $kind"
-
+# One label, not two. There used to be a `$BLOCKED_LABEL: <kind>` label beside
+# it; it put the same fact in a third place (label, comment, board) and none of
+# them was the one a person read. The kind now travels in the body section
+# below, where the reason it belongs to already is.
 marking=""
 if [[ "$blocked" == "true" ]]; then
 	if ! wearing "$BLOCKED_LABEL"; then
@@ -112,15 +111,65 @@ elif wearing "$BLOCKED_LABEL"; then
 	args+=(--remove-label "$BLOCKED_LABEL")
 fi
 
-# Every kind label it is wearing and should not be — the one it stopped for last
-# time, when this stop is a different kind, and all of them when the mark goes.
+# Left over from when the kind was a label of its own: take them off wherever
+# they are still worn, so a repository converges without anyone editing labels
+# by hand. Nothing writes them any more.
 while IFS= read -r label; do
-	[[ "$label" == "$BLOCKED_LABEL: "* && "$label" != "$want_kind" ]] &&
-		args+=(--remove-label "$label")
+	[[ "$label" == "$BLOCKED_LABEL: "* ]] && args+=(--remove-label "$label")
 done <<<"$have"
-if [[ -n "$want_kind" ]] && ! wearing "$want_kind"; then
-	args+=(--add-label "$want_kind")
-	new_kind_label="$want_kind"
+
+# --- why, as a field on the item ------------------------------------------
+#
+# The reason lives in a marked section at the top of the issue body: one
+# section, rewritten in place, removed the moment the mark goes. It used to be
+# a comment, which is append-only — the reason that matters is the current one,
+# and a trail of near-identical comments is how an issue stops being readable.
+#
+# The open marker carries the same fact as base64 JSON so list.sh can read it
+# back exactly (list.sh:@base64d) and the board can say why an item stopped
+# without walking run history. Base64 because a reason is free text and a
+# reason containing "-->" would otherwise end the comment early.
+BLOCK_CLOSE='<!-- /conveyor:block -->'
+
+strip_block() {
+	# `endm`, not `close`: close is an awk builtin, and -v close=… is a hard
+	# "cannot command line assign" error rather than a shadowed name.
+	awk -v endm="$BLOCK_CLOSE" '
+		/^<!-- conveyor:block / { inb = 1; next }
+		inb && $0 == endm { inb = 0; blank = 1; next }
+		inb { next }
+		blank && $0 == "" { next }
+		{ blank = 0; print }'
+}
+
+rest=$(strip_block <<<"$body")
+# Only when there is something to say. A mark with no reason is a script that
+# said nothing; rewriting someone's issue body to tell them so is noise, and
+# the label already carries the whole of what is known.
+if [[ "$blocked" == "true" && -n "$reason" ]]; then
+	meta=$(jq -cn --arg k "$kind" --arg s "$to" --arg r "$reason" \
+		'{kind: $k, stage: $s, reason: $r}' | base64 -w0)
+	want_body=$(
+		printf '<!-- conveyor:block %s -->\n' "$meta"
+		printf '> **Blocked in `%s`**%s\n>\n' "$to" "${kind:+ — $kind}"
+		sed 's/^/> /' <<<"$reason"
+		printf '>\n> _Remove the `%s` label to hand this back; it resumes in `%s`._\n' \
+			"$BLOCKED_LABEL" "$to"
+		printf '%s\n' "$BLOCK_CLOSE"
+		# An `if`, not `[[ … ]] && printf`: this is the last command in the
+		# substitution, so under `set -e` a false test would fail the whole
+		# assignment on the one case that is entirely normal — an empty body.
+		if [[ -n "$rest" ]]; then printf '\n%s\n' "$rest"; fi
+	)
+else
+	want_body="$rest"
+fi
+
+if [[ "$want_body" != "$body" ]]; then
+	bodyfile=$(mktemp)
+	trap 'rm -f "$bodyfile"' EXIT
+	printf '%s\n' "$want_body" >"$bodyfile"
+	args+=(--body-file "$bodyfile")
 fi
 
 if [[ ${#args[@]} -eq 0 ]]; then
@@ -130,52 +179,19 @@ if [[ ${#args[@]} -eq 0 ]]; then
 	exit 0
 fi
 
-echo "issue #$ref -> $to${want:+ ($want)}${marking:+ + $BLOCKED_LABEL}${want_kind:+ [$kind]}" >&2
+echo "issue #$ref -> $to${want:+ ($want)}${marking:+ + $BLOCKED_LABEL}${kind:+ [$kind]}" >&2
+
+# The body travels through a temp file, whose name is noise; a log that says
+# `--body-file /tmp/tmp.9fK2` tells nobody anything, and a dry run has to be
+# reproducible from one run to the next to be worth diffing.
+shown=("${args[@]}")
+if [[ -n "${bodyfile:-}" ]]; then
+	shown=("${shown[@]/#"$bodyfile"/<body>}")
+fi
 
 if [[ -n "${CONVEYOR_DRY_RUN:-}" ]]; then
-	echo "DRY RUN: gh issue edit $ref --repo $REPO ${args[*]}" >&2
-	[[ "$marking" == "set" && -n "$reason" ]] &&
-		echo "DRY RUN: gh issue comment $ref --repo $REPO --body <reason>" >&2
+	echo "DRY RUN: gh issue edit $ref --repo $REPO ${shown[*]}" >&2
 	exit 0
 fi
 
-# A kind is whatever the script that stopped called it, so its label may not
-# exist yet. Creating it is this adapter's job — the alternative is a mark that
-# fails to write because a repository has never seen this kind of stop before.
-if [[ -n "${new_kind_label:-}" ]]; then
-	gh label create "$new_kind_label" --repo "$REPO" --color d4a72c \
-		--description "Blocked: $kind. Remove the $BLOCKED_LABEL label to hand it back." >/dev/null 2>&1 || true
-fi
-
 gh issue edit "$ref" --repo "$REPO" "${args[@]}" >&2
-
-# Why, said once, where the person who clears the label will read it. Only on
-# the transition into the mark: a marked item is never handed out again, so this
-# cannot repeat, and a failed comment must not fail the move — the label is the
-# state, the comment is only the explanation.
-if [[ "$marking" == "set" && -n "$reason" ]]; then
-	body="**Blocked** — $reason
-
-Remove the \`$BLOCKED_LABEL\` label to hand this back to the pipeline; it resumes in \`$to\`."
-
-	# The same stop, said twice, is noise. A mark that is cleared and comes
-	# straight back — an hourly stall retry, or a person handing the board back
-	# before the thing that stopped it was fixed — enters the mark again, and
-	# without this each pass leaves another identical comment on the same issue.
-	# Compared against every comment, not just the newest: a reply underneath
-	# ours does not make the explanation new.
-	#
-	# Captured into a variable first, not piped straight into grep: under load,
-	# piping `gh issue view | grep -qxF` intermittently handed grep an empty
-	# read before gh had actually written anything, which read as "never said"
-	# and posted the same reason again. A command substitution waits for gh to
-	# finish before grep ever runs.
-	existing=$(gh issue view "$ref" --repo "$REPO" --json comments \
-		--jq '.comments[].body' 2>/dev/null || true)
-	if grep -qxF "$(head -1 <<<"$body")" <<<"$existing"; then
-		echo "the same reason is already commented on #$ref; not repeating it" >&2
-	else
-		gh issue comment "$ref" --repo "$REPO" --body "$body" >&2 ||
-			echo "could not comment the reason; the label is set regardless" >&2
-	fi
-fi

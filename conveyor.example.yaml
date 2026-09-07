@@ -45,7 +45,22 @@ concurrency:
                       # a directory. See §5.
   perStage: 1         # one item per stage, so the pipeline behaves like a line:
                       # a station works a single item while others run their own
-  global: 4           # total in flight. Every slot is an agent.
+  global: 4           # total transitions in flight, whatever they cost.
+
+# What the work actually consumes, by name, and how much of it there is.
+#
+# A transition is not the scarce thing. One account's quota, one deploy host,
+# one staging database is — and `global:` counts every transition equally, so
+# the number had to be picked for the agent runs and a stage that only reads
+# the GitHub API queued behind them for no reason at all. Name the scarce
+# thing here, list it on the stages that spend it, and everything else is
+# bounded by nothing but `global`.
+#
+# Names are yours. The engine never reads one; it counts them.
+resources:
+  claude: 1           # one Claude run at a time, across every repository
+  codex: 2
+  ssh-prod: 5         # five concurrent deploys to the production host
 
 poll: 5m              # how often to re-list every source
 retryStalled: 1h      # when EVERY item is marked and nothing can move at all,
@@ -124,6 +139,16 @@ stages:
   - name: in-progress
     script: implement         # conveyor.d/<source>/implement
     onSuccess: announcing
+    resources: [claude]       # what this stage's work consumes. A transition
+                              # into it takes one `claude` and gives it back
+                              # when it ends; it starts only when it can have
+                              # every resource it names, so nothing sits on
+                              # half of what it needs. Declared here because
+                              # this is where the work is described — but the
+                              # same stage is Claude in one repository and
+                              # Codex in the next, so a source that spends
+                              # something different says so in its own
+                              # `scripts:` entry, which replaces this list.
     maxAttempts: 2            # two goes before the item is marked blocked where
                               # it stands. Unset means one: the first failure
                               # marks it, because a failure that neither routed
@@ -142,6 +167,37 @@ stages:
       cat >/dev/null    # the item arrives as JSON on stdin; ignore it here
       echo "$CONVEYOR_SOURCE #$CONVEYOR_ITEM_REF is done"
     onSuccess: done
+
+  - name: cleaning-up
+    # Buttons a person may press on a card sitting in this stage. Pressing one
+    # arms a single word for the next run of this stage for that item, handed
+    # to the script in $CONVEYOR_MANUAL and on stdin, and spent by it.
+    #
+    # This is the whole of the manual override, and it is deliberately not a
+    # way to drive the pipeline: an action cannot move an item, choose a stage
+    # or skip a script. It hands one word to the script, which decides what —
+    # if anything — that word means, so a gate a person can open stays a gate
+    # the script still owns. The shipped `approve` reads `merge-now` and takes
+    # it to mean "stop waiting out the quiet period", never "merge whatever
+    # state this is in": every other check still has to pass.
+    #
+    # The other half of the same idea is that a script may say what it is
+    # waiting for. Exiting 10 with {"waiting": {"until": "…", "why": "…"}} in
+    # $CONVEYOR_RESULT (agents/_blocked:waits) draws a live countdown on the
+    # card — a resting item and a stuck one look identical otherwise.
+    actions:
+      - name: clean-now
+        label: Clean up now
+        confirm: Remove this item's worktree and branches now?
+    script: cleanup           # agents/git/cleanup, or a source's own — see below
+    onSuccess: done
+    # An item in flight owns real resources: a worktree on disk, a branch here
+    # and one on the remote, whatever a repository started to test with. A
+    # stage is where work goes, and giving those back is work — it can fail, it
+    # can be retried, and a person can see on the board when it did not happen.
+    # The alternative, cleaning up inside whichever stage happened to finish
+    # last, is invisible when it breaks and skipped entirely for an item that
+    # reached the end some other way.
 
   - name: done
     terminal: true            # no further transitions
@@ -199,6 +255,17 @@ sources:
         agent: mock
         params:
           NOTE: "implementing"
+        # This source's version of `implement` spends nothing scarce — it is a
+        # mock. Naming resources here replaces the stage's list outright rather
+        # than adding to it, so a repository running a different agent (or none)
+        # is not throttled by the one the stage was written for.
+        resources: []
+      cleanup:
+        # The git half is the same in every repository, so it ships. A source
+        # that also starts containers, clones a database or puts up a preview
+        # points this at its own script and calls agents/git/cleanup from it if
+        # it wants the git half too.
+        agent: git
       doctor:
         # A reserved key — no stage names it. POST /api/doctor sweeps every
         # marked item through it. Try it: mark an item, then run the sweep.

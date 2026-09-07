@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# The `cleanup` stage: give back everything a finished item was holding.
+#
+# An item in flight owns real resources — a worktree on disk, a branch here and
+# a branch on the remote — and nothing was ever taking them back. `approve`
+# drops the worktree when it merges, which covers the happy path and only the
+# happy path: an item merged by hand, one that reached `done` some other way,
+# or one whose approve run died between the merge and the cleanup left the
+# directory and both branches behind forever. A stage is where work goes, and
+# reclaiming resources is work: it can fail, it can be retried, and a person
+# can see on the board that it did not happen.
+#
+# This is the git half, which is the same in every repository. Anything else a
+# source spends — a container it started to run tests in, a database it
+# cloned, a preview deployment — is that repository's business, so a source
+# with more to clean up points `cleanup:` at its own script and calls this one
+# if it wants the git half too.
+#
+# Config:
+#   REPO           owner/name — required, for the "did it actually land" check
+#   CLEANUP_REMOTE the remote to delete the branch from (default: origin)
+#
+# Exit 0 always, unless the work did not land. Nothing here is worth marking an
+# item for on its own — a branch somebody already deleted is the outcome this
+# script wants — but a *finished* item whose work never merged is not a
+# cleanup problem, it is a wrong answer somewhere upstream, and deleting its
+# branch would destroy the only copy of the work.
+set -euo pipefail
+
+source "$(dirname "$0")/../_blocked"
+source "$(dirname "$0")/../_worktree"
+source "$(dirname "$0")/../_pr"
+
+: "${REPO:?REPO is required (set it in the source env: block)}"
+remote="${CLEANUP_REMOTE:-origin}"
+
+payload=$(cat)
+ref=$(jq -r '.item.ref' <<<"$payload")
+branch="issue-$ref"
+
+echo "cleaning up $CONVEYOR_SOURCE #$ref" >&2
+
+# Deleting a branch is the one irreversible thing here, so it happens only when
+# GitHub itself says the work is in: the issue is closed and a pull request it
+# recorded as closing it has merged. "unavailable" is not a verdict — a network
+# blip must not read as "nothing landed" — so it defers to the next poll.
+item_landed "$ref"
+case "$LANDED" in
+no)
+	blocked no-output "#$ref reached cleanup but GitHub has no merged pull request closing it (issue is ${ISSUE_STATE:-unknown}). Its branch still holds the only copy of the work, so nothing here was deleted."
+	;;
+unavailable)
+	waits "cannot reach GitHub to confirm #$ref actually merged; not deleting anything until it can"
+	;;
+esac
+echo "#$ref landed as PR #$LANDED_PR" >&2
+
+# The worktree, by the same ownership proof approve uses: a path is only ever
+# touched when it is provably this pipeline's (agents/_worktree).
+drop_worktree "$CONVEYOR_SOURCE" "$ref"
+
+# The local branch. -D rather than -d on purpose: the merge was a squash, so
+# the branch's own commits are not ancestors of the base and -d would refuse
+# every single time. The `landed` check above is what makes that safe, and it
+# is the only thing that does.
+if git show-ref --verify --quiet "refs/heads/$branch"; then
+	git branch -D "$branch" >&2 && echo "deleted local branch $branch" >&2
+else
+	echo "no local branch $branch" >&2
+fi
+
+# And on the remote. `gh pr merge --delete-branch` usually got here first, so
+# "already gone" is the expected answer and not a failure.
+if git ls-remote --exit-code --heads "$remote" "$branch" >/dev/null 2>&1; then
+	if git push "$remote" --delete "$branch" >&2; then
+		echo "deleted $remote/$branch" >&2
+	else
+		echo "could not delete $remote/$branch; it can be removed by hand" >&2
+	fi
+else
+	echo "no $remote/$branch" >&2
+fi
+
+git worktree prune 2>/dev/null || true
+git remote prune "$remote" >/dev/null 2>&1 || true

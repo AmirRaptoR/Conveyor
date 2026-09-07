@@ -116,3 +116,35 @@ asks() {
 	echo "asks ($kind): $question" >&2
 	exit 20
 }
+
+# waits "<why>" [<unix seconds>] — stop until the next poll, saying what for.
+#
+# Exit 10, not 20: this is not a mark and nobody has to do anything. It is the
+# script saying "nothing to do yet" *and* what would change that, which the
+# board draws as a countdown on the card. Without it a resting item and a stuck
+# one look identical — both sit still — and telling them apart is the question
+# this board gets asked most.
+#
+# The instant is optional, because plenty of waits have no deadline: waiting
+# for a review, for a person, for a check that takes as long as it takes. A
+# wait with no instant says what it is waiting for and draws no clock.
+#
+# The engine reads neither field. It stores them against the item and hands
+# them to the board; what a wait means stays the script's business.
+waits() {
+	local why=$1 until_epoch=${2:-}
+	local until=""
+	[[ -n "$until_epoch" ]] && until=$(date -u -d "@$until_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+	_write_stop --arg why "$why" --arg until "$until" \
+		'. + {waiting: ({why: $why} + (if $until == "" then {} else {until: $until} end))}'
+	echo "waiting: $why" >&2
+	exit 10
+}
+
+# manual_action <name> — did a person press this button for this run?
+#
+# The board arms one of the stage's declared `actions:` and the engine hands it
+# to exactly one run, in $CONVEYOR_MANUAL, then forgets it. A script asks about
+# the actions it knows and ignores the rest; the engine never learns what any
+# of them mean.
+manual_action() { [[ "${CONVEYOR_MANUAL:-}" == "$1" ]]; }

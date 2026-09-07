@@ -19,8 +19,28 @@ import (
 type Config struct {
 	Version     int         `yaml:"version"`
 	Concurrency Concurrency `yaml:"concurrency"`
-	Poll        Duration    `yaml:"poll"`
-	Timeout     Duration    `yaml:"timeout"`
+	// Resources is how many of a scarce thing may be in use at once, by name:
+	//
+	//	resources:
+	//	  claude:   1
+	//	  codex:    2
+	//	  ssh-prod: 5
+	//
+	// A stage lists which of them its work consumes, and a transition into
+	// that stage takes one of each before it starts. This is the limit that
+	// actually matters, because the scarce thing is never "a transition": it
+	// is one account's quota, one deploy host, one database. `global:` caps
+	// transitions, and capping transitions meant a stage that only polls
+	// GitHub was throttled exactly as hard as one running an agent — so the
+	// number had to be set for the agents, and everything cheap queued behind
+	// them.
+	//
+	// A stage naming no resource is unlimited, which is the right default for
+	// the cheap ones. A name with no entry here is a load error, because a
+	// silently unlimited resource is the failure this exists to prevent.
+	Resources map[string]int `yaml:"resources"`
+	Poll      Duration       `yaml:"poll"`
+	Timeout   Duration       `yaml:"timeout"`
 	// Discovery bounds one source's list script independently of Timeout,
 	// which defaults to 90 minutes and exists for agent work. A listing is a
 	// handful of API calls, not a stage, and must not be able to hold a
@@ -131,6 +151,19 @@ type Stage struct {
 	MaxAttempts int  `yaml:"maxAttempts"`
 	Terminal    bool `yaml:"terminal"`
 
+	// Resources this stage's work consumes — names from the top-level
+	// `resources:` map. Every one is taken before the transition starts and
+	// given back when it ends, and a transition that cannot have all of them
+	// takes none: holding one while waiting for another is how two schedulers
+	// deadlock each other.
+	//
+	// Declared on the stage because that is where the work is described. A
+	// source whose version of this stage spends something different says so
+	// in its own `scripts:` entry, which wins — the same stage is Claude in
+	// one repository and Codex in the next, and one list here cannot be true
+	// of both.
+	Resources []string `yaml:"resources"`
+
 	// Removed, and still parsed so the error can say so. Blocked used to be a
 	// stage an item was carried to; it is a mark it wears where it stopped, and
 	// a config still routing to a dead-end column would be silently obeyed if
@@ -138,10 +171,32 @@ type Stage struct {
 	OnFailure string `yaml:"onFailure"`
 	OnBlocked string `yaml:"onBlocked"`
 
+	// Actions are the buttons a person may press on an item sitting in this
+	// stage. Pressing one arms a single flag for the next run of this stage
+	// for that item, and the run spends it.
+	//
+	// This is the whole of the manual override, and it is deliberately not a
+	// way to steer the pipeline: an action cannot move an item, choose a
+	// stage, or skip a script. It hands one word to the script, which decides
+	// what — if anything — that word means. A gate a person can open is a
+	// gate the script still owns; "merge now" skips a wait, not the checks.
+	Actions []Action `yaml:"actions"`
+
 	// Reserved for v2 and inert in v1: parsed and validated now so adding
 	// human-driven moves later is not a schema migration. See DESIGN.md.
 	Manual      bool `yaml:"manual"`
 	AllowManual bool `yaml:"allowManual"`
+}
+
+// Action is one button on a card, and the word pressing it hands the script.
+type Action struct {
+	// Name is what the script receives, in $CONVEYOR_MANUAL and in stdin.
+	Name string `yaml:"name"`
+	// Label is what the button says. Defaults to Name.
+	Label string `yaml:"label"`
+	// Confirm, when set, is asked before the action is armed — for the ones
+	// that skip a wait somebody put there on purpose.
+	Confirm string `yaml:"confirm"`
 }
 
 type Source struct {
@@ -224,6 +279,10 @@ type ScriptSpec struct {
 	// the fast one, and picking the larger silently removes the guard
 	// everywhere it was doing its job.
 	Timeout Duration `yaml:"timeout"`
+	// Resources this source's version of the script spends, replacing the
+	// stage's list outright rather than adding to it. Unset means the
+	// stage's, which is the normal case.
+	Resources []string `yaml:"resources"`
 }
 
 // Duration accepts "30d", "90m", "5m" — Go's ParseDuration has no day unit, and
@@ -231,6 +290,11 @@ type ScriptSpec struct {
 type Duration time.Duration
 
 var dayRe = regexp.MustCompile(`^(\d+)d$`)
+
+// nameRe is what an action may be called. It becomes an environment variable's
+// value, a URL body field and a button id, so it is kept to the boring subset
+// that needs no quoting anywhere.
+var nameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 // sweepAtRe is 24-hour HH:MM, the only form the daily retention sweep accepts.
 var sweepAtRe = regexp.MustCompile(`^([01]\d|2[0-3]):([0-5]\d)$`)
@@ -444,6 +508,49 @@ func (c *Config) AgentFor(source, stage string) string {
 		}
 	}
 	return ""
+}
+
+// HasAction reports whether a stage declares an action by this name. The
+// board offers only what a stage declares, and the endpoint accepts only what
+// the board could have offered.
+func (c *Config) HasAction(stage, name string) bool {
+	st, ok := c.Stage(stage)
+	if !ok {
+		return false
+	}
+	for _, a := range st.Actions {
+		if a.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// ResourcesFor names what one source's version of one stage consumes.
+//
+// The source's own entry wins outright when it has one: the same stage is
+// Claude in one repository and Codex in the next, and a single list on the
+// stage cannot be true of both. Nothing declared anywhere means unlimited,
+// which is what a stage that only reads an API should be.
+func (c *Config) ResourcesFor(source, stage string) []string {
+	st, ok := c.Stage(stage)
+	if !ok {
+		return nil
+	}
+	if st.Script != "" {
+		for _, src := range c.Sources {
+			if src.Name == source {
+				// nil, not empty: `resources: []` is a source saying its
+				// version of this stage spends nothing, which is a different
+				// statement from saying nothing at all.
+				if r := src.Scripts[st.Script].Resources; r != nil {
+					return r
+				}
+				break
+			}
+		}
+	}
+	return st.Resources
 }
 
 // AgentsInUse lists the agents this config's sources actually call.
@@ -670,6 +777,50 @@ func (c *Config) Validate() []string {
 		// agents in one directory overwrite each other; two worktrees of one
 		// repository share only the object store, which git makes safe.
 		add("concurrency.perSource must be at least 1, got %d", c.Concurrency.PerSource)
+	}
+	for name, n := range c.Resources {
+		if strings.TrimSpace(name) == "" {
+			add("resources: a resource must be named")
+		}
+		if n < 1 {
+			add("resources.%s must be at least 1, got %d", name, n)
+		}
+	}
+	// A resource with no limit declared is the failure this whole mechanism
+	// exists to prevent: it would read as "unlimited", which is exactly what
+	// somebody was trying to stop by naming it.
+	declared := func(where string, names []string) {
+		for _, r := range names {
+			if _, ok := c.Resources[r]; !ok {
+				add("%s names resource %q, which has no limit under resources:", where, r)
+			}
+		}
+	}
+	for _, st := range c.Stages {
+		declared(fmt.Sprintf("stage %q", st.Name), st.Resources)
+	}
+	for _, src := range c.Sources {
+		for name, spec := range src.Scripts {
+			declared(fmt.Sprintf("source %q script %q", src.Name, name), spec.Resources)
+		}
+	}
+	for _, st := range c.Stages {
+		seen := map[string]bool{}
+		for _, a := range st.Actions {
+			switch {
+			case !nameRe.MatchString(a.Name):
+				add("stage %q: action name %q must be lowercase letters, digits and dashes", st.Name, a.Name)
+			case seen[a.Name]:
+				add("stage %q declares two actions named %q", st.Name, a.Name)
+			}
+			seen[a.Name] = true
+		}
+		// An action on a stage that runs nothing could never be spent: there
+		// is no run to hand the word to, so the button would arm something
+		// and then sit there forever looking like it had not worked.
+		if len(st.Actions) > 0 && !st.Runs() {
+			add("stage %q declares actions but runs no script; there would be nothing to hand them to", st.Name)
+		}
 	}
 	if c.Concurrency.Global < 1 {
 		add("concurrency.global must be at least 1")

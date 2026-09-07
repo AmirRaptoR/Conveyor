@@ -322,6 +322,31 @@ function ageChip(it) {
   return `<span class="age">${durSpan(startMs, terminal, title)}</span>`;
 }
 
+// What a resting item said it is waiting for, and how long is left of it.
+//
+// A resting item and a stuck one look identical otherwise — both sit still —
+// and the difference is the single most common question this board is asked.
+// The engine neither reads `why` nor acts on `until`: the script that stopped
+// said both, and this draws them.
+function waitChip(it) {
+  const w = state.waiting && state.waiting[it.id];
+  if (!w) return "";
+  const untilMs = w.until ? new Date(w.until).getTime() : NaN;
+  const title = esc(w.why || "waiting");
+  if (!(untilMs > 0) || isNaN(untilMs)) {
+    return `<span class="wait" title="${title}">waiting</span>`;
+  }
+  return `<span class="wait" title="${title}"><span class="dur" data-until="${untilMs}">${
+    esc(countdown(untilMs - nowMs()))}</span></span>`;
+}
+
+// A countdown reads differently from an age: "3m left", and "any moment" once
+// it runs out rather than a negative number or a zero, because the thing it is
+// counting down to happens on the next poll and not on the tick.
+export function countdown(ms) {
+  return ms > 0 ? formatDuration(ms) + " left" : "any moment";
+}
+
 function card(it, active, place) {
   // Number, or nothing. `undefined !== null` is true, so a missing argument
   // used to render "NaN" in the rank badge rather than omitting it.
@@ -340,6 +365,7 @@ function card(it, active, place) {
       ${it.blocked ? why(it) : ""}
       ${ranked && !working && !it.blocked ? `<span class="rank">${place + 1}</span>` : ""}
       ${hasPrio ? `<span class="prio">p${it.priority}</span>` : ""}
+      ${working ? "" : waitChip(it)}
       ${ageChip(it)}
       <span class="src">${esc(it.id)}</span>
       ${it.url ? (isHttpUrl(it.url)
@@ -403,5 +429,12 @@ export function tickDurations() {
     const start = Number(el.dataset.start);
     if (!(start > 0)) return;
     el.textContent = formatDuration(n - start) + (el.dataset.ago ? " ago" : "");
+  });
+  // The same mechanism, counting the other way: a span carrying the instant
+  // it is waiting for rather than the instant it started.
+  document.querySelectorAll(".dur[data-until]").forEach(el => {
+    const until = Number(el.dataset.until);
+    if (!(until > 0)) return;
+    el.textContent = countdown(until - n);
   });
 }

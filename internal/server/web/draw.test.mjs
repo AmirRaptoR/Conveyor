@@ -253,3 +253,54 @@ test("draw: items that disappear when their source's listing fails are not left 
   assert.doesNotMatch(p.el("#rail").innerHTML, /still here a moment ago/);
   assert.match(p.el("#line1").innerHTML, /not listing/);
 });
+
+// ---- the waiting countdown --------------------------------------------------
+//
+// A resting item and a stuck one look identical on a board — both sit still —
+// so the script says what it is waiting for and the card draws the clock.
+
+test("draw: an item with a waiting entry gets a countdown chip", async () => {
+  const p = await page();
+  const until = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  await withState(p, baseState({
+    items: [{ id: "s1:1", source: "s1", stage: "backlog", title: "settling" }],
+    waiting: { "s1:1": { until, why: "the PR must stay quiet" } },
+  }));
+  const rendered = p.el("#rail").innerHTML;
+  assert.match(rendered, /class="wait"/);
+  assert.match(rendered, /left</);
+  // The instant travels on the element, so tickDurations can recount it in
+  // place without draw() rebuilding the board once a second.
+  assert.match(rendered, /data-until="\d+"/);
+  assert.match(rendered, /the PR must stay quiet/);
+});
+
+test("draw: a wait with no deadline says so and draws no clock", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:1", source: "s1", stage: "backlog", title: "settling" }],
+    waiting: { "s1:1": { why: "a human is reviewing it" } },
+  }));
+  const rendered = p.el("#rail").innerHTML;
+  assert.match(rendered, /class="wait"/);
+  assert.doesNotMatch(rendered, /data-until/);
+});
+
+test("draw: an item nobody is waiting on gets no chip", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:1", source: "s1", stage: "backlog", title: "moving" }],
+  }));
+  assert.doesNotMatch(p.el("#rail").innerHTML, /class="wait"/);
+});
+
+// A deadline that has passed reads as "any moment", never a negative number
+// or a zero: the thing it was counting down to happens on the next poll.
+test("draw: an elapsed countdown says any moment", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:1", source: "s1", stage: "backlog", title: "due" }],
+    waiting: { "s1:1": { until: "2020-01-01T00:00:00Z", why: "overdue" } },
+  }));
+  assert.match(p.el("#rail").innerHTML, /any moment/);
+});

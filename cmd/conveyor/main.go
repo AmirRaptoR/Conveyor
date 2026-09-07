@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -185,6 +186,21 @@ func cmdValidate(args []string) error {
 	fmt.Printf("    stages: %s\n", strings.Join(parts, " -> "))
 	fmt.Printf("    %d source(s), concurrency %d global / %d per stage / %d per source\n",
 		len(cfg.Sources), cfg.Concurrency.Global, cfg.Concurrency.PerStage, cfg.Concurrency.PerSource)
+	// The limits that actually bind. `global` counts transitions; these count
+	// the scarce things, and a reader deciding why nothing started needs to
+	// see them without opening the config.
+	if len(cfg.Resources) > 0 {
+		names := make([]string, 0, len(cfg.Resources))
+		for name := range cfg.Resources {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		limits := make([]string, len(names))
+		for i, name := range names {
+			limits[i] = fmt.Sprintf("%s %d", name, cfg.Resources[name])
+		}
+		fmt.Printf("    resources: %s\n", strings.Join(limits, ", "))
+	}
 	fmt.Printf("    poll %s, default timeout %s, log retention %s\n",
 		cfg.Poll.D(), cfg.Timeout.D(), cfg.Logs.Retention.D())
 	// Printed because it is the one setting that acts on its own: a reader

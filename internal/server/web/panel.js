@@ -1,6 +1,6 @@
 import { $, esc } from "./dom.js";
 import { nextQueueIndex, controlsForMode } from "./pure.js";
-import { state, focusDescriptor, findFocusTarget } from "./shared.js";
+import { state, load, focusDescriptor, findFocusTarget } from "./shared.js";
 import { blocks, tone, questionsOf, formatDuration, durSpan } from "./board.js";
 import { queueOf, stageBy, startable, startItem, saveOrder, handBack } from "./drag.js";
 import { openAsk, openReport } from "./report.js";
@@ -93,6 +93,17 @@ export function renderPanelActions(id) {
   if (first && stage === first.name && startable(stage, into)) {
     parts.push(`<button class="ctl" data-act="start" aria-label="Start ${esc(title)}">Start</button>`);
   }
+  // What this stage says a person may press. The board offers exactly what
+  // the config declares and invents nothing — pressing one hands a single
+  // word to the next run of this stage, which is the whole of the manual
+  // override: it cannot move the item, choose a stage or skip a check.
+  if (controlsForMode(state?.mode || "auto").handBack) {
+    for (const a of stageBy(stage)?.actions || []) {
+      parts.push(`<button class="ctl act" data-action="${esc(a.name)}"
+          ${a.confirm ? `data-confirm="${esc(a.confirm)}"` : ""}
+          aria-label="${esc(a.label)} for ${esc(title)}">${esc(a.label)}</button>`);
+    }
+  }
   box.innerHTML = parts.join("");
   box.querySelectorAll("[data-act]").forEach(btn => {
     btn.onclick = () => {
@@ -100,6 +111,39 @@ export function renderPanelActions(id) {
       else moveItem(id, btn.dataset.act === "up" ? -1 : 1);
     };
   });
+  box.querySelectorAll("[data-action]").forEach(btn => {
+    btn.onclick = () => armAction(id, btn);
+  });
+}
+
+// Arm one of the stage's actions for the next run. The button reports its own
+// outcome and stays disabled while the request is in flight: a person pressing
+// "merge now" three times because nothing visibly happened is three runs told
+// to stop waiting, and the third arrives after the merge.
+async function armAction(id, btn) {
+  if (btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "…";
+  let res;
+  try {
+    res = await fetch(`/api/items/${encodeURIComponent(id)}/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: btn.dataset.action }),
+    });
+  } catch {
+    btn.disabled = false; btn.textContent = label;
+    announce("Could not reach the server."); return;
+  }
+  if (!res.ok) {
+    btn.disabled = false; btn.textContent = label;
+    announce((await res.text()).trim() || `Could not do that (HTTP ${res.status}).`);
+    return;
+  }
+  btn.textContent = "armed";
+  announce(`${label}: the next run of ${id} will be told.`);
+  load();
 }
 
 const queueEls = stage => [...document.querySelectorAll(`.queue[data-stage="${CSS.escape(stage)}"] .item`)];

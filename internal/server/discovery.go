@@ -566,14 +566,14 @@ func (s *Server) askAgents(ctx context.Context) {
 func (s *Server) recallBlocks(items []model.Item) {
 	s.mu.RLock()
 	wantBlocks := map[string]bool{}
-	listedReason := map[string]string{}
+	listed := map[string]Block{}
 	for _, it := range items {
 		if it.Blocked {
 			if _, known := s.blocks[it.ID]; !known {
 				wantBlocks[it.ID] = true
 			}
 			if it.BlockReason != "" {
-				listedReason[it.ID] = it.BlockReason
+				listed[it.ID] = Block{Kind: it.BlockKind, Reason: it.BlockReason, Stage: it.Stage}
 			}
 		}
 	}
@@ -594,7 +594,13 @@ func (s *Server) recallBlocks(items []model.Item) {
 	foundBlocks := map[string]Block{}
 	foundTimes := map[string]ItemTime{}
 	s.walkRuns(func(m RunMeta) bool {
-		if wantBlocks[m.ItemID] && m.Kind == "stage" {
+		// Only a run of the stage the item is *in*. The walk is newest-first
+		// over the whole store, and without this the newest failed run in any
+		// stage answered for a mark it had nothing to do with: a card stopped
+		// in `approving` showed a three-day-old `in-progress` failure as the
+		// reason, which sends the reader to the wrong log and is worse than
+		// saying nothing.
+		if wantBlocks[m.ItemID] && m.Kind == "stage" && m.To == stageOf[m.ItemID] {
 			switch m.Outcome {
 			case model.OutcomeBlocked, model.OutcomeFailure, model.OutcomeTimeout:
 				var data json.RawMessage
@@ -633,23 +639,42 @@ func (s *Server) recallBlocks(items []model.Item) {
 
 	s.mu.Lock()
 	for id, b := range foundBlocks {
-		if _, known := s.blocks[id]; !known {
-			s.blocks[id] = b
+		if _, known := s.blocks[id]; known {
+			continue
 		}
-	}
-	// Marked, and no run to explain it: either someone put the label on by
-	// hand, or this poll's listing supplied its own reason (a closed issue
-	// found sitting in a non-terminal stage, say) — CONTRACTS.md §6. The
-	// listing's own words beat the generic fallback whenever it gave one.
-	for id := range wantBlocks {
-		if _, known := s.blocks[id]; !known {
-			if reason, ok := listedReason[id]; ok {
-				s.blocks[id] = Block{Kind: "by hand", Reason: reason}
-				continue
+		// The listing read the reason off the item itself, so when it has
+		// one it is the current mark's, by construction; the run is history
+		// and may be an older stop in the same stage that was cleared since.
+		// The run is still worth having for what only it knows — whether the
+		// stop was a question, the session that asked it, and the options it
+		// offered — but only when the two are talking about the same stop.
+		if l, ok := listed[id]; ok {
+			if l.Reason != b.Reason {
+				b = Block{Kind: l.Kind, Reason: l.Reason, Stage: l.Stage}
+			} else if l.Kind != "" {
+				b.Kind = l.Kind
 			}
-			s.blocks[id] = Block{Kind: "by hand",
-				Reason: "marked outside the pipeline; there is no run to explain it"}
 		}
+		s.blocks[id] = b
+	}
+	// Whatever is still unexplained. The listing's own account comes first:
+	// the provider reads it back off the item itself (the GitHub adapter
+	// writes it into a marked section of the issue body), so it is this
+	// poll's truth, it survives a restart and a retention sweep, and it is
+	// the only account there is for a mark no run in this pipeline made.
+	for id := range wantBlocks {
+		if _, known := s.blocks[id]; known {
+			continue
+		}
+		if b, ok := listed[id]; ok {
+			if b.Kind == "" {
+				b.Kind = "by hand"
+			}
+			s.blocks[id] = b
+			continue
+		}
+		s.blocks[id] = Block{Kind: "by hand",
+			Reason: "marked outside the pipeline; there is no run to explain it"}
 	}
 	// No matching move survives in retained history: an item onboarded
 	// straight into its stage, one whose move was swept by retention, or one

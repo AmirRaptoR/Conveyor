@@ -172,6 +172,7 @@ func (s *Server) handler() (http.Handler, error) {
 	mux.HandleFunc("PUT /api/order", s.handleOrder)
 	mux.HandleFunc("POST /api/items/{id}/start", s.mutationGuard(s.handleStart))
 	mux.HandleFunc("POST /api/items/{id}/unblock", s.mutationGuard(s.handleUnblock))
+	mux.HandleFunc("POST /api/items/{id}/action", s.mutationGuard(s.handleAction))
 	mux.HandleFunc("POST /api/unblock", s.mutationGuard(s.handleUnblockAll))
 	mux.HandleFunc("POST /api/doctor", s.mutationGuard(s.handleDoctorStart))
 	mux.HandleFunc("GET /api/doctor", s.handleDoctorGet)

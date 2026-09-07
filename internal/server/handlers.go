@@ -27,10 +27,17 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	st.Items = pipeline.Order(s.cfg, s.state.Items, s.state.Order)
 	bySrc, byStage, held, max, perSrc, perStage := s.eng.Locks().Snapshot()
 	st.Slots = SlotsView{BySource: bySrc, ByStage: byStage, Global: held, GlobalMax: max,
-		PerSource: perSrc, PerStage: perStage, Running: int(s.inFlight.Load())}
+		PerSource: perSrc, PerStage: perStage, Running: int(s.inFlight.Load()),
+		Resources: s.eng.Locks().Resources()}
 	st.Blocks = make(map[string]Block, len(s.blocks))
 	for id, b := range s.blocks {
 		st.Blocks[id] = b
+	}
+	if len(s.waiting) > 0 {
+		st.Waiting = make(map[string]model.Waiting, len(s.waiting))
+		for id, wt := range s.waiting {
+			st.Waiting[id] = wt
+		}
 	}
 	st.Times = make(map[string]ItemTime, len(s.times))
 	for id, t := range s.times {
@@ -236,6 +243,68 @@ func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleAction arms one of a stage's declared actions for the next run of that
+// item's stage. It is the whole of the manual override.
+//
+// Arming, not running: the action is a word handed to the script, and the
+// script decides what it means. Nothing here moves an item, chooses a stage or
+// skips a check — a person pressing "merge now" is saying "stop waiting", not
+// "merge whatever the state of it is", and the difference is the reason this
+// is one string rather than a way to drive the pipeline by hand.
+//
+// It clears the item's deferral too, because a stage that exited 10 to wait is
+// exactly the one this exists to hurry, and leaving it resting would mean the
+// button did nothing until the next listing.
+func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var said struct {
+		Action string `json:"action"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&said)
+	}
+
+	s.mu.RLock()
+	var item model.Item
+	found := false
+	for _, it := range s.state.Items {
+		if it.ID == id {
+			item, found = it, true
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if !found {
+		http.Error(w, "no item "+id+" on the board", http.StatusNotFound)
+		return
+	}
+	// Only what the stage the item is actually in declares. The board offers
+	// nothing else, so anything else is a stale page or a hand-written
+	// request, and either way the script would not know the word.
+	if !s.cfg.HasAction(item.Stage, said.Action) {
+		http.Error(w, fmt.Sprintf("%s declares no action named %q", item.Stage, said.Action),
+			http.StatusBadRequest)
+		return
+	}
+	// Layered onto whatever is already armed rather than replacing it: an
+	// answer someone typed and an action they then pressed are two things a
+	// person said about the same stop, and the next run should get both.
+	armed := s.answers.Get(item.ID)
+	armed.Manual = said.Action
+	if err := s.answers.Set(item.ID, armed); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.mu.Lock()
+	delete(s.resting, item.ID)
+	delete(s.restingAt, item.ID)
+	delete(s.waiting, item.ID)
+	s.mu.Unlock()
+	s.hub.publish(event{Kind: "state"})
+	s.wakeUp()
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // answerThenUnblock records an answer against a marked item, if there is one,
 // and then clears its mark — the sequence handleUnblock performs for a person
 // typing into a card, and the doctor sweep performs for a script's verdict.
@@ -252,7 +321,11 @@ func (s *Server) answerThenUnblock(ctx context.Context, item model.Item, answer 
 		s.mu.RLock()
 		sess := s.blocks[item.ID].Session
 		s.mu.RUnlock()
-		resume = model.Resume{Answer: answer, Session: sess}
+		// Layered onto whatever is armed, never replacing it: an action a
+		// person pressed and a reply they then typed are two things said
+		// about the same stop, and the next run should be handed both.
+		resume = s.answers.Get(item.ID)
+		resume.Answer, resume.Session = answer, sess
 		if err := s.answers.Set(item.ID, resume); err != nil {
 			return err
 		}
@@ -387,6 +460,30 @@ func saidAt(dir string) (asked bool, session string, questions json.RawMessage) 
 		v.Questions = nil
 	}
 	return v.Asked, v.Session, v.Questions
+}
+
+// waitingAt reads what a run said it is waiting for out of its own result
+// file. Absent, unreadable or malformed is simply "it did not say", which is
+// the ordinary case: most stages that exit 10 have nothing to add.
+func waitingAt(dir string) (model.Waiting, bool) {
+	if dir == "" {
+		return model.Waiting{}, false
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "result.json"))
+	if err != nil {
+		return model.Waiting{}, false
+	}
+	var v struct {
+		Waiting *model.Waiting `json:"waiting"`
+	}
+	if json.Unmarshal(b, &v) != nil || v.Waiting == nil {
+		return model.Waiting{}, false
+	}
+	// Neither half said anything: not a wait, just an empty object.
+	if v.Waiting.Until.IsZero() && strings.TrimSpace(v.Waiting.Why) == "" {
+		return model.Waiting{}, false
+	}
+	return *v.Waiting, true
 }
 
 // applyAgentStates turns what the agents said into what the scheduler does.
@@ -561,6 +658,7 @@ func (s *Server) unblock(ctx context.Context, item model.Item) error {
 	// deferred stage was waiting to see.
 	delete(s.resting, item.ID)
 	delete(s.restingAt, item.ID)
+	delete(s.waiting, item.ID)
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
 	s.wakeUp()
@@ -582,9 +680,18 @@ func (s *Server) whyStuck(it model.Item) string {
 	return fmt.Sprintf("%s has nowhere to go from %s", it.ID, it.Stage)
 }
 
-// whyBusy names what is holding the slot. perSource comes first because it is
-// the constraint an operator hits: one worktree, one agent.
+// whyBusy names what is holding the slot, in the operator's terms.
+//
+// The locks are asked first and believed: they know which axis actually
+// refused, and a resource — one account's quota, one deploy host — is held by
+// work in some other repository as often as by anything visible here, so
+// guessing from the active list alone names the wrong thing.
 func (s *Server) whyBusy(src, stage string) string {
+	held := s.eng.Locks().Holding(src, stage, s.cfg.ResourcesFor(src, stage)...)
+	if name, ok := strings.CutPrefix(held, "resource "); ok {
+		r := s.eng.Locks().Resources()[name]
+		return fmt.Sprintf("all %d of %s is in use; %s waits for one to come free", r[1], name, stage)
+	}
 	active := s.activeList()
 	for _, a := range active {
 		if a.Source == src {

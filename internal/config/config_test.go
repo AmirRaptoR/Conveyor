@@ -664,3 +664,91 @@ func TestOmittedRetentionStillDefaultsTo30Days(t *testing.T) {
 		t.Errorf("Retention = %v, want 30d default", cfg.Logs.Retention.D())
 	}
 }
+
+// loadYAML writes a whole config, lays down the provider and agent it names,
+// and loads it — for the cases the shared `stages` prefix cannot express.
+func loadYAML(t *testing.T, body string) (*Config, error) {
+	t.Helper()
+	dir := t.TempDir()
+	provider(t, dir)
+	script(t, filepath.Join(dir, "agents", "claude", "do"))
+	path := filepath.Join(dir, "conveyor.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return Load(path)
+}
+
+// A resource named on a stage but never given a limit is a load error. The
+// alternative is that it silently means "unlimited", which is precisely what
+// somebody was trying to prevent by naming it.
+func TestAResourceWithNoLimitIsALoadError(t *testing.T) {
+	_, err := loadYAML(t, `
+version: 1
+resources:
+  claude: 1
+stages:
+  - name: work
+    script: do
+    resources: [claude, codex]
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: github
+    scripts:
+      do: {agent: claude}
+`)
+	if err == nil || !strings.Contains(err.Error(), "codex") {
+		t.Fatalf("err = %v, want it to name the undeclared resource", err)
+	}
+}
+
+// A source may say its version of a stage spends something different — the
+// same stage is Claude in one repository and Codex in the next — and `[]` says
+// it spends nothing, which is not the same as saying nothing at all.
+func TestASourceOverridesAStagesResources(t *testing.T) {
+	cfg, err := loadYAML(t, `
+version: 1
+resources:
+  claude: 1
+  codex: 1
+stages:
+  - name: work
+    script: do
+    resources: [claude]
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: uses-stage-default
+    provider: github
+    scripts:
+      do: {agent: claude}
+  - name: uses-codex
+    provider: github
+    scripts:
+      do: {agent: claude, resources: [codex]}
+  - name: spends-nothing
+    provider: github
+    scripts:
+      do: {agent: claude, resources: []}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		source string
+		want   []string
+	}{
+		{"uses-stage-default", []string{"claude"}},
+		{"uses-codex", []string{"codex"}},
+		{"spends-nothing", []string{}},
+	} {
+		got := cfg.ResourcesFor(c.source, "work")
+		if len(got) != len(c.want) || (len(got) > 0 && got[0] != c.want[0]) {
+			t.Errorf("ResourcesFor(%q) = %v, want %v", c.source, got, c.want)
+		}
+	}
+}
