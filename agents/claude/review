@@ -44,6 +44,26 @@ if [[ -n "${REPO:-}" ]]; then
 		blocked decision "more than one open pull request closes issue #$ref; resolve which one is correct before this can proceed."
 		;;
 	none)
+		# No *open* PR is not the same as nothing to review: it may already
+		# have merged, by hand or by an earlier approving run. The provider's
+		# own record of what closed the issue settles it — before the
+		# worktree, since a merged pull request's branch is usually deleted.
+		item_landed "$ref"
+		case "$LANDED" in
+		unavailable)
+			echo "could not confirm whether #$ref already landed before reporting nothing to review; deferring" >&2
+			exit 10
+			;;
+		yes)
+			echo "issue #$ref is already closed by merged pull request #$LANDED_PR; nothing to review"
+			exit 0
+			;;
+		esac
+		if [[ "$ISSUE_STATE" == "CLOSED" ]]; then
+			asks input "issue #$ref is closed but no merged pull request references it, so \
+there is nothing to review. Check whether it was closed by hand; if the work still needs \
+doing, reopen it, or answer here with what to do next."
+		fi
 		blocked input "no open pull request closes #$ref, so there is nothing to \
 review. Either the implement stage did not land its work, or the PR was closed \
 by hand."
