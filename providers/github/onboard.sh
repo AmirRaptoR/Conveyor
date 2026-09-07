@@ -6,11 +6,13 @@
 # Not a verb: `provider:` resolves only list and move, so a third file here can
 # never be mistaken for a stage script — the same precedent selfcheck.sh sets.
 #
-# Labels are created lazily today: move.sh writes a stage label the first time
-# an item reaches that stage. That works, and it means the first item into a
-# stage in a new repository is also the first time anyone finds out whether the
-# label write succeeds. This is the one-shot version, so onboarding a repository
-# is one command rather than a discovery spread over a week.
+# move.sh does create a missing label when it turns out it needs one, so a
+# stage added to the config after a repository was onboarded still works. That
+# is a recovery, not a plan: it means the first item into a new stage is also
+# the first time anyone finds out whether the label write succeeds, and it
+# creates the label with a generic colour and description. This is the one-shot
+# version, so onboarding a repository is one command rather than a discovery
+# spread over a week.
 #
 # Idempotent: an existing label is not an error, and neither its colour nor its
 # description is overwritten. Someone may have recoloured a label on purpose,

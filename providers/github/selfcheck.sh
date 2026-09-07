@@ -487,6 +487,52 @@ Second paragraph." "$cleared"
 issue_view_stub
 export BODY=""
 
+# --- a label that does not exist yet ---------------------------------------
+#
+# A stage added to the config after a repository was onboarded names a label
+# that repository has never seen, and `gh issue edit --add-label` fails outright
+# on one. That marked the item with an `error` the moment it reached the new
+# stage, which is a confusing way to be told to run onboard.sh.
+echo "move.sh (a label the repo does not have yet)"
+cat >"$tmp/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+	*"--json"*)
+		jq -n --arg l "${LABELS:-}" --arg b "${BODY:-}" \
+			'{labels: ($l | split("\n") | map(select(. != "")) | map({name: .})), body: $b}' ;;
+	*"label create"*)
+		echo "CREATED: $3" >>"$CALLS"; exit 0 ;;
+	*"issue edit"*)
+		n=$(cat "$EDITS" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >"$EDITS"
+		if [[ "$n" -le "${EDIT_FAILS:-0}" ]]; then
+			echo "could not add label: 'status:new' not found" >&2; exit 1
+		fi
+		echo "EDITED" >>"$CALLS" ;;
+esac
+STUB
+chmod +x "$tmp/stub/gh"
+export CALLS="$tmp/calls" EDITS="$tmp/edits"
+saved_labels=$STAGE_LABELS
+export STAGE_LABELS='new=status:new'
+export LABELS="" BODY=""
+
+: >"$CALLS"; : >"$EDITS"
+echo '{"item":{"ref":"61"},"stage":"new"}' | PATH="$tmp/stub:$PATH" EDIT_FAILS=1 ./move.sh 2>/dev/null
+check "the missing label is created" "yes" "$(grep -q "^CREATED: status:new" "$CALLS" && echo yes || echo no)"
+check "and the edit is retried once it exists" "yes" "$(grep -q "^EDITED" "$CALLS" && echo yes || echo no)"
+check "     exactly twice, never in a loop" "2" "$(cat "$EDITS")"
+
+# A failure nothing created explains is a failure. Retrying an identical call
+# that broke for some other reason is how a provider write becomes a rate limit.
+: >"$CALLS"; : >"$EDITS"
+rc=0
+echo '{"item":{"ref":"61"},"stage":"new"}' | PATH="$tmp/stub:$PATH" EDIT_FAILS=9 ./move.sh >/dev/null 2>&1 || rc=$?
+check "a failure no missing label explains is still a failure" "yes" "$([[ $rc -ne 0 ]] && echo yes || echo no)"
+check "     and it did not retry forever" "2" "$(cat "$EDITS")"
+
+export STAGE_LABELS=$saved_labels
+issue_view_stub
+
 # --- the label namespace ----------------------------------------------------
 #
 # Every label this pipeline owns begins with one prefix, so a repository can see

@@ -194,4 +194,34 @@ if [[ -n "${CONVEYOR_DRY_RUN:-}" ]]; then
 	exit 0
 fi
 
-gh issue edit "$ref" --repo "$REPO" "${args[@]}" >&2
+# A label this pipeline wants may simply not exist yet — a stage added to the
+# config since the repository was onboarded is the ordinary way to get there,
+# and `gh issue edit --add-label` fails outright on a name the repository has
+# never seen. That failure marked the item with an `error` the moment it
+# reached the new stage, which is a confusing way to be told to run
+# providers/github/onboard.sh.
+#
+# Created on failure rather than before every edit: adding a label is the
+# common path and this is the rare one, so the normal move still costs exactly
+# one API call.
+if ! gh issue edit "$ref" --repo "$REPO" "${args[@]}" >&2; then
+	made=0
+	for i in "${!args[@]}"; do
+		[[ "${args[$i]}" == "--add-label" ]] || continue
+		label="${args[$((i + 1))]}"
+		if gh label create "$label" --repo "$REPO" --color 1D76DB \
+			--description "Conveyor: $to" >/dev/null 2>&1; then
+			echo "created missing label $label" >&2
+			made=1
+		fi
+	done
+	# Retried once, and only when creating something actually changed the
+	# world: a second identical call that failed for any other reason would
+	# just fail again, and looping on it is how a provider write turns into a
+	# rate limit.
+	if [[ "$made" -eq 0 ]]; then
+		echo "gh issue edit #$ref failed and no missing label explained it" >&2
+		exit 1
+	fi
+	gh issue edit "$ref" --repo "$REPO" "${args[@]}" >&2
+fi
