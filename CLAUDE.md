@@ -190,7 +190,15 @@ every repository the config enrols.
   `agents/_pr` is the one lookup — "Closes #N" in the body, or the
   `issue-N` branch `_worktree` names — used by implement, review and approve.
   `gh pr list --search "$ref"` matched the number anywhere in any PR and handed
-  issue 188 the PR whose body said "depends on #188".
+  issue 188 the PR whose body said "depends on #188". `agents/_pr` also asks
+  GitHub whether an item has *landed* — `item_landed`, straight off
+  `Issue.closedByPullRequestsReferences` rather than a page of `pr list` —
+  because no *open* PR is not the same as nothing landed: it may already be
+  merged, and a guard that cannot tell those apart marks a finished item
+  `no-output` forever, since a merged PR never becomes open again for
+  `retryStalled` to find. This is not a second way to pick a pull request to
+  work on; it only ever answers whether this item is already done, and stays
+  the one place both implement and review ask that question.
 - **An item sequenced behind an open issue is not started.** `agents/_deps`
   reads "Depends on #N" / "Blocked by #N" lines from the body; implement stops
   before the worktree with a `dependency` mark, a condition the doctor clears
