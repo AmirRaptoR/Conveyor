@@ -49,10 +49,20 @@ Nothing to install but Go — the mocks need no GitHub and no AI.
 go build -o conveyor ./cmd/conveyor
 
 # -c keeps your own conveyor.yaml, if you have one, out of the way
-./conveyor validate -c conveyor.example.yaml   # check config, print the graph
-./conveyor list     -c conveyor.example.yaml   # run every source's list script
-./conveyor tick     -c conveyor.example.yaml -n 10 -v
+./conveyor validate   -c conveyor.example.yaml   # check config, print the graph
+./conveyor preflight  -c conveyor.example.yaml   # is the outside world ready?
+./conveyor list       -c conveyor.example.yaml   # run every source's list script
+./conveyor tick       -c conveyor.example.yaml -n 10 -v
 ```
+
+`conveyor preflight [-source NAME]` is a readiness check, not a run: it moves
+no item, runs no stage, and writes nothing to any provider or to the config.
+For each source it reports the engine-side problems `validate` already
+catches, then whatever its provider's own `preflight` script finds (`gh`
+installed and authenticated, the labels the pipeline needs, write access to
+the repository) — see `providers/github/preflight.sh` — then one check per
+agent the source names, via `agents/<name>/status`. Exits non-zero if
+anything came back `fail` or `unknown`.
 
 `conveyor.yaml` is the working config and is deliberately untracked;
 `conveyor.example.yaml` is the template that ships.

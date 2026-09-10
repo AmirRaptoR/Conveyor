@@ -195,6 +195,56 @@ tokens or money is the interesting number — all of that differs per agent and
 belongs to the script, which is why the engine holds no struct for it. An agent
 with no `status` script simply says nothing, which is not an error.
 
+**`preflight`** (optional, `providers/<name>/preflight`) — a readiness check
+for one source, run only by `conveyor preflight`, and by `conveyor enroll`
+and `conveyor run`'s post-run checklist when they need the same answer. Never
+run by the scheduler, and never as part of an ordinary poll: this is the
+outside world checked deliberately, on request. Receives the same stdin
+`list` receives — `model.ListInput` with `source`, `stages` and
+`terminalStages`; `config` left unset, exactly as `Client.List` leaves it —
+and `ProviderEnv()` (the source's `env:` plus its `provider.params:`), since
+what this script checks (a label existing, a repository's permission level)
+is the provider's own vocabulary and belongs to the same env `list` and
+`move` already see. Writes:
+
+```json
+{"checks": [
+  {"name": "gh on PATH", "status": "pass"},
+  {"name": "label conveyor:blocked", "status": "fail",
+   "detail": "missing", "fix": "providers/github/onboard.sh ..."}
+]}
+```
+
+`status` is one of `pass`, `fail`, `warn`, `skip`. Any other word, or an
+absent one, is read as `unknown` and counts as a failure, the same as an
+unrecognised agent `state` does — a check whose outcome cannot be read has
+not passed. Exit 0 means only "the checks ran, and here is what they found";
+the verdicts carry the outcome. A non-zero exit, a timeout, or a failure to
+start becomes one synthetic `fail` naming the exit code (or timeout) and the
+run directory, since none of those left any verdict to trust. A malformed
+envelope — not JSON, not an object, no `checks` key, `checks` not an array,
+or an empty result on a 0 exit — becomes the same kind of synthetic `fail`.
+A malformed *entry* inside an otherwise well-formed array does not take the
+rest down with it: it becomes one `unknown` check named by its index, and
+every valid entry beside it is still reported.
+
+Resolved by name with or without an extension, exactly like `list` and
+`move`. A provider shipping none is not a problem — `conveyor preflight`
+reports a single `skip` for that source, and `Source.OK()` is unaffected;
+providers that predate this issue keep working with no changes. Two matching
+files is a single `fail` naming both, for the same reason two matching
+`list` files would be an error: the choice must not depend on glob order.
+Every invocation is recorded with `Kind: "preflight"`, bounded by
+`discovery:` rather than `timeout:` — these are API reads, not agent work.
+
+What a preflight script writes into `detail` or `fix` — or logs on its own
+account — is that script's own promise, not something the engine polices:
+the same standing `move`'s own comment on an issue already carries. A script
+that echoes one of its own params into a `detail` string has broken that
+promise, not the engine's redaction, which only ever covers what the *engine
+itself* prints (env values in `conveyor run -explain`, `conveyor enroll`'s
+stdout) and never rewrites a script's own prose.
+
 **`doctor`** (optional, `scripts.doctor:` — a reserved source-script key no
 stage names) — triage one marked item, on demand, as part of a *sweep* the
 board starts across every marked item at once (`POST /api/doctor`). Not a
