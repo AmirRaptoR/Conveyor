@@ -30,11 +30,25 @@ export CONVEYOR_RESULT="$tmp/result.json"
 # The stub answers `gh pr list` and `gh api graphql` from fixtures the scene
 # writes; anything else is a fixture the scene did not expect and fails loudly
 # rather than guessing.
+#
+# `pr list` is call-sensitive: the Nth call in a run reads `prlist_N` if the
+# scene wrote one, falling back to the scene's single `prlist` fixture
+# otherwise. Preflight and postcondition both call `pr_lookup`, so this is
+# what lets one scene answer them differently — a PR that is not yet a draft
+# when review's preflight looks, but is by the time its postcondition looks
+# again.
 cat >"$tmp/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 scene="$SCENE"
 case "$1 $2" in
-"pr list")     what=prlist ;;
+"pr list")
+	n=0
+	[[ -f "$scene/prlist_n" ]] && n=$(cat "$scene/prlist_n")
+	n=$((n + 1))
+	echo "$n" >"$scene/prlist_n"
+	what="prlist_$n"
+	[[ -f "$scene/$what" ]] || what=prlist
+	;;
 "api graphql") what=graphql ;;
 *) echo "stub gh: unhandled: $*" >&2; exit 97 ;;
 esac
@@ -46,8 +60,12 @@ chmod +x "$tmp/bin/gh"
 # `git` is never expected to run for a preflight scene that stops before the
 # worktree — stubbed to fail loudly instead of left off PATH, so a regression
 # that does reach it is a clear failure here rather than a real invocation.
+# Leaves its own marker so a scene can assert directly that no call reached
+# it, rather than inferring that from the exit code alone.
 cat >"$tmp/bin/git" <<'STUB'
 #!/usr/bin/env bash
+scene="$SCENE"
+touch "$scene/git_called"
 echo "stub git: unexpected call from a preflight that should stop first: $*" >&2
 exit 99
 STUB
@@ -69,9 +87,14 @@ STUB
 	chmod +x "$tmp/bin/claude"
 }
 claude_called() { [[ -f "$tmp/scene/claude_called" ]] && echo yes || echo no; }
+git_called() { [[ -f "$tmp/scene/git_called" ]] && echo yes || echo no; }
 
 scene() { rm -f "$tmp/scene"/*; stub_claude_refuses; }
 prlist() { printf '%s' "$1" >"$tmp/scene/prlist"; }
+# prlist_at <n> <json> — what the Nth `pr list` call in this scene answers,
+# overriding the scene's single `prlist` fixture for that call only. Lets one
+# run give the preflight and the postcondition different answers.
+prlist_at() { printf '%s' "$2" >"$tmp/scene/prlist_$1"; }
 graphql() { printf '%s' "$1" >"$tmp/scene/graphql"; }
 fail_graphql() { touch "$tmp/scene/fail_graphql"; }
 
@@ -83,6 +106,17 @@ open_issue='{"data":{"repository":{"issue":{"state":"OPEN",
 	"closedByPullRequestsReferences":{"nodes":[]}}}}}'
 
 payload() { jq -n --arg ref "$1" '{item:{ref:$ref,title:"an item",description:"",url:"u"}}'; }
+
+# pr_entry <number> <ref> <state> <draft> — a one-element `pr list` fixture
+# that closes #ref, matched by body ("Closes #ref") rather than by branch. The
+# branch is named after ref so two scenes' worktrees never collide over one
+# real git checkout — item_worktree refuses a branch already checked out
+# elsewhere, which is a different scene's business, not this one's.
+pr_entry() {
+	local number=$1 ref=$2 state=$3 draft=$4
+	printf '[{"number":%s,"body":"Closes #%s","state":"%s","headRefName":"pr-branch-%s","url":"u","isDraft":%s}]' \
+		"$number" "$ref" "$state" "$ref" "$draft"
+}
 
 run_implement() {
 	: >"$CONVEYOR_RESULT"
@@ -125,6 +159,17 @@ chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RES
 chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "input"
 chk "  and never starts the model" "$(claude_called)" "no"
 
+# --- review: a draft PR stops before the worktree and before the model -----
+scene; prlist "$(pr_entry 40 28 OPEN true)"
+rc=$(run_review 28)
+chk "review blocks a draft at the preflight" "$rc" "20"
+chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "false"
+chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "draft"
+chk "  and names the PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#40')" "1"
+chk "  and says draft" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -ci 'draft')" "1"
+chk "  never starts the model" "$(claude_called)" "no"
+chk "  and never reaches git" "$(git_called)" "no"
+
 # --- implement's postcondition: an issue closed by hand with nothing merged
 # behind it is a question, not a bulk-clearable condition — the same shape of
 # permanent state a merged PR is, just with the opposite answer. Reaching this
@@ -165,6 +210,100 @@ rc=0
 chk "implement asks on a closed issue with nothing merged" "$rc" "20"
 chk "  the mark is a question, not a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "true"
 chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "no-output"
+
+# --- implement's postcondition: the model left the PR a draft ---------------
+# item_landed's own fixture is "no" here (the issue is still open), the
+# ordinary case: nothing about item_landed decides this, only what the
+# postcondition's own lookup finds afterward.
+rm -f "$tmp/scene"/*
+prlist_at 1 '[]' # preflight: no existing PR, a fresh item
+prlist_at 2 "$(pr_entry 50 26 OPEN true)" # postcondition: the model opened one, still a draft
+graphql "$open_issue"
+: >"$CONVEYOR_RESULT"
+rc=0
+(cd "$tmp/srcrepo" && payload 26 | "$here/implement" >"$tmp/out" 2>"$tmp/err") || rc=$?
+chk "implement blocks when its own postcondition finds a draft" "$rc" "20"
+chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "false"
+chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "draft"
+chk "  and names the PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#50')" "1"
+chk "  and says draft" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -ci 'draft')" "1"
+chk "  never prints opened PR" "$(grep -c 'opened PR' "$tmp/out")" "0"
+
+# --- implement's postcondition: the draft stop fires even when the model
+# itself exited non-zero — a real error, not a usage limit or a turns wall,
+# neither of which this stub's output matches. This is the asymmetry the
+# criterion calls out explicitly: a non-zero run that also left a draft is
+# exactly the silent case the stop exists to catch, and nothing above this
+# scene actually drove the model to a non-zero exit while leaving a draft.
+rm -f "$tmp/bin/claude"
+cat >"$tmp/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+echo '{"type":"result","is_error":true,"subtype":"error","num_turns":3,"result":"hit an unexpected error"}'
+exit 1
+STUB
+chmod +x "$tmp/bin/claude"
+
+rm -f "$tmp/scene"/*
+prlist_at 1 '[]'
+prlist_at 2 "$(pr_entry 52 32 OPEN true)"
+graphql "$open_issue"
+: >"$CONVEYOR_RESULT"
+rc=0
+(cd "$tmp/srcrepo" && payload 32 | "$here/implement" >"$tmp/out" 2>"$tmp/err") || rc=$?
+chk "implement blocks a draft even when the model itself exited non-zero" "$rc" "20"
+chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "false"
+chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "draft"
+chk "  and names the PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#52')" "1"
+
+# Restore the uneventful stub for the scenes below, which expect a clean run.
+rm -f "$tmp/bin/claude"
+cat >"$tmp/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+echo '{"type":"result","is_error":false,"subtype":"success","num_turns":1,"result":"nothing to implement"}'
+exit 0
+STUB
+chmod +x "$tmp/bin/claude"
+
+# --- implement's postcondition: an OPEN, non-draft PR is unaffected ---------
+rm -f "$tmp/scene"/*
+prlist_at 1 '[]'
+prlist_at 2 "$(pr_entry 51 27 OPEN false)"
+graphql "$open_issue"
+: >"$CONVEYOR_RESULT"
+rc=0
+(cd "$tmp/srcrepo" && payload 27 | "$here/implement" >"$tmp/out" 2>"$tmp/err") || rc=$?
+chk "implement still reports a non-draft PR" "$rc" "0"
+chk "  and never touches the mark file" "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+chk "  and prints the PR it opened" "$(grep -c 'opened PR #51' "$tmp/out")" "1"
+
+# --- review: an OPEN, non-draft PR advances all the way to approving -------
+# One fixture serves both of review's lookups (preflight's `--state open` and
+# the postcondition's `--state all`) — the object is the same PR either way.
+rm -f "$tmp/scene"/*
+prlist "$(pr_entry 60 30 OPEN false)"
+: >"$CONVEYOR_RESULT"
+rc=0
+(cd "$tmp/srcrepo" && payload 30 | "$here/review" >"$tmp/out" 2>"$tmp/err") || rc=$?
+chk "review advances a non-draft PR exactly as before" "$rc" "0"
+chk "  and never touches the mark file" "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+chk "  and hands it to approving" "$(grep -c 'PR #60 is OPEN; handing it to the approving stage' "$tmp/out")" "1"
+
+# --- review's postcondition: a person returned the PR to draft mid-review --
+# The preflight sees it ready; by the time the postcondition looks again
+# (after the model ran) it is a draft. This is the one scene the per-call
+# fixture exists for: unreachable if the preflight's own check answered both
+# calls the same way.
+rm -f "$tmp/scene"/*
+prlist_at 1 "$(pr_entry 70 31 OPEN false)" # preflight: not a draft
+prlist_at 2 "$(pr_entry 70 31 OPEN true)"  # postcondition: now a draft
+: >"$CONVEYOR_RESULT"
+rc=0
+(cd "$tmp/srcrepo" && payload 31 | "$here/review" >"$tmp/out" 2>"$tmp/err") || rc=$?
+chk "review's postcondition catches a PR returned to draft" "$rc" "20"
+chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "false"
+chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "draft"
+chk "  and names the PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#70')" "1"
+chk "  never hands it to approving" "$(grep -c 'handing it to the approving stage' "$tmp/out")" "0"
 
 if [[ $fail -eq 0 ]]; then echo "all checks passed"; else echo "SOME CHECKS FAILED"; fi
 exit $fail

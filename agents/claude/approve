@@ -818,8 +818,7 @@ check_gates_once() {
 	fetch_details
 
 	if [[ "$(jq -r '.isDraft' <<<"$details")" == "true" ]]; then
-		echo "PR #$pr is a draft; waiting" >&2
-		exit 10
+		waits "pull request #$pr is a draft; waiting for it to be marked ready"
 	fi
 
 	# Gate 14a, reachable from any poll: a PR this same script enqueued (or one
