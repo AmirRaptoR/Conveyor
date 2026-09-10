@@ -540,4 +540,23 @@ brief=$(CONVEYOR_DEADLINE=$(date -u -d "@$at" +%Y-%m-%dT%H:%M:%SZ) WRAP_UP_GRACE
 chk "a grace wider than the stage still reads" \
 	"$(grep -c "$(date -u -d "@$at" +'%H:%M UTC')" <<<"$brief")" "2"
 
+# 13. is_condition_kind (#68): the predicate agent_asked derives `asked`
+# from, checked directly rather than through a model-written result.
+for k in limit turns unfinished dependency worktree; do
+	chk "is_condition_kind recognises $k" "$(is_condition_kind "$k" && echo yes)" "yes"
+done
+for k in decision no-output input draft error flabbergasted; do
+	chk "is_condition_kind rejects $k" "$(is_condition_kind "$k" && echo yes)" ""
+done
+
+# 14. board.js's WAITING set and agents/_blocked's CONDITION_KINDS are one
+# list, not two that can drift apart. agents/_blocked is authoritative, so
+# this fails on a word added to or removed from either side — verified by
+# making each of those four edits and watching this line fail.
+board_waiting=$(grep -o 'WAITING = new Set(\[[^]]*\])' "$here/../internal/server/web/board.js" |
+	grep -oE '"[a-z-]+"' | tr -d '"' | sort)
+blocked_conditions=$(printf '%s\n' "${CONDITION_KINDS[@]}" | sort)
+chk "board.js's WAITING matches agents/_blocked's CONDITION_KINDS" \
+	"$board_waiting" "$blocked_conditions"
+
 exit $fail
