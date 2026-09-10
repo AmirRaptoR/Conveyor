@@ -24,7 +24,16 @@ drains the mock pipeline in priority order and marks a blocked item in place.
 SSE, run history, drag-to-reorder, drag out of the backlog to start an item now
 (`POST /api/items/{id}/start`), each mark's reason on its card with a hand-back
 button, `Unblock all`, a `Diagnose` sweep, and a strip saying how each agent is
-doing. It advances items on its own — `-watch`
+doing. An Inbox tab beside it (#40) is the same items again, reordered around
+attention rather than stage: a question, a failure, a dependency wait, a quota
+limit and a resting "pending" item are five distinct labels, never one grey
+"blocked", and a source that has not been listed recently marks its own items
+`stale` so old data cannot read as current. Its filters (source, search) are a
+client-side array transform with no fetch and no ordering rule of its own —
+never mistaken for the scheduler's own order or a provider write — and every
+action opens the very same `#panel` `inspect()` does, so nothing there is a
+second implementation of hand-back, Answer, or the report/history/log it
+already carries. It advances items on its own — `-watch`
 is what makes it observe without touching anything. Discovery, scheduling and
 the tick button are three goroutines, deliberately: a 90-minute stage must not
 be able to stop every source being listed. `Diagnose` (`POST /api/doctor`)
