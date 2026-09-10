@@ -229,6 +229,41 @@ chk "  and names the PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#50')" "
 chk "  and says draft" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -ci 'draft')" "1"
 chk "  never prints opened PR" "$(grep -c 'opened PR' "$tmp/out")" "0"
 
+# --- implement's postcondition: the draft stop fires even when the model
+# itself exited non-zero — a real error, not a usage limit or a turns wall,
+# neither of which this stub's output matches. This is the asymmetry the
+# criterion calls out explicitly: a non-zero run that also left a draft is
+# exactly the silent case the stop exists to catch, and nothing above this
+# scene actually drove the model to a non-zero exit while leaving a draft.
+rm -f "$tmp/bin/claude"
+cat >"$tmp/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+echo '{"type":"result","is_error":true,"subtype":"error","num_turns":3,"result":"hit an unexpected error"}'
+exit 1
+STUB
+chmod +x "$tmp/bin/claude"
+
+rm -f "$tmp/scene"/*
+prlist_at 1 '[]'
+prlist_at 2 "$(pr_entry 52 32 OPEN true)"
+graphql "$open_issue"
+: >"$CONVEYOR_RESULT"
+rc=0
+(cd "$tmp/srcrepo" && payload 32 | "$here/implement" >"$tmp/out" 2>"$tmp/err") || rc=$?
+chk "implement blocks a draft even when the model itself exited non-zero" "$rc" "20"
+chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "false"
+chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "draft"
+chk "  and names the PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#52')" "1"
+
+# Restore the uneventful stub for the scenes below, which expect a clean run.
+rm -f "$tmp/bin/claude"
+cat >"$tmp/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+echo '{"type":"result","is_error":false,"subtype":"success","num_turns":1,"result":"nothing to implement"}'
+exit 0
+STUB
+chmod +x "$tmp/bin/claude"
+
 # --- implement's postcondition: an OPEN, non-draft PR is unaffected ---------
 rm -f "$tmp/scene"/*
 prlist_at 1 '[]'

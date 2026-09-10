@@ -235,7 +235,8 @@ limit looks exactly like this."
 	if [[ "$PR_DRAFT" == "true" ]]; then
 		blocked draft "pull request #$PR_NUMBER, which closes issue #$ref, is \
 still a draft. A pull request must be marked ready before this item can \
-advance; \`gh pr ready\` not having run before the wall is the usual cause."
+advance; an implement run that did not reach \`gh pr ready\` is the usual \
+cause."
 	fi
 	pr=$PR_NUMBER
 	echo "opened PR #$pr"
