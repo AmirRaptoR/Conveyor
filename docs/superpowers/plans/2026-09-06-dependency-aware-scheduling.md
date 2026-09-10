@@ -78,6 +78,9 @@ In `providers/github/selfcheck.sh`, add three fixtures to the `data=` array insi
  {"state":"OPEN","number":29,"title":"Mid-line, not line-start","body":"Part of the live duel epic (#8). Depends on #21, #23 and #25, all still open.\n",
   "labels":[{"name":"conveyor"}],
   "url":"https://example.test/29","assignees":[]},
+ {"state":"OPEN","number":31,"title":"Anchored and phrase-anywhere in one sentence","body":"Requires #21, blocked by #23\n",
+  "labels":[{"name":"conveyor"}],
+  "url":"https://example.test/31","assignees":[]},
 ```
 
 Then append these checks immediately after the `check "an unmarked issue is not blocked"` block (around line 97):
@@ -103,12 +106,19 @@ check "an issue declaring nothing has no dependencies" \
 # both parsers have to keep agreeing on as they evolve.
 check "a mid-line declaration is read, not just a line-start one" \
 	"midgame:21,midgame:23,midgame:25" "$(jq -r '.[] | select(.ref == "29") | .dependsOn | join(",")' "$tmp/out.json")"
+# The anchored keyword opens the sentence, so it is always the earliest
+# possible cut point — the whole rest of the sentence counts, including a
+# phrase-anywhere keyword that also occurs later in it. The cut must not
+# instead jump to whichever of the two keywords happens to read first in the
+# raw text, which is the bug round 1 found in an earlier draft of this jq.
+check "an anchored keyword at the start still donates a later phrase-anywhere match" \
+	"midgame:21,midgame:23" "$(jq -r '.[] | select(.ref == "31") | .dependsOn | join(",")' "$tmp/out.json")"
 ```
 
 - [ ] **Step 2: Run it to make sure it fails**
 
 Run: `./providers/github/selfcheck.sh`
-Expected: FAIL on all five new checks — `want: midgame:21`, `got:` (empty), because `list.sh` emits no `dependsOn` field at all.
+Expected: FAIL on all six new checks — `want: midgame:21`, `got:` (empty), because `list.sh` emits no `dependsOn` field at all.
 
 - [ ] **Step 3: Implement the parse**
 
@@ -167,7 +177,7 @@ In `providers/github/list.sh`, inside the `jq` object, immediately after the `pr
 - [ ] **Step 4: Run it to make sure it passes**
 
 Run: `./providers/github/selfcheck.sh`
-Expected: PASS — all five new checks `ok`, and every pre-existing check still `ok`.
+Expected: PASS — all six new checks `ok`, and every pre-existing check still `ok`.
 
 - [ ] **Step 5: Add the model field**
 
