@@ -17,10 +17,11 @@ import (
 type claimRefusal int
 
 const (
-	claimAccepted    claimRefusal = iota
-	claimItemBusy                 // this item already has a transition in flight
-	claimSlotBusy                 // the (source, stage) slot has none free
-	claimAgentPaused              // the stage's agent is over quota and overridePause is false
+	claimAccepted       claimRefusal = iota
+	claimItemBusy                    // this item already has a transition in flight
+	claimSlotBusy                    // the (source, stage) slot has none free
+	claimAgentPaused                 // the stage's agent is over quota and overridePause is false
+	claimManuallyPaused              // an operator paused this source, or the whole board
 )
 
 // claim is the only place s.working is populated. Every dispatch path — the
@@ -46,6 +47,14 @@ const (
 // -watch), while launch and handleStart hand it to a goroutine — both call
 // this same function first.
 func (s *Server) claim(item model.Item, target string, overridePause bool) claimRefusal {
+	// An operator's own pause, unlike a paused agent's quota, is never
+	// overridden — not even by overridePause, which exists only because the
+	// tick button is the sole mover under -watch and must not be wedged shut
+	// by an agent's own quota. A manual pause is the person's own decision,
+	// and only their Resume undoes it (#39).
+	if s.manuallyPaused(item.Source) {
+		return claimManuallyPaused
+	}
 	if !overridePause && s.agentPaused(s.cfg.AgentFor(item.Source, target)) {
 		return claimAgentPaused
 	}
@@ -131,6 +140,14 @@ func (s *Server) launch(ctx context.Context) int {
 			if s.agentPaused(s.cfg.AgentFor(it.Source, target)) {
 				continue
 			}
+			// An operator's own pause, global or on this item's source —
+			// filtered here, before Pick, for the same reason a paused
+			// agent is: it is a fact about the world right now, not about
+			// the ordering, so a held item is simply not a candidate this
+			// pass rather than one Pick ranks and claim then refuses.
+			if s.manuallyPaused(it.Source) {
+				continue
+			}
 			if _, running := s.working.Load(it.ID); running {
 				continue // already being worked; the locks do not know that
 			}
@@ -162,7 +179,7 @@ func (s *Server) launch(ctx context.Context) int {
 				fullStage[target] = true
 			}
 			continue
-		case claimItemBusy, claimAgentPaused:
+		case claimItemBusy, claimAgentPaused, claimManuallyPaused:
 			busy[item.ID] = true
 			continue
 		}
@@ -199,6 +216,19 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 	s.setActive(item.ID, &Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title, StartedAt: time.Now()})
 	defer s.setActive(item.ID, nil)
 
+	// A child of ctx, one per transition, so cancelling this item's run —
+	// handleCancel calling the func stored below — reaches only this run's
+	// process group (runner.Run's own runCtx.Done() case) and never another
+	// one sharing the same parent. A fresh attempt supersedes whatever audit
+	// trail the last one left.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	s.cancelFns.Store(item.ID, cancelRun)
+	defer s.cancelFns.Delete(item.ID)
+	s.mu.Lock()
+	delete(s.cancels, item.ID)
+	s.mu.Unlock()
+
 	// Read, not taken. An answer is spent when the run it was written for
 	// actually ran — including one that stops to ask something else, which is a
 	// new question and wants a new answer. A run that failed outright never got
@@ -206,7 +236,7 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 	// bad agent invocation: the answer is kept and the session dropped, because
 	// a resume that did not work names a conversation worth abandoning.
 	resume := s.answers.Get(item.ID)
-	tr, err := s.eng.Advance(ctx, item.Source, &item, target, resume)
+	tr, err := s.eng.Advance(runCtx, item.Source, &item, target, resume)
 	if tr == nil {
 		// An unknown source or stage: a config problem, not a transient one,
 		// and nothing ran — there is nothing to mark, move or spend an answer

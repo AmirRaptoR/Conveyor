@@ -62,6 +62,13 @@ type State struct {
 	// one question this view exists to answer: a paused line and an idle line
 	// look identical otherwise.
 	Paused []PauseView `json:"paused,omitempty"`
+	// ManualPauses is every operator-placed hold on dispatch, global or
+	// per-source, and why — distinct from Paused, which is an agent's own
+	// quota reporting itself out. Only Resume lifts one of these.
+	ManualPauses []ManualPauseView `json:"manualPauses,omitempty"`
+	// Cancels is the audit record of a run an operator cancelled, keyed by
+	// item id, kept until that item's next transition starts.
+	Cancels map[string]CancelView `json:"cancels,omitempty"`
 	// Slots is what the concurrency locks are holding, against their limits. It
 	// is here rather than behind a debug flag because "nothing is starting" is
 	// the question this board gets asked most, and a held slot is the one cause
@@ -269,6 +276,26 @@ type PauseView struct {
 // Live reports whether this pause still holds at t.
 func (p PauseView) Live(t time.Time) bool { return p.Until.IsZero() || t.Before(p.Until) }
 
+// ManualPauseView is one operator-placed hold on dispatch: distinct from
+// PauseView, which is an agent's own quota reporting itself out, this is a
+// person's decision and only a person's Resume lifts it.
+type ManualPauseView struct {
+	// Scope is the empty string for a hold on the whole board, or one
+	// source's name for a hold on that source alone.
+	Scope  string    `json:"scope"`
+	Reason string    `json:"reason"`
+	By     string    `json:"by,omitempty"`
+	At     time.Time `json:"at"`
+}
+
+// CancelView is the audit record of one operator cancelling a run in flight:
+// who asked and why, kept beside the item until its next transition starts.
+type CancelView struct {
+	By     string    `json:"by,omitempty"`
+	Reason string    `json:"reason"`
+	At     time.Time `json:"at"`
+}
+
 type SourceView struct {
 	Name     string   `json:"name"`
 	Provider string   `json:"provider"`
@@ -371,7 +398,21 @@ type Server struct {
 	// answers is what a person typed when handing an item back, held until the
 	// run it was written for has been given it.
 	answers *store.Answers
-	active  sync.Map // itemID -> Active, one entry per transition in flight
+	// manualPauses is every operator-placed hold on dispatch, persisted:
+	// unlike an agent's own quota pause, nothing but a person's Resume can
+	// lift one, so a restart must not silently forget it (#39).
+	manualPauses *store.Pauses
+	// cancels is the audit record of a run an operator cancelled, kept until
+	// that item's next transition starts and overwrites it. Memory-only: a
+	// restart has no run left in flight to cancel, so there is nothing here
+	// worth surviving one.
+	cancels map[string]CancelView
+	// cancelFns is itemID -> context.CancelFunc, one entry per transition
+	// currently in flight — the handle handleCancel calls to reach the
+	// process-group shutdown path (runner.Run's own runCtx.Done() case)
+	// without touching any other run's context.
+	cancelFns sync.Map
+	active    sync.Map // itemID -> Active, one entry per transition in flight
 	// working is which items have a transition in flight, recorded before the
 	// goroutine starts rather than from inside it.
 	//
@@ -488,16 +529,17 @@ type Server struct {
 func New(cfg *config.Config, r *runner.Runner) *Server {
 	secureDataDir(cfg.DataDir())
 	s := &Server{
-		cfg:        cfg,
-		run:        r,
-		eng:        pipeline.New(cfg, r),
-		hub:        newHub(),
-		order:      store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
-		answers:    store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
-		tick:       make(chan struct{}, 1),
-		wake:       make(chan struct{}, 1),
-		ctx:        context.Background(),
-		drainGrace: drainGrace,
+		cfg:          cfg,
+		run:          r,
+		eng:          pipeline.New(cfg, r),
+		hub:          newHub(),
+		order:        store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
+		answers:      store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
+		manualPauses: store.OpenPauses(filepath.Join(cfg.DataDir(), "pauses.json")),
+		tick:         make(chan struct{}, 1),
+		wake:         make(chan struct{}, 1),
+		ctx:          context.Background(),
+		drainGrace:   drainGrace,
 	}
 	s.pushSubs = push.OpenStore(filepath.Join(cfg.DataDir(), "push.json"))
 	if keys, err := push.LoadKeys(filepath.Join(cfg.DataDir(), "vapid.json")); err != nil {
@@ -509,6 +551,7 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 	s.times = map[string]ItemTime{}
 	s.transitionErrs = map[string]TransitionError{}
 	s.paused = map[string]PauseView{}
+	s.cancels = map[string]CancelView{}
 	s.resting = map[string]bool{}
 	s.restingAt = map[string]time.Time{}
 	s.waiting = map[string]model.Waiting{}

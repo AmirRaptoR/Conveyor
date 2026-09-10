@@ -405,6 +405,16 @@ func (c *Config) Stage(name string) (*Stage, bool) {
 	return nil, false
 }
 
+// Source returns a source by name.
+func (c *Config) Source(name string) (*Source, bool) {
+	for i := range c.Sources {
+		if c.Sources[i].Name == name {
+			return &c.Sources[i], true
+		}
+	}
+	return nil, false
+}
+
 // runs reports whether entering this stage executes anything.
 func (s Stage) runs() bool { return s.Script != "" || s.Run != "" }
 

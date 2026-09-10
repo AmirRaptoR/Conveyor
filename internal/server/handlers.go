@@ -51,7 +51,14 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	for id, a := range s.answerInfo {
 		st.Answers[id] = a
 	}
+	if len(s.cancels) > 0 {
+		st.Cancels = make(map[string]CancelView, len(s.cancels))
+		for id, c := range s.cancels {
+			st.Cancels[id] = c
+		}
+	}
 	s.mu.RUnlock()
+	st.ManualPauses = s.manualPauseList()
 	writeJSON(w, st)
 }
 
@@ -193,6 +200,9 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	case claimAgentPaused:
 		http.Error(w, s.whyPaused(s.cfg.AgentFor(item.Source, target)), http.StatusConflict)
+		return
+	case claimManuallyPaused:
+		http.Error(w, s.whyManuallyPaused(item.Source), http.StatusConflict)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
