@@ -1,0 +1,49 @@
+# A template systemd unit for `conveyor serve`. Copy it, fill in the paths
+# and user for this box, and install it — none of that filling-in belongs in
+# this repository, which is why this ships as a `.example` rather than a
+# `.service` the checkout expects to be live:
+#
+#   sudo cp deploy/conveyor.service.example /etc/systemd/system/conveyor.service
+#   sudo $EDITOR /etc/systemd/system/conveyor.service   # fill in the paths below
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now conveyor
+#
+# See README.md's "Post-deploy check: conveyor probe" for what `Restart=`
+# does and does not cover, and docs/INSTALL.md for the sequence this unit is
+# the last step of.
+[Unit]
+Description=Conveyor — pipeline engine and board
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Fill in for this box:
+User=conveyor
+WorkingDirectory=/opt/conveyor
+ExecStart=/opt/conveyor/conveyor serve -c /opt/conveyor/conveyor.yaml -addr 127.0.0.1:8090
+# Everything a stage script can reach: go (agents build and test with it),
+# gh (every provider and agent shells out to it), jq (every script parses
+# JSON with it), and claude (what the shipped agents run headlessly). Extend
+# this for anything a source's own scripts additionally need — codex, node,
+# docker.
+Environment=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/home/conveyor/.local/bin
+
+# The engine can exit 0 on its own (a deliberate stop is not this), and
+# `on-failure` then leaves it dead with nothing distinguishing that from an
+# idle line. `always` does not mask an actual `systemctl stop`, though —
+# systemd never restarts a service stopped that way, whatever `Restart=`
+# says (systemd.service(5)) — so this only ever covers the clean self-exit.
+Restart=always
+RestartSec=5
+
+# TERM then KILL, the whole process group: a stage's own timeout already
+# does this to one stage's children (CLAUDE.md, "A timeout kills the process
+# group"), and the unit needs the same guarantee for the engine itself, so a
+# restart never leaves an orphaned agent process holding a source's worktree
+# lock.
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

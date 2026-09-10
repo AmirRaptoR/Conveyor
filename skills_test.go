@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -173,5 +174,63 @@ func TestImplementSkillDefersToItsBranch(t *testing.T) {
 
 	if !strings.Contains(section, "Defer to the branch you were handed") {
 		t.Errorf("%s: branch step does not state the deference explicitly", path)
+	}
+}
+
+// slashCommand matches a PROMPT that leads with a slash command, e.g.
+// "/refine $REF" or "/implement $REF auto" — the adapters treat a leading
+// "/" specially (it must lead the message, per agents/claude/refine), so
+// this is the same test a running adapter effectively makes.
+var slashCommand = regexp.MustCompile(`^/(\S+)`)
+
+// TestExampleSlashCommandsResolveToShippedSkills is the technical note in
+// issue #70: every tracked *.example.yaml at the repository root that names a
+// slash-command PROMPT must name one this repository actually vendored under
+// agents/claude/skills/ — otherwise the config depends on an artefact that
+// exists only on one operator's machine, exactly the drift #70 exists to
+// close. PROMPT is read from both scripts[].params (which wins) and the
+// source's own env:, since a slash command sitting only in env: would
+// otherwise escape a test that reads params alone (internal/config/config.go
+// layers params over env).
+func TestExampleSlashCommandsResolveToShippedSkills(t *testing.T) {
+	root := repoRoot(t)
+	matches, err := filepath.Glob(filepath.Join(root, "*.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) == 0 {
+		t.Fatal("no *.example.yaml found at the repository root")
+	}
+
+	checked := 0
+	for _, cfgPath := range matches {
+		cfgPath := cfgPath
+		t.Run(filepath.Base(cfgPath), func(t *testing.T) {
+			cfg, err := config.Load(cfgPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, s := range cfg.Sources {
+				for scriptName, spec := range s.Scripts {
+					prompt := spec.Params["PROMPT"]
+					if prompt == "" {
+						prompt = s.Env["PROMPT"]
+					}
+					m := slashCommand.FindStringSubmatch(prompt)
+					if m == nil {
+						continue
+					}
+					checked++
+					skill := m[1]
+					skillPath := filepath.Join(root, "agents", "claude", "skills", skill, "SKILL.md")
+					if _, err := os.Stat(skillPath); err != nil {
+						t.Errorf("source %q, script %q: PROMPT names slash command /%s, but %s does not exist", s.Name, scriptName, skill, skillPath)
+					}
+				}
+			}
+		})
+	}
+	if checked == 0 {
+		t.Skip("no tracked example config names a slash-command PROMPT yet")
 	}
 }
