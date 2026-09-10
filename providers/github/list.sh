@@ -65,16 +65,10 @@ BLOCKED_LABEL="${BLOCKED_LABEL:-${LABEL_PREFIX}blocked}"
 ONBOARD_LABEL="${LABEL_PREFIX%[^[:alnum:]]}"
 
 # STAGE_LABELS is written stage=label because that is the direction move.sh
-# needs. Listing needs the reverse, so invert it here into {label: stage}.
-label_to_stage=$(
-	printf '%s\n' "${STAGE_LABELS:-}" |
-		jq -R -s '
-			split("\n")
-			| map(select(test("=")))
-			| map(split("=") | {key: (.[1] | gsub("^\\s+|\\s+$"; "")),
-			                    value: (.[0] | gsub("^\\s+|\\s+$"; ""))})
-			| from_entries'
-)
+# needs. Listing needs the reverse, so invert it here into {label: stage} —
+# via _stage_labels.sh, the one parse onboard.sh and preflight.sh also use.
+source "$(dirname "${BASH_SOURCE[0]}")/_stage_labels.sh"
+label_to_stage=$(stage_labels_json <<<"${STAGE_LABELS:-}")
 
 echo "listing issues in $REPO" >&2
 
