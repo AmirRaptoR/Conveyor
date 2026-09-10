@@ -58,14 +58,25 @@ done
 # return for the rest of the script, not just this one's, so a plain
 # function leaked "tmp: unbound variable" into the very next step. A
 # subshell's trap table is its own.
-check_validate() (
+#
+# Every tracked *.example.yaml at the repository root, not just the mock demo
+# — discovered by name so a new example (like conveyor.github.example.yaml)
+# is validated without editing this script a second time.
+check_validate() ( # CONFIG
   set -e
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
   go build -o "$tmp/conveyor" ./cmd/conveyor
-  "$tmp/conveyor" validate -c conveyor.example.yaml
+  "$tmp/conveyor" validate -c "$1"
 )
-step "conveyor validate -c conveyor.example.yaml" check_validate
+mapfile -t example_configs < <(find "$here" -maxdepth 1 -type f -name '*.example.yaml' | sort)
+if [[ ${#example_configs[@]} -eq 0 ]]; then
+  echo "check: FAILED at: example config discovery (found none)" >&2
+  exit 1
+fi
+for cfg in "${example_configs[@]}"; do
+  step "conveyor validate -c ${cfg#"$here"/}" check_validate "$cfg"
+done
 
 # UI interaction tests: any *.test.mjs file, anywhere in the tree, run with
 # node:test + node:assert from a stock Node — no npm install, no network. See
