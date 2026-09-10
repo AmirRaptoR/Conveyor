@@ -44,7 +44,7 @@ pr_match_filter() {
 closing_prs() {
 	local ref=$1 state=${2:-open} out matches n_all n_match
 	if ! out=$(gh pr list --repo "$REPO" --state "$state" --limit 100 \
-		--json number,body,state,headRefName,url 2>&1); then
+		--json number,body,state,headRefName,url,isDraft 2>&1); then
 		echo "gh pr list (state=$state) for #$ref failed: $out" >&2
 		return 1
 	fi
@@ -69,12 +69,16 @@ closing_prs() {
 
 # pr_lookup <ref> [state] — the shared three-way outcome. Sets $PR_STATUS to
 # one of none / one / several / unavailable, and on "one" also $PR_NUMBER,
-# $PR_STATE, $PR_HEAD. $PR_MATCHES is always the raw array closing_prs found
-# (empty on unavailable), for a caller like approve that needs its own notion
-# of "active" (state != CLOSED) rather than "exactly one match of any state".
+# $PR_STATE, $PR_HEAD, $PR_DRAFT (jq's own "true"/"false"/"null" text — a
+# match carrying no isDraft key at all reads as "null", not as a draft; a
+# caller asks "is a draft" with `[[ "$PR_DRAFT" == "true" ]]`, the same
+# textual test agents/claude/approve already uses on the field). $PR_MATCHES
+# is always the raw array closing_prs found (empty on unavailable), for a
+# caller like approve that needs its own notion of "active" (state !=
+# CLOSED) rather than "exactly one match of any state".
 pr_lookup() {
 	local ref=$1 state=${2:-open} matches n
-	PR_STATUS=unavailable PR_NUMBER="" PR_STATE="" PR_HEAD="" PR_MATCHES="[]"
+	PR_STATUS=unavailable PR_NUMBER="" PR_STATE="" PR_HEAD="" PR_DRAFT="" PR_MATCHES="[]"
 	matches=$(closing_prs "$ref" "$state") || return 0
 	PR_MATCHES=$matches
 	n=$(jq 'length' <<<"$matches")
@@ -85,6 +89,7 @@ pr_lookup() {
 		PR_NUMBER=$(jq -r '.[0].number' <<<"$matches")
 		PR_STATE=$(jq -r '.[0].state' <<<"$matches")
 		PR_HEAD=$(jq -r '.[0].headRefName' <<<"$matches")
+		PR_DRAFT=$(jq -r '.[0].isDraft' <<<"$matches")
 	else
 		PR_STATUS=several
 	fi

@@ -79,11 +79,43 @@ scene; list '[{"number":9,"body":"Closes #7","state":"OPEN","headRefName":"a","u
 pr_lookup 7
 chk "two PRs closing the same ref is several" "$PR_STATUS" "several"
 
+# --- PR_DRAFT rides alongside the other three globals on "one" -------------
+scene; list '[{"number":9,"body":"Closes #7","state":"OPEN","headRefName":"a","url":"u","isDraft":true}]'
+pr_lookup 7
+chk "an open draft sets PR_DRAFT"            "$PR_STATUS" "one"
+chk "  to true"                              "$PR_DRAFT" "true"
+
+scene; list '[{"number":9,"body":"Closes #7","state":"OPEN","headRefName":"a","url":"u","isDraft":false}]'
+pr_lookup 7
+chk "an open non-draft sets PR_DRAFT"        "$PR_STATUS" "one"
+chk "  to false"                             "$PR_DRAFT" "false"
+
+# A match with no isDraft key at all (a fixture predating this field, or a
+# state gh never sends it for) reads as null, not as a draft.
+scene; list '[{"number":9,"body":"Closes #7","state":"OPEN","headRefName":"a","url":"u"}]'
+pr_lookup 7
+chk "a match with no isDraft key sets PR_DRAFT" "$PR_STATUS" "one"
+chk "  to null, not true"                       "$PR_DRAFT" "null"
+
+# PR_DRAFT is reset to empty on none, several and unavailable, exactly as the
+# other three are.
+scene; list '[]'
+pr_lookup 7
+chk "PR_DRAFT is empty on none"              "$PR_STATUS" "none"
+chk "  "                                     "$PR_DRAFT" ""
+
+scene; list '[{"number":9,"body":"Closes #7","state":"OPEN","headRefName":"a","url":"u","isDraft":true},
+              {"number":10,"body":"fixes #7","state":"OPEN","headRefName":"b","url":"u","isDraft":false}]'
+pr_lookup 7
+chk "PR_DRAFT is empty on several"           "$PR_STATUS" "several"
+chk "  "                                     "$PR_DRAFT" ""
+
 # --- a failed gh call is unavailable, never none ----------------------------
 scene; touch "$tmp/fail"
 pr_lookup 7
 chk "a failed gh call is unavailable"        "$PR_STATUS" "unavailable"
 chk "  never read as none"                   "$([[ "$PR_STATUS" == "none" ]] && echo yes || echo no)" "no"
+chk "  and PR_DRAFT is empty"                "$PR_DRAFT" ""
 
 # --- a non-JSON response is unavailable -------------------------------------
 scene; list 'not json'
