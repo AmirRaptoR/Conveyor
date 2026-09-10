@@ -21,6 +21,7 @@
 <link rel="stylesheet" href="/report.css">
 <link rel="stylesheet" href="/faults.css">
 <link rel="stylesheet" href="/panel.css">
+<link rel="stylesheet" href="/inbox.css">
 <link rel="stylesheet" href="/dialogs.css">
 <link rel="stylesheet" href="/design.css">
 </head>
@@ -42,13 +43,27 @@
   <button class="ctl primary" id="tick">Tick once</button>
 </div>
 
+<div class="itemgone" id="itemgone" hidden role="alert">
+  <span id="itemgone-text"></span>
+  <button class="ctl" id="itemgone-dismiss">Dismiss</button>
+</div>
 <div class="needs" id="needs"></div>
 <div id="agents"></div>
 <div id="sources"></div>
 <div id="warnings"></div>
 <div id="faults"></div>
 <div id="doctor"></div>
-<div class="rail-wrap">
+
+<!-- The inbox (#40) is a second way to reach the same items, never a second
+     source of truth: it reads the one #rail/#panel already draws from and
+     opens the very same panel. Two tabs, not a phone/desktop split — a wide
+     screen can use it too, and a narrow one can still fall back to Pipeline. -->
+<div class="viewtabs" id="viewtabs" role="tablist" aria-label="Board view">
+  <button class="vtab" id="tab-pipeline" role="tab" aria-selected="true" aria-controls="rail-wrap">Pipeline</button>
+  <button class="vtab" id="tab-inbox" role="tab" aria-selected="false" aria-controls="inbox">Inbox</button>
+</div>
+
+<div class="rail-wrap" id="rail-wrap">
   <div class="line" id="line"><div class="rail" id="rail" tabindex="-1"></div></div>
   <div class="railctl" id="railctl" hidden>
     <button class="railbtn" id="rail-left" aria-label="Scroll the line left">‹</button>
@@ -59,6 +74,18 @@
     <button class="railbtn" id="rail-right" aria-label="Scroll the line right">›</button>
   </div>
 </div>
+
+<section class="inbox" id="inbox" aria-label="Inbox" hidden>
+  <div class="inbox-controls">
+    <input type="search" id="inbox-search" placeholder="Search title or id" aria-label="Search items in the inbox">
+    <select id="inbox-source" aria-label="Filter the inbox by source"><option value="">All sources</option></select>
+  </div>
+  <div class="inbox-subtabs" role="tablist" aria-label="Inbox section">
+    <button class="vtab" id="inbox-tab-attention" role="tab" aria-selected="true" aria-controls="inbox-list">Needs attention</button>
+    <button class="vtab" id="inbox-tab-done" role="tab" aria-selected="false" aria-controls="inbox-list">Done</button>
+  </div>
+  <div class="inbox-list" id="inbox-list"></div>
+</section>
 
 <dialog id="ask"></dialog>
 <dialog id="reportdlg"></dialog>
