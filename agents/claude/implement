@@ -231,6 +231,12 @@ fi
 # neither ref moved. Re-running that blind reproduces the hold, so this is
 # `asks`, not `blocked`: a question, never bulk-cleared by `Unblock all` or
 # `retryStalled`. `record_session` first, since `asks` writes to the same file.
+#
+# Deliberately ahead of the postcondition below: a clean exit with nothing
+# recorded is judged before anything about pull requests is even looked up. A
+# test driving this script into the postcondition therefore has to move one of
+# the two refs captured above first — a stubbed `claude` that commits nothing
+# stops here instead, whatever fixture the postcondition itself is given.
 if [[ $rc -eq 0 ]] && [[ ! -s "${CONVEYOR_RESULT:-}" ]]; then
 	guard_head_after=$(git rev-parse -q --verify "refs/heads/$guard_branch" 2>/dev/null || true)
 	guard_origin_after=$(git rev-parse -q --verify "refs/remotes/origin/$guard_branch" 2>/dev/null || true)
