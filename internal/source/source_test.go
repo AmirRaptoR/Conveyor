@@ -1,6 +1,8 @@
 package source
 
 import (
+	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -41,5 +43,139 @@ func TestValidateRejectsAnEmptyRef(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("warnings = %v, want one naming items[0] with no ref", warns)
+	}
+}
+
+// preflightConfig builds a real, on-disk config with one source "s1" backed
+// by a fake provider, so Client.Preflight can resolve providers/<name> and
+// Workdir exactly as it does in production.
+func preflightConfig(t *testing.T, providerFiles map[string]string) (*config.Config, config.Source) {
+	t.Helper()
+	dir := t.TempDir()
+	writeExecFile(t, filepath.Join(dir, "providers", "fake", "list.sh"), "#!/bin/sh\nexit 0\n")
+	writeExecFile(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\nexit 0\n")
+	for name, body := range providerFiles {
+		writeExecFile(t, filepath.Join(dir, "providers", "fake", name), body)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "conveyor.yaml")
+	yaml := `version: 1
+stages:
+  - name: backlog
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: fake
+    workdir: ./repo
+`
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg, cfg.Sources[0]
+}
+
+func writeExecFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func contextBG() context.Context { return context.Background() }
+
+func TestPreflightNoScriptIsSkip(t *testing.T) {
+	cfg, src := preflightConfig(t, nil)
+	c := New(cfg, src, runner.New(filepath.Join(t.TempDir(), "runs")))
+	checks, run, err := c.Preflight(contextBG())
+	if err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	if run != nil {
+		t.Errorf("run = %+v, want nil for an absent script", run)
+	}
+	if len(checks) != 1 || checks[0].Status != "skip" {
+		t.Fatalf("checks = %+v, want one skip", checks)
+	}
+}
+
+func TestPreflightRunsAndParsesChecks(t *testing.T) {
+	body := "#!/bin/sh\ncat > \"$CONVEYOR_RESULT\" <<'EOF'\n{\"checks\":[{\"name\":\"gh\",\"status\":\"pass\"},{\"name\":\"labels\",\"status\":\"fail\",\"detail\":\"missing\",\"fix\":\"run onboard\"}]}\nEOF\n"
+	cfg, src := preflightConfig(t, map[string]string{"preflight.sh": body})
+	c := New(cfg, src, runner.New(filepath.Join(t.TempDir(), "runs")))
+	checks, run, err := c.Preflight(contextBG())
+	if err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	if run == nil {
+		t.Fatal("run = nil, want the recorded run")
+	}
+	if run.Kind != "preflight" {
+		t.Errorf("run.Kind = %q, want preflight", run.Kind)
+	}
+	if len(checks) != 2 {
+		t.Fatalf("checks = %+v, want 2", checks)
+	}
+	if checks[0].Status != "pass" || checks[1].Status != "fail" || checks[1].Fix != "run onboard" {
+		t.Errorf("checks = %+v", checks)
+	}
+}
+
+func TestPreflightNonZeroExitIsSyntheticFail(t *testing.T) {
+	cfg, src := preflightConfig(t, map[string]string{"preflight.sh": "#!/bin/sh\nexit 3\n"})
+	c := New(cfg, src, runner.New(filepath.Join(t.TempDir(), "runs")))
+	checks, run, err := c.Preflight(contextBG())
+	if err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	if run == nil {
+		t.Fatal("run = nil, want the recorded run")
+	}
+	if len(checks) != 1 || checks[0].Status != "fail" {
+		t.Fatalf("checks = %+v, want one synthetic fail", checks)
+	}
+}
+
+func TestPreflightAmbiguousScriptIsFail(t *testing.T) {
+	cfg, src := preflightConfig(t, map[string]string{
+		"preflight.sh": "#!/bin/sh\nexit 0\n",
+		"preflight.py": "#!/bin/sh\nexit 0\n",
+	})
+	c := New(cfg, src, runner.New(filepath.Join(t.TempDir(), "runs")))
+	checks, run, err := c.Preflight(contextBG())
+	if err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	if run != nil {
+		t.Errorf("run = %+v, want nil — the script never ran", run)
+	}
+	if len(checks) != 1 || checks[0].Status != "fail" {
+		t.Fatalf("checks = %+v, want one fail naming the ambiguity", checks)
+	}
+}
+
+func TestPreflightRunnable(t *testing.T) {
+	cfg, src := preflightConfig(t, nil)
+	if ok, reason := PreflightRunnable(cfg, src); !ok {
+		t.Fatalf("PreflightRunnable = false (%s), want true for a healthy source", reason)
+	}
+}
+
+func TestPreflightRunnableBadWorkdir(t *testing.T) {
+	cfg, src := preflightConfig(t, nil)
+	src.Workdir = "./does-not-exist"
+	if ok, reason := PreflightRunnable(cfg, src); ok {
+		t.Fatal("PreflightRunnable = true for a missing workdir")
+	} else if reason == "" {
+		t.Error("reason is empty")
 	}
 }

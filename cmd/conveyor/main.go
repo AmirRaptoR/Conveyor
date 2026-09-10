@@ -37,6 +37,8 @@ func main() {
 		err = cmdValidate(os.Args[2:])
 	case "list":
 		err = cmdList(os.Args[2:])
+	case "preflight":
+		err = cmdPreflight(os.Args[2:])
 	case "run":
 		err = cmdRun(os.Args[2:])
 	case "tick":
@@ -66,6 +68,9 @@ func usage() {
 
   validate                              load and check the config
   list      [-source NAME]              run list scripts, print items
+  preflight [-source NAME]              readiness: gh/agent/label checks per
+                                        source, exit non-zero if any failed.
+                                        Moves nothing, writes nothing.
   run       -source N -item ID -stage S move one item into a stage and run it
   tick      [-source NAME] [-n N]       one scheduling pass: pick and advance
   serve     [-addr :8080] [-mode M]     run the pipeline; board, live logs,

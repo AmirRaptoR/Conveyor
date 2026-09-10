@@ -12,6 +12,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
+	"github.com/AmirRaptoR/Conveyor/internal/preflight"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 	"github.com/AmirRaptoR/Conveyor/internal/source"
 )
@@ -517,9 +518,9 @@ func (s *Server) askAgents(ctx context.Context) {
 				break
 			}
 			got.Name, got.At = a.Name, time.Now()
-			if got.State != "ok" && got.State != "limited" {
-				got.State = "unknown" // the vocabulary is closed; anything else is silence
-			}
+			// The vocabulary is closed; anything else is silence — one
+			// definition, shared with conveyor preflight.
+			got.State = preflight.NormalizeAgentState(got.State)
 			v = got
 		}
 		out = append(out, v)
