@@ -48,6 +48,8 @@ _write_stop() {
 #   dependency  the item names an issue that is still open; clears once it is
 #   unfinished  the run stopped itself at its deadline with work pushed and a
 #               conversation to resume into (agents/_deadline)
+#   draft       the item's pull request is still a draft when it needs to be
+#               ready; marking it ready is what clears this
 #
 # A question can carry `questions`: the AskUserQuestion shape (header,
 # question, options[{label, description}], multiSelect), which the board turns

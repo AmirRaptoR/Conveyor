@@ -263,6 +263,8 @@ chk "a kind label alone is not a hold"        "$(run)" "0"
 # --- 7/8. draft and conflict ------------------------------------------------
 scene; pr 9 OPEN; labels; details true MERGEABLE SUCCESS
 chk "(7) a draft waits"                       "$(run)" "10"
+chk "     and names the PR in what it's waiting for" \
+	"$(jq -r '.waiting.why // ""' "$CONVEYOR_RESULT" | grep -c '#9')" "1"
 
 # (1/2) try_rebase always fails here (no worktree in this sandbox), whatever
 # CONFLICT_RESOLVE is set to — so with it at "0" this is exactly today's old
