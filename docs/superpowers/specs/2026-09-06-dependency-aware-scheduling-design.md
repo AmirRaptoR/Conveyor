@@ -103,9 +103,12 @@ Three consequences, all deliberate:
 produces `priority` and `blocked`, emitting `"<source>:<ref>"` so the value
 joins directly against `Item.ID`.
 
-The body syntax is `agents/_deps`' existing one, unchanged: a line beginning
-with `depends on` / `blocked by` / `blocks on` / `requires` / `after`, cut at
-its first mid-line sentence break before numbers are taken out of it.
+The body syntax is `agents/_deps`' existing one, unchanged: the body is split
+into sentences (at a line break, or at `.`/`!`/`?` followed by whitespace),
+and a sentence declares a dependency when it contains `depends on` /
+`blocked by` / `blocks on` anywhere, or opens — after any run of leading
+markdown noise — with `requires` / `after`. Only the numbers from the
+keyword onward, within that sentence, are taken.
 
 **The parse is stated twice, on purpose.** `agents/` and `providers/` are
 separately-resolvable roots and providers must not reach into agents. The two

@@ -55,6 +55,47 @@ chk "a number before the keyword in the same clause is not donated" \
 chk "'depend' without 's' is not the keyword 'depends on'" \
 	"$(refs 'Blocks: #12, #13 depend on this one')" ""
 
+# --- ! and ? end a sentence too, in both directions --------------------------
+chk "'!' ends a sentence"  "$(refs 'Fixed #8! Depends on #12.')" "12"
+chk "'?' ends a sentence"  "$(refs 'Does #8 count? Blocked by #12.')" "12"
+chk "'!' also cuts off what follows the declaring sentence" \
+	"$(refs 'Depends on #12! Unrelated mention #99.')" "12"
+chk "'?' also cuts off what follows the declaring sentence" \
+	"$(refs 'Depends on #12? Unrelated mention #99.')" "12"
+
+# --- requires/after declare a dependency only at the start of a sentence ----
+# unlike "depends on" / "blocked by" / "blocks on", which are not English
+# words used in ordinary prose, "requires" and "after" keep an anchor so a
+# false positive stays the expensive direction it would otherwise be.
+chk "'after' mid-sentence is not a declaration" \
+	"$(refs 'Regenerate the fixtures after the parser lands, see #12')" ""
+chk "'requires' at the start of a sentence still matches" \
+	"$(refs 'Fix the thing first. Requires #4.')" "4"
+chk "'after' at the start of a sentence still matches" \
+	"$(refs 'After #12')" "12"
+
+# --- the widened noise class (adds _ ~ + and a backtick to the old * > -) ---
+chk "bold-wrapped 'Requires' at sentence start still matches" \
+	"$(refs '**Requires #4**')" "4"
+chk "a numbered-list marker is itself a sentence break" \
+	"$(refs '1. Requires #4')" "4"
+
+# --- two declaring sentences on one line donate both -------------------------
+chk "two declaring sentences on one line" \
+	"$(refs 'Blocked by #12. Depends on #13.')" "12 13"
+
+# --- line boundaries hold in both directions ---------------------------------
+chk "a later line's unrelated mention is not donated" \
+	"$(refs $'Depends on #12\nordinary prose mentioning #99')" "12"
+chk "a declaration split across two lines stays unread" \
+	"$(refs $'Depends on\n#12')" ""
+
+# --- duplicates collapse; output is ascending numerically, not lexically ----
+chk "duplicates collapse" \
+	"$(refs 'Depends on #13, #12 and #13')" "12 13"
+chk "output sorts numerically, not lexically" \
+	"$(refs 'Depends on #10, #2')" "2 10"
+
 # --- open_dependencies filters through a stubbed gh --------------------------
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -78,5 +119,22 @@ chk "open_dependencies is empty once every named issue is closed" \
 	"$(open_dependencies 'Depends on #12, #13')" ""
 chk "open_dependencies is empty with no dependency declared at all" \
 	"$(open_dependencies 'Related: #10')" ""
+
+# A stubbed gh that fails outright (e.g. #14 is in another repository, or a
+# typo) is not counted, same as a closed issue — doctor-selfcheck's fixtures
+# never exercise all three outcomes on one body.
+cat >"$tmp/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+# #10 is open, #12 is closed, #14 cannot be read at all.
+n=${2##*/}
+case "$n" in
+10) echo open ;;
+12) echo closed ;;
+14) echo "gh: issue not found" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$tmp/bin/gh"
+chk "open_dependencies: one open, one closed, one unreadable -> only the open one" \
+	"$(open_dependencies 'Depends on #10, #12 and #14')" "#10"
 
 exit $fail

@@ -75,6 +75,9 @@ In `providers/github/selfcheck.sh`, add three fixtures to the `data=` array insi
  {"state":"OPEN","number":27,"title":"Not a dependency","body":"Related: #9\nthe record the board depends on: x\nDepends on: ADR 9 (merged). Blocks: #12, #13 depend on this one\n",
   "labels":[{"name":"conveyor"}],
   "url":"https://example.test/27","assignees":[]},
+ {"state":"OPEN","number":29,"title":"Mid-line, not line-start","body":"Part of the live duel epic (#8). Depends on #21, #23 and #25, all still open.\n",
+  "labels":[{"name":"conveyor"}],
+  "url":"https://example.test/29","assignees":[]},
 ```
 
 Then append these checks immediately after the `check "an unmarked issue is not blocked"` block (around line 97):
@@ -87,19 +90,25 @@ check "a dependency line becomes an item id" \
 check "two numbers on one line become two ids" \
 	"midgame:21,midgame:23" "$(jq -r '.[] | select(.ref == "25") | .dependsOn | join(",")' "$tmp/out.json")"
 # Three traps in one body, and none of them is a dependency: a "Related:" line,
-# the word "depends" mid-sentence, and a line whose dependency clause ends at
-# its first sentence break — "Blocks: #12, #13 depend on this one" describes
-# who depends on IT. agents/_deps cuts at ". " for exactly this reason.
+# the word "depends" mid-sentence, and a sentence whose own dependency clause
+# ends before it starts — "Blocks: #12, #13 depend on this one" describes who
+# depends on IT, in the sentence right after "Depends on: ADR 9 (merged)."
+# agents/_deps splits into sentences for exactly this reason.
 check "prose that merely says 'depends' is not a dependency" \
 	"" "$(jq -r '.[] | select(.ref == "27") | .dependsOn | join(",")' "$tmp/out.json")"
 check "an issue declaring nothing has no dependencies" \
 	"" "$(jq -r '.[] | select(.ref == "19") | .dependsOn // [] | join(",")' "$tmp/out.json")"
+# The declaring sentence is reached only after an earlier, unrelated one on
+# the same line — the case a line-start anchor alone would miss, and the one
+# both parsers have to keep agreeing on as they evolve.
+check "a mid-line declaration is read, not just a line-start one" \
+	"midgame:21,midgame:23,midgame:25" "$(jq -r '.[] | select(.ref == "29") | .dependsOn | join(",")' "$tmp/out.json")"
 ```
 
 - [ ] **Step 2: Run it to make sure it fails**
 
 Run: `./providers/github/selfcheck.sh`
-Expected: FAIL on all four new checks — `want: midgame:21`, `got:` (empty), because `list.sh` emits no `dependsOn` field at all.
+Expected: FAIL on all five new checks — `want: midgame:21`, `got:` (empty), because `list.sh` emits no `dependsOn` field at all.
 
 - [ ] **Step 3: Implement the parse**
 
@@ -114,15 +123,28 @@ In `providers/github/list.sh`, inside the `jq` object, immediately after the `pr
 				# The shared fixture corpus in both selfchecks is what keeps
 				# the two from drifting.
 				#
-				# A matching line is cut at its first mid-line sentence break
-				# before numbers are taken out of it, so "Depends on: ADR 9
-				# (merged). Blocks: #12, #13 depend on this one" does not
-				# donate #12 and #13 to this issue's own list.
+				# The body is split into sentences — at a line break, or at
+				# "." / "!" / "?" followed by whitespace — before a sentence
+				# is checked for a keyword, so a declaration reached only
+				# after an earlier, unrelated sentence on the same line is
+				# still read, and a sentence that merely shares a line with a
+				# declaration is not. "depends on" / "blocked by" / "blocks
+				# on" match anywhere in the sentence; "requires" / "after" are
+				# ordinary English words, so they match only where the
+				# sentence opens (after markdown noise). Only the numbers
+				# from the keyword onward, within that sentence, are taken —
+				# so "Depends on: ADR 9 (merged). Blocks: #12, #13 depend on
+				# this one" donates nothing: the first sentence's own keyword
+				# ends before #12/#13, and the second sentence's "depend on"
+				# (no s) is not a keyword of its own.
 				dependsOn:  ([
 					(.body // "")
-					| split("\n")[]
-					| select(test("^[[:space:]*>_-]*(depends on|blocked by|blocks on|requires|after)\\b"; "i"))
-					| sub("\\.[[:space:]].*$"; "")
+					| [splits("\n")]
+					| map(splits("(?<=[.!?])[ \t]+"))
+					| .[]
+					| select(test("\\b(depends on|blocked by|blocks on)\\b"; "i")
+						or test("^[\\s*_~`>+-]*(requires|after)\\b"; "i"))
+					| sub("^.*?\\b(?:depends on|blocked by|blocks on|requires|after)\\b"; ""; "i")
 					| scan("#[0-9]+")
 				] | map(ltrimstr("#")) | unique | map("\($source):\(.)")),
 ```
@@ -130,7 +152,7 @@ In `providers/github/list.sh`, inside the `jq` object, immediately after the `pr
 - [ ] **Step 4: Run it to make sure it passes**
 
 Run: `./providers/github/selfcheck.sh`
-Expected: PASS — all four new checks `ok`, and every pre-existing check still `ok`.
+Expected: PASS — all five new checks `ok`, and every pre-existing check still `ok`.
 
 - [ ] **Step 5: Add the model field**
 

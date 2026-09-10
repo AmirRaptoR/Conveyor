@@ -9,27 +9,42 @@
 # `dependency` mark, and the doctor clears it once every number named is
 # closed (agents/claude/doctor).
 
-# dependency_refs <body> — the issue numbers named in a clause that declares a
-# dependency: "Depends on #12", "Blocked by: #12, #13", "- depends on #12", or
-# a clause reached mid-line — "Part of the epic (#8). Depends on #10, #11."
-# donates only #10 and #11, not #8. Nothing else in the body is read; a
+# dependency_refs <body> — the issue numbers named in a sentence that declares
+# a dependency: "Depends on #12", "Blocked by: #12, #13", "- depends on #12",
+# or a sentence reached mid-line — "Part of the epic (#8). Depends on #10,
+# #11." donates only #10 and #11, not #8. Nothing else in the body is read; a
 # "Related: #9" is not a dependency.
 #
-# The body is split into clauses at every mid-line sentence break (". ")
-# before a clause is checked for the keyword, so a clause is read against the
-# keyword it actually contains rather than the line it happens to share with
-# one. "Depends on: ADR 9 (merged). Blocks: #12, #13 depend on this one"
-# splits into two clauses, and the second's "depend on" (no s, so no keyword
-# match of its own) does not donate #12 and #13 to this issue's own
-# dependency list just because the word "depend" recurs there.
+# The body is split into sentences at every mid-line sentence break — `.`,
+# `!` or `?` followed by whitespace — before a sentence is checked for a
+# keyword, so a sentence is read against the keyword it actually contains
+# rather than the line it happens to share with one, in either direction:
+# "Depends on #12! Unrelated mention #99." donates only #12, and "Depends on:
+# ADR 9 (merged). Blocks: #12, #13 depend on this one" splits into two
+# sentences whose second's "depend on" (no s, so no keyword match of its own)
+# does not donate #12 and #13 to this issue's own dependency list just
+# because the word "depend" recurs there. A `.` not followed by whitespace is
+# not a break, so "all still open.**" stays one sentence, and a line break is
+# always a break in both directions regardless of surrounding punctuation.
 #
-# Within a matching clause, only the text from the keyword onward counts, so
-# a number mentioned earlier in the same clause — "Related to #9, this
+# Within a matching sentence, only the text from the keyword onward counts,
+# so a number mentioned earlier in the same sentence — "Related to #9, this
 # depends on #12" — donates #12 and not #9: the cut is taken relative to the
-# keyword, never to the start of the clause or the line.
+# keyword, never to the start of the sentence or the line.
+#
+# "depends on", "blocked by" and "blocks on" declare a dependency anywhere in
+# a sentence. "requires" and "after" are ordinary English words — unlike the
+# other three — so they declare one only when they open a sentence, after any
+# run of leading markdown noise (whitespace, `*`, `_`, `~`, `>`, `-`, `+` and
+# a backtick): "Regenerate the fixtures after the parser lands, see #12" is
+# not a declaration, but "**Requires #4**" and "1. Requires #4" are, since
+# "1. " is itself a sentence break. A false positive is the expensive
+# direction — it marks a healthy item `dependency` until some unrelated issue
+# happens to close — so the anchor stays even now that the other three no
+# longer need one.
 dependency_refs() {
-	sed -E 's/\.[[:space:]]+/\n/g' <<<"$1" |
-		grep -ioE '\b(depends on|blocked by|blocks on|requires|after)\b.*' |
+	sed -E 's/([.!?])[[:space:]]+/\1\n/g' <<<"$1" |
+		grep -ioE '\b(depends on|blocked by|blocks on)\b.*|^[[:space:]*_~`>+-]*(requires|after)\b.*' |
 		grep -oE '#[0-9]+' | tr -d '#' | sort -un
 }
 
