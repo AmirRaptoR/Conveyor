@@ -198,9 +198,15 @@ export function draw() {
 
   document.querySelectorAll(".item").forEach(el => {
     const open = () => { if (!justDragged) inspect(el.dataset.id, el.dataset.title, el.dataset.stage); };
-    el.onclick = e => { if (!e.target.closest("a")) open(); };
+    // The inbox (#40) is the first `.item` to nest a real `<button>` (its
+    // "Answer question" control) rather than only the rail's own `<a>` — a
+    // button reachable by Tab needs the same exclusion an anchor already
+    // has, or Enter/Space on it bubbles here first, and `preventDefault()`
+    // below cancels the browser's own click synthesis for that key before
+    // the button's own handler ever runs it.
+    el.onclick = e => { if (!e.target.closest("a, button")) open(); };
     el.onkeydown = e => {
-      if ((e.key === "Enter" || e.key === " ") && !e.target.closest("a")) { e.preventDefault(); open(); }
+      if ((e.key === "Enter" || e.key === " ") && !e.target.closest("a, button")) { e.preventDefault(); open(); }
     };
     wireDrag(el);
   });
