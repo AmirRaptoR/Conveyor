@@ -379,6 +379,11 @@ func (s *Server) refresh(ctx context.Context) {
 			delete(s.answerInfo, id)
 		}
 	}
+	for id := range s.cancels {
+		if !onBoard[id] {
+			delete(s.cancels, id)
+		}
+	}
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
 }
