@@ -137,14 +137,29 @@ In `providers/github/list.sh`, inside the `jq` object, immediately after the `pr
 				# this one" donates nothing: the first sentence's own keyword
 				# ends before #12/#13, and the second sentence's "depend on"
 				# (no s) is not a keyword of its own.
+				#
+				# The anchored branch is checked first: when a sentence opens
+				# with "requires"/"after", that keyword is always the
+				# earliest possible match in it, so the cut is taken there
+				# even if "depends on"/"blocked by"/"blocks on" also occurs
+				# later in the same sentence ("Requires #4, blocked by #12"
+				# donates both #4 and #12). Only a sentence that does *not*
+				# open with the anchored pair falls through to the
+				# phrase-anywhere cut ("This requires #4, but depends on #12"
+				# donates #12 only — "requires" is mid-sentence here, not a
+				# declaration of its own).
 				dependsOn:  ([
 					(.body // "")
 					| [splits("\n")]
 					| map(splits("(?<=[.!?])[ \t]+"))
 					| .[]
-					| select(test("\\b(depends on|blocked by|blocks on)\\b"; "i")
-						or test("^[\\s*_~`>+-]*(requires|after)\\b"; "i"))
-					| sub("^.*?\\b(?:depends on|blocked by|blocks on|requires|after)\\b"; ""; "i")
+					| if test("^[\\s*_~`>+-]*(requires|after)\\b"; "i") then
+						sub("^[\\s*_~`>+-]*(?:requires|after)\\b"; ""; "i")
+					elif test("\\b(depends on|blocked by|blocks on)\\b"; "i") then
+						sub("^.*?\\b(?:depends on|blocked by|blocks on)\\b"; ""; "i")
+					else
+						empty
+					end
 					| scan("#[0-9]+")
 				] | map(ltrimstr("#")) | unique | map("\($source):\(.)")),
 ```
