@@ -457,6 +457,12 @@ func writeMeta(run *model.Run, dir string) error {
 // did not already hand the script in the clear.
 const redactedValue = "«redacted»"
 
+// RedactEnv is redactEnv, exported so a caller outside this package — `run
+// -explain` today — can print the environment a script would receive using
+// the exact same redaction writeMeta applies, rather than a second copy of
+// which keys are safe to show in the clear.
+func RedactEnv(env map[string]string) map[string]string { return redactEnv(env) }
+
 func redactEnv(env map[string]string) map[string]string {
 	if env == nil {
 		return nil

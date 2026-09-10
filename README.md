@@ -64,6 +64,18 @@ the repository) — see `providers/github/preflight.sh` — then one check per
 agent the source names, via `agents/<name>/status`. Exits non-zero if
 anything came back `fail` or `unknown`.
 
+`conveyor run -source N -item ID [-stage S]` moves one item into a stage and
+runs it — the one supervised, single-item way to watch a source work for
+real. `-stage` is optional: left unset, the stage is whatever
+`pipeline.Target` would pick, the same choice the scheduler makes on its
+own. Add `-explain` to see the plan — source, item, `from -> to`, the
+resolved script, the resources and timeout it would take, and its
+environment with every non-`CONVEYOR_` value redacted — without moving
+anything or running anything. After a real run it prints a short checklist:
+stage, outcome, exit code, the run directory, and (on failure, blocked or
+timeout) the source's remaining `preflight` problems, read together with
+what just went wrong.
+
 `conveyor.yaml` is the working config and is deliberately untracked;
 `conveyor.example.yaml` is the template that ships.
 
