@@ -478,8 +478,9 @@ adapter that reaches a model at meaningful volume (`refine` 152/193 = 79%,
 `implement` 259/613 = 42%, `review` 18/50 = 36%) and 429 of 891 blocked
 outcomes across the four adapters in this window are `limit`. A subagent's
 `Agent` tool call runs inside the parent's own process, under the same
-authenticated account — no separate login, token or session is created for
-it — so at minimum it is one more real model call the account pays for.
+authenticated account — no separate login or auth token is created for it,
+even though it gets its own context window (as noted above) — so at minimum
+it is one more real model call the account pays for.
 Whether the usage window's *accounting* treats that call identically to one
 the parent makes directly, or meters it some other way, is exactly the one
 thing this report flagged in its opening as untestable (no quota endpoint
