@@ -9,18 +9,27 @@
 # `dependency` mark, and the doctor clears it once every number named is
 # closed (agents/claude/doctor).
 
-# dependency_refs <body> — the issue numbers named on lines that declare a
-# dependency: "Depends on #12", "Blocked by: #12, #13", "- depends on #12".
-# Nothing else in the body is read; a "Related: #9" is not a dependency.
+# dependency_refs <body> — the issue numbers named in a clause that declares a
+# dependency: "Depends on #12", "Blocked by: #12, #13", "- depends on #12", or
+# a clause reached mid-line — "Part of the epic (#8). Depends on #10, #11."
+# donates only #10 and #11, not #8. Nothing else in the body is read; a
+# "Related: #9" is not a dependency.
 #
-# A matching line is cut at its first mid-line sentence break (". ") before
-# numbers are pulled out of it, so a second clause on the same line — "Depends
-# on: ADR 9 (merged). Blocks: #12, #13 depend on this one" — does not donate
-# #12 and #13 to this issue's own dependency list just because the word
-# "depend" recurs later in the sentence describing who depends on *it*.
+# The body is split into clauses at every mid-line sentence break (". ")
+# before a clause is checked for the keyword, so a clause is read against the
+# keyword it actually contains rather than the line it happens to share with
+# one. "Depends on: ADR 9 (merged). Blocks: #12, #13 depend on this one"
+# splits into two clauses, and the second's "depend on" (no s, so no keyword
+# match of its own) does not donate #12 and #13 to this issue's own
+# dependency list just because the word "depend" recurs there.
+#
+# Within a matching clause, only the text from the keyword onward counts, so
+# a number mentioned earlier in the same clause — "Related to #9, this
+# depends on #12" — donates #12 and not #9: the cut is taken relative to the
+# keyword, never to the start of the clause or the line.
 dependency_refs() {
-	grep -iE '^[[:space:]*>-]*(depends on|blocked by|blocks on|requires|after)\b' <<<"$1" |
-		sed -E 's/\.[[:space:]].*$//' |
+	sed -E 's/\.[[:space:]]+/\n/g' <<<"$1" |
+		grep -ioE '\b(depends on|blocked by|blocks on|requires|after)\b.*' |
 		grep -oE '#[0-9]+' | tr -d '#' | sort -un
 }
 

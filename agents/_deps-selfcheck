@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Self-check for agents/_deps — the shared "read an item's declared
+# dependencies out of its body" rule agents/claude/implement and
+# agents/claude/doctor both use. Touches no network and no repository;
+# dependency_refs is pure text, and open_dependencies is driven against a
+# stubbed `gh`.
+#
+#   agents/_deps-selfcheck
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/_deps"
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+# refs <body> — dependency_refs's output, one line per number, joined with a
+# space so it compares against chk's single-line expectation.
+refs() { dependency_refs "$1" | tr '\n' ' ' | sed -E 's/ $//'; }
+
+# --- a dependency at the start of its own line still matches ----------------
+chk "a line-start declaration matches"     "$(refs 'Depends on #12')" "12"
+chk "a list-item declaration matches"      "$(refs '- depends on #12')" "12"
+chk "a blockquote declaration matches"     "$(refs '> Blocked by #9')" "9"
+chk "several numbers on one line"          "$(refs 'Blocked by: #12, #13')" "12 13"
+chk "matching is case-insensitive"         "$(refs 'DEPENDS ON #5')" "5"
+
+# --- a mere mention is not a dependency --------------------------------------
+chk "a mention with no keyword is not read" "$(refs 'Related: #9')" ""
+
+# --- the mid-sentence case from #67 (AmirRaptoR/quesshi#13) -----------------
+# The line does not begin with the keyword; the declaration is reached only
+# after an earlier, unrelated sentence naming a different issue.
+body='Part of the live duel epic (#8). Depends on #10 (`ILiveMatchGrain`), #11 (the SignalR transport) and #12 (the friend lobby), all still open.'
+chk "a mid-line declaration is matched, not just line-start" "$(refs "$body")" "10 11 12"
+chk "  and the unrelated earlier #8 is not donated"          "$([[ "$(refs "$body")" == *8* ]] && echo yes || echo no)" "no"
+
+# A mid-line declaration with no earlier issue reference at all still matches.
+chk "a mid-line declaration with nothing before it" \
+	"$(refs 'See the design doc first. Depends on #10.')" "10"
+
+# --- the sentence-break cut is relative to the keyword, not the line --------
+# "Depends on: ADR 9 (merged)." ends its own sentence before "Blocks: #12,
+# #13 depend on this one" starts; the second clause's "depend on" (no s) is
+# not a keyword of its own, so #12 and #13 are never donated.
+chk "a later clause's own numbers are not donated by an earlier keyword" \
+	"$(refs 'Depends on: ADR 9 (merged). Blocks: #12, #13 depend on this one')" ""
+
+# A number named earlier in the very same clause as the keyword — not cut
+# off by a sentence break at all — is still not donated: only the text from
+# the keyword onward counts.
+chk "a number before the keyword in the same clause is not donated" \
+	"$(refs 'Related to #9, this depends on #12')" "12"
+
+# --- prose that merely contains the word "depend" is not a keyword ----------
+chk "'depend' without 's' is not the keyword 'depends on'" \
+	"$(refs 'Blocks: #12, #13 depend on this one')" ""
+
+# --- open_dependencies filters through a stubbed gh --------------------------
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/bin"
+export PATH="$tmp/bin:$PATH"
+export REPO="owner/repo"
+cat >"$tmp/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+# repos/o/n/issues/N --jq .state: #10 and #11 are open, everything else closed.
+n=${2##*/}
+case "$n" in
+10|11) echo open ;;
+*) echo closed ;;
+esac
+STUB
+chmod +x "$tmp/bin/gh"
+
+chk "open_dependencies keeps only the numbers still open" \
+	"$(open_dependencies 'Depends on #10, #11 and #12')" "#10 #11"
+chk "open_dependencies is empty once every named issue is closed" \
+	"$(open_dependencies 'Depends on #12, #13')" ""
+chk "open_dependencies is empty with no dependency declared at all" \
+	"$(open_dependencies 'Related: #10')" ""
+
+exit $fail
