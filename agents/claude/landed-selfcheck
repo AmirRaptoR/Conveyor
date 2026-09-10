@@ -89,6 +89,27 @@ STUB
 claude_called() { [[ -f "$tmp/scene/claude_called" ]] && echo yes || echo no; }
 git_called() { [[ -f "$tmp/scene/git_called" ]] && echo yes || echo no; }
 
+# The real `claude`, for the scenes below that legitimately need the model to
+# run: a clean, uneventful pass that still makes one local commit — enough to
+# move `refs/heads/<branch>`, which is what clears #82's no-output guard ahead
+# of implement's postcondition — and writes nothing to $CONVEYOR_RESULT, same
+# as a model that looked and found nothing else to do. Distinct content each
+# call so nothing collides across scenes sharing one throwaway repo. Runs in
+# whatever the adapter has already `cd`-ed into, and relies on no identity but
+# the one already configured on that repo (never a global git config).
+stub_claude_clean() {
+	rm -f "$tmp/bin/claude"
+	cat >"$tmp/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+date +%s%N >>stub-claude-commit.txt
+git add -A
+git commit --quiet -m "stub: clean run"
+echo '{"type":"result","is_error":false,"subtype":"success","num_turns":1,"result":"nothing to implement"}'
+exit 0
+STUB
+	chmod +x "$tmp/bin/claude"
+}
+
 scene() { rm -f "$tmp/scene"/*; stub_claude_refuses; }
 prlist() { printf '%s' "$1" >"$tmp/scene/prlist"; }
 # prlist_at <n> <json> — what the Nth `pr list` call in this scene answers,
@@ -190,16 +211,7 @@ git -C "$tmp/srcrepo" push --quiet -u origin main
 git -C "$tmp/srcrepo" remote set-head origin -a >/dev/null 2>&1 || true
 export WORKTREES="$tmp/worktrees"
 
-# The real `claude`: a clean, uneventful run that writes nothing to
-# $CONVEYOR_RESULT — the agent looked and found nothing to do, same as the
-# transcript quesshi:25 actually left.
-rm -f "$tmp/bin/claude"
-cat >"$tmp/bin/claude" <<'STUB'
-#!/usr/bin/env bash
-echo '{"type":"result","is_error":false,"subtype":"success","num_turns":1,"result":"nothing to implement"}'
-exit 0
-STUB
-chmod +x "$tmp/bin/claude"
+stub_claude_clean
 
 rm -f "$tmp/scene"/*
 prlist '[]'
@@ -210,6 +222,8 @@ rc=0
 chk "implement asks on a closed issue with nothing merged" "$rc" "20"
 chk "  the mark is a question, not a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "true"
 chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "no-output"
+chk "  and gives the postcondition's own reason" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -ci 'closed by hand')" "1"
+chk "  and names the issue" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#25')" "1"
 
 # --- implement's postcondition: the model left the PR a draft ---------------
 # item_landed's own fixture is "no" here (the issue is still open), the
@@ -226,7 +240,7 @@ chk "implement blocks when its own postcondition finds a draft" "$rc" "20"
 chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "false"
 chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "draft"
 chk "  and names the PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#50')" "1"
-chk "  and says draft" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -ci 'draft')" "1"
+chk "  and gives the draft stop's own reason" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c 'gh pr ready')" "1"
 chk "  never prints opened PR" "$(grep -c 'opened PR' "$tmp/out")" "0"
 
 # --- implement's postcondition: the draft stop fires even when the model
@@ -254,15 +268,13 @@ chk "implement blocks a draft even when the model itself exited non-zero" "$rc" 
 chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "false"
 chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "draft"
 chk "  and names the PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#52')" "1"
+chk "  and gives the draft stop's own reason" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c 'gh pr ready')" "1"
 
-# Restore the uneventful stub for the scenes below, which expect a clean run.
-rm -f "$tmp/bin/claude"
-cat >"$tmp/bin/claude" <<'STUB'
-#!/usr/bin/env bash
-echo '{"type":"result","is_error":false,"subtype":"success","num_turns":1,"result":"nothing to implement"}'
-exit 0
-STUB
-chmod +x "$tmp/bin/claude"
+# Restore the clean, committing stub for the scenes below, which expect a
+# clean run — implement's still needs to move a ref to clear the no-output
+# guard, and the commit is harmless to the review scenes further down, which
+# have no such guard and only care about the pull request's state.
+stub_claude_clean
 
 # --- implement's postcondition: an OPEN, non-draft PR is unaffected ---------
 rm -f "$tmp/scene"/*
