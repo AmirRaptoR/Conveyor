@@ -30,11 +30,25 @@ export CONVEYOR_RESULT="$tmp/result.json"
 # The stub answers `gh pr list` and `gh api graphql` from fixtures the scene
 # writes; anything else is a fixture the scene did not expect and fails loudly
 # rather than guessing.
+#
+# `pr list` is call-sensitive: the Nth call in a run reads `prlist_N` if the
+# scene wrote one, falling back to the scene's single `prlist` fixture
+# otherwise. Preflight and postcondition both call `pr_lookup`, so this is
+# what lets one scene answer them differently — a PR that is not yet a draft
+# when review's preflight looks, but is by the time its postcondition looks
+# again.
 cat >"$tmp/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 scene="$SCENE"
 case "$1 $2" in
-"pr list")     what=prlist ;;
+"pr list")
+	n=0
+	[[ -f "$scene/prlist_n" ]] && n=$(cat "$scene/prlist_n")
+	n=$((n + 1))
+	echo "$n" >"$scene/prlist_n"
+	what="prlist_$n"
+	[[ -f "$scene/$what" ]] || what=prlist
+	;;
 "api graphql") what=graphql ;;
 *) echo "stub gh: unhandled: $*" >&2; exit 97 ;;
 esac
@@ -46,8 +60,12 @@ chmod +x "$tmp/bin/gh"
 # `git` is never expected to run for a preflight scene that stops before the
 # worktree — stubbed to fail loudly instead of left off PATH, so a regression
 # that does reach it is a clear failure here rather than a real invocation.
+# Leaves its own marker so a scene can assert directly that no call reached
+# it, rather than inferring that from the exit code alone.
 cat >"$tmp/bin/git" <<'STUB'
 #!/usr/bin/env bash
+scene="$SCENE"
+touch "$scene/git_called"
 echo "stub git: unexpected call from a preflight that should stop first: $*" >&2
 exit 99
 STUB
@@ -69,9 +87,14 @@ STUB
 	chmod +x "$tmp/bin/claude"
 }
 claude_called() { [[ -f "$tmp/scene/claude_called" ]] && echo yes || echo no; }
+git_called() { [[ -f "$tmp/scene/git_called" ]] && echo yes || echo no; }
 
 scene() { rm -f "$tmp/scene"/*; stub_claude_refuses; }
 prlist() { printf '%s' "$1" >"$tmp/scene/prlist"; }
+# prlist_at <n> <json> — what the Nth `pr list` call in this scene answers,
+# overriding the scene's single `prlist` fixture for that call only. Lets one
+# run give the preflight and the postcondition different answers.
+prlist_at() { printf '%s' "$2" >"$tmp/scene/prlist_$1"; }
 graphql() { printf '%s' "$1" >"$tmp/scene/graphql"; }
 fail_graphql() { touch "$tmp/scene/fail_graphql"; }
 
@@ -83,6 +106,15 @@ open_issue='{"data":{"repository":{"issue":{"state":"OPEN",
 	"closedByPullRequestsReferences":{"nodes":[]}}}}}'
 
 payload() { jq -n --arg ref "$1" '{item:{ref:$ref,title:"an item",description:"",url:"u"}}'; }
+
+# pr_entry <number> <ref> <state> <draft> — a one-element `pr list` fixture
+# that closes #ref, matched by body ("Closes #ref") rather than by branch, so
+# the branch name stays free to name whatever the scene needs.
+pr_entry() {
+	local number=$1 ref=$2 state=$3 draft=$4
+	printf '[{"number":%s,"body":"Closes #%s","state":"%s","headRefName":"pr-branch","url":"u","isDraft":%s}]' \
+		"$number" "$ref" "$state" "$draft"
+}
 
 run_implement() {
 	: >"$CONVEYOR_RESULT"
@@ -124,6 +156,17 @@ chk "review still blocks input when the issue is open and no PR closes it" "$rc"
 chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "false"
 chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "input"
 chk "  and never starts the model" "$(claude_called)" "no"
+
+# --- review: a draft PR stops before the worktree and before the model -----
+scene; prlist "$(pr_entry 40 28 OPEN true)"
+rc=$(run_review 28)
+chk "review blocks a draft at the preflight" "$rc" "20"
+chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "false"
+chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "draft"
+chk "  and names the PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#40')" "1"
+chk "  and says draft" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -ci 'draft')" "1"
+chk "  never starts the model" "$(claude_called)" "no"
+chk "  and never reaches git" "$(git_called)" "no"
 
 # --- implement's postcondition: an issue closed by hand with nothing merged
 # behind it is a question, not a bulk-clearable condition — the same shape of

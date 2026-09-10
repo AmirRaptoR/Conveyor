@@ -69,6 +69,16 @@ review. Either the implement stage did not land its work, or the PR was closed \
 by hand."
 		;;
 	esac
+	# A draft here means implementation did not finish: /implement marks a PR
+	# ready when the suite is green, so review is the stage that already knows
+	# this before spending a worktree or a model run finding it out. Checked
+	# before either.
+	if [[ "$PR_DRAFT" == "true" ]]; then
+		blocked draft "pull request #$PR_NUMBER, which closes issue #$ref, is \
+still a draft. A pull request must be marked ready before this item can \
+advance to approving; an implement run that did not reach \`gh pr ready\` is \
+the usual cause."
+	fi
 	pr=$PR_NUMBER
 	head=$PR_HEAD
 	echo "reviewing PR #$pr for $CONVEYOR_SOURCE #$ref — $title"
