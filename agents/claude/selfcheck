@@ -136,6 +136,18 @@ rc=0; agent_asked || rc=$?
 chk "a JSON array (not an object) is untouched" "$(cat "$CONVEYOR_RESULT")" "$before"
 chk "and still returns 0"                       "$rc" "0"
 
+# `null` is the scalar jq treats as the identity for `+` — a merge left
+# unguarded turns it into {"kind":"decision","asked":true} instead of leaving
+# it alone, which is not a hypothetical: it is exactly what the unguarded
+# filter did before the type check above it was added.
+for v in 'null' '42' 'true' '"a string"'; do
+	echo "$v" > "$CONVEYOR_RESULT"
+	before=$(cat "$CONVEYOR_RESULT")
+	rc=0; agent_asked || rc=$?
+	chk "valid non-object JSON ($v) is untouched" "$(cat "$CONVEYOR_RESULT")" "$before"
+	chk "and still returns 0"                     "$rc" "0"
+done
+
 # 7. the model that actually ran is read out of the raw stream, first one wins,
 #    and recorded as one line. Not an echo of $MODEL: with MODEL unset the CLI
 #    picks, and that is the case worth writing down.
