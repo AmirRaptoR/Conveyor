@@ -117,18 +117,33 @@ rather than leaving it implicit.
 least one line matching `stdout +· [A-Za-z]{2,20}:` — `agents/claude/_stream`
 `render_stream` prints a rendered tool call as `  · Name: arg`, prefixed by
 the runner with a timestamp and `stdout`. This **undercounts** a run whose
-model answered in prose without calling any tool (a `refine` that read
-nothing new and just wrote a comment via `Bash` would still be counted — a
-zero-tool-call clean text answer is the only case this proxy misses, and
-nothing in this box's logs distinguishes that from a run that never started
-the model at all). No better signal exists without parsing `--output-format
+model answered in prose without calling any tool at all — a `refine` that
+read nothing new and posted its comment straight from the model's reply
+rather than via a `Bash`/`gh` call would leave no rendered tool-call line to
+match, even though a model plainly ran. (The nearby case that *is* still
+caught: a `refine` that reads nothing new but still writes its comment via
+`Bash` shows up as one tool call and is counted correctly.) A genuinely
+zero-tool-call clean-text answer is the only case this proxy misses, and
+nothing in this box's logs distinguishes it from a run that never started
+the model at all. No better signal exists without parsing `--output-format
 stream-json`, which is deleted at the end of every run
 (`agents/claude/_stream:24`, `trap 'rm -f "$CLAUDE_SAID" "$CLAUDE_RAW"' EXIT`)
 and therefore isn't retained to check against.
 
 ```bash
-# reached-model count, per adapter, over the window above (paths pre-filtered
-# to the four adapters via the meta.json query above, piped to a file list)
+# loglist_<adapter>.txt: each matching run's meta.json path, filtered exactly
+# as the per-adapter table above (full script path, same window), via
+# input_filename rather than -s so the source path survives the filter;
+# meta.json's sibling log.txt in the same run directory is the log:
+find ~/codes/data/runs -name meta.json -print0 | xargs -0 jq -r \
+  --arg s "agents/claude/implement" \
+  --arg lo "2026-08-28T00:00:00Z" --arg hi "2026-09-10T11:30:00Z" \
+  'select(.kind=="stage" and (.script|endswith($s))
+        and .startedAt>=$lo and .startedAt<$hi) | input_filename' \
+  | sed 's/meta\.json$/log.txt/' > loglist_implement.txt
+wc -l loglist_implement.txt          # 754 — matches the table's total above
+
+# reached-model count, per adapter, over the window above
 xargs grep -lE "stdout +· [A-Za-z]{2,20}:" < loglist_<adapter>.txt | wc -l
 ```
 
@@ -462,9 +477,14 @@ left as a maybe.
 adapter that reaches a model at meaningful volume (`refine` 152/193 = 79%,
 `implement` 259/613 = 42%, `review` 18/50 = 36%) and 429 of 891 blocked
 outcomes across the four adapters in this window are `limit`. A subagent's
-`Agent` tool call is a real, metered model call under the same authenticated
-session as the parent — it spends the same account's usage window, not a
-separate one. Specialization only nets a saving if the subagent's job is
+`Agent` tool call runs inside the parent's own process, under the same
+authenticated account — no separate login, token or session is created for
+it — so at minimum it is one more real model call the account pays for.
+Whether the usage window's *accounting* treats that call identically to one
+the parent makes directly, or meters it some other way, is exactly the one
+thing this report flagged in its opening as untestable (no quota endpoint
+exists to ask) — so that finer claim stays **undetermined**, not asserted
+here. Either way, specialization only nets a saving if the subagent's job is
 genuinely narrower than what the parent would otherwise spend re-deriving —
 the exploration candidates above argue exactly that; a subagent that instead
 duplicates context the parent already holds is a net quota loss, not a
@@ -513,6 +533,9 @@ window average 34.8 KB of `log.txt`; a 200-run sample of the ones that did
 not average 2.2 KB — roughly 16×.
 
 ```bash
+# agent_logs.txt: the 43 log.txt paths behind "Runs with >=1 Agent call" above.
+# sample_non_agent.txt: 200 lines taken at random (`shuf -n 200`) from the
+# reached-model log.txt paths of the same four adapters, excluding those 43.
 awk '{ "stat -c%s "$0 | getline s; sum+=s; n++ } END{print sum/n}' agent_logs.txt        # 34812
 awk '{ "stat -c%s "$0 | getline s; sum+=s; n++ } END{print sum/n}' sample_non_agent.txt  # 2198.72
 ```
