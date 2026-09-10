@@ -112,7 +112,16 @@ export function focusDescriptor(el) {
 export function findFocusTarget(desc) {
   if (!desc) return null;
   if (desc.kind === "card") {
-    const card = document.querySelector(`.item[data-id="${CSS.escape(desc.id)}"]`);
+    // The inbox (#40) can render the very same item as its own `.item`, in
+    // parallel with the rail's — plain `querySelector` would always hand
+    // back whichever sits first in document order (the rail's, since it is
+    // written before #inbox), even while that one sits under a `[hidden]`
+    // ancestor and .focus() on it silently does nothing. Every match is
+    // walked so the one actually on screen wins; the first at all is still
+    // the fallback, since a hidden one is better than none for callers that
+    // only care whether *a* card was found (see draw()'s own use of this).
+    const matches = [...document.querySelectorAll(`.item[data-id="${CSS.escape(desc.id)}"]`)];
+    const card = matches.find(c => !c.closest("[hidden]")) || matches[0];
     if (!card) return null;
     return desc.control === "open" ? (card.querySelector(".open") || card) : card;
   }

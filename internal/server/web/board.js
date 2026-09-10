@@ -5,6 +5,7 @@ import { updateRailCtl } from "./rail.js";
 import { openFromHash } from "./device.js";
 import { openItemId, inspect, renderPanelActions, refreshOpenStop } from "./panel.js";
 import { dragging, justDragged, refusals, stageBy, wireDrag, wireQueue } from "./drag.js";
+import { renderInbox } from "./inbox.js";
 
 // A draw() that lands mid-drag defers instead of touching #rail (see draw()
 // and shouldDeferDraw above); the drag's own dragend runs the one redraw that
@@ -29,7 +30,7 @@ export function draw() {
   // open. `shown` (below) and the rail's own scrollLeft already survive this
   // for the same reason — neither lives in the DOM this replaces.
   const active0 = document.activeElement;
-  const focusDesc = active0 && active0.closest?.("#rail, #needs") ? focusDescriptor(active0) : null;
+  const focusDesc = active0 && active0.closest?.("#rail, #needs, #inbox-list") ? focusDescriptor(active0) : null;
   const openAgents = new Set(
     [...document.querySelectorAll("#agents details[open]")].map(d => d.dataset.agent));
 
@@ -189,11 +190,23 @@ export function draw() {
       : `<b>${items.length}</b> items${asking.length ? `, <b>${asking.length}</b> need${asking.length === 1 ? "s" : ""} you`
           : held ? `, <b>${held}</b> stopped` : ""} &nbsp;·&nbsp; updated ${when}`) + degradedNote;
 
+  // Rebuilt from the same `state`/`blocks` the rail just drew from, so the
+  // inbox is never a step behind it — and before the wiring loop below, so
+  // its rows are picked up by the same querySelectorAll(".item") that wires
+  // the rail's own cards (click-to-open, Enter/Space, focus restoration).
+  renderInbox();
+
   document.querySelectorAll(".item").forEach(el => {
     const open = () => { if (!justDragged) inspect(el.dataset.id, el.dataset.title, el.dataset.stage); };
-    el.onclick = e => { if (!e.target.closest("a")) open(); };
+    // The inbox (#40) is the first `.item` to nest a real `<button>` (its
+    // "Answer question" control) rather than only the rail's own `<a>` — a
+    // button reachable by Tab needs the same exclusion an anchor already
+    // has, or Enter/Space on it bubbles here first, and `preventDefault()`
+    // below cancels the browser's own click synthesis for that key before
+    // the button's own handler ever runs it.
+    el.onclick = e => { if (!e.target.closest("a, button")) open(); };
     el.onkeydown = e => {
-      if ((e.key === "Enter" || e.key === " ") && !e.target.closest("a")) { e.preventDefault(); open(); }
+      if ((e.key === "Enter" || e.key === " ") && !e.target.closest("a, button")) { e.preventDefault(); open(); }
     };
     wireDrag(el);
   });
