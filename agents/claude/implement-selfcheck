@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# Drives the real agents/claude/implement against a stubbed `gh` and a stubbed
+# `claude`, over a throwaway bare remote and clone — never this repository.
+# Asserts the exit code and the resulting $CONVEYOR_RESULT for the guard added
+# by #72: a run that exits 0 having left the item's branch exactly where it
+# found it, locally and on its remote-tracking ref, and having written nothing
+# to $CONVEYOR_RESULT, does not exit 0 either.
+#
+#   agents/claude/implement-selfcheck
+#
+# `git` is left real throughout — the guard's whole premise is ref movement,
+# which a stub cannot fake convincingly — so every scene builds a genuine
+# worktree off a genuine bare origin. Only `gh` and `claude` are stubbed.
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/../_blocked"
+source "$here/../_worktree"
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/bin" "$tmp/scene"
+export PATH="$tmp/bin:$PATH"
+export REPO="owner/repo"
+export CONVEYOR_SOURCE="demo"
+export PROMPT="do the work"
+export SCENE="$tmp/scene"
+export CONVEYOR_RESULT="$tmp/result.json"
+export WORKTREES="$tmp/worktrees"
+
+# The stub answers by verb, out of files the scene wrote. A missing fixture is
+# a missing expectation, not an empty answer read as a real one.
+cat >"$tmp/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+scene="$SCENE"
+case "$1 $2" in
+"pr list")     what=prlist ;;
+"api graphql") what=graphql ;;
+*)
+	case "$1" in
+	api) what=depstate ;;
+	*) echo "stub gh: unhandled: $*" >&2; exit 97 ;;
+	esac
+	;;
+esac
+[[ -f "$scene/fail_$what" ]] && { echo "stub gh: $what failed" >&2; exit 1; }
+if [[ -f "$scene/$what" ]]; then cat "$scene/$what"; else echo "stub gh: no fixture for $what" >&2; exit 98; fi
+STUB
+chmod +x "$tmp/bin/gh"
+
+# The stub `claude`: captures the prompt it was handed (for the prompt-shape
+# assertion), then plays out whatever the scene asked for — a commit, a push,
+# a result file, a nonzero exit — around a real stream-json system/result pair
+# so record_session has a session id to find, exactly like a real run.
+cat >"$tmp/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+scene="$SCENE"
+prev=""
+for a in "$@"; do
+	[[ "$prev" == "-p" ]] && printf '%s' "$a" >"$scene/claude_prompt"
+	prev="$a"
+done
+
+session=""
+[[ -f "$scene/no_session" ]] || session="sess-abcdef123456"
+[[ -n "$session" ]] &&
+	printf '{"type":"system","subtype":"init","session_id":"%s","model":"claude-selfcheck"}\n' "$session"
+
+if [[ -f "$scene/do_commit" ]]; then
+	echo committed >>file.txt
+	git add -A
+	git commit --quiet -m "the agent committed"
+fi
+[[ -f "$scene/do_push" ]] && git push --quiet origin HEAD 2>/dev/null
+[[ -f "$scene/write_result" ]] && cat "$scene/write_result" >"$CONVEYOR_RESULT"
+
+if [[ -n "$session" ]]; then
+	printf '{"type":"result","subtype":"success","is_error":false,"num_turns":3,"session_id":"%s"}\n' "$session"
+else
+	printf '{"type":"result","subtype":"success","is_error":false,"num_turns":3}\n'
+fi
+[[ -f "$scene/exit_nonzero" ]] && exit 7
+exit 0
+STUB
+chmod +x "$tmp/bin/claude"
+
+# A throwaway bare origin and a clone with one commit on its default branch.
+# Every scene below hangs its own item branch off this, never off this
+# repository's own remote.
+src="$tmp/src" origin="$tmp/origin.git"
+git init --quiet --bare -b main "$origin"
+git init --quiet -b main "$src"
+git -C "$src" config user.email selfcheck@example.invalid
+git -C "$src" config user.name selfcheck
+git -C "$src" remote add origin "$origin"
+echo base >"$src/file.txt"
+git -C "$src" add -A
+git -C "$src" commit --quiet -m base
+git -C "$src" push --quiet -u origin main
+git -C "$src" remote set-head origin -a >/dev/null 2>&1 || true
+
+# Every scene's preflight asks item_landed whether the issue already merged —
+# it never has, here — so the fixture is rewritten on every scene() call
+# rather than once, since scene() clears the whole directory.
+scene() {
+	rm -f "$tmp/scene"/*
+	printf '{"data":{"repository":{"issue":{"state":"OPEN","closedByPullRequestsReferences":{"nodes":[]}}}}}' \
+		>"$tmp/scene/graphql"
+}
+# pr_fixture <ref> — one open PR that closes the issue, on the item's own
+# branch. Present in every scene: what is under test is the guard's own
+# placement ahead of the pull-request postcondition, not the postcondition
+# itself (agents/claude/landed-selfcheck already covers that), so every scene
+# the guard lets through must still find a PR to pass it.
+pr_fixture() {
+	printf '[{"number":9,"body":"Closes #%s","state":"OPEN","headRefName":"issue-%s","url":"u"}]' "$1" "$1" \
+		>"$tmp/scene/prlist"
+}
+
+payload() { jq -n --arg ref "$1" '{item:{ref:$ref,title:"an item",description:"",url:"u"}}'; }
+run_implement() {
+	local ref=$1 rc=0
+	: >"$CONVEYOR_RESULT"
+	(cd "$src" && payload "$ref" | "$here/implement" >"$tmp/out" 2>"$tmp/err") || rc=$?
+	echo "$rc"
+}
+kind() { jq -r '.kind // "none"' "$CONVEYOR_RESULT" 2>/dev/null || echo none; }
+asked() { jq -r '.asked // false' "$CONVEYOR_RESULT" 2>/dev/null || echo false; }
+reason() { jq -r '.reason // ""' "$CONVEYOR_RESULT" 2>/dev/null; }
+session_field() { jq -r '.session // ""' "$CONVEYOR_RESULT" 2>/dev/null; }
+result_written() { [[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty; }
+
+# --- (a) fresh item, no commit, no push, empty result: the observed bug -----
+# Remote-tracking ref absent both before and after — a branch that has never
+# been pushed at all, the ordinary shape of a first attempt.
+scene; pr_fixture 100
+rc=$(run_implement 100)
+chk "(a) fresh item producing nothing does not exit 0" "$rc" "20"
+chk "    kind is no-output"                             "$(kind)" "no-output"
+chk "    it is a question, never bulk-cleared"           "$(asked)" "true"
+chk "    the conversation is resumable"                  "$(session_field)" "sess-abcdef123456"
+chk "    the reason is non-empty"                        "$([[ -n "$(reason)" ]] && echo yes)" "yes"
+
+# --- (b) the model's own stop always wins ------------------------------------
+scene; pr_fixture 101
+printf '{"blocked":true,"kind":"decision","reason":"pick a design"}' >"$tmp/scene/write_result"
+rc=$(run_implement 101)
+chk "(b) a model-written block is unaffected" "$rc" "20"
+chk "    its own kind is kept, not overwritten by the guard" "$(kind)" "decision"
+chk "    and its own reason is kept verbatim" "$(reason)" "pick a design"
+
+# --- (c) commit and push, empty result: exits 0 as today ---------------------
+scene; pr_fixture 102
+touch "$tmp/scene/do_commit" "$tmp/scene/do_push"
+chk "(c) a commit that was pushed exits 0" "$(run_implement 102)" "0"
+
+# --- (d) commit without push, empty result: exits 0 as today -----------------
+# The local tip alone moving is enough — pushing later is normal (the model
+# often pushes only once, at the end).
+scene; pr_fixture 103
+touch "$tmp/scene/do_commit"
+chk "(d) a local commit with no push yet exits 0" "$(run_implement 103)" "0"
+
+# --- (e) push only: an earlier run's commit, this run only pushes it --------
+# Simulates the ordinary resume shape: a prior run committed and died before
+# pushing, and this run's whole job was to push what was already there.
+scene; pr_fixture 104
+(cd "$src" && item_worktree demo 104 >/dev/null)
+wt="$tmp/worktrees/demo/104"
+(cd "$wt" && echo earlier >>file.txt && git add -A && git commit --quiet -m earlier &&
+	git push --quiet -u origin issue-104)
+(cd "$wt" && echo later >>file.txt && git add -A && git commit --quiet -m later)
+unpushed_head=$(git -C "$wt" rev-parse HEAD)
+touch "$tmp/scene/do_push"
+rc=$(run_implement 104)
+chk "(e) pushing an unmoved local tip exits 0" "$rc" "0"
+chk "    and the local tip really was left alone by the push" \
+	"$(git -C "$wt" rev-parse HEAD)" "$unpushed_head"
+chk "    with the remote now caught up to it" \
+	"$(git -C "$origin" rev-parse issue-104)" "$unpushed_head"
+
+# --- (f) an explicit no-op result, no commit: exits 0 -------------------------
+scene; pr_fixture 105
+printf '{"noop":true,"reason":"nothing needed doing"}' >"$tmp/scene/write_result"
+chk "(f) a written noop result exits 0" "$(run_implement 105)" "0"
+
+# --- (g) the stream yields no session: the guard still stops, with no session
+scene; pr_fixture 106
+touch "$tmp/scene/no_session"
+rc=$(run_implement 106)
+chk "(g) no session id still stops the item"  "$rc" "20"
+chk "    kind is still no-output"             "$(kind)" "no-output"
+chk "    but no session field is written"     "$(jq -r 'has("session")' "$CONVEYOR_RESULT")" "false"
+
+# --- (h) claude itself exits nonzero: never converted into the mark ----------
+scene; pr_fixture 107
+touch "$tmp/scene/exit_nonzero"
+rc=$(run_implement 107)
+chk "(h) a nonzero claude exit keeps its own status" "$rc" "7"
+chk "    and writes no no-output mark"               "$(result_written)" "empty"
+
+# --- the prompt: the escape hatch has a shape, distinct from decision_brief --
+scene; pr_fixture 108
+run_implement 108 >/dev/null
+chk "the prompt tells the agent how to declare a deliberate no-op" \
+	"$(grep -c '"noop": true' "$tmp/scene/claude_prompt")" "1"
+chk "and names the shape distinctly from a decision" \
+	"$(grep -c 'nobody has to choose anything' "$tmp/scene/claude_prompt")" "1"
+
+exit $fail

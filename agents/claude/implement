@@ -20,6 +20,24 @@ source "$(dirname "$0")/../_deadline"
 source "$(dirname "$0")/../_pr"
 source "$(dirname "$0")/../_deps"
 
+# noop_brief — the escape hatch for the no-output guard below: a way to end a
+# run deliberately, with nothing committed, that is not the model asking a
+# question in prose and stopping. Distinct from decision_brief: nobody has to
+# decide anything here, there is simply no work to do.
+noop_brief() {
+	cat <<-BRIEF
+	If you finish without committing anything on purpose — you looked and there
+	was nothing needed doing — say so by writing this to the file at ${CONVEYOR_RESULT}:
+
+	  {"noop": true, "reason": "<why nothing needed doing>"}
+
+	This is not the decision above: nobody has to choose anything. A run that
+	ends with no commit and no result file at all will be marked for a person
+	to look at, on the assumption that a question was asked in prose and never
+	written down.
+	BRIEF
+}
+
 : "${PROMPT:?PROMPT is required (set it in this script params: block)}"
 
 payload=$(cat)
@@ -97,6 +115,19 @@ cd "$wt"
 resume_leftovers "$ref"
 leftovers="$RESUME_BRIEF"
 
+# Captured now, before the model runs, so a run that leaves both of these
+# exactly where it found them can be told apart from one that quietly did the
+# work (the no-output guard below). Branch name, not HEAD: an agent that
+# changed branch under itself — which the prompt below forbids — must still
+# read as "the item's branch did not move", which is the truth. `-q --verify`
+# with `|| true` *inside* the substitution, not around it, so a ref that does
+# not exist yet (a freshly created item branch has no remote-tracking ref
+# until its first push) yields an empty string rather than tripping `set -e`.
+guard_branch=$(git branch --show-current)
+[[ -n "$guard_branch" ]] || guard_branch=HEAD
+guard_head_before=$(git rev-parse -q --verify "refs/heads/$guard_branch" 2>/dev/null || true)
+guard_origin_before=$(git rev-parse -q --verify "refs/remotes/origin/$guard_branch" 2>/dev/null || true)
+
 echo "implementing $CONVEYOR_SOURCE #$ref — $title"
 echo "  worktree: $wt  (branch $(git branch --show-current))"
 
@@ -137,7 +168,9 @@ now, main is checked out elsewhere, and changing branch under yourself is how
 one item's work lands on another item's branch. The branch you are on is the
 branch for this issue — commit to it and push it with \`git push -u origin HEAD\`.
 
-$(decision_brief)"
+$(decision_brief)
+
+$(noop_brief)"
 
 # How long it has, and what to do if that is not enough. Last, because it is the
 # instruction that governs all the others.
@@ -185,6 +218,29 @@ if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 	agent_asked
 	echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
 	exit 20 # the agent wrote its own reason; leave it exactly as written
+fi
+
+# The model's own stop above always wins; this is the adapter's inference for
+# when it says nothing at all. Only checked on a clean exit — `hit_limit` and
+# `hit_max_turns` already caught the two known conditions that leave a run
+# producing nothing (quota, the turn wall), and a crashed run is already a
+# failure with its own log, so turning that into an unclearable question would
+# be the wrong trade for a transient tool failure. What is left is dominated by
+# the observed case: a model that asked its question in prose, believing it
+# was talking to someone, and stopped — leaving $CONVEYOR_RESULT empty and
+# neither ref moved. Re-running that blind reproduces the hold, so this is
+# `asks`, not `blocked`: a question, never bulk-cleared by `Unblock all` or
+# `retryStalled`. `record_session` first, since `asks` writes to the same file.
+if [[ $rc -eq 0 ]] && [[ ! -s "${CONVEYOR_RESULT:-}" ]]; then
+	guard_head_after=$(git rev-parse -q --verify "refs/heads/$guard_branch" 2>/dev/null || true)
+	guard_origin_after=$(git rev-parse -q --verify "refs/remotes/origin/$guard_branch" 2>/dev/null || true)
+	if [[ "$guard_head_after" == "$guard_head_before" && "$guard_origin_after" == "$guard_origin_before" ]]; then
+		record_session
+		asks no-output "the run finished without committing, pushing or writing a result. \
+Read this run's log for what it actually did — a model that asked a question in prose and \
+stopped, believing it was talking to someone, is the usual cause. Answering this mark \
+resumes the same conversation rather than starting cold."
+	fi
 fi
 
 # The provider is the record, never the agent's claim: if no PR references the
