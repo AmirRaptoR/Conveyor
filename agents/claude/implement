@@ -226,6 +226,17 @@ nothing landed. Read this run's log for what it did — a run cut short by a usa
 limit looks exactly like this."
 		;;
 	esac
+	# A draft here means the run did not finish: /implement marks a PR ready
+	# when the suite is green, so a model that stopped short of that (or a run
+	# whose exit code says nothing went wrong) has left work for review to find
+	# undone. Checked whatever $rc is — the same asymmetry the no-output stop
+	# above already has, because a non-zero run that also left a draft is
+	# exactly the silent case this exists to catch.
+	if [[ "$PR_DRAFT" == "true" ]]; then
+		blocked draft "pull request #$PR_NUMBER, which closes issue #$ref, is \
+still a draft. A pull request must be marked ready before this item can \
+advance; \`gh pr ready\` not having run before the wall is the usual cause."
+	fi
 	pr=$PR_NUMBER
 	echo "opened PR #$pr"
 fi

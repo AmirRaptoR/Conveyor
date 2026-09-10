@@ -108,12 +108,14 @@ open_issue='{"data":{"repository":{"issue":{"state":"OPEN",
 payload() { jq -n --arg ref "$1" '{item:{ref:$ref,title:"an item",description:"",url:"u"}}'; }
 
 # pr_entry <number> <ref> <state> <draft> — a one-element `pr list` fixture
-# that closes #ref, matched by body ("Closes #ref") rather than by branch, so
-# the branch name stays free to name whatever the scene needs.
+# that closes #ref, matched by body ("Closes #ref") rather than by branch. The
+# branch is named after ref so two scenes' worktrees never collide over one
+# real git checkout — item_worktree refuses a branch already checked out
+# elsewhere, which is a different scene's business, not this one's.
 pr_entry() {
 	local number=$1 ref=$2 state=$3 draft=$4
-	printf '[{"number":%s,"body":"Closes #%s","state":"%s","headRefName":"pr-branch","url":"u","isDraft":%s}]' \
-		"$number" "$ref" "$state" "$draft"
+	printf '[{"number":%s,"body":"Closes #%s","state":"%s","headRefName":"pr-branch-%s","url":"u","isDraft":%s}]' \
+		"$number" "$ref" "$state" "$ref" "$draft"
 }
 
 run_implement() {
@@ -208,6 +210,65 @@ rc=0
 chk "implement asks on a closed issue with nothing merged" "$rc" "20"
 chk "  the mark is a question, not a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "true"
 chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "no-output"
+
+# --- implement's postcondition: the model left the PR a draft ---------------
+# item_landed's own fixture is "no" here (the issue is still open), the
+# ordinary case: nothing about item_landed decides this, only what the
+# postcondition's own lookup finds afterward.
+rm -f "$tmp/scene"/*
+prlist_at 1 '[]' # preflight: no existing PR, a fresh item
+prlist_at 2 "$(pr_entry 50 26 OPEN true)" # postcondition: the model opened one, still a draft
+graphql "$open_issue"
+: >"$CONVEYOR_RESULT"
+rc=0
+(cd "$tmp/srcrepo" && payload 26 | "$here/implement" >"$tmp/out" 2>"$tmp/err") || rc=$?
+chk "implement blocks when its own postcondition finds a draft" "$rc" "20"
+chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "false"
+chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "draft"
+chk "  and names the PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#50')" "1"
+chk "  and says draft" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -ci 'draft')" "1"
+chk "  never prints opened PR" "$(grep -c 'opened PR' "$tmp/out")" "0"
+
+# --- implement's postcondition: an OPEN, non-draft PR is unaffected ---------
+rm -f "$tmp/scene"/*
+prlist_at 1 '[]'
+prlist_at 2 "$(pr_entry 51 27 OPEN false)"
+graphql "$open_issue"
+: >"$CONVEYOR_RESULT"
+rc=0
+(cd "$tmp/srcrepo" && payload 27 | "$here/implement" >"$tmp/out" 2>"$tmp/err") || rc=$?
+chk "implement still reports a non-draft PR" "$rc" "0"
+chk "  and never touches the mark file" "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+chk "  and prints the PR it opened" "$(grep -c 'opened PR #51' "$tmp/out")" "1"
+
+# --- review: an OPEN, non-draft PR advances all the way to approving -------
+# One fixture serves both of review's lookups (preflight's `--state open` and
+# the postcondition's `--state all`) — the object is the same PR either way.
+rm -f "$tmp/scene"/*
+prlist "$(pr_entry 60 30 OPEN false)"
+: >"$CONVEYOR_RESULT"
+rc=0
+(cd "$tmp/srcrepo" && payload 30 | "$here/review" >"$tmp/out" 2>"$tmp/err") || rc=$?
+chk "review advances a non-draft PR exactly as before" "$rc" "0"
+chk "  and never touches the mark file" "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+chk "  and hands it to approving" "$(grep -c 'PR #60 is OPEN; handing it to the approving stage' "$tmp/out")" "1"
+
+# --- review's postcondition: a person returned the PR to draft mid-review --
+# The preflight sees it ready; by the time the postcondition looks again
+# (after the model ran) it is a draft. This is the one scene the per-call
+# fixture exists for: unreachable if the preflight's own check answered both
+# calls the same way.
+rm -f "$tmp/scene"/*
+prlist_at 1 "$(pr_entry 70 31 OPEN false)" # preflight: not a draft
+prlist_at 2 "$(pr_entry 70 31 OPEN true)"  # postcondition: now a draft
+: >"$CONVEYOR_RESULT"
+rc=0
+(cd "$tmp/srcrepo" && payload 31 | "$here/review" >"$tmp/out" 2>"$tmp/err") || rc=$?
+chk "review's postcondition catches a PR returned to draft" "$rc" "20"
+chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "false"
+chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "draft"
+chk "  and names the PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#70')" "1"
+chk "  never hands it to approving" "$(grep -c 'handing it to the approving stage' "$tmp/out")" "0"
 
 if [[ $fail -eq 0 ]]; then echo "all checks passed"; else echo "SOME CHECKS FAILED"; fi
 exit $fail

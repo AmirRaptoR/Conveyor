@@ -220,6 +220,19 @@ if [[ $rc -eq 0 && -n "${REPO:-}" ]]; then
 		blocked no-output "the review finished but no open or merged pull request \
 references #$ref any more. A run cut short by a usage limit looks exactly like this."
 	fi
-	echo "PR #${landed% *} is ${landed#* }; handing it to the approving stage"
+	number=${landed% *} state=${landed#* }
+	# Read off the selected element of $active, not $PR_DRAFT: this lookup used
+	# --state all and filtered to non-CLOSED itself, so PR_DRAFT (set only on
+	# pr_lookup's own "one" outcome) is not the flag for whichever PR this
+	# picked. Reachable even with the preflight's own check in place, because a
+	# person can return a ready PR to draft while review is running. Never
+	# fires on MERGED: a merged PR is never a draft.
+	if [[ "$state" == "OPEN" && "$(jq -r '.[0].isDraft' <<<"$active")" == "true" ]]; then
+		blocked draft "pull request #$number, which closes issue #$ref, is \
+still a draft. A pull request must be marked ready before this item can \
+advance to approving; an implement run that did not reach \`gh pr ready\` is \
+the usual cause."
+	fi
+	echo "PR #$number is $state; handing it to the approving stage"
 fi
 exit $rc
