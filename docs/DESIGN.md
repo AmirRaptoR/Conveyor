@@ -47,7 +47,8 @@ implementing it, generalised.
 `perSource: 1` is a constraint, not a default: a source maps to a git worktree,
 and two agents in one checkout corrupt each other. `global` starts at 1 and is
 what you raise to run several sources at once. A stage script may spawn as many
-subagents as it likes — invisible to the engine.
+subagents as it likes — invisible to the engine. Whether Conveyor's own stages
+should is measured in `docs/specialized-agents.md`.
 
 ## v1 scope
 
