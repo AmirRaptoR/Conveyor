@@ -4,7 +4,15 @@
   padding:10px 22px; border-bottom:1px solid var(--rule); background:var(--panel);
   font-size:11px; color:var(--dim);
 }
-.src-chip { display:flex; align-items:center; gap:7px; }
+/* Every chip but the storage one is a real <button> — the Pipeline view's own
+   source filter (#93) — reset out of button chrome so it keeps reading as the
+   quiet strip it always was. */
+.src-chip {
+  display:flex; align-items:center; gap:7px;
+  font:inherit; font-size:11px; color:inherit; background:none; border:0; padding:0;
+  cursor:pointer; border-radius:3px;
+}
+.src-chip.storage { cursor:default; }
 .src-chip .swatch { width:9px; height:2px; background:var(--src); }
 .src-chip .repo { color:var(--faint); }
 .src-chip .n { color:var(--ink); font-variant-numeric:tabular-nums; }
@@ -17,6 +25,18 @@
 .src-chip.degraded .swatch { background:var(--run); }
 .src-chip.degraded .n { color:var(--run); }
 .src-chip .never { color:var(--run); }
+
+/* The pressed chip — "All" or one source, never both — composes with
+   .broken/.degraded rather than replacing them: a selected broken source
+   keeps its red swatch and "cannot run" text, a selected degraded source
+   keeps its amber swatch and "?" count, both with the pressed ring added. */
+.src-chip.all { color:var(--dim); }
+.src-chip.selected {
+  outline:1px solid color-mix(in srgb, var(--src, var(--ink)) 55%, var(--rule));
+  outline-offset:4px;
+  border-radius:4px;
+}
+.src-chip.all.selected { color:var(--ink); outline-color:var(--ink); }
 
 /* The agents' own report on themselves. A strip above the sources, because
    an agent over its usage limit stops every source at once, and that is the

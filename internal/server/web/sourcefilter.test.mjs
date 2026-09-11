@@ -319,6 +319,31 @@ test("saveOrder: no non-terminal items at all behaves as before (an empty order 
   assert.deepEqual(JSON.parse(opts.body), []);
 });
 
+// ---- a filter change mid-drag --------------------------------------------------
+
+test("sources: a filter change mid-drag defers the rail rebuild; dragend renders the new value everywhere", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [
+      { id: "s1:1", source: "s1", stage: "backlog", title: "s1 first" },
+      { id: "s2:1", source: "s2", stage: "backlog", title: "s2 first" },
+    ],
+  }));
+  const fakeCard = { dataset: { id: "s1:1" }, classList: { add() {}, remove() {} }, closest() { return null; } };
+  p.mod.wireDrag(fakeCard);
+  fakeCard.ondragstart({ dataTransfer: { setData() {}, effectAllowed: "" } });
+  const writesBefore = p.el("#rail").writes;
+  p.mod.setSourceFilter("s2"); // the shared value itself changes at once...
+  assert.equal(p.el("#rail").writes, writesBefore, "...but the rail rebuild is deferred while dragging");
+  fakeCard.ondragend();
+  assert.equal(p.el("#rail").writes, writesBefore + 1, "dragend flushes exactly the one owed redraw");
+  const html = p.el("#rail").innerHTML;
+  assert.match(html, /s2 first/);
+  assert.doesNotMatch(html, /s1 first/);
+  assert.match(p.el("#sources").innerHTML, /data-source="s2" aria-pressed="true"/);
+  assert.equal(p.el("#inbox-source").value, "s2");
+});
+
 // ---- no network ---------------------------------------------------------------
 
 test("sources: selecting or clearing the filter makes no fetch call", async () => {
