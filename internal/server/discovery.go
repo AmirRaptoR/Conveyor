@@ -380,7 +380,20 @@ func (s *Server) refresh(ctx context.Context) {
 			delete(s.answerInfo, id)
 		}
 	}
+	for id := range s.cancels {
+		if !onBoard[id] {
+			delete(s.cancels, id)
+		}
+	}
 	s.mu.Unlock()
+	// Unlike cancels and the other caches above, an item's execution-budget
+	// ledger is deliberately never pruned by board visibility: MaxRunsPerItem
+	// is a lifetime ceiling that must survive an item scrolling off the
+	// closed-issues window or being reopened, not just a restart. Onboard is
+	// only ever a bounded recent slice (open issues plus the last
+	// CLOSED_LIMIT closed ones), so treating absence from it as "gone for
+	// good" would let an item spend past its ceiling simply by leaving and
+	// re-entering that window.
 	s.hub.publish(event{Kind: "state"})
 }
 

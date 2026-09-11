@@ -51,7 +51,24 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	for id, a := range s.answerInfo {
 		st.Answers[id] = a
 	}
+	if len(s.cancels) > 0 {
+		st.Cancels = make(map[string]CancelView, len(s.cancels))
+		for id, c := range s.cancels {
+			st.Cancels[id] = c
+		}
+	}
+	ids := make([]string, len(st.Items))
+	for i, it := range st.Items {
+		ids[i] = it.ID
+	}
 	s.mu.RUnlock()
+	st.ManualPauses = s.manualPauseList()
+	if budgets := s.budgetViews(ids); len(budgets) > 0 {
+		st.Budgets = budgets
+	}
+	st.BudgetDayUsage = s.budgets.DayUsage(budgetDay(time.Now()))
+	st.BudgetMaxRunsPerItem = s.cfg.Budgets.MaxRunsPerItem
+	st.BudgetMaxRunsPerDay = s.cfg.Budgets.MaxRunsPerDay
 	writeJSON(w, st)
 }
 
@@ -193,6 +210,12 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	case claimAgentPaused:
 		http.Error(w, s.whyPaused(s.cfg.AgentFor(item.Source, target)), http.StatusConflict)
+		return
+	case claimManuallyPaused:
+		http.Error(w, s.whyManuallyPaused(item.Source), http.StatusConflict)
+		return
+	case claimBudgetExhausted:
+		http.Error(w, s.whyBudgetExhausted(item.ID), http.StatusConflict)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)

@@ -17,10 +17,12 @@ import (
 type claimRefusal int
 
 const (
-	claimAccepted    claimRefusal = iota
-	claimItemBusy                 // this item already has a transition in flight
-	claimSlotBusy                 // the (source, stage) slot has none free
-	claimAgentPaused              // the stage's agent is over quota and overridePause is false
+	claimAccepted        claimRefusal = iota
+	claimItemBusy                     // this item already has a transition in flight
+	claimSlotBusy                     // the (source, stage) slot has none free
+	claimAgentPaused                  // the stage's agent is over quota and overridePause is false
+	claimManuallyPaused               // an operator paused this source, or the whole board
+	claimBudgetExhausted              // this item, or the board's day, spent its execution ceiling
 )
 
 // claim is the only place s.working is populated. Every dispatch path — the
@@ -41,11 +43,26 @@ const (
 // is the only thing that moves anything. Every other caller is stopped by a
 // paused agent exactly as it is stopped by a busy slot.
 //
+// A configured execution budget (#39) is likewise never lifted by
+// overridePause: it is an operator-defined ceiling, not a quota the outside
+// world reports, so only an explicit budget override — never the tick
+// button — spends past it. It is checked last, once every other gate has
+// already passed, so a run is counted only when it is certain to actually
+// launch: a claim refused for a busy slot or a paused source spends nothing.
+//
 // claim only reserves; it does not run anything. advance runs the transition
 // inline so it can refresh right afterwards (the button's contract under
 // -watch), while launch and handleStart hand it to a goroutine — both call
 // this same function first.
 func (s *Server) claim(item model.Item, target string, overridePause bool) claimRefusal {
+	// An operator's own pause, unlike a paused agent's quota, is never
+	// overridden — not even by overridePause, which exists only because the
+	// tick button is the sole mover under -watch and must not be wedged shut
+	// by an agent's own quota. A manual pause is the person's own decision,
+	// and only their Resume undoes it (#39).
+	if s.manuallyPaused(item.Source) {
+		return claimManuallyPaused
+	}
 	if !overridePause && s.agentPaused(s.cfg.AgentFor(item.Source, target)) {
 		return claimAgentPaused
 	}
@@ -55,6 +72,17 @@ func (s *Server) claim(item model.Item, target string, overridePause bool) claim
 	if !s.eng.Locks().TryAcquire(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...) {
 		s.working.Delete(item.ID)
 		return claimSlotBusy
+	}
+	// Spent last, once nothing else stands between this item and actually
+	// launching: a claim refused for a busy slot or a paused source has run
+	// nothing and must not count against either ceiling, so the reservation
+	// itself is what claim() returns claimAccepted for. On refusal, unwind
+	// everything already reserved — the same "changed nothing" guarantee
+	// claimSlotBusy above keeps.
+	if ok, _ := s.reserveBudget(item.ID); !ok {
+		s.working.Delete(item.ID)
+		s.eng.Locks().Release(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...)
+		return claimBudgetExhausted
 	}
 	return claimAccepted
 }
@@ -131,6 +159,22 @@ func (s *Server) launch(ctx context.Context) int {
 			if s.agentPaused(s.cfg.AgentFor(it.Source, target)) {
 				continue
 			}
+			// An operator's own pause, global or on this item's source —
+			// filtered here, before Pick, for the same reason a paused
+			// agent is: it is a fact about the world right now, not about
+			// the ordering, so a held item is simply not a candidate this
+			// pass rather than one Pick ranks and claim then refuses.
+			if s.manuallyPaused(it.Source) {
+				continue
+			}
+			// This item's own execution budget, or the board's daily one —
+			// a fact about the world right now, filtered here for the same
+			// reason a paused agent and a manual pause are: claim spends the
+			// reservation atomically and is the authority, this only saves
+			// Pick from ranking a candidate that cannot actually launch.
+			if !s.budgetAvailable(it.ID) {
+				continue
+			}
 			if _, running := s.working.Load(it.ID); running {
 				continue // already being worked; the locks do not know that
 			}
@@ -162,7 +206,7 @@ func (s *Server) launch(ctx context.Context) int {
 				fullStage[target] = true
 			}
 			continue
-		case claimItemBusy, claimAgentPaused:
+		case claimItemBusy, claimAgentPaused, claimManuallyPaused, claimBudgetExhausted:
 			busy[item.ID] = true
 			continue
 		}
@@ -196,6 +240,24 @@ func spends(resources []string, full map[string]bool) bool {
 
 // runOne performs one transition and keeps the board honest about it.
 func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
+	// A child of ctx, one per transition, so cancelling this item's run —
+	// handleCancel calling the func stored below — reaches only this run's
+	// process group (runner.Run's own runCtx.Done() case) and never another
+	// one sharing the same parent. A fresh attempt supersedes whatever audit
+	// trail the last one left.
+	//
+	// Registered — and the stale cancel record cleared — before setActive
+	// publishes this run as active: a client that reacts to that event by
+	// cancelling at once must find a cancel func already in place, never a
+	// 409 for a run the board just told it was running.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	s.cancelFns.Store(item.ID, cancelRun)
+	defer s.cancelFns.Delete(item.ID)
+	s.mu.Lock()
+	delete(s.cancels, item.ID)
+	s.mu.Unlock()
+
 	s.setActive(item.ID, &Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title, StartedAt: time.Now()})
 	defer s.setActive(item.ID, nil)
 
@@ -206,7 +268,7 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 	// bad agent invocation: the answer is kept and the session dropped, because
 	// a resume that did not work names a conversation worth abandoning.
 	resume := s.answers.Get(item.ID)
-	tr, err := s.eng.Advance(ctx, item.Source, &item, target, resume)
+	tr, err := s.eng.Advance(runCtx, item.Source, &item, target, resume)
 	if tr == nil {
 		// An unknown source or stage: a config problem, not a transient one,
 		// and nothing ran — there is nothing to mark, move or spend an answer
