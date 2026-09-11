@@ -71,6 +71,38 @@ test("sources: a degraded chip still carries the degraded class and the ? count 
   assert.match(html, /<span class="n">\?<\/span>/);
 });
 
+// ---- no sorting ---------------------------------------------------------------
+
+test("sources: filtering removes cards but never reorders the ones left visible", async () => {
+  const p = await page();
+  // Deliberately not alphabetical or grouped by source — the order /api/state
+  // delivered them in, which filtering must preserve exactly.
+  await withState(p, baseState({
+    items: [
+      { id: "s1:z", source: "s1", stage: "backlog", title: "z first" },
+      { id: "s2:1", source: "s2", stage: "backlog", title: "s2 only" },
+      { id: "s1:a", source: "s1", stage: "backlog", title: "a second" },
+    ],
+  }));
+  p.mod.setSourceFilter("s1");
+  const html = p.el("#rail").innerHTML;
+  assert.ok(html.indexOf("z first") < html.indexOf("a second"), "s1:z still precedes s1:a, as delivered");
+});
+
+// ---- drag-to-start behaves the same, filtered or not ------------------------
+
+test("sources: startItem posts the same request whether or not a filter is active", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:1", source: "s1", stage: "backlog", title: "x" }],
+  }));
+  p.mod.setSourceFilter("s2"); // s1:1 itself is filtered out of view
+  await p.mod.startItem("s1:1", "working");
+  const call = p.calls.fetch.at(-1);
+  assert.equal(call[0], "/api/items/s1%3A1/start");
+  assert.deepEqual(JSON.parse(call[1].body), { stage: "working" });
+});
+
 // ---- filtering, no sorting, rank badge --------------------------------------
 
 test("sources: selecting s1 shows only s1 cards in every #rail column, clearing shows both again", async () => {
