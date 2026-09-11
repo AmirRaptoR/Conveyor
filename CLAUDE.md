@@ -68,7 +68,12 @@ each line so the cost can be raised later without invalidating them — and a
 plaintext password there is a load error, not a warning. **Serving a
 non-loopback address with no `auth.users` is refused**, because the board starts
 agent runs, reorders work and hands items back: reaching it is enough to drive
-every repository the config enrols.
+every repository the config enrols. `serve` also always listens on a Unix
+socket at `<data>/api.sock`, mode `0600` and no password at all — a caller on
+the same OS user already has full authority over the data directory, so a
+loopback TCP peer check would be trusting exactly what a same-host proxy
+(Caddy, `cloudflared`) can forward by accident; TCP keeps auth regardless of
+peer, and the socket is the only door with no password on it (#94).
 
 ## Invariants — do not break these
 
