@@ -118,6 +118,24 @@ error, like every other `auth` problem. See docs/CONTRACTS.md's section on
 what a stage script's credentials actually reach — worktrees isolate
 checkouts, not credentials or host access.
 
+### The local socket
+
+Alongside loopback TCP, `serve` also listens on a Unix domain socket at
+`<data>/api.sock` (`<data>` is the config's data directory — the one holding
+`owner.lock`, `order.json` and `runs/`). It needs no password: its access
+control is the file's own permission bits, `0600`, so only the OS user
+`conveyor` runs as can connect to it at all.
+
+```bash
+curl --unix-socket ~/.local/share/conveyor/api.sock http://localhost/api/state
+```
+
+Loopback TCP is never given the same exemption, no matter the peer: both
+Caddy and a Cloudflare tunnel connect to the board from `127.0.0.1` too, so a
+loopback-peer check cannot tell that traffic apart from the whole internet.
+The socket proves "local" the way a peer address cannot — the filesystem
+already stops every other user from reaching it.
+
 ### Post-deploy check: `conveyor probe`
 
 A deploy that builds, tests and installs cleanly can still leave the running

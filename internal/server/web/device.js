@@ -68,15 +68,27 @@ if ("serviceWorker" in navigator) {
   addEventListener("appinstalled", () => subscribePush());
 }
 
-// A notification opens the item it was about.
+// A notification opens the item it was about — or, when a push arrives for
+// an item that finished, was reclaimed by retention, or is simply gone by
+// the time the tap lands, says so plainly instead of doing nothing. Silence
+// there used to read as a broken link; a person cannot tell "this app is
+// stuck" from "that item moved on" without something on screen saying which.
 export function openFromHash() {
   const m = location.hash.match(/^#item=(.+)$/);
   if (!m || !state) return;
   const id = decodeURIComponent(m[1]);
   const it = (state.items || []).find(i => i.id === id);
   history.replaceState(null, "", location.pathname);
-  if (it) inspect(it.id, it.title, it.stage);
+  if (it) { hideItemGone(); inspect(it.id, it.title, it.stage); return; }
+  showItemGone(id);
 }
+
+function showItemGone(id) {
+  $("#itemgone-text").textContent = `${id} is no longer on the board — it may have finished or been removed.`;
+  $("#itemgone").hidden = false;
+}
+function hideItemGone() { $("#itemgone").hidden = true; }
+$("#itemgone-dismiss").onclick = hideItemGone;
 addEventListener("hashchange", openFromHash);
 $("#tick").onclick = async e => {
   const btn = e.target;
