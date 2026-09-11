@@ -822,3 +822,62 @@ sources:
 		}
 	}
 }
+
+func TestPreflightScriptAbsentIsNotAnError(t *testing.T) {
+	_, path := onboarded(t)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Sources[0].OK() {
+		t.Fatalf("a provider with no preflight script must not become a Source.Problem: %v", cfg.Sources[0].Problems)
+	}
+	path2, ambiguous, err := cfg.PreflightScript(cfg.Sources[0])
+	if path2 != "" || ambiguous != nil || err != nil {
+		t.Fatalf("PreflightScript(absent) = %q, %v, %v; want all zero", path2, ambiguous, err)
+	}
+}
+
+func TestPreflightScriptFound(t *testing.T) {
+	dir, path := onboarded(t)
+	script(t, filepath.Join(dir, "providers", "github", "preflight.sh"))
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, ambiguous, err := cfg.PreflightScript(cfg.Sources[0])
+	if err != nil {
+		t.Fatalf("PreflightScript: %v", err)
+	}
+	if ambiguous != nil {
+		t.Errorf("ambiguous = %v, want nil", ambiguous)
+	}
+	if filepath.Base(got) != "preflight.sh" {
+		t.Errorf("PreflightScript = %q, want preflight.sh", got)
+	}
+}
+
+func TestPreflightScriptAmbiguous(t *testing.T) {
+	dir, path := onboarded(t)
+	script(t, filepath.Join(dir, "providers", "github", "preflight.sh"))
+	script(t, filepath.Join(dir, "providers", "github", "preflight.py"))
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, ambiguous, err := cfg.PreflightScript(cfg.Sources[0])
+	if err == nil {
+		t.Fatal("PreflightScript(ambiguous) returned no error")
+	}
+	if got != "" {
+		t.Errorf("path = %q, want empty on ambiguity", got)
+	}
+	if len(ambiguous) != 2 {
+		t.Errorf("ambiguous = %v, want both candidates named", ambiguous)
+	}
+	// Still not a Source.Problem: ambiguity is conveyor preflight's business,
+	// reported as a fail check, not a load-time problem.
+	if !cfg.Sources[0].OK() {
+		t.Errorf("ambiguous preflight script became a Source.Problem: %v", cfg.Sources[0].Problems)
+	}
+}

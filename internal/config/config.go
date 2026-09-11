@@ -581,6 +581,15 @@ func (c *Config) AgentsInUse() []Agent {
 	return out
 }
 
+// AgentStatusScript resolves agents/<name>/status, or "" when that agent has
+// none — the same optional-script convention `doctor` and `preflight` use.
+func (c *Config) AgentStatusScript(agent string) string {
+	if path, err := findScript(filepath.Join(c.AgentsDir(), agent), "status"); err == nil {
+		return path
+	}
+	return ""
+}
+
 // providerScript finds providers/<provider>/<verb>.
 func (c *Config) providerScript(provider, verb string) (string, error) {
 	dir := filepath.Join(c.ProvidersDir(), provider)
@@ -596,11 +605,13 @@ func (c *Config) providerScript(provider, verb string) (string, error) {
 	return path, nil
 }
 
-// findScript finds dir/<name>, with or without an extension: name.sh, name.py
-// and a compiled `name` are equivalent, because the runner execs the file
-// directly and never consults an interpreter. Exactly one match is required —
-// two would make the choice depend on glob order.
-func findScript(dir, name string) (string, error) {
+// scriptCandidates lists every file in dir matching name, with or without an
+// extension: name.sh, name.py and a compiled name are all candidates, sorted
+// so the result is deterministic. findScript and PreflightScript both build
+// their own classification (absent / found / ambiguous) on this, since they
+// disagree about what an absent match means: findScript's callers treat it
+// as a problem, PreflightScript's caller treats it as a skip.
+func scriptCandidates(dir, name string) []string {
 	cand, _ := filepath.Glob(filepath.Join(dir, name+".*"))
 	cand = append(cand, filepath.Join(dir, name))
 
@@ -611,7 +622,13 @@ func findScript(dir, name string) (string, error) {
 		}
 	}
 	sort.Strings(found)
+	return found
+}
 
+// findScript finds dir/<name>, with or without an extension. Exactly one
+// match is required — two would make the choice depend on glob order.
+func findScript(dir, name string) (string, error) {
+	found := scriptCandidates(dir, name)
 	switch len(found) {
 	case 0:
 		return "", fmt.Errorf("no %s script in %s", name, dir)
@@ -624,6 +641,59 @@ func findScript(dir, name string) (string, error) {
 		}
 		return "", fmt.Errorf("ambiguous %s script (%s)", name, strings.Join(names, ", "))
 	}
+}
+
+// PreflightScript resolves a source's provider preflight script, exactly as
+// list and move are resolved (findScript: with or without an extension). It
+// answers differently than findScript because conveyor preflight treats
+// absence and ambiguity differently: absence is not a problem — a provider
+// shipping none simply yields a `skip` check — so it is reported by returning
+// "", nil, nil rather than an error. Ambiguity ("", names, err) names every
+// candidate so the caller can report which files collided.
+//
+// Deliberately never a Source.Problem: Source.OK() must stay unaffected by a
+// provider declaring no preflight, so a source with none can still be worked.
+func (c *Config) PreflightScript(s Source) (path string, ambiguous []string, err error) {
+	if s.Provider.Name == "" {
+		return "", nil, fmt.Errorf("no provider configured")
+	}
+	dir := filepath.Join(c.ProvidersDir(), s.Provider.Name)
+	if fi, statErr := os.Stat(dir); statErr != nil {
+		return "", nil, statErr
+	} else if !fi.IsDir() {
+		return "", nil, fmt.Errorf("%s is not a directory", dir)
+	}
+	found := scriptCandidates(dir, "preflight")
+	switch len(found) {
+	case 0:
+		return "", nil, nil
+	case 1:
+		return found[0], nil, nil
+	default:
+		names := make([]string, len(found))
+		for i, f := range found {
+			names[i] = filepath.Base(f)
+		}
+		return "", names, fmt.Errorf("ambiguous preflight script (%s)", strings.Join(names, ", "))
+	}
+}
+
+// ProviderVerbs resolves provider/<name>'s list and move scripts, exactly as
+// a source's own `provider:` resolves them — with or without an extension,
+// exactly one match required. Unlike resolveSources, this asks about a
+// provider name directly rather than a configured source, which is what
+// `conveyor enroll` needs to decide which directories under the provider
+// root are even usable before any source names one.
+func (c *Config) ProviderVerbs(provider string) (list, move string, err error) {
+	list, err = c.providerScript(provider, "list")
+	if err != nil {
+		return "", "", err
+	}
+	move, err = c.providerScript(provider, "move")
+	if err != nil {
+		return "", "", err
+	}
+	return list, move, nil
 }
 
 // resolveSources fills in each source's script paths and records why it cannot

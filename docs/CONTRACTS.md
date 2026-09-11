@@ -195,6 +195,56 @@ tokens or money is the interesting number — all of that differs per agent and
 belongs to the script, which is why the engine holds no struct for it. An agent
 with no `status` script simply says nothing, which is not an error.
 
+**`preflight`** (optional, `providers/<name>/preflight`) — a readiness check
+for one source, run only by `conveyor preflight`, and by `conveyor enroll`
+and `conveyor run`'s post-run checklist when they need the same answer. Never
+run by the scheduler, and never as part of an ordinary poll: this is the
+outside world checked deliberately, on request. Receives the same stdin
+`list` receives — `model.ListInput` with `source`, `stages` and
+`terminalStages`; `config` left unset, exactly as `Client.List` leaves it —
+and `ProviderEnv()` (the source's `env:` plus its `provider.params:`), since
+what this script checks (a label existing, a repository's permission level)
+is the provider's own vocabulary and belongs to the same env `list` and
+`move` already see. Writes:
+
+```json
+{"checks": [
+  {"name": "gh on PATH", "status": "pass"},
+  {"name": "label conveyor:blocked", "status": "fail",
+   "detail": "missing", "fix": "providers/github/onboard.sh ..."}
+]}
+```
+
+`status` is one of `pass`, `fail`, `warn`, `skip`. Any other word, or an
+absent one, is read as `unknown` and counts as a failure, the same as an
+unrecognised agent `state` does — a check whose outcome cannot be read has
+not passed. Exit 0 means only "the checks ran, and here is what they found";
+the verdicts carry the outcome. A non-zero exit, a timeout, or a failure to
+start becomes one synthetic `fail` naming the exit code (or timeout) and the
+run directory, since none of those left any verdict to trust. A malformed
+envelope — not JSON, not an object, no `checks` key, `checks` not an array,
+or an empty result on a 0 exit — becomes the same kind of synthetic `fail`.
+A malformed *entry* inside an otherwise well-formed array does not take the
+rest down with it: it becomes one `unknown` check named by its index, and
+every valid entry beside it is still reported.
+
+Resolved by name with or without an extension, exactly like `list` and
+`move`. A provider shipping none is not a problem — `conveyor preflight`
+reports a single `skip` for that source, and `Source.OK()` is unaffected;
+providers that predate this issue keep working with no changes. Two matching
+files is a single `fail` naming both, for the same reason two matching
+`list` files would be an error: the choice must not depend on glob order.
+Every invocation is recorded with `Kind: "preflight"`, bounded by
+`discovery:` rather than `timeout:` — these are API reads, not agent work.
+
+What a preflight script writes into `detail` or `fix` — or logs on its own
+account — is that script's own promise, not something the engine polices:
+the same standing `move`'s own comment on an issue already carries. A script
+that echoes one of its own params into a `detail` string has broken that
+promise, not the engine's redaction, which only ever covers what the *engine
+itself* prints (env values in `conveyor run -explain`, `conveyor enroll`'s
+stdout) and never rewrites a script's own prose.
+
 **`doctor`** (optional, `scripts.doctor:` — a reserved source-script key no
 stage names) — triage one marked item, on demand, as part of a *sweep* the
 board starts across every marked item at once (`POST /api/doctor`). Not a
@@ -239,6 +289,45 @@ every onboarded repository at once. A dry run clears no mark and records no
 answer, whatever the script exits; what a doctor writes to the *provider*
 under it (a comment, say) is the script's own promise, exactly as it already
 is for `move`.
+
+**`source.template.yaml`** (optional, `providers/<name>/source.template.yaml`)
+— not a script; never resolved by `findScript`, so it can never be mistaken
+for `list`, `move`, `status`, `doctor` or `preflight`, the way `onboard.sh`
+and `selfcheck.sh` already avoid a name `provider:` could resolve. It is the
+one thing `conveyor enroll` reads to ask a provider's own questions without
+understanding what a param means:
+
+```yaml
+prompts:
+  - name: STAGE_LABELS_HINT   # [A-Z][A-Z0-9_]* — becomes {{NAME}} and an
+                              # -answer flag; SOURCE, WORKDIR and SCRIPTS are
+                              # reserved for the engine's own questions
+    prompt: "a one-line label prefix"
+    example: "conveyor"      # optional
+    default: "conveyor"      # optional
+template: |
+  - name: {{SOURCE}}
+    provider: mock
+    workdir: {{WORKDIR}}
+    scripts:
+      {{SCRIPTS}}
+```
+
+A provider that resolves `list` and `move` but ships no template is still a
+usable provider — `enroll` just cannot offer it, and says so with the reason.
+`enroll` substitutes single-pass and never recursively, so a value containing
+literal `{{X}}` text is emitted as-is; every substituted value — the
+provider's own answers, and the engine's `{{SOURCE}}`/`{{WORKDIR}}` — is
+encoded as a YAML-safe scalar first. `{{SCRIPTS}}` is the one exception: it
+is `enroll`'s own rendering of the `agent:`/`script:` choice for every
+distinct script name a stage asks for, spliced in verbatim and indented to
+whatever column its placeholder sits at. A malformed template — an
+unresolved placeholder, a prompt never named in `template:`, a duplicate or
+reserved prompt name, a name shaped like a secret (`token`, `secret`,
+`password`, `key`, `credential`, case-insensitively) — is a refusal naming
+the file and the offending entry, never a partial draft: `enroll` prints
+everything it collects, on stdout, in the clear, so a credential belongs in
+the drafted source's `env:` by hand instead.
 
 ## 4. Transition order
 

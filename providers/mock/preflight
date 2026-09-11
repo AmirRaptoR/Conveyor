@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Mock provider preflight: nothing external to check, so this always passes.
+# Exists so `conveyor preflight` has something to run against the mock
+# pipeline — and so a clean checkout with no network and no `gh` still comes
+# back green.
+set -euo pipefail
+STORE="${MOCK_STORE:-/tmp/conveyor-mock.json}"
+
+cat >"$CONVEYOR_RESULT" <<EOF
+{"checks":[
+  {"name":"mock store path","status":"pass","detail":"$STORE"}
+]}
+EOF

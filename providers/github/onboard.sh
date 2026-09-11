@@ -52,19 +52,12 @@ echo "onboarding $REPO"
 # list.sh — so it is described as the gesture it is rather than as a stage.
 label "$ONBOARD_LABEL" 1D76DB "Hand this issue over to the conveyor pipeline (onboarding tag)"
 
-# Every right-hand side of STAGE_LABELS. Read the same way list.sh and move.sh
-# read it, comments and blank lines included, so a config that works for them
-# works here.
-while IFS= read -r line; do
-	line="${line%%#*}"
-	line="${line#"${line%%[![:space:]]*}"}"
-	line="${line%"${line##*[![:space:]]}"}"
-	[[ -z "$line" || "$line" != *=* ]] && continue
-	stage="${line%%=*}"
-	name="${line#*=}"
-	[[ -z "$name" ]] && continue
+# Every right-hand side of STAGE_LABELS. Read the same way list.sh and
+# preflight.sh read it — via _stage_labels.sh, the one parse all three share.
+source "$(dirname "${BASH_SOURCE[0]}")/_stage_labels.sh"
+while IFS=$'\t' read -r stage name; do
 	label "$name" 1D76DB "Conveyor: $stage"
-done <<<"$STAGE_LABELS"
+done < <(stage_labels_pairs <<<"$STAGE_LABELS")
 
 # The mark. One label, and no per-kind labels beside it: which kind of stop it
 # was rides in the section move.sh writes into the issue body, next to the

@@ -49,10 +49,44 @@ Nothing to install but Go — the mocks need no GitHub and no AI.
 go build -o conveyor ./cmd/conveyor
 
 # -c keeps your own conveyor.yaml, if you have one, out of the way
-./conveyor validate -c conveyor.example.yaml   # check config, print the graph
-./conveyor list     -c conveyor.example.yaml   # run every source's list script
-./conveyor tick     -c conveyor.example.yaml -n 10 -v
+./conveyor validate   -c conveyor.example.yaml   # check config, print the graph
+./conveyor preflight  -c conveyor.example.yaml   # is the outside world ready?
+./conveyor list       -c conveyor.example.yaml   # run every source's list script
+./conveyor tick       -c conveyor.example.yaml -n 10 -v
 ```
+
+`conveyor preflight [-source NAME]` is a readiness check, not a run: it moves
+no item, runs no stage, and writes nothing to any provider or to the config.
+For each source it reports the engine-side problems `validate` already
+catches, then whatever its provider's own `preflight` script finds (`gh`
+installed and authenticated, the labels the pipeline needs, write access to
+the repository) — see `providers/github/preflight.sh` — then one check per
+agent the source names, via `agents/<name>/status`. Exits non-zero if
+anything came back `fail` or `unknown`.
+
+`conveyor enroll [-answer NAME=VALUE]...` is the guided way to write a
+`sources:` entry instead of assembling one by hand: it asks for a name and a
+workdir, which provider, that provider's own questions (read from
+`providers/<name>/source.template.yaml`, so the engine never has to
+understand what a param means), and which `agent:` or `script:` answers each
+distinct script name the stages ask for. It prints the drafted block on
+stdout and nothing else there — pasteable straight under your own `sources:`,
+the same contract `conveyor passwd` keeps for an `auth.users` line — and
+edits no file itself. Every prompt, and a checklist of the same readiness
+checks `preflight` runs against the draft alone, goes to stderr. `-answer`
+pre-answers a prompt so the whole flow can run scripted, with stdin closed.
+
+`conveyor run -source N -item ID [-stage S]` moves one item into a stage and
+runs it — the one supervised, single-item way to watch a source work for
+real. `-stage` is optional: left unset, the stage is whatever
+`pipeline.Target` would pick, the same choice the scheduler makes on its
+own. Add `-explain` to see the plan — source, item, `from -> to`, the
+resolved script, the resources and timeout it would take, and its
+environment with every non-`CONVEYOR_` value redacted — without moving
+anything or running anything. After a real run it prints a short checklist:
+stage, outcome, exit code, the run directory, and (on failure, blocked or
+timeout) the source's remaining `preflight` problems, read together with
+what just went wrong.
 
 `conveyor.yaml` is the working config and is deliberately untracked;
 `conveyor.example.yaml` is the template that ships.
@@ -252,7 +286,8 @@ sources:
   - name: midgame
     workdir: ~/codes/midgame
 
-    # How it reaches its backend. Params here reach ONLY list and move.
+    # How it reaches its backend. Params here reach ONLY list, move and
+    # preflight — never a stage script.
     provider:
       name: github
       params:
@@ -305,7 +340,7 @@ directory a given stage happens to run in.
 
 | | reaches | for |
 | --- | --- | --- |
-| `provider.params:` | `list` and `move` only | the backend's own vocabulary — `STAGE_LABELS` |
+| `provider.params:` | `list`, `move` and `preflight` only | the backend's own vocabulary — `STAGE_LABELS` |
 | `env:` | every script | what the source **is** — `REPO` |
 | `scripts.*.params:` | one script | what it **needs** — its prompt, its tools |
 

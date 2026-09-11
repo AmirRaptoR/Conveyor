@@ -37,6 +37,8 @@ func main() {
 		err = cmdValidate(os.Args[2:])
 	case "list":
 		err = cmdList(os.Args[2:])
+	case "preflight":
+		err = cmdPreflight(os.Args[2:])
 	case "run":
 		err = cmdRun(os.Args[2:])
 	case "tick":
@@ -47,6 +49,8 @@ func main() {
 		err = cmdProbe(os.Args[2:])
 	case "passwd":
 		err = cmdPasswd(os.Args[2:])
+	case "enroll":
+		err = cmdEnroll(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -66,7 +70,13 @@ func usage() {
 
   validate                              load and check the config
   list      [-source NAME]              run list scripts, print items
-  run       -source N -item ID -stage S move one item into a stage and run it
+  preflight [-source NAME]              readiness: gh/agent/label checks per
+                                        source, exit non-zero if any failed.
+                                        Moves nothing, writes nothing.
+  run       -source N -item ID [-stage S] move one item into a stage and run
+            [-explain]                   it. -stage defaults to whatever
+                                        pipeline.Target would pick. -explain
+                                        prints the plan and runs nothing.
   tick      [-source NAME] [-n N]       one scheduling pass: pick and advance
   serve     [-addr :8080] [-mode M]     run the pipeline; board, live logs,
             [-watch]                    run history. -mode is auto (default),
@@ -82,6 +92,12 @@ func usage() {
                                         README
   passwd    <name>                      hash a password for the config's
                                         auth.users block
+  enroll    [-answer NAME=VALUE]...     guided setup: asks for what a source
+                                        needs and prints a sources: block on
+                                        stdout, ready to paste — nothing else
+                                        on stdout. Writes no file, starts no
+                                        stage, lists no items. -answer
+                                        pre-answers a prompt; repeatable.
   
 Common flags:
   -c <config>       path to the config (default conveyor.yaml). Stage scripts
@@ -310,20 +326,26 @@ func cmdRun(args []string) error {
 	c := newFlags("run")
 	srcName := c.fs.String("source", "", "source name (required)")
 	itemID := c.fs.String("item", "", "item id (required)")
-	stageName := c.fs.String("stage", "", "stage to move into (required)")
+	stageName := c.fs.String("stage", "", "stage to move into (default: pipeline.Target's own choice)")
+	explain := c.fs.Bool("explain", false, "print the plan and perform no transition")
 	cfg, r, ctx, stop, err := c.load(args)
 	if err != nil {
 		return err
 	}
 	defer stop()
-	if *srcName == "" || *itemID == "" || *stageName == "" {
-		return errors.New("-source, -item and -stage are all required")
+	if *srcName == "" || *itemID == "" {
+		return errors.New("-source and -item are both required")
 	}
-	release, err := own(cfg, r, true)
-	if err != nil {
-		return err
+
+	// -explain reads only: no owner lock, same as list and preflight — it
+	// starts no stage and calls no move.
+	if !*explain {
+		release, err := own(cfg, r, true)
+		if err != nil {
+			return err
+		}
+		defer release()
 	}
-	defer release()
 
 	eng := pipeline.New(cfg, r)
 	client, ok := eng.Client(*srcName)
@@ -343,8 +365,23 @@ func cmdRun(args []string) error {
 	if item == nil {
 		return fmt.Errorf("source %q has no item %q", *srcName, *itemID)
 	}
-	tr, err := eng.Advance(ctx, *srcName, item, *stageName, model.Resume{})
+
+	stage := *stageName
+	if stage == "" {
+		target, ok := pipeline.Target(cfg, item)
+		if !ok {
+			return fmt.Errorf("no stage to run: %s", declineReason(cfg, item))
+		}
+		stage = target
+	}
+
+	if *explain {
+		return explainRun(cfg, *srcName, item, stage, os.Stdout)
+	}
+
+	tr, err := eng.Advance(ctx, *srcName, item, stage, model.Resume{})
 	report(tr)
+	printChecklist(ctx, cfg, r, *srcName, tr)
 	if err != nil {
 		return err
 	}

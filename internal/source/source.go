@@ -7,11 +7,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/preflight"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 )
+
+func statDir(p string) (bool, error) {
+	fi, err := os.Stat(p)
+	if err != nil {
+		return false, err
+	}
+	return fi.IsDir(), nil
+}
 
 // Warning is a non-fatal problem with one item. A bad item is skipped and
 // reported, never silently dropped: an item that vanishes without explanation
@@ -127,6 +138,87 @@ func (c *Client) validate(in []model.Item) ([]model.Item, []Warning) {
 		ok = append(ok, it)
 	}
 	return ok, warns
+}
+
+// Preflight runs this source's provider preflight script, if it has one, and
+// returns readiness checks — docs/CONTRACTS.md §3. Unlike List, an absent
+// script is not a Go error: it is a single `skip` check, because a provider
+// shipping none is not a problem (Source.OK() is unaffected). An ambiguous
+// one is a single `fail` check naming both candidates. Only a script that
+// exists and ran, however it exited, produces run to report — every other
+// case returns a nil *model.Run because there was no run to speak of.
+//
+// The invocation is bounded by Discovery, not Timeout: these are API reads,
+// not agent work, matching List.
+func (c *Client) Preflight(ctx context.Context) ([]preflight.Check, *model.Run, error) {
+	path, ambiguous, err := c.cfg.PreflightScript(c.src)
+	if err != nil {
+		if ambiguous != nil {
+			names := ""
+			for i, n := range ambiguous {
+				if i > 0 {
+					names += ", "
+				}
+				names += n
+			}
+			return []preflight.Check{{
+				Name: "preflight script", Status: preflight.StatusFail,
+				Detail: fmt.Sprintf("ambiguous preflight script (%s)", names),
+			}}, nil, nil
+		}
+		return []preflight.Check{{
+			Name: "preflight script", Status: preflight.StatusFail,
+			Detail: fmt.Sprintf("provider %q: %v", c.src.Provider.Name, err),
+		}}, nil, nil
+	}
+	if path == "" {
+		return []preflight.Check{{
+			Name: "preflight script", Status: preflight.StatusSkip,
+			Detail: "provider declares no preflight script",
+		}}, nil, nil
+	}
+
+	res, runErr := c.run.Run(ctx, runner.Spec{
+		Script:  path,
+		Kind:    "preflight",
+		Workdir: c.cfg.Workdir(c.src),
+		Env:     c.src.ProviderEnv(),
+		Source:  c.src.Name,
+		Timeout: c.cfg.Discovery.D(),
+		Stdin: model.ListInput{
+			Source:         c.src.Name,
+			Stages:         c.cfg.StageNames(),
+			TerminalStages: c.cfg.TerminalStageNames(),
+		},
+	})
+	if res == nil {
+		return []preflight.Check{{
+			Name: "preflight script", Status: preflight.StatusFail,
+			Detail: fmt.Sprintf("could not start: %v", runErr),
+		}}, nil, nil
+	}
+	return preflight.FromRun(res.Run, res.Data), &res.Run, nil
+}
+
+// PreflightRunnable reports whether this source is in a state where its
+// provider preflight script could even be attempted — the runner needs
+// Workdir as cmd.Dir, and the provider itself has to have resolved. When it
+// is not, conveyor preflight reports a single `skip` naming the blocking
+// problem instead of running the script and getting a confusing failure that
+// only restates what Source.Problems already says.
+func PreflightRunnable(cfg *config.Config, src config.Source) (ok bool, reason string) {
+	wd := cfg.Workdir(src)
+	if fi, err := statDir(wd); err != nil || !fi {
+		return false, fmt.Sprintf("workdir %s: not a directory", wd)
+	}
+	if src.Provider.Name == "" {
+		return false, "no provider configured"
+	}
+	dir := filepath.Join(cfg.ProvidersDir(), src.Provider.Name)
+	if fi, err := statDir(dir); err != nil || !fi {
+		return false, fmt.Sprintf("provider %q: %s is not a directory", src.Provider.Name, dir)
+	}
+	return true, ""
 }
 
 // Mark is the blocked flag as the provider should end up writing it. Setting

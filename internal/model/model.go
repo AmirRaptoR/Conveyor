@@ -113,7 +113,7 @@ type Run struct {
 	ID     string `json:"id"`
 	Source string `json:"source"`
 	ItemID string `json:"itemId,omitempty"`
-	// Kind is "list", "move" or "stage".
+	// Kind is "list", "move", "stage", "doctor", "status" or "preflight".
 	Kind   string `json:"kind"`
 	Script string `json:"script"`
 	// From and To are stage names; empty for list runs.
