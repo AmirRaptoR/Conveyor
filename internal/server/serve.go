@@ -177,6 +177,8 @@ func (s *Server) handler() (http.Handler, error) {
 	mux.HandleFunc("POST /api/pause", s.mutationGuard(s.handlePause))
 	mux.HandleFunc("POST /api/resume", s.mutationGuard(s.handleResume))
 	mux.HandleFunc("POST /api/items/{id}/cancel", s.mutationGuard(s.handleCancel))
+	mux.HandleFunc("POST /api/items/{id}/budget-override", s.mutationGuard(s.handleBudgetOverride))
+	mux.HandleFunc("POST /api/items/{id}/budget-restore", s.mutationGuard(s.handleBudgetRestore))
 	mux.HandleFunc("POST /api/doctor", s.mutationGuard(s.handleDoctorStart))
 	mux.HandleFunc("GET /api/doctor", s.handleDoctorGet)
 	mux.HandleFunc("GET /api/push/key", s.handlePushKey)

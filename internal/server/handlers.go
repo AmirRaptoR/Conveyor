@@ -57,8 +57,16 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 			st.Cancels[id] = c
 		}
 	}
+	ids := make([]string, len(st.Items))
+	for i, it := range st.Items {
+		ids[i] = it.ID
+	}
 	s.mu.RUnlock()
 	st.ManualPauses = s.manualPauseList()
+	if budgets := s.budgetViews(ids); len(budgets) > 0 {
+		st.Budgets = budgets
+	}
+	st.BudgetDayUsage = s.budgets.DayUsage(budgetDay(time.Now()))
 	writeJSON(w, st)
 }
 
@@ -203,6 +211,9 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	case claimManuallyPaused:
 		http.Error(w, s.whyManuallyPaused(item.Source), http.StatusConflict)
+		return
+	case claimBudgetExhausted:
+		http.Error(w, s.whyBudgetExhausted(item.ID), http.StatusConflict)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)

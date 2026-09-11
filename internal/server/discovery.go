@@ -385,6 +385,14 @@ func (s *Server) refresh(ctx context.Context) {
 		}
 	}
 	s.mu.Unlock()
+	// Outside the lock, like every other store write: this is disk I/O, and
+	// s.mu guards in-memory state that has nothing to do with it. An item's
+	// own execution-budget ledger follows the same lifetime discipline as
+	// cancels above — once it is no longer on the board, there is nothing
+	// left for it to explain.
+	if err := s.budgets.Prune(onBoard); err != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: could not prune execution budgets: %v\n", err)
+	}
 	s.hub.publish(event{Kind: "state"})
 }
 

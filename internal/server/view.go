@@ -69,6 +69,15 @@ type State struct {
 	// Cancels is the audit record of a run an operator cancelled, keyed by
 	// item id, kept until that item's next transition starts.
 	Cancels map[string]CancelView `json:"cancels,omitempty"`
+	// Budgets is each item's own execution-budget ledger, keyed by item id —
+	// present only for an item that has actually run or carries an
+	// override. Distinct from Cancels and Blocks: exhausting a budget stops
+	// dispatch without marking the item or touching a run in flight.
+	Budgets map[string]BudgetView `json:"budgets,omitempty"`
+	// BudgetDayUsage is how many transitions the whole board has dispatched
+	// so far today (UTC), against cfg.Budgets.MaxRunsPerDay — the one fact
+	// here that is not about a single item.
+	BudgetDayUsage int `json:"budgetDayUsage,omitempty"`
 	// Slots is what the concurrency locks are holding, against their limits. It
 	// is here rather than behind a debug flag because "nothing is starting" is
 	// the question this board gets asked most, and a held slot is the one cause
@@ -296,6 +305,25 @@ type CancelView struct {
 	At     time.Time `json:"at"`
 }
 
+// BudgetOverrideView is the audit record of an operator letting one item keep
+// spending past its configured execution ceiling — who asked, why, and when.
+type BudgetOverrideView struct {
+	By     string    `json:"by,omitempty"`
+	Reason string    `json:"reason"`
+	At     time.Time `json:"at"`
+}
+
+// BudgetView is one item's own execution-budget ledger: how many runs it has
+// spent (all time) against cfg.Budgets.MaxRunsPerItem, and its override if an
+// operator granted one — the "show the budget that prevents dispatch ... and
+// an explicit operator override" half of #39. Present in State only for
+// items that have actually run at least once or carry an override; an item
+// that has never been dispatched has nothing here worth showing.
+type BudgetView struct {
+	Runs     int                 `json:"runs"`
+	Override *BudgetOverrideView `json:"override,omitempty"`
+}
+
 type SourceView struct {
 	Name     string   `json:"name"`
 	Provider string   `json:"provider"`
@@ -402,6 +430,12 @@ type Server struct {
 	// unlike an agent's own quota pause, nothing but a person's Resume can
 	// lift one, so a restart must not silently forget it (#39).
 	manualPauses *store.Pauses
+	// budgets is how many times each item, and the board as a whole today,
+	// have actually been dispatched — claim's own ledger against
+	// cfg.Budgets, persisted for the same reason manualPauses is: an
+	// operator-defined execution ceiling is a decision, not a fact a status
+	// script rediscovers, so a restart must not silently forget it (#39).
+	budgets *store.Budgets
 	// cancels is the audit record of a run an operator cancelled, kept until
 	// that item's next transition starts and overwrites it. Memory-only: a
 	// restart has no run left in flight to cancel, so there is nothing here
@@ -536,6 +570,7 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 		order:        store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
 		answers:      store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
 		manualPauses: store.OpenPauses(filepath.Join(cfg.DataDir(), "pauses.json")),
+		budgets:      store.OpenBudgets(filepath.Join(cfg.DataDir(), "budgets.json")),
 		tick:         make(chan struct{}, 1),
 		wake:         make(chan struct{}, 1),
 		ctx:          context.Background(),

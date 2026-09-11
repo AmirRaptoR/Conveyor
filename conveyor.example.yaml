@@ -62,6 +62,19 @@ resources:
   codex: 2
   ssh-prod: 5         # five concurrent deploys to the production host
 
+# Operator-defined execution ceilings — distinct from a stage's own
+# maxAttempts (below), which counts one stage's consecutive failures and
+# marks the item. A budget counts every dispatch of any outcome and simply
+# stops new dispatch, spent at the moment a transition is actually about to
+# launch. Both are unset here, meaning unlimited; an operator override
+# (POST /api/items/{id}/budget-override, with a reason) lets one item run
+# past its own ceiling, recorded the same way a pause or a cancellation is.
+#
+# budgets:
+#   maxRunsPerItem: 20   # one item's lifetime dispatch ceiling, across every
+#                        # stage, attempt and restart
+#   maxRunsPerDay: 200   # the whole board's dispatch ceiling for one UTC day
+
 poll: 5m              # how often to re-list every source
 retryStalled: 1h      # when EVERY item is marked and nothing can move at all,
                       # clear the marks this often and let the line try again. A

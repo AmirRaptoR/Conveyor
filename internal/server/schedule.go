@@ -17,11 +17,12 @@ import (
 type claimRefusal int
 
 const (
-	claimAccepted       claimRefusal = iota
-	claimItemBusy                    // this item already has a transition in flight
-	claimSlotBusy                    // the (source, stage) slot has none free
-	claimAgentPaused                 // the stage's agent is over quota and overridePause is false
-	claimManuallyPaused              // an operator paused this source, or the whole board
+	claimAccepted        claimRefusal = iota
+	claimItemBusy                     // this item already has a transition in flight
+	claimSlotBusy                     // the (source, stage) slot has none free
+	claimAgentPaused                  // the stage's agent is over quota and overridePause is false
+	claimManuallyPaused               // an operator paused this source, or the whole board
+	claimBudgetExhausted              // this item, or the board's day, spent its execution ceiling
 )
 
 // claim is the only place s.working is populated. Every dispatch path — the
@@ -41,6 +42,13 @@ const (
 // "the tick button still overrides" a paused agent, because under -watch it
 // is the only thing that moves anything. Every other caller is stopped by a
 // paused agent exactly as it is stopped by a busy slot.
+//
+// A configured execution budget (#39) is likewise never lifted by
+// overridePause: it is an operator-defined ceiling, not a quota the outside
+// world reports, so only an explicit budget override — never the tick
+// button — spends past it. It is checked last, once every other gate has
+// already passed, so a run is counted only when it is certain to actually
+// launch: a claim refused for a busy slot or a paused source spends nothing.
 //
 // claim only reserves; it does not run anything. advance runs the transition
 // inline so it can refresh right afterwards (the button's contract under
@@ -64,6 +72,17 @@ func (s *Server) claim(item model.Item, target string, overridePause bool) claim
 	if !s.eng.Locks().TryAcquire(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...) {
 		s.working.Delete(item.ID)
 		return claimSlotBusy
+	}
+	// Spent last, once nothing else stands between this item and actually
+	// launching: a claim refused for a busy slot or a paused source has run
+	// nothing and must not count against either ceiling, so the reservation
+	// itself is what claim() returns claimAccepted for. On refusal, unwind
+	// everything already reserved — the same "changed nothing" guarantee
+	// claimSlotBusy above keeps.
+	if ok, _ := s.reserveBudget(item.ID); !ok {
+		s.working.Delete(item.ID)
+		s.eng.Locks().Release(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...)
+		return claimBudgetExhausted
 	}
 	return claimAccepted
 }
@@ -148,6 +167,14 @@ func (s *Server) launch(ctx context.Context) int {
 			if s.manuallyPaused(it.Source) {
 				continue
 			}
+			// This item's own execution budget, or the board's daily one —
+			// a fact about the world right now, filtered here for the same
+			// reason a paused agent and a manual pause are: claim spends the
+			// reservation atomically and is the authority, this only saves
+			// Pick from ranking a candidate that cannot actually launch.
+			if !s.budgetAvailable(it.ID) {
+				continue
+			}
 			if _, running := s.working.Load(it.ID); running {
 				continue // already being worked; the locks do not know that
 			}
@@ -179,7 +206,7 @@ func (s *Server) launch(ctx context.Context) int {
 				fullStage[target] = true
 			}
 			continue
-		case claimItemBusy, claimAgentPaused, claimManuallyPaused:
+		case claimItemBusy, claimAgentPaused, claimManuallyPaused, claimBudgetExhausted:
 			busy[item.ID] = true
 			continue
 		}

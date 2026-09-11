@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -702,6 +703,40 @@ sources:
 `)
 	if err == nil || !strings.Contains(err.Error(), "codex") {
 		t.Fatalf("err = %v, want it to name the undeclared resource", err)
+	}
+}
+
+// A negative execution budget is a load error, the same as a negative
+// maxAttempts: zero is the deliberate way to say "unlimited", not the sign bit.
+func TestBudgetsCannotBeNegative(t *testing.T) {
+	base := `
+version: 1
+budgets:
+  %s
+stages:
+  - name: work
+    script: do
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: github
+    scripts:
+      do: {agent: claude}
+`
+	if _, err := loadYAML(t, fmt.Sprintf(base, "maxRunsPerItem: -1")); err == nil || !strings.Contains(err.Error(), "maxRunsPerItem") {
+		t.Errorf("negative maxRunsPerItem: err = %v, want it named", err)
+	}
+	if _, err := loadYAML(t, fmt.Sprintf(base, "maxRunsPerDay: -1")); err == nil || !strings.Contains(err.Error(), "maxRunsPerDay") {
+		t.Errorf("negative maxRunsPerDay: err = %v, want it named", err)
+	}
+	cfg, err := loadYAML(t, fmt.Sprintf(base, "maxRunsPerItem: 5\n  maxRunsPerDay: 50"))
+	if err != nil {
+		t.Fatalf("valid budgets: Load: %v", err)
+	}
+	if cfg.Budgets.MaxRunsPerItem != 5 || cfg.Budgets.MaxRunsPerDay != 50 {
+		t.Errorf("Budgets = %+v, want {5 50}", cfg.Budgets)
 	}
 }
 

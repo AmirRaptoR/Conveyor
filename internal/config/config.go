@@ -39,8 +39,18 @@ type Config struct {
 	// the cheap ones. A name with no entry here is a load error, because a
 	// silently unlimited resource is the failure this exists to prevent.
 	Resources map[string]int `yaml:"resources"`
-	Poll      Duration       `yaml:"poll"`
-	Timeout   Duration       `yaml:"timeout"`
+	// Budgets bounds how many times work may actually be dispatched — an
+	// operator-defined execution ceiling, and deliberately not the same
+	// knob as a stage's own MaxAttempts. MaxAttempts counts one stage's
+	// consecutive failures and marks the item where it stopped; a budget
+	// counts every dispatch of any outcome, across the item's whole life or
+	// the whole board's day, and stops new dispatch rather than marking
+	// anything — exhausting a budget is not itself a failure, and the item
+	// is left exactly where it is for the next window or an operator's
+	// override to free it.
+	Budgets Budgets  `yaml:"budgets"`
+	Poll    Duration `yaml:"poll"`
+	Timeout Duration `yaml:"timeout"`
 	// Discovery bounds one source's list script independently of Timeout,
 	// which defaults to 90 minutes and exists for agent work. A listing is a
 	// handful of API calls, not a stage, and must not be able to hold a
@@ -90,6 +100,24 @@ type Concurrency struct {
 	PerStage int `yaml:"perStage"`
 	// Global caps the total in flight. Every slot is an agent.
 	Global int `yaml:"global"`
+}
+
+// Budgets is the two execution ceilings an operator may declare — see
+// Config.Budgets. Both are counted at claim time, the moment a transition is
+// actually about to be dispatched, never merely attempted: a claim refused
+// for a busy slot or a paused source spends nothing, because nothing ran.
+type Budgets struct {
+	// MaxRunsPerItem is how many times one item may ever be dispatched,
+	// across every stage, every attempt and every restart — a lifetime
+	// ceiling, unlike MaxAttempts which counts one stage's own consecutive
+	// failures and resets the moment the item moves. Zero means unlimited.
+	MaxRunsPerItem int `yaml:"maxRunsPerItem"`
+	// MaxRunsPerDay is how many times the whole board — every source,
+	// every stage — may be dispatched in one UTC day. Zero means
+	// unlimited. The day is UTC for the same reason CONVEYOR_DEADLINE is:
+	// one definition of "today" that does not depend on where the process
+	// happens to run.
+	MaxRunsPerDay int `yaml:"maxRunsPerDay"`
 }
 
 type Logs struct {
@@ -834,6 +862,12 @@ func (c *Config) Validate() []string {
 	}
 	if c.Concurrency.Global < 1 {
 		add("concurrency.global must be at least 1")
+	}
+	if c.Budgets.MaxRunsPerItem < 0 {
+		add("budgets.maxRunsPerItem cannot be negative")
+	}
+	if c.Budgets.MaxRunsPerDay < 0 {
+		add("budgets.maxRunsPerDay cannot be negative")
 	}
 	if c.Logs.Retention <= 0 {
 		add("logs.retention must be greater than zero, got %s", time.Duration(c.Logs.Retention))
