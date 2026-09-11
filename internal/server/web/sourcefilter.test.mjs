@@ -286,6 +286,39 @@ test("sources: choosing 'All sources' in the select presses All", async () => {
   assert.match(p.el("#rail").innerHTML, /s1 first/);
 });
 
+// ---- saveOrder()'s reorder guard, driven off the unfiltered bucket ----------
+// applyVisibleOrder itself (the actual merge rule) is exercised directly, with
+// no DOM at all, in pure.test.mjs — this only checks that saveOrder() reaches
+// it with the right inputs and the empty-order guard reads the unfiltered
+// count. The fake DOM's querySelectorAll defaults to [] (see testutil.mjs),
+// which stands in here for "every card in this stage is filtered out of view".
+
+test("saveOrder: non-terminal items present but every one filtered out of the DOM does not refuse on emptiness", async () => {
+  const p = await page();
+  await withState(p, {
+    stages: [{ name: "backlog", next: "working" }, { name: "working", next: "done" }, { name: "done", terminal: true }],
+    items: [{ id: "s1:1", source: "s1", stage: "backlog" }, { id: "s2:1", source: "s2", stage: "working" }],
+  });
+  const before = p.calls.fetch.length;
+  await p.mod.saveOrder();
+  assert.equal(p.calls.fetch.length - before, 1, "must still PUT rather than refuse");
+  const [, opts] = p.calls.fetch[before];
+  assert.deepEqual(JSON.parse(opts.body), ["s2:1", "s1:1"], "working (closer to done) before backlog, each stage's own order kept");
+});
+
+test("saveOrder: no non-terminal items at all behaves as before (an empty order is saved, not refused)", async () => {
+  const p = await page();
+  await withState(p, {
+    stages: [{ name: "backlog", next: "working" }, { name: "done", terminal: true }],
+    items: [{ id: "s1:1", source: "s1", stage: "done" }],
+  });
+  const before = p.calls.fetch.length;
+  await p.mod.saveOrder();
+  assert.equal(p.calls.fetch.length - before, 1);
+  const [, opts] = p.calls.fetch[before];
+  assert.deepEqual(JSON.parse(opts.body), []);
+});
+
 // ---- no network ---------------------------------------------------------------
 
 test("sources: selecting or clearing the filter makes no fetch call", async () => {
