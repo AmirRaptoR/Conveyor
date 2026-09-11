@@ -216,35 +216,6 @@ func (b *Budgets) Restore(itemID string) error {
 	return nil
 }
 
-// Prune drops usage records for items no longer on the board — the same
-// lifetime discipline Times, TransitionErrors, AnswerInfo and Cancels already
-// follow: once an item is gone, there is nothing left for its own ledger to
-// explain, and an id GitHub reuses (it never does, but nothing here relies on
-// that) simply starts a fresh ledger the way a brand new item would.
-func (b *Budgets) Prune(onBoard map[string]bool) error {
-	b.writeMu.Lock()
-	defer b.writeMu.Unlock()
-
-	next := b.snapshot()
-	changed := false
-	for id := range next.Items {
-		if !onBoard[id] {
-			delete(next.Items, id)
-			changed = true
-		}
-	}
-	if !changed {
-		return nil
-	}
-	if err := b.persist(next); err != nil {
-		return err
-	}
-	b.dataMu.Lock()
-	b.data = next
-	b.dataMu.Unlock()
-	return nil
-}
-
 // snapshot copies the current ledger. Called only from within a writeMu
 // critical section, so the copy it starts from cannot change under it before
 // persist writes it out.

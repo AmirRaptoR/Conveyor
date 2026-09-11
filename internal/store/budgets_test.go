@@ -232,28 +232,27 @@ func TestOpenBudgetsStartsEmptyOnAMalformedFile(t *testing.T) {
 	}
 }
 
-func TestPruneDropsUsageForItemsNoLongerOnTheBoard(t *testing.T) {
+// Budgets has no Prune: MaxRunsPerItem is a lifetime ceiling, and "on the
+// board" is only ever a bounded recent window (open issues plus the last
+// CLOSED_LIMIT closed ones), not a durable existence check. An item that
+// scrolls out of that window, or is closed and later reopened, must still
+// meet the ceiling it already spent against — nothing here should offer a
+// way to reset it back to zero.
+func TestBudgetUsageIsNeverPrunedByBoardMembership(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "budgets.json")
 	b := OpenBudgets(path)
 
-	if _, _, err := b.Reserve("item-1", "2026-09-11", 0, 0); err != nil {
+	if _, _, err := b.Reserve("item-1", "2026-09-11", 1, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := b.Reserve("item-2", "2026-09-11", 0, 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Prune(map[string]bool{"item-2": true}); err != nil {
-		t.Fatal(err)
-	}
-	if runs, _ := b.Usage("item-1"); runs != 0 {
-		t.Errorf("item-1 usage after Prune = %d, want 0 (it is no longer on the board)", runs)
-	}
-	if runs, _ := b.Usage("item-2"); runs != 1 {
-		t.Errorf("item-2 usage after Prune = %d, want 1 (it is still on the board)", runs)
+	// item-1 has since scrolled off the board's visible window entirely —
+	// nothing observes that here, because Budgets has nothing that could.
+	if ok, reason, err := b.Reserve("item-1", "2026-09-11", 1, 0); err != nil || ok {
+		t.Fatalf("Reserve after item-1's lifetime ceiling = ok=%v reason=%q err=%v, want refused", ok, reason, err)
 	}
 
 	reopened := OpenBudgets(path)
-	if runs, _ := reopened.Usage("item-1"); runs != 0 {
-		t.Errorf("item-1 usage after reopen = %d, want 0 (Prune must persist)", runs)
+	if runs, _ := reopened.Usage("item-1"); runs != 1 {
+		t.Errorf("item-1 usage after reopen = %d, want 1 (a lifetime ceiling survives, it is never reset)", runs)
 	}
 }

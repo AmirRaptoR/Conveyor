@@ -240,14 +240,16 @@ func spends(resources []string, full map[string]bool) bool {
 
 // runOne performs one transition and keeps the board honest about it.
 func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
-	s.setActive(item.ID, &Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title, StartedAt: time.Now()})
-	defer s.setActive(item.ID, nil)
-
 	// A child of ctx, one per transition, so cancelling this item's run —
 	// handleCancel calling the func stored below — reaches only this run's
 	// process group (runner.Run's own runCtx.Done() case) and never another
 	// one sharing the same parent. A fresh attempt supersedes whatever audit
 	// trail the last one left.
+	//
+	// Registered — and the stale cancel record cleared — before setActive
+	// publishes this run as active: a client that reacts to that event by
+	// cancelling at once must find a cancel func already in place, never a
+	// 409 for a run the board just told it was running.
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	s.cancelFns.Store(item.ID, cancelRun)
@@ -255,6 +257,9 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 	s.mu.Lock()
 	delete(s.cancels, item.ID)
 	s.mu.Unlock()
+
+	s.setActive(item.ID, &Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title, StartedAt: time.Now()})
+	defer s.setActive(item.ID, nil)
 
 	// Read, not taken. An answer is spent when the run it was written for
 	// actually ran — including one that stops to ask something else, which is a

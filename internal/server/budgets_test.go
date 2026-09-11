@@ -323,3 +323,77 @@ func TestBudgetUsageSurvivesARestart(t *testing.T) {
 		t.Errorf("third claim() after restart = %v, want claimBudgetExhausted", got)
 	}
 }
+
+// MaxRunsPerItem is a lifetime ceiling, and "on the board" a listing produces
+// is only ever a bounded recent window — open issues plus the last
+// CLOSED_LIMIT closed ones — never a durable existence check. A listing that
+// drops an item (it scrolled out of that window, or a source hiccuped) must
+// not reset the item's spent ceiling back to zero the next time it reappears.
+func TestRefreshNeverPrunesAnItemsExecutionBudget(t *testing.T) {
+	dir := t.TempDir()
+	itemsFile := filepath.Join(dir, "items.json")
+	if err := os.WriteFile(itemsFile, []byte(`[{"id":"s1:1","ref":"1","source":"s1","stage":"backlog","title":"here today"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), `#!/bin/sh
+cat "`+itemsFile+`" > "$CONVEYOR_RESULT"
+`)
+	writeScript(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\nexit 0\n")
+	if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "conveyor.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`version: 1
+budgets:
+  maxRunsPerItem: 1
+stages:
+  - name: backlog
+  - name: working
+    script: work
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: fake
+    workdir: ./repo
+    scripts:
+      work:
+        script: ./work.sh
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeScript(t, filepath.Join(dir, "work.sh"), "#!/bin/sh\nexit 0\n")
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := runner.New(filepath.Join(dir, "runs"))
+	s := New(cfg, r)
+	s.ctx = context.Background()
+
+	s.refresh(s.ctx) // the item is on the board
+	if ok, _, err := s.budgets.Reserve("s1:1", budgetDay(time.Now()), 1, 0); err != nil || !ok {
+		t.Fatal("could not seed s1:1's one run")
+	}
+
+	// The item drops out of the listing entirely — closed and scrolled off
+	// the recent window, say — and a fresh listing lands while it is gone.
+	if err := os.WriteFile(itemsFile, []byte(`[]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.refresh(s.ctx)
+	if runs, _ := s.budgets.Usage("s1:1"); runs != 1 {
+		t.Fatalf("s1:1 usage after a listing that dropped it = %d, want 1 (a lifetime ceiling must survive)", runs)
+	}
+
+	// It reappears — reopened, say — and must still meet the ceiling it
+	// already spent against rather than getting a fresh one.
+	if err := os.WriteFile(itemsFile, []byte(`[{"id":"s1:1","ref":"1","source":"s1","stage":"backlog","title":"back again"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.refresh(s.ctx)
+	if got := s.claim(model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"}, "working", false); got != claimBudgetExhausted {
+		t.Errorf("claim() for a reappeared item past its ceiling = %v, want claimBudgetExhausted", got)
+	}
+}

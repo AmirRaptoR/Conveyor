@@ -385,14 +385,14 @@ func (s *Server) refresh(ctx context.Context) {
 		}
 	}
 	s.mu.Unlock()
-	// Outside the lock, like every other store write: this is disk I/O, and
-	// s.mu guards in-memory state that has nothing to do with it. An item's
-	// own execution-budget ledger follows the same lifetime discipline as
-	// cancels above — once it is no longer on the board, there is nothing
-	// left for it to explain.
-	if err := s.budgets.Prune(onBoard); err != nil {
-		fmt.Fprintf(os.Stderr, "conveyor: could not prune execution budgets: %v\n", err)
-	}
+	// Unlike cancels and the other caches above, an item's execution-budget
+	// ledger is deliberately never pruned by board visibility: MaxRunsPerItem
+	// is a lifetime ceiling that must survive an item scrolling off the
+	// closed-issues window or being reopened, not just a restart. Onboard is
+	// only ever a bounded recent slice (open issues plus the last
+	// CLOSED_LIMIT closed ones), so treating absence from it as "gone for
+	// good" would let an item spend past its ceiling simply by leaving and
+	// re-entering that window.
 	s.hub.publish(event{Kind: "state"})
 }
 
