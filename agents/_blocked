@@ -68,6 +68,27 @@ blocked() {
 	exit 20
 }
 
+# CONDITION_KINDS — the self-clearing subset of the vocabulary above: a stop
+# that may have passed by the time anyone looks, so bulk-clearing it costs at
+# most one run wrongly retried, never a question answered twice. Not the
+# whole vocabulary — decision, no-output, input, draft and error are
+# deliberately not on it. The five words are already written down in
+# CLAUDE.md's three-tone bullet and in board.js's WAITING set; this is what
+# gives them one place a script can read instead of a third copy of the list
+# (a check in ./check keeps this and board.js's WAITING in agreement).
+CONDITION_KINDS=(limit turns unfinished dependency worktree)
+
+# is_condition_kind <word> — true when word names a condition rather than a
+# question. Used by agent_asked (agents/claude/_stream) to derive `asked`
+# from the kind the model actually wrote, instead of a call site guessing.
+is_condition_kind() {
+	local word=$1 k
+	for k in "${CONDITION_KINDS[@]}"; do
+		[[ "$word" == "$k" ]] && return 0
+	done
+	return 1
+}
+
 # asks <kind> "<question>" — stop because a person has to answer something.
 #
 # The same mark, with one bit more: `asked`. A stop is one of two things and

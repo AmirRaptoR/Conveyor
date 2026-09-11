@@ -235,6 +235,11 @@ peer, and the socket is the only door with no password on it (#94).
   stall — nobody answers a question by waiting, and handing it back unanswered
   spends a run to be asked it again. Condition is the default because it is the
   safe one to get wrong. The engine reads the flag, never the word beside it.
+  For a model-written stop the split lives in `agents/_blocked`'s
+  `CONDITION_KINDS`/`is_condition_kind`: `agent_asked` (`agents/claude/_stream`)
+  derives `asked` from the kind the model actually declared, never forces it
+  true, so a model that correctly recognises a condition is not promoted to a
+  question it never asked (#68).
 - **A question carries its options.** `decision_brief` in `agents/_blocked` is
   the paragraph every adapter appends: stop by writing `kind: decision`, a
   one-sentence `reason`, and `questions` in the AskUserQuestion shape (the tool

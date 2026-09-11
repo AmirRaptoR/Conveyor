@@ -176,21 +176,57 @@ record_session() {
 	fi
 }
 
-# agent_asked marks what the model wrote in $CONVEYOR_RESULT as a question, and
-# adds the conversation it can be answered in.
+# agent_asked needs _blocked's is_condition_kind, but every adapter sources
+# this file first — agents/claude/selfcheck earliest of all, calling
+# agent_asked well before it ever sources _blocked itself — so this sources
+# it here, guarded on the predicate not already being defined: an adapter's
+# own `source ../_blocked` line right after this one then finds it already
+# there, and no path sources the file twice.
+declare -f is_condition_kind >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_blocked"
+
+# agent_asked classifies what the model wrote in $CONVEYOR_RESULT as a
+# question or leaves it a condition, following the kind the model actually
+# declared, and adds the conversation it can be answered or resumed in
+# either way.
 #
-# Called only where the model stopped itself, which every adapter's prompt
-# defines as "this needs a decision only a human can make" — so it is a question
-# by construction, and gets `asked` for the engine and `session` for the reply.
-# Merged rather than written: the model owns that file, knows nothing about
-# either field, and its reason is the part worth keeping intact.
+# Every adapter's prompt tells the model to stop with `kind: decision` when a
+# person has to choose something — but nothing stops a model that correctly
+# recognises a *condition* instead (out of scope, a dependency still open,
+# the deadline hit) and says so, and forcing `asked: true` on that stop made a
+# condition that clears itself sit waiting for a person with nothing to
+# decide (#68). is_condition_kind (agents/_blocked) is the one place that
+# split lives; this reads it rather than assuming every model-written stop is
+# a question by construction:
+#
+#   the kind is on agents/_blocked's condition list  → asked: false
+#   anything else, including an unknown word         → asked: true
+#   `questions` is a non-empty array of objects, the
+#   shape board.js's questionsOf walks — whatever the
+#   kind, since the model wrote options for a person
+#   to press, which is unambiguous                    → asked: true
+#
+# `asked` is always written, overwriting whatever was already there, so the
+# merged file can never say both things at once. `session` is added whenever
+# the stream has one, on a condition exactly as on a question — `turns` and
+# `unfinished` are the resumable kinds, and the session is what a resume goes
+# back into. `kind` still defaults to `decision` when the model wrote none;
+# `reason` and `questions` are left exactly as written, and a file jq cannot
+# read as an object is left untouched, same as always.
 agent_asked() {
-	local sess tmp
+	local sess kind asked tmp
 	[[ -z "${CONVEYOR_RESULT:-}" || ! -s "$CONVEYOR_RESULT" ]] && return 0
+	jq -e 'type == "object"' "$CONVEYOR_RESULT" >/dev/null 2>&1 || return 0
+	kind=$(jq -r '.kind // "decision"' "$CONVEYOR_RESULT" 2>/dev/null) || return 0
 	sess=$(claude_session)
+	asked=true
+	is_condition_kind "$kind" && asked=false
+	if jq -e '(.questions // []) | type == "array" and length > 0 and all(.[]; type == "object")' \
+		"$CONVEYOR_RESULT" >/dev/null 2>&1; then
+		asked=true
+	fi
 	tmp=$(mktemp)
-	if jq --arg s "$sess" \
-		'. + {asked: true, kind: (.kind // "decision")} + (if $s == "" then {} else {session: $s} end)' \
+	if jq --arg s "$sess" --arg kind "$kind" --argjson asked "$asked" \
+		'. + {kind: $kind, asked: $asked} + (if $s == "" then {} else {session: $s} end)' \
 		"$CONVEYOR_RESULT" >"$tmp" 2>/dev/null; then
 		mv "$tmp" "$CONVEYOR_RESULT"
 	else
