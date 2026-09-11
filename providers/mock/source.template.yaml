@@ -1,0 +1,22 @@
+# conveyor enroll's questions for the mock provider, and the sources: entry
+# they fill in. Not a verb: provider: resolves only list, move and
+# preflight, so this file can never be mistaken for a script — the same
+# care onboard.sh and selfcheck.sh already document for their own names.
+#
+# {{SOURCE}}, {{WORKDIR}} and {{SCRIPTS}} are supplied by the engine itself
+# and must not be declared as prompts here — see internal/enroll.
+
+prompts:
+  - name: GREETING
+    prompt: "a greeting stamped into env: (read by the mock adapters)"
+    example: "hello from the mock source"
+    default: "hello from the mock source"
+
+template: |
+  - name: {{SOURCE}}
+    provider: mock
+    workdir: {{WORKDIR}}
+    env:
+      GREETING: {{GREETING}}
+    scripts:
+      {{SCRIPTS}}

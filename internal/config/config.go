@@ -678,6 +678,24 @@ func (c *Config) PreflightScript(s Source) (path string, ambiguous []string, err
 	}
 }
 
+// ProviderVerbs resolves provider/<name>'s list and move scripts, exactly as
+// a source's own `provider:` resolves them — with or without an extension,
+// exactly one match required. Unlike resolveSources, this asks about a
+// provider name directly rather than a configured source, which is what
+// `conveyor enroll` needs to decide which directories under the provider
+// root are even usable before any source names one.
+func (c *Config) ProviderVerbs(provider string) (list, move string, err error) {
+	list, err = c.providerScript(provider, "list")
+	if err != nil {
+		return "", "", err
+	}
+	move, err = c.providerScript(provider, "move")
+	if err != nil {
+		return "", "", err
+	}
+	return list, move, nil
+}
+
 // resolveSources fills in each source's script paths and records why it cannot
 // run. Nothing here is fatal: onboarding a repo is configuration work, and a
 // repo half-way through it must be reported as broken, not crash the engine and
