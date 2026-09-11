@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# Installs every skill under agents/claude/skills/ into a Claude Code skills
+# directory — $HOME/.claude/skills by default, since that is where the
+# pipeline's own adapters resolve slash commands from (agents/_worktree cd's
+# into the item's own worktree before running `claude`, so a skill sitting in
+# this checkout never resolves; see CLAUDE.md, "Why $HOME/.claude/skills").
+#
+# Usage:
+#   agents/claude/install-skills [--dest DIR] [--force] [--check] [--copy|--link]
+#
+#   --dest DIR   install into DIR instead of $HOME/.claude/skills
+#   --force      replace a destination entry this installer does not own
+#                (see "Ownership" below), or an unusable one (a plain file
+#                where a skill directory belongs, a broken symlink)
+#   --check      report each skill's state and change nothing; see below
+#   --copy       copy each skill (the default)
+#   --link       symlink each skill's directory instead of copying it
+#
+# Ownership. Each installed skill directory gets a provenance marker
+# (.conveyor-provenance.json) recording where it came from and a content hash
+# of what was installed. That marker is the one thing this installer trusts
+# to tell its own work apart from anything else living in the destination:
+#
+#   marker present, hash matches the repo's current copy    -> installed
+#   marker present, hash differs (the repo's copy moved on) -> differs
+#   marker absent (or the entry is not a directory we made) -> foreign
+#   nothing at that path                                     -> missing
+#
+# `differs` may be upgraded without --force — it is still this installer's,
+# just stale. `foreign` is refused without --force: something else put it
+# there, or it predates this installer, and overwriting it silently would
+# lose whatever it was.
+#
+# All or nothing. Every skill's state is decided before anything is written.
+# If any skill would be refused, nothing is installed and the destination is
+# left exactly as found — a run that gets to skill 3 and finds it foreign must
+# not have already installed 1 and 2.
+#
+# --check writes nothing at all, not even to create a missing destination: it
+# prints one `<state> <name>` line per skill, in the skills' own directory
+# order, and exits 0 only when every line says `installed`. This is the drift
+# alarm: a `differs` here means the repository's copy of a skill changed since
+# it was installed, and nobody has run the installer since.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+skills_root="$here/skills"
+marker_name=".conveyor-provenance.json"
+
+dest="${HOME:-}/.claude/skills"
+force=0
+check=0
+mode="copy"
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--dest)
+		[[ $# -ge 2 && -n "$2" ]] || {
+			echo "install-skills: --dest requires a directory argument" >&2
+			exit 2
+		}
+		dest=$2
+		shift 2
+		;;
+	--dest=*)
+		dest=${1#--dest=}
+		[[ -n "$dest" ]] || {
+			echo "install-skills: --dest requires a directory argument" >&2
+			exit 2
+		}
+		shift
+		;;
+	--force)
+		force=1
+		shift
+		;;
+	--check)
+		check=1
+		shift
+		;;
+	--copy)
+		mode="copy"
+		shift
+		;;
+	--link)
+		mode="link"
+		shift
+		;;
+	*)
+		echo "install-skills: unrecognised argument: $1" >&2
+		exit 2
+		;;
+	esac
+done
+
+if [[ ! -d "$skills_root" ]]; then
+	echo "install-skills: no skills found at $skills_root" >&2
+	exit 2
+fi
+
+mapfile -t skills < <(find "$skills_root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+if [[ ${#skills[@]} -eq 0 ]]; then
+	echo "install-skills: no skill directories under $skills_root" >&2
+	exit 2
+fi
+for name in "${skills[@]}"; do
+	if [[ ! -f "$skills_root/$name/SKILL.md" ]]; then
+		echo "install-skills: $skills_root/$name has no SKILL.md" >&2
+		exit 2
+	fi
+done
+
+# skill_hash DIR — a content hash of every regular file under DIR (never the
+# provenance marker itself), independent of mtime, permissions or the order
+# the filesystem happens to return files in.
+skill_hash() {
+	local dir=$1
+	(
+		cd "$dir"
+		find . -type f ! -name "$marker_name" -print0 | sort -z |
+			while IFS= read -r -d '' f; do
+				printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"
+			done
+	) | sha256sum | cut -d' ' -f1
+}
+
+# state NAME — one of installed, differs, foreign, missing. Never writes
+# anything; every call is safe from --check.
+state() {
+	local name=$1 path="$dest/$name"
+	if [[ ! -e "$path" && ! -L "$path" ]]; then
+		echo missing
+		return
+	fi
+	if [[ -L "$path" && ! -e "$path" ]]; then
+		echo foreign # broken symlink
+		return
+	fi
+	if [[ -L "$path" ]]; then
+		# --link mode: no marker lives inside the source directory it points
+		# at (that would write into this checkout), so the link itself, if it
+		# resolves to exactly this skill's source, is the whole proof.
+		if [[ "$(readlink -f -- "$path")" == "$(readlink -f -- "$skills_root/$name")" ]]; then
+			echo installed
+		else
+			echo foreign
+		fi
+		return
+	fi
+	if [[ ! -d "$path" ]]; then
+		echo foreign # a file where a skill directory belongs
+		return
+	fi
+	if [[ ! -f "$path/$marker_name" ]]; then
+		echo foreign
+		return
+	fi
+	local recorded current
+	recorded=$(jq -r '.hash // empty' "$path/$marker_name" 2>/dev/null || true)
+	if [[ -z "$recorded" ]]; then
+		echo foreign # unreadable or malformed marker: not trustworthy as ours
+		return
+	fi
+	current=$(skill_hash "$skills_root/$name")
+	if [[ "$recorded" == "$current" ]]; then
+		echo installed
+	else
+		echo differs
+	fi
+}
+
+if [[ $check -eq 1 ]]; then
+	all_installed=1
+	if [[ ! -d "$dest" ]]; then
+		for name in "${skills[@]}"; do
+			echo "missing $name"
+		done
+		exit 1
+	fi
+	for name in "${skills[@]}"; do
+		s=$(state "$name")
+		echo "$s $name"
+		[[ "$s" == "installed" ]] || all_installed=0
+	done
+	[[ $all_installed -eq 1 ]]
+	exit $?
+fi
+
+# Destination hazards that are never silently fixed, --force or not: turning
+# an unrelated file into a directory, or writing under a parent that refuses
+# it, both risk losing something that was never this installer's to begin
+# with.
+if [[ -e "$dest" && ! -d "$dest" ]]; then
+	echo "install-skills: destination $dest exists and is not a directory" >&2
+	exit 2
+fi
+# $dest itself, and any part of it above that, may not exist yet on a fresh
+# machine — this is meant to work before $HOME/.claude does. Walk up to
+# whatever ancestor does exist and require only that it is writable.
+ancestor=$dest
+while [[ ! -d "$ancestor" ]]; do
+	ancestor=$(dirname -- "$ancestor")
+done
+if [[ ! -w "$ancestor" ]]; then
+	echo "install-skills: cannot create $dest — $ancestor is not writable" >&2
+	exit 2
+fi
+
+# Pass 1 — decide every skill's fate before writing anything, so a refusal
+# found on the last skill never leaves the earlier ones newly installed.
+declare -A action # name -> install | skip | blocked
+blocked=0
+for name in "${skills[@]}"; do
+	s=$([[ -d "$dest" ]] && state "$name" || echo missing)
+	case "$s" in
+	missing | differs)
+		action[$name]=install
+		;;
+	installed)
+		action[$name]=skip
+		;;
+	foreign)
+		if [[ $force -eq 1 ]]; then
+			action[$name]=install
+		else
+			echo "install-skills: $dest/$name is not this installer's (no provenance marker, or an unusable entry) — refusing without --force" >&2
+			blocked=1
+		fi
+		;;
+	esac
+done
+
+if [[ $blocked -eq 1 ]]; then
+	echo "install-skills: nothing installed (all-or-nothing; see above)" >&2
+	exit 1
+fi
+
+mkdir -p "$dest"
+
+for name in "${skills[@]}"; do
+	[[ "${action[$name]}" == "skip" ]] && continue
+	src="$skills_root/$name"
+	target="$dest/$name"
+	replaced=0
+	if [[ -e "$target" || -L "$target" ]]; then
+		replaced=1
+		rm -rf -- "$target"
+	fi
+	if [[ "$mode" == "link" ]]; then
+		ln -s -- "$src" "$target"
+	else
+		mkdir -p "$target"
+		cp -a -- "$src"/. "$target"/
+		hash=$(skill_hash "$src")
+		jq -n --arg source "$src" --arg hash "$hash" \
+			'{source: $source, hash: $hash}' >"$target/$marker_name"
+	fi
+	if [[ $replaced -eq 1 ]]; then
+		echo "install-skills: replaced $target" >&2
+	else
+		echo "install-skills: installed $target" >&2
+	fi
+done
+
+exit 0

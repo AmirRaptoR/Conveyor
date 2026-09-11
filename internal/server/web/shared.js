@@ -2,6 +2,31 @@ import { $, esc } from "./dom.js";
 import { draw } from "./board.js";
 
 export let state = null;
+
+// The Pipeline view's source filter (#93): page state only, shared by the
+// source chips and the Inbox's own `#inbox-source` — one value, never two
+// filters that can disagree. `""` means "All". Lives here, not in board.js or
+// inbox.js, because those two already import each other and neither can
+// assign the other's binding (see flushPendingRedraw for the same reason).
+export let sourceFilter = "";
+
+// The one way anything outside this module changes the filter: normalises,
+// updates it, and draws — used by the chip buttons and the Inbox `<select>`
+// alike, so a choice on either always reaches both.
+export function setSourceFilter(name) {
+  sourceFilter = name || "";
+  draw();
+}
+
+// Called from inside draw() itself, before anything reads the filter to
+// decide what to show: a source that no longer appears in `state.sources`
+// (removed from the config, or simply absent this poll) resets the filter to
+// "All" rather than silently hiding every item forever. A plain assignment
+// here, not setSourceFilter — that would recurse back into the very draw()
+// this is called from.
+export function reconcileSourceFilter(sourceNames) {
+  if (sourceFilter && !sourceNames.includes(sourceFilter)) sourceFilter = "";
+}
 export const clock = iso => { const d = new Date(iso);
   return isNaN(d) ? iso : d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}); };
 // The run store's own size, in the units a person reads it in — the board
@@ -102,6 +127,10 @@ export function focusDescriptor(el) {
   if (more) return { kind: "more", stage: more.dataset.stage };
   const need = el.closest?.(".need[data-id]");
   if (need) return { kind: "need", id: need.dataset.id };
+  // The source chips (#93), "All" included — "All"'s own `data-source` is the
+  // empty string, which is still a match here.
+  const chip = el.closest?.(".src-chip[data-source]");
+  if (chip) return { kind: "chip", source: chip.dataset.source };
   return null;
 }
 
@@ -112,11 +141,30 @@ export function focusDescriptor(el) {
 export function findFocusTarget(desc) {
   if (!desc) return null;
   if (desc.kind === "card") {
-    const card = document.querySelector(`.item[data-id="${CSS.escape(desc.id)}"]`);
+    // The inbox (#40) can render the very same item as its own `.item`, in
+    // parallel with the rail's — plain `querySelector` would always hand
+    // back whichever sits first in document order (the rail's, since it is
+    // written before #inbox), even while that one sits under a `[hidden]`
+    // ancestor and .focus() on it silently does nothing. Every match is
+    // walked so the one actually on screen wins; the first at all is still
+    // the fallback, since a hidden one is better than none for callers that
+    // only care whether *a* card was found (see draw()'s own use of this).
+    const matches = [...document.querySelectorAll(`.item[data-id="${CSS.escape(desc.id)}"]`)];
+    const card = matches.find(c => !c.closest("[hidden]")) || matches[0];
     if (!card) return null;
     return desc.control === "open" ? (card.querySelector(".open") || card) : card;
   }
   if (desc.kind === "more") return document.querySelector(`.more[data-stage="${CSS.escape(desc.stage)}"]`);
   if (desc.kind === "need") return document.querySelector(`.need[data-id="${CSS.escape(desc.id)}"]`);
+  if (desc.kind === "chip") {
+    // querySelectorAll, not querySelector: a source that vanished between
+    // redraws must be told apart from one still there, and querySelector
+    // alone cannot say "no match" the way an empty list can (see the card
+    // case above, which reads the same way for the same reason).
+    const matches = [...document.querySelectorAll(`.src-chip[data-source="${CSS.escape(desc.source)}"]`)];
+    if (matches.length) return matches[0];
+    // The focused chip is gone — land on "All", which always renders.
+    return document.querySelector(`.src-chip[data-source=""]`);
+  }
   return null;
 }

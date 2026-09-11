@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# Drives agents/claude/install-skills against temporary destinations only —
+# never a real $HOME — and asserts its own contract: fresh install, idempotent
+# re-run, refusal on a foreign entry with all-or-nothing left intact, --force
+# over that refusal, every --check state, and that --check writes nothing.
+#
+#   agents/claude/install-skills-selfcheck
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+install_skills="$here/install-skills"
+repo_root=$(cd "$here/../.." && pwd)
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+chk_ne() { if [[ "$2" != "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2], wanted anything else"; fail=1; fi; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# Every real skill this repo ships, so the fixture tracks whatever is
+# actually vendored rather than a hard-coded list.
+mapfile -t skill_names < <(find "$here/skills" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+chk_ne "at least one skill is vendored to test against" "${#skill_names[@]}" "0"
+
+snapshot() { # DIR — a content fingerprint, order-independent
+	find "$1" -type f -exec sha256sum {} \; 2>/dev/null | sort
+}
+
+### 1. Fresh install ##########################################################
+dest1="$tmp/fresh"
+out=$("$install_skills" --dest "$dest1" 2>&1)
+rc=$?
+chk "fresh install exits 0" "$rc" "0"
+for name in "${skill_names[@]}"; do
+	if [[ -f "$dest1/$name/SKILL.md" && -f "$dest1/$name/.conveyor-provenance.json" ]]; then
+		echo "ok   fresh install placed $name with its marker"
+	else
+		echo "FAIL fresh install placed $name with its marker"
+		fail=1
+	fi
+done
+line=$("$install_skills" --dest "$dest1" --check | head -1)
+chk "--check after a fresh install reports installed" "$(echo "$line" | cut -d' ' -f1)" "installed"
+
+### 2. Idempotent re-run ######################################################
+before=$(snapshot "$dest1")
+"$install_skills" --dest "$dest1" >/dev/null 2>&1
+rc=$?
+after=$(snapshot "$dest1")
+chk "a second run exits 0" "$rc" "0"
+chk "a second run against the same destination is byte-identical" "$after" "$before"
+
+### 3. Refusal on a foreign entry, all-or-nothing #############################
+dest3="$tmp/foreign"
+mkdir -p "$dest3"
+first="${skill_names[0]}"
+last="${skill_names[-1]}"
+mkdir -p "$dest3/$first"
+echo "not ours" >"$dest3/$first/SKILL.md" # no provenance marker: foreign
+"$install_skills" --dest "$dest3" >"$tmp/foreign.stdout" 2>"$tmp/foreign.stderr"
+rc=$?
+chk_ne "install exits non-zero on a foreign entry" "$rc" "0"
+if grep -q "$dest3/$first" "$tmp/foreign.stderr"; then
+	echo "ok   the refusal names the foreign path on stderr"
+else
+	echo "FAIL the refusal names the foreign path on stderr: $(cat "$tmp/foreign.stderr")"
+	fail=1
+fi
+chk "all-or-nothing: the untouched skill was never installed either" \
+	"$([[ -e "$dest3/$last" ]] && echo present || echo absent)" "absent"
+chk "all-or-nothing: the foreign entry itself is untouched" "$(cat "$dest3/$first/SKILL.md")" "not ours"
+
+### 4. --force replaces the foreign entry, and reports it ####################
+out=$("$install_skills" --dest "$dest3" --force 2>&1)
+rc=$?
+chk "--force over a foreign entry exits 0" "$rc" "0"
+if grep -q "replaced $dest3/$first" <<<"$out"; then
+	echo "ok   --force reports the replacement"
+else
+	echo "FAIL --force reports the replacement: $out"
+	fail=1
+fi
+line=$("$install_skills" --dest "$dest3" --check | grep "^[a-z]* $first$")
+chk "the forced-over entry now reads installed" "$(cut -d' ' -f1 <<<"$line")" "installed"
+chk "the previously-untouched skill is now installed too" \
+	"$("$install_skills" --dest "$dest3" --check | grep " $last$" | cut -d' ' -f1)" "installed"
+
+### 5. --check states: missing, installed, differs ###########################
+dest5="$tmp/states"
+out=$("$install_skills" --dest "$dest5" --check)
+rc=$?
+chk_ne "--check on a destination that does not exist yet exits non-zero" "$rc" "0"
+chk "--check reports every skill missing before any install" \
+	"$(cut -d' ' -f1 <<<"$out" | sort -u)" "missing"
+chk "--check does not create the missing destination" "$([[ -e "$dest5" ]] && echo created || echo absent)" "absent"
+
+"$install_skills" --dest "$dest5" >/dev/null 2>&1
+chk "--check reports installed right after a real install" \
+	"$("$install_skills" --dest "$dest5" --check | cut -d' ' -f1 | sort -u)" "installed"
+
+# Simulate drift by recording a hash that no longer matches this skill's
+# actual, current content in the repo — exactly what happens when the repo's
+# copy moves on after an install and nobody has re-run the installer since.
+marker="$dest5/$first/.conveyor-provenance.json"
+jq '.hash = "0000000000000000000000000000000000000000000000000000000000000000"' \
+	"$marker" >"$marker.tmp" && mv "$marker.tmp" "$marker"
+state_line=$("$install_skills" --dest "$dest5" --check | grep " $first$")
+chk "--check reports differs when the recorded hash is stale" "$(cut -d' ' -f1 <<<"$state_line")" "differs"
+
+# differs may be upgraded without --force.
+"$install_skills" --dest "$dest5" >/dev/null 2>&1
+rc=$?
+chk "install upgrades a differs entry without --force" "$rc" "0"
+chk "the upgraded entry reads installed again" \
+	"$("$install_skills" --dest "$dest5" --check | grep " $first$" | cut -d' ' -f1)" "installed"
+
+### 6. --check writes nothing #################################################
+dest6="$tmp/readonly-check"
+"$install_skills" --dest "$dest6" >/dev/null 2>&1
+before=$(snapshot "$dest6")
+"$install_skills" --dest "$dest6" --check >/dev/null 2>&1
+after=$(snapshot "$dest6")
+chk "--check leaves an already-installed destination byte-identical" "$after" "$before"
+
+### 7. Destination hazards are named, not corrupted ###########################
+dest7="$tmp/hazard-file"
+touch "$dest7"
+out=$("$install_skills" --dest "$dest7" 2>&1)
+rc=$?
+chk_ne "a destination that is a plain file is refused" "$rc" "0"
+if grep -q "$dest7" <<<"$out"; then
+	echo "ok   the file hazard names the path"
+else
+	echo "FAIL the file hazard names the path: $out"
+	fail=1
+fi
+chk "the file hazard is left untouched" "$([[ -f "$dest7" && ! -d "$dest7" ]] && echo file || echo altered)" "file"
+
+dest7b="$tmp/hazard-symlink"
+mkdir -p "$dest7b"
+ln -s "$dest7b/nowhere" "$dest7b/$first"
+out=$("$install_skills" --dest "$dest7b" 2>&1)
+rc=$?
+chk_ne "a broken symlink in place of an installed skill is refused" "$rc" "0"
+
+dest7c="$tmp/locked"
+mkdir -p "$dest7c"
+chmod 000 "$dest7c"
+out=$("$install_skills" --dest "$dest7c/skills" 2>&1)
+rc=$?
+chmod 755 "$dest7c" # so the trap can clean it up
+chk_ne "an unwritable ancestor of the destination is refused" "$rc" "0"
+if grep -q "$dest7c" <<<"$out"; then
+	echo "ok   the unwritable-ancestor hazard names the path"
+else
+	echo "FAIL the unwritable-ancestor hazard names the path: $out"
+	fail=1
+fi
+
+### 8. Malformed arguments are rejected, not guessed at #######################
+out=$("$install_skills" --dest 2>&1)
+chk_ne "a --dest with no value is rejected" "$?" "0"
+out=$("$install_skills" --bogus 2>&1)
+chk_ne "an unrecognised flag is rejected" "$?" "0"
+out=$("$install_skills" --copy=extra 2>&1)
+chk_ne "a malformed --copy is rejected" "$?" "0"
+
+### 9. Never touches a real $HOME #############################################
+fake_home="$tmp/fakehome"
+mkdir -p "$fake_home"
+HOME="$fake_home" "$install_skills" >/dev/null 2>&1
+chk "the default destination resolves under \$HOME/.claude/skills" \
+	"$([[ -d "$fake_home/.claude/skills/${skill_names[0]}" ]] && echo yes || echo no)" "yes"
+stray=$(find "$fake_home" -mindepth 1 ! -path "$fake_home/.claude" ! -path "$fake_home/.claude/skills*" -print)
+chk "nothing else was created under the temporary \$HOME" "${stray:-none}" "none"
+
+### 10. The checkout itself is never touched ##################################
+status=$(cd "$repo_root" && git status --porcelain 2>/dev/null || true)
+chk "the checkout is unmodified after every scenario above" "$status" ""
+
+if [[ $fail -eq 0 ]]; then
+	echo "install-skills-selfcheck: all checks passed"
+else
+	echo "install-skills-selfcheck: FAILED" >&2
+fi
+exit $fail

@@ -1,0 +1,151 @@
+# conveyor — a complete, runnable GitHub pipeline
+#
+# conveyor.example.yaml is the zero-dependency demo: it needs nothing but this
+# checkout, and its only live source is `mock`. This file is the other half —
+# the pipeline a real repository actually runs, with `agent: claude` in every
+# stage and a GitHub source wired up end to end. Every key it needs is active;
+# nothing required is commented out. It still cannot touch a real repository as
+# shipped: `workdir:` and `REPO:` below are placeholders (see docs/INSTALL.md
+# for filling them in — that is an operator's job, or #41's, never this file's).
+#
+# See docs/CONTRACTS.md for the abstraction and docs/INSTALL.md for the
+# clone-to-running-board sequence this file is one step of.
+
+version: 1
+
+concurrency:
+  perSource: 1        # items in flight per this source — safe above 1 too,
+                      # since an item works in its own git worktree, never the
+                      # source's checkout (CLAUDE.md, "An item gets its own
+                      # worktree, not the source's checkout").
+  perStage: 1         # one item per stage, so the pipeline behaves like a line
+  global: 2           # total transitions in flight, whatever they cost
+
+# The scarce thing here is one Claude account's usage window, shared by every
+# stage below that names it — not the transitions themselves, which is why
+# `global:` alone would have thrown agent work and a plain `gh` read into the
+# same bucket.
+resources:
+  claude: 1
+
+poll: 5m
+retryStalled: 1h      # a total stall is almost always the outside world — a
+                      # usage limit, an expired credential — and both come back
+                      # on their own; see CLAUDE.md, "Only a person clears a mark"
+timeout: 90m          # default per-script timeout; a source may override per
+                      # script — a slower repository's suite needs more room
+                      # than a faster one's, and one number for both is either
+                      # too tight or no guard at all
+discovery: 2m         # a listing is a handful of API calls, not agent work,
+                      # and must not be able to delay any other source's
+
+logs:
+  retention: 30d
+  sweepAt: "04:00"
+
+# ---------------------------------------------------------------------------
+# Stages — refine, implement, review, then the merge gate. `review` ends once
+# a pull request exists; `approving` is the gate that decides when it is safe
+# to land (CLAUDE.md, "Merging is a gate, not a judgement"). There is no
+# separate cleanup stage: `approve` removes the worktree itself once a merge
+# is confirmed.
+# ---------------------------------------------------------------------------
+stages:
+  - name: backlog
+    # No script: nothing runs. Items land here and wait to be picked up.
+
+  - name: refining
+    script: refine
+    timeout: 30m
+    onSuccess: ready
+
+  - name: ready
+    manual: false       # v2: engine never auto-advances OUT of this stage
+    allowManual: true   # v2: may a human move a card INTO this stage?
+
+  - name: in-progress
+    script: implement
+    onSuccess: review
+    resources: [claude]
+    maxAttempts: 2
+
+  - name: review
+    script: review
+    onSuccess: approving
+    resources: [claude]
+
+  - name: approving
+    script: approve
+    onSuccess: done
+    resources: [claude]
+    # The one manual override the merge gate honours: "stop giving review more
+    # room", nothing else. Every other check in the gate still has to pass —
+    # this cannot merge a red build (CLAUDE.md, "Merging is a gate").
+    actions:
+      - name: merge-now
+        label: Merge now
+        confirm: Stop waiting out the quiet period and merge if every other check passes?
+
+  - name: done
+    terminal: true
+
+# ---------------------------------------------------------------------------
+# Sources. Only what is listed here is ever scanned. This one source is a
+# template: `workdir:` and `REPO:` are placeholders on purpose, so this file
+# can never act on a real repository as shipped. Point them at a real
+# checkout and a real `owner/name` to bring a repository under this pipeline.
+# ---------------------------------------------------------------------------
+sources:
+  - name: example-repo
+    workdir: /path/to/a/real/checkout   # placeholder — see docs/INSTALL.md
+
+    provider:
+      name: github
+      params:
+        # stage=label, one per line. The mark (a human must decide) is
+        # `${LABEL_PREFIX}blocked` by default and does not need its own entry.
+        STAGE_LABELS: |
+          refining=conveyor:refining
+          ready=conveyor:ready
+          in-progress=conveyor:in-progress
+          review=conveyor:review
+          approving=conveyor:approving
+
+    # What this source IS — reaches every script it runs, list and move too.
+    env:
+      REPO: OWNER/REPO   # placeholder — see docs/INSTALL.md
+
+    # What this source PROVIDES, for the names the stages ask for. `agent:
+    # claude` resolves agents/claude/<name>, the vendored adapters that in
+    # turn invoke the skills under agents/claude/skills/ as slash commands.
+    scripts:
+      refine:
+        agent: claude
+        params:
+          ALLOWED_TOOLS: "Bash,Read,Glob,Grep"
+          MAX_TURNS: "40"
+          PROMPT: "/refine $REF"
+      implement:
+        agent: claude
+        params:
+          MAX_TURNS: "200"
+          PROMPT: "/implement $REF"
+      review:
+        agent: claude
+        params:
+          PROMPT: "/review $REF"
+      approve:
+        agent: claude
+        params:
+          QUIET_SECONDS: "600"
+      doctor:
+        # A reserved key — no stage names it. `POST /api/doctor` sweeps every
+        # item this repository has marked through it. A source declaring none
+        # simply has its marked items skipped by a sweep.
+        agent: claude
+
+  # Leaving MODEL unset above is a choice, and the one this file ships: every
+  # adapter then inherits whatever the operator's CLI is configured with. That
+  # opinion belongs in a working config, where it can differ per repository —
+  # see conveyor.example.yaml's commented `midgame` source for what setting it
+  # per stage looks like.

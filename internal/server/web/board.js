@@ -1,10 +1,14 @@
 import { $, esc } from "./dom.js";
-import { shouldDeferDraw, sourceDegraded, controlsForMode, isHttpUrl } from "./pure.js";
-import { state, clock, fmtBytes, nowMs, focusDescriptor, findFocusTarget } from "./shared.js";
+import { shouldDeferDraw, sourceDegraded, controlsForMode, isHttpUrl, stationEmptyText } from "./pure.js";
+import {
+  state, clock, fmtBytes, nowMs, focusDescriptor, findFocusTarget,
+  sourceFilter, setSourceFilter, reconcileSourceFilter,
+} from "./shared.js";
 import { updateRailCtl } from "./rail.js";
 import { openFromHash } from "./device.js";
 import { openItemId, inspect, renderPanelActions, refreshOpenStop } from "./panel.js";
 import { dragging, justDragged, refusals, stageBy, wireDrag, wireQueue } from "./drag.js";
+import { renderInbox } from "./inbox.js";
 
 // A draw() that lands mid-drag defers instead of touching #rail (see draw()
 // and shouldDeferDraw above); the drag's own dragend runs the one redraw that
@@ -13,6 +17,24 @@ let pendingRedraw = false;
 // Why each marked item is marked, keyed by item id — the engine's note, not the
 // provider's. See State.Blocks.
 export let blocks = {};
+
+// Buckets every item into the stage it is actually in right now, folding in
+// the active-stage override so a card mid-transition shows in the stage it is
+// being worked in rather than the one it left (see draw()'s own comment on
+// this, below). Exported because the source filter (#93) needs each stage's
+// full, unfiltered order in more than one place: draw() itself (rank, tally),
+// and the reorder logic in drag.js/panel.js, which must move a visible item
+// among *all* of a stage's items — never a second copy of this rule.
+export function bucketByStage(stages, items, active) {
+  const workingOn = id => active.find(a => a.itemId === id);
+  const bucket = {};
+  for (const st of stages) bucket[st.name] = [];
+  for (const it of items) {
+    const a = workingOn(it.id);
+    (bucket[a ? a.stage : it.stage] ||= []).push(it);
+  }
+  return bucket;
+}
 
 let firstDraw = true;
 export function draw() {
@@ -29,7 +51,7 @@ export function draw() {
   // open. `shown` (below) and the rail's own scrollLeft already survive this
   // for the same reason — neither lives in the DOM this replaces.
   const active0 = document.activeElement;
-  const focusDesc = active0 && active0.closest?.("#rail, #needs") ? focusDescriptor(active0) : null;
+  const focusDesc = active0 && active0.closest?.("#rail, #needs, #inbox-list, #sources") ? focusDescriptor(active0) : null;
   const openAgents = new Set(
     [...document.querySelectorAll("#agents details[open]")].map(d => d.dataset.agent));
 
@@ -37,8 +59,18 @@ export function draw() {
   indexSources(state.sources);
   // A list, because stages run in parallel: one entry per transition in flight.
   const active = state.active || [];
-  const workingOn = id => active.find(a => a.itemId === id);
   blocks = state.blocks || {};
+
+  // A source that vanished from `state.sources` (removed from the config, or
+  // simply absent this poll) cannot go on filtering the board forever — reset
+  // to "All" before anything below reads the filter. A plain reassignment
+  // inside shared.js, not setSourceFilter: that would call back into this
+  // very draw().
+  reconcileSourceFilter((state.sources || []).map(s => s.name));
+  // Changing which source is selected reopens every terminal column at ten —
+  // a redraw that leaves the value alone must not reset a column someone just
+  // expanded, so this only fires on an actual change.
+  if (sourceFilter !== lastShownFilter) { for (const k of Object.keys(shown)) delete shown[k]; lastShownFilter = sourceFilter; }
 
   // Degraded describes a source, not the board: at least one refresh has
   // completed and that source's own listing has failed, never happened, or
@@ -51,17 +83,11 @@ export function draw() {
   // Items arrive in the order the scheduler will work them, so the board does
   // not sort: it draws them in the order it is given. A card's position is the
   // claim it makes, and re-deriving that here would be a second copy of rules
-  // that live in the engine, free to disagree with it.
-  const bucket = {};
-  for (const st of stages) bucket[st.name] = [];
-  for (const it of items) {
-    // The item list is from the last poll; `active` is from now. An item being
-    // worked has already been moved, so show it in the stage it is being worked
-    // in — otherwise it sits in its old column flagged as working, which is
-    // true of two different moments and reads as a bug.
-    const a = workingOn(it.id);
-    (bucket[a ? a.stage : it.stage] ||= []).push(it);
-  }
+  // that live in the engine, free to disagree with it. This is the unfiltered
+  // bucket — every item, whatever the source filter says — because rank,
+  // tallies and reordering all need to measure against it; station()/terminus()
+  // apply the filter themselves, to what they show rather than to this.
+  const bucket = bucketByStage(stages, items, active);
   // The line runs through the working stages; terminal ones leave it.
   const flow = stages.filter(s => !s.terminal);
   const ends = stages.filter(s => s.terminal);
@@ -131,10 +157,19 @@ export function draw() {
         <span class="repo">${storage.runs} run${storage.runs === 1 ? "" : "s"}${
           storage.oldestDay ? ` retained since ${esc(storage.oldestDay)}` : ""}</span>
       </span>` : "";
-  $("#sources").innerHTML = `<div class="sources">${
+  // The source chips are the Pipeline view's own filter (#93): a real
+  // `<button>` per source, plus "All" first — single-select, the same model
+  // as the Inbox's `#inbox-source`, and the one shared value the two agree
+  // on (see shared.js's sourceFilter/setSourceFilter). A broken or degraded
+  // source stays selectable and keeps showing that state while selected; the
+  // storage chip is never a button, having nothing to filter by.
+  $("#sources").innerHTML = `<div class="sources">
+      <button type="button" class="src-chip all${!sourceFilter ? " selected" : ""}" data-source=""
+          aria-pressed="${!sourceFilter}">All</button>${
     (state.sources || []).map(s => {
       const broken = (s.problems || []).length > 0;
       const degraded = !broken && degradedSources.includes(s);
+      const selected = sourceFilter === s.name;
       // A broken source shows only its cannot-run badge — never additionally
       // reported as degraded, stale or not-listing; that is what its own
       // configuration problems already mean.
@@ -142,15 +177,21 @@ export function draw() {
         ? durSpan(new Date(s.lastListedAt).getTime(), true, esc(`listed ${new Date(s.lastListedAt).toLocaleString()}`))
         : `<span class="never">not listed yet</span>`;
       const chipTitle = esc((s.workdir || "") + (degraded && s.listError ? ` — ${s.listError}` : ""));
-      return `<span class="src-chip${broken ? " broken" : ""}${degraded ? " degraded" : ""}" style="--src:${sourceColour(s.name)}"
+      return `<button type="button" class="src-chip${broken ? " broken" : ""}${degraded ? " degraded" : ""}${selected ? " selected" : ""}"
+          data-source="${esc(s.name)}" aria-pressed="${selected}" style="--src:${sourceColour(s.name)}"
           title="${chipTitle}">
         <span class="swatch"></span>
         <span class="name">${esc(s.name)}</span>
         <span class="n">${degraded ? "?" : (counts[s.name] || 0)}</span>
         ${broken ? `<span class="repo">cannot run</span>` : freshness ? `<span class="repo">${freshness}</span>` : ""}
-      </span>`;
+      </button>`;
     }).join("") + storageChip
   }</div>`;
+  document.querySelectorAll("#sources .src-chip[data-source]").forEach(btn => {
+    // Pressing the chip already selected clears the filter, "All" included —
+    // one formula covers both, since "All"'s own data-source is "".
+    btn.onclick = () => setSourceFilter(sourceFilter === btn.dataset.source ? "" : btn.dataset.source);
+  });
 
   const bad = (state.sources || []).filter(s => (s.problems || []).length);
   // A persistence fault is not a source problem — it is a fact about the run
@@ -189,11 +230,23 @@ export function draw() {
       : `<b>${items.length}</b> items${asking.length ? `, <b>${asking.length}</b> need${asking.length === 1 ? "s" : ""} you`
           : held ? `, <b>${held}</b> stopped` : ""} &nbsp;·&nbsp; updated ${when}`) + degradedNote;
 
+  // Rebuilt from the same `state`/`blocks` the rail just drew from, so the
+  // inbox is never a step behind it — and before the wiring loop below, so
+  // its rows are picked up by the same querySelectorAll(".item") that wires
+  // the rail's own cards (click-to-open, Enter/Space, focus restoration).
+  renderInbox();
+
   document.querySelectorAll(".item").forEach(el => {
     const open = () => { if (!justDragged) inspect(el.dataset.id, el.dataset.title, el.dataset.stage); };
-    el.onclick = e => { if (!e.target.closest("a")) open(); };
+    // The inbox (#40) is the first `.item` to nest a real `<button>` (its
+    // "Answer question" control) rather than only the rail's own `<a>` — a
+    // button reachable by Tab needs the same exclusion an anchor already
+    // has, or Enter/Space on it bubbles here first, and `preventDefault()`
+    // below cancels the browser's own click synthesis for that key before
+    // the button's own handler ever runs it.
+    el.onclick = e => { if (!e.target.closest("a, button")) open(); };
     el.onkeydown = e => {
-      if ((e.key === "Enter" || e.key === " ") && !e.target.closest("a")) { e.preventDefault(); open(); }
+      if ((e.key === "Enter" || e.key === " ") && !e.target.closest("a, button")) { e.preventDefault(); open(); }
     };
     wireDrag(el);
   });
@@ -234,16 +287,23 @@ export function flushPendingRedraw() { if (pendingRedraw) { pendingRedraw = fals
 // there is genuinely no work, and a reader needs to be able to tell those
 // apart. Terminal columns (terminus(), below) never take this: they are a
 // ledger of closed work, not a claim about what is in flight.
+//
+// `items` is the stage's full, unfiltered bucket — the source filter (#93)
+// only ever narrows what this draws, never what it counts a card's rank
+// against: `card(it, active, i)` below is called with `items`' own index,
+// which is why a filtered-out neighbour still leaves a visible card's rank
+// exactly where the unfiltered column had it.
 function station(st, items, active, degraded) {
+  const visible = sourceFilter ? items.filter(it => it.source === sourceFilter) : items;
   const live = active.some(a => a.stage === st.name);
   return `<section class="station${live ? " live" : ""}">
     <div class="plate">
-      <div class="name">${esc(st.name)}${tally(items)}</div>
+      <div class="name">${esc(st.name)}${tally(visible)}</div>
       <div class="runs-label">${st.script ? `runs <b>${esc(st.script)}</b>` : st.runs ? "runs a script" : "waits"}</div>
     </div>
     <div class="queue" data-stage="${esc(st.name)}">${
-      items.length ? items.map((it, i) => card(it, active, i)).join("")
-                   : `<div class="slot">${degraded ? "Picture incomplete — discovery is degraded" : "Nothing here"}</div>`}</div>
+      visible.length ? visible.map(it => card(it, active, items.indexOf(it))).join("")
+                   : `<div class="slot">${esc(stationEmptyText(degraded, sourceFilter))}</div>`}</div>
   </section>`;
 }
 
@@ -251,21 +311,29 @@ function station(st, items, active, degraded) {
 // ones anyone reads. The rest are one press away. Per column, kept across
 // redraws so an SSE update does not fold the list back up mid-read.
 const shown = {};
+// The filter value `shown`'s expansion was last drawn against — draw() resets
+// every column back to ten the moment this stops matching `sourceFilter`
+// (#93), and leaves `shown` alone on a redraw that changes nothing about it.
+let lastShownFilter = "";
 function terminus(st, items) {
+  const visible = sourceFilter ? items.filter(it => it.source === sourceFilter) : items;
   const n = shown[st.name] || 10;
-  const left = items.length - n;
+  const left = visible.length - n;
   return `<section class="terminus">
     <div class="plate">
-      <div class="name">${esc(st.name)}${tally(items)}</div>
+      <div class="name">${esc(st.name)}${tally(visible)}</div>
       <div class="runs-label">Finished</div>
     </div>
-    <div class="queue">${items.slice(0, n).map(it => card(it, [], null)).join("")}${
+    <div class="queue">${visible.slice(0, n).map(it => card(it, [], null)).join("")}${
       left > 0 ? `<button class="more" data-stage="${esc(st.name)}">Show ${Math.min(10, left)} more · ${left} older</button>` : ""}</div>
   </section>`;
 }
+// The ".more" button's own handler, pulled out so a test can drive the same
+// expansion the click does without needing a real click event.
+export function expandTerminus(stage) { shown[stage] = (shown[stage] || 10) + 10; draw(); }
 document.addEventListener("click", e => {
   const more = e.target.closest(".more");
-  if (more) { shown[more.dataset.stage] = (shown[more.dataset.stage] || 10) + 10; draw(); return; }
+  if (more) { expandTerminus(more.dataset.stage); return; }
   const need = e.target.closest(".need");
   if (need) inspect(need.dataset.id, need.dataset.title, need.dataset.stage);
 });

@@ -13,6 +13,13 @@ import (
 	"time"
 )
 
+// netListen is net.Listen, indirected the same way chmodSocket is (socket.go)
+// so a test can force the TCP http.Server's Serve loop into a genuine runtime
+// failure — closing the listener it returns directly, never through the
+// http.Server's own Close — which is the only way the "TCP Serve returns an
+// error other than http.ErrServerClosed" criterion can be reproduced.
+var netListen = net.Listen
+
 // Run serves until ctx is done. mode is what this process is willing to do to
 // the pipeline: auto drives it, manual only moves an item when the tick
 // button is pressed, and observe never runs a stage, a move or a doctor
@@ -61,7 +68,7 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 		s.listenHost = h
 	}
 
-	handler, err := s.handler()
+	handler, sockHandler, err := s.handler()
 	if err != nil {
 		return err
 	}
@@ -82,7 +89,7 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 	// and drain() above still run on a bind failure: it must stop the guard
 	// check having succeeded from leaving anything behind, though nothing has
 	// been spawned yet at this point either.
-	ln, err := net.Listen("tcp", addr)
+	ln, err := netListen("tcp", addr)
 	if err != nil {
 		return err
 	}
@@ -91,6 +98,23 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 		case s.listening <- ln.Addr().String():
 		default:
 		}
+	}
+
+	// The local, no-auth door: a Unix socket beside the rest of the data
+	// directory, reachable only by the OS user this process runs as (the
+	// socket file is mode 0600, the directory 0700). Bound right after the
+	// TCP listener and before any loop starts — a failure here is never
+	// blamed on work already launched, and a TCP bind failure above never
+	// touches this file at all. Never fatal: a warning is the whole
+	// consequence of not having one.
+	sockPath := socketPath(s.cfg)
+	var sockLn *net.UnixListener
+	if l, err := prepareSocket(sockPath); err != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: %s: %v\n", sockPath, err)
+		s.signalSocket("")
+	} else {
+		sockLn = l
+		s.signalSocket(sockPath)
 	}
 
 	// Three loops, and they are separate on purpose. Discovery must keep its
@@ -107,7 +131,27 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 		s.spawn(func() { s.sweep(runCtx) })
 	}
 
-	go func() { <-runCtx.Done(); _ = srv.Close() }()
+	// The socket's http.Server serves from its own goroutine, through spawn so
+	// drain waits for it — the TCP http.Server below stays synchronous, as
+	// today. Same timeouts as TCP, for the same reason (SSE).
+	var sockSrv *http.Server
+	if sockLn != nil {
+		sockSrv = &http.Server{
+			Handler:           s.tracked(sockHandler),
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    1 << 20,
+		}
+		s.spawn(func() { s.serveSocket(sockSrv, sockLn, sockPath) })
+	}
+
+	go func() {
+		<-runCtx.Done()
+		_ = srv.Close()
+		if sockSrv != nil {
+			_ = sockSrv.Close()
+		}
+	}()
 	banner := "running: items advance on their own"
 	switch mode {
 	case ModeManual:
@@ -117,6 +161,9 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 	}
 	if s.cfg.Auth.Enabled() {
 		banner += "\n  basic auth on, " + strconv.Itoa(len(s.cfg.Auth.Users)) + " user(s)"
+	}
+	if sockLn != nil {
+		banner += "\n  " + sockPath + " needs no password"
 	}
 	// ":8080" means every interface, so name a host you can actually open;
 	// "127.0.0.1:8090" already names one and must not have a second glued on.
@@ -141,11 +188,15 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 	return nil
 }
 
-// handler builds the whole route table and wraps it: host validation first
-// (cheapest), then cross-origin protection, then Basic Auth (the expensive
-// one) — so a cross-site or bad-Host flood never reaches a password
-// derivation. mutation routes additionally refuse in observe mode.
-func (s *Server) handler() (http.Handler, error) {
+// handler builds the whole route table once and wraps it into two chains
+// around the same mux, never a second copy of the route registrations: the
+// TCP chain — host validation first (cheapest), then cross-origin
+// protection, then Basic Auth (the expensive one), so a cross-site or
+// bad-Host flood never reaches a password derivation — and the socket chain,
+// identical except it never puts Basic Auth in front at all. mutation routes
+// additionally refuse in observe mode, in the handler itself, so both chains
+// get it for free.
+func (s *Server) handler() (tcp, socket http.Handler, err error) {
 	if s.cop == nil {
 		s.cop = http.NewCrossOriginProtection()
 	}
@@ -153,11 +204,11 @@ func (s *Server) handler() (http.Handler, error) {
 	// mean a Config built without going through config.Load.
 	origins, err := s.cfg.Auth.ParsedOrigins()
 	if err != nil {
-		return nil, fmt.Errorf("auth.origins: %w", err)
+		return nil, nil, fmt.Errorf("auth.origins: %w", err)
 	}
 	for _, o := range origins {
 		if err := s.cop.AddTrustedOrigin(o.Origin); err != nil {
-			return nil, fmt.Errorf("auth.origins: %s: %w", o.Origin, err)
+			return nil, nil, fmt.Errorf("auth.origins: %s: %w", o.Origin, err)
 		}
 	}
 
@@ -183,15 +234,13 @@ func (s *Server) handler() (http.Handler, error) {
 
 	static, err := webHandler()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	mux.Handle("/", static)
 
-	h := s.authed(mux)
-	if s.cop != nil {
-		h = s.cop.Handler(h)
-	}
-	return s.hostCheck(h), nil
+	tcp = s.hostCheck(s.cop.Handler(s.authed(mux)))
+	socket = s.hostCheck(s.cop.Handler(mux))
+	return tcp, socket, nil
 }
 
 // mutationGuard refuses a route in any mode that does not allow mutation —
@@ -373,6 +422,11 @@ func (s *Server) tracked(next http.Handler) http.Handler {
 // anything. There is no per-route exemption on purpose: every route either
 // reads the state of the repositories or changes it, and a health endpoint
 // nobody asked for would be the first hole in a wall one line high.
+//
+// The local Unix socket (socket.go) is not that hole either: it is a
+// different door, whose lock is the filesystem rather than a password —
+// handler() builds it as a second chain around the same mux that simply
+// never calls authed at all, never a per-route exemption inside this wall.
 //
 // It replaces a reverse proxy that did the same job in a second process with a
 // second config file and a second password store. What the proxy added beyond
