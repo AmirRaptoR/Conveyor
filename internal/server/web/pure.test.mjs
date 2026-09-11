@@ -12,7 +12,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, staleThresholdMs, sourceDegraded,
-  controlsForMode, isHttpUrl,
+  controlsForMode, isHttpUrl, attentionCategory, attentionAction, filterItems,
 } from "./pure.js";
 
 test("focusKeyOf: a card and its .open link are different keys", () => {
@@ -161,4 +161,88 @@ test("sourceDegraded: with pollNs absent, the 10-minute fallback applies", () =>
   const justOver = { lastListedAt: new Date(now - 11 * 60 * 1000).toISOString() };
   assert.equal(sourceDegraded(justUnder, 1000, 0, now), false);
   assert.equal(sourceDegraded(justOver, 1000, 0, now), true);
+});
+
+// ---- attentionCategory / attentionAction (#40's inbox) ----------------------
+// One word for why a card belongs in the inbox at all, and the label for the
+// one primary action it offers — both derived from the same block/tone facts
+// board.js's tone() already reads, never a second vocabulary. See pure.js.
+
+test("attentionCategory: a question is its own category, ahead of its kind", () => {
+  assert.equal(attentionCategory({ blocked: true }, { asked: true, kind: "human-review" }, null), "question");
+});
+
+test("attentionCategory: dependency and limit are their own categories, not folded into 'waiting'", () => {
+  assert.equal(attentionCategory({ blocked: true }, { kind: "dependency" }, null), "dependency");
+  assert.equal(attentionCategory({ blocked: true }, { kind: "limit" }, null), "limit");
+});
+
+test("attentionCategory: turns/unfinished/worktree are the generic waiting category", () => {
+  for (const kind of ["turns", "unfinished", "worktree"]) {
+    assert.equal(attentionCategory({ blocked: true }, { kind }, null), "waiting");
+  }
+});
+
+test("attentionCategory: any other blocked kind (checks, error, conflict, ...) is a failure", () => {
+  for (const kind of ["checks", "error", "conflict", "no-output", "input"]) {
+    assert.equal(attentionCategory({ blocked: true }, { kind }, null), "failure");
+  }
+});
+
+test("attentionCategory: an unblocked item with a resting wait is 'pending' (e.g. a quiet PR waiting on CI)", () => {
+  assert.equal(attentionCategory({ blocked: false }, null, { why: "quiet period" }), "pending");
+});
+
+test("attentionCategory: an unblocked item with no resting wait needs no attention at all", () => {
+  assert.equal(attentionCategory({ blocked: false }, null, null), null);
+});
+
+test("attentionCategory: a missing item is null, never a thrown error", () => {
+  assert.equal(attentionCategory(null, null, null), null);
+});
+
+test("attentionAction: each category names one primary action, backed by an existing control", () => {
+  assert.equal(attentionAction("question", {}), "Answer question");
+  assert.equal(attentionAction("failure", { kind: "checks" }), "View failed check");
+  assert.equal(attentionAction("failure", { kind: "error" }), "Retry stage");
+  assert.equal(attentionAction("dependency", {}), "View dependency");
+  assert.equal(attentionAction("limit", {}), "View limit");
+  assert.equal(attentionAction("waiting", {}), "View status");
+  assert.equal(attentionAction("pending", {}), "View progress");
+});
+
+// ---- filterItems -------------------------------------------------------------
+// A plain array transform — no fetch, no ordering rule of its own — so a
+// filter changing on the client can never be mistaken for a scheduler or
+// provider write (#40's "source/search filters do not alter scheduler order
+// or provider state").
+
+const items = [
+  { id: "a:1", source: "a", title: "Fix the flaky login test" },
+  { id: "b:2", source: "b", title: "Add dark mode toggle" },
+  { id: "a:3", source: "a", title: "Rotate the deploy key" },
+];
+
+test("filterItems: no source and no query returns every item, in the same order", () => {
+  assert.deepEqual(filterItems(items, "", ""), items);
+});
+
+test("filterItems: a source filters to exactly that source's items, order preserved", () => {
+  assert.deepEqual(filterItems(items, "a", ""), [items[0], items[2]]);
+});
+
+test("filterItems: a query matches the title case-insensitively", () => {
+  assert.deepEqual(filterItems(items, "", "DARK"), [items[1]]);
+});
+
+test("filterItems: a query matches the id too", () => {
+  assert.deepEqual(filterItems(items, "", "b:2"), [items[1]]);
+});
+
+test("filterItems: source and query compose (both must match)", () => {
+  assert.deepEqual(filterItems(items, "a", "deploy"), [items[2]]);
+});
+
+test("filterItems: whitespace-only query is the same as no query", () => {
+  assert.deepEqual(filterItems(items, "", "   "), items);
 });

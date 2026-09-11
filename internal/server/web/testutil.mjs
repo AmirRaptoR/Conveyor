@@ -69,6 +69,11 @@ function makeElement(cache, sel) {
     closest() { return null; },
     contains() { return false; },
     focus() {}, click() {},
+    // Enough of <dialog> for report.js's openAsk/openReport to run to
+    // completion rather than throw on the one call neither makes
+    // conditionally: `open` tracks the two methods that flip it.
+    open: false,
+    showModal() { this.open = true; }, close() { this.open = false; },
   };
   Object.defineProperty(el, "innerHTML", {
     get: () => innerHTML,
@@ -137,11 +142,16 @@ export async function page({ fetch: fetchImpl, now } = {}) {
   define("removeEventListener", () => {});
   define("CSS", { escape: s => String(s) });
   define("ResizeObserver", class { observe() {} disconnect() {} unobserve() {} });
+  // report.js's openAsk feature-tests its opener with `instanceof HTMLElement`
+  // before it can safely restore focus to it — nothing in this fake DOM is a
+  // real one, so this exists only so that check does not throw.
+  // document.activeElement stays null, so the check is always false here.
+  define("HTMLElement", class {});
   Date.now = now === undefined ? realNow : () => now;
 
   const v = ++generation;
   const mods = await Promise.all(
-    ["board.js", "shared.js", "panel.js", "drag.js", "report.js", "rail.js", "device.js"]
+    ["board.js", "shared.js", "panel.js", "drag.js", "report.js", "rail.js", "device.js", "inbox.js"]
       .map(name => import(`./${name}?v=${v}`)));
   const mod = Object.assign({}, ...mods.map(m => ({ ...m })));
 

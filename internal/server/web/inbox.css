@@ -1,0 +1,70 @@
+/* The inbox (#40): a second, attention-first way to reach the same items —
+   reachable at any width, not gated behind a media query, so a phone user's
+   one tap to it is the same tap a desktop user has. Rows reuse `.item` from
+   line.css (border, radius, background) and layer a list on top of it. */
+
+.viewtabs { display:flex; gap:2px; padding:0 22px; }
+.vtab {
+  font:inherit; font-size:12.5px; color:var(--dim); background:transparent;
+  border:1px solid transparent; border-bottom:2px solid transparent;
+  padding:8px 12px; cursor:pointer; min-height:44px;
+}
+.vtab:hover { color:var(--ink); }
+.vtab[aria-selected="true"] { color:var(--ink); border-bottom-color:var(--run); font-weight:600; }
+
+.inbox { padding:14px 22px 22px; }
+.inbox[hidden] { display:none; }
+
+.inbox-controls { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+.inbox-controls input[type="search"], .inbox-controls select {
+  font:inherit; font-size:13px; color:var(--ink); background:var(--raised);
+  border:1px solid var(--rule); border-radius:6px; padding:8px 10px; min-height:44px;
+}
+.inbox-controls input[type="search"] { flex:1 1 220px; min-width:0; }
+.inbox-controls select { flex:0 0 auto; }
+
+.inbox-subtabs { display:flex; gap:6px; margin-bottom:10px; }
+.inbox-subtabs .vtab {
+  border:1px solid var(--rule); border-radius:999px; padding:6px 14px;
+}
+.inbox-subtabs .vtab[aria-selected="true"] {
+  background:var(--raised); border-color:var(--faint);
+}
+
+.inbox-list { display:flex; flex-direction:column; gap:8px; }
+.inbox-row { display:block; cursor:pointer; }
+.inbox-row .reason { margin:8px 0 0; font-size:12.5px; color:var(--dim); line-height:1.5; }
+.inbox-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+.inbox-actions .ctl {
+  font-size:12.5px; padding:8px 12px; border-radius:6px; min-height:44px;
+  display:inline-flex; align-items:center; text-decoration:none;
+}
+.inbox-actions .act-label {
+  font-size:11.5px; letter-spacing:.02em; color:var(--dim); align-self:center;
+}
+.inbox-actions .ask { color:var(--ask); border-color:color-mix(in srgb, var(--ask) 45%, var(--rule)); }
+.inbox-actions .ask:hover { background:color-mix(in srgb, var(--ask) 14%, transparent); }
+.inbox-actions .openpr { color:var(--dim); border-color:var(--rule); background:var(--raised); }
+
+/* Stale is its own visual note, distinct from a fault (red) or a wait
+   (grey text): a dashed amber-adjacent outline so "this may be out of
+   date" never reads as either "broken" or "fine, just waiting". */
+.stale {
+  font-size:10.5px; letter-spacing:.04em; text-transform:uppercase; color:var(--run);
+  border:1px dashed color-mix(in srgb, var(--run) 55%, var(--rule)); border-radius:999px;
+  padding:0 7px;
+}
+
+.itemgone {
+  display:flex; align-items:center; gap:12px; margin:0 22px; padding:10px 14px;
+  border-left:2px solid var(--stop); background:var(--panel); font-size:12.5px; color:var(--dim);
+}
+.itemgone[hidden] { display:none; }
+.itemgone button { min-height:36px; }
+
+@media (max-width: 640px) {
+  /* A phone opens straight into the inbox's own scroll, not the rail's —
+     the toggle still switches either way, this only picks the default. */
+  .inbox { padding:12px 14px 18px; }
+  .inbox-controls, .inbox-subtabs { gap:6px; }
+}
