@@ -78,6 +78,15 @@ type State struct {
 	// so far today (UTC), against cfg.Budgets.MaxRunsPerDay — the one fact
 	// here that is not about a single item.
 	BudgetDayUsage int `json:"budgetDayUsage,omitempty"`
+	// BudgetMaxRunsPerItem and BudgetMaxRunsPerDay are the two ceilings
+	// themselves, echoed from cfg.Budgets the same reason PollNs is: a
+	// client that reads Budgets[id].Runs or BudgetDayUsage cannot tell
+	// "close" from "exhausted" without the number they are counted against,
+	// and guessing at a constant of its own is exactly what PollNs exists to
+	// avoid. Zero means that ceiling is unset (unlimited), the same meaning
+	// it has in config.
+	BudgetMaxRunsPerItem int `json:"budgetMaxRunsPerItem,omitempty"`
+	BudgetMaxRunsPerDay  int `json:"budgetMaxRunsPerDay,omitempty"`
 	// Slots is what the concurrency locks are holding, against their limits. It
 	// is here rather than behind a debug flag because "nothing is starting" is
 	// the question this board gets asked most, and a held slot is the one cause

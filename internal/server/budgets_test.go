@@ -271,6 +271,32 @@ func TestBudgetOverrideAndRestoreAPI(t *testing.T) {
 	}
 }
 
+// /api/state must echo the configured ceilings themselves, not just usage
+// against them: a client reading Budgets[id].Runs or BudgetDayUsage cannot
+// tell "close" from "exhausted" without the number it is counted against,
+// the same reason PollNs is in State rather than assumed to be a constant
+// the page already knows.
+func TestStateReportsTheConfiguredBudgetCeilings(t *testing.T) {
+	cfg, r, _ := twoSourcesFor(t)
+	cfg.Budgets = config.Budgets{MaxRunsPerItem: 3, MaxRunsPerDay: 7}
+	s := New(cfg, r)
+	s.ctx = context.Background()
+	s.mode = ModeAuto
+
+	w := httptest.NewRecorder()
+	s.handleState(w, httptest.NewRequest("GET", "/api/state", nil))
+	var st State
+	if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.BudgetMaxRunsPerItem != 3 {
+		t.Errorf("BudgetMaxRunsPerItem = %d, want 3", st.BudgetMaxRunsPerItem)
+	}
+	if st.BudgetMaxRunsPerDay != 7 {
+		t.Errorf("BudgetMaxRunsPerDay = %d, want 7", st.BudgetMaxRunsPerDay)
+	}
+}
+
 // A manual start refused for a spent budget must say so plainly, the same
 // as a manual pause or a busy slot does.
 func TestManualStartRefusesOnASpentBudgetWithAClearMessage(t *testing.T) {

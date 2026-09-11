@@ -67,6 +67,8 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		st.Budgets = budgets
 	}
 	st.BudgetDayUsage = s.budgets.DayUsage(budgetDay(time.Now()))
+	st.BudgetMaxRunsPerItem = s.cfg.Budgets.MaxRunsPerItem
+	st.BudgetMaxRunsPerDay = s.cfg.Budgets.MaxRunsPerDay
 	writeJSON(w, st)
 }
 
