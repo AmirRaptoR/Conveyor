@@ -49,6 +49,8 @@ func main() {
 		err = cmdProbe(os.Args[2:])
 	case "passwd":
 		err = cmdPasswd(os.Args[2:])
+	case "enroll":
+		err = cmdEnroll(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -90,6 +92,12 @@ func usage() {
                                         README
   passwd    <name>                      hash a password for the config's
                                         auth.users block
+  enroll    [-answer NAME=VALUE]...     guided setup: asks for what a source
+                                        needs and prints a sources: block on
+                                        stdout, ready to paste — nothing else
+                                        on stdout. Writes no file, starts no
+                                        stage, lists no items. -answer
+                                        pre-answers a prompt; repeatable.
   
 Common flags:
   -c <config>       path to the config (default conveyor.yaml). Stage scripts

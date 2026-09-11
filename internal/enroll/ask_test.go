@@ -84,6 +84,44 @@ func TestAskEmptyNoDefaultReAsksThenEOF(t *testing.T) {
 	}
 }
 
+// Stdin closed outright (no trailing newline at all, immediate EOF) takes
+// the default when there is one — the same as an empty interactive line —
+// rather than erroring just because the stream never had anything in it.
+func TestAskImmediateEOFTakesDefault(t *testing.T) {
+	a := &Asker{In: bufio.NewReader(strings.NewReader("")), Out: &bytes.Buffer{}}
+	got, err := a.Ask("NAME", "prompt", "", "fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "fallback" {
+		t.Errorf("got %q, want default %q", got, "fallback")
+	}
+}
+
+// Stdin closed outright with no default is an error naming the prompt —
+// this is what makes an under-answered `-answer` invocation fail loudly with
+// stdin closed rather than hang.
+func TestAskImmediateEOFNoDefaultIsError(t *testing.T) {
+	a := &Asker{In: bufio.NewReader(strings.NewReader("")), Out: &bytes.Buffer{}}
+	_, err := a.Ask("NAME", "prompt", "", "")
+	if err == nil || !strings.Contains(err.Error(), "NAME") {
+		t.Fatalf("err = %v, want it to name NAME", err)
+	}
+}
+
+// A piped stream's very last line, with no trailing newline, still counts
+// as an answer rather than being swallowed by the EOF that ends the read.
+func TestAskLastLineWithNoTrailingNewlineStillCounts(t *testing.T) {
+	a := &Asker{In: bufio.NewReader(strings.NewReader("value")), Out: &bytes.Buffer{}}
+	got, err := a.Ask("NAME", "prompt", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "value" {
+		t.Errorf("got %q, want %q", got, "value")
+	}
+}
+
 func TestAskBool(t *testing.T) {
 	cases := []struct {
 		in   string

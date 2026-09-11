@@ -290,6 +290,45 @@ answer, whatever the script exits; what a doctor writes to the *provider*
 under it (a comment, say) is the script's own promise, exactly as it already
 is for `move`.
 
+**`source.template.yaml`** (optional, `providers/<name>/source.template.yaml`)
+— not a script; never resolved by `findScript`, so it can never be mistaken
+for `list`, `move`, `status`, `doctor` or `preflight`, the way `onboard.sh`
+and `selfcheck.sh` already avoid a name `provider:` could resolve. It is the
+one thing `conveyor enroll` reads to ask a provider's own questions without
+understanding what a param means:
+
+```yaml
+prompts:
+  - name: STAGE_LABELS_HINT   # [A-Z][A-Z0-9_]* — becomes {{NAME}} and an
+                              # -answer flag; SOURCE, WORKDIR and SCRIPTS are
+                              # reserved for the engine's own questions
+    prompt: "a one-line label prefix"
+    example: "conveyor"      # optional
+    default: "conveyor"      # optional
+template: |
+  - name: {{SOURCE}}
+    provider: mock
+    workdir: {{WORKDIR}}
+    scripts:
+      {{SCRIPTS}}
+```
+
+A provider that resolves `list` and `move` but ships no template is still a
+usable provider — `enroll` just cannot offer it, and says so with the reason.
+`enroll` substitutes single-pass and never recursively, so a value containing
+literal `{{X}}` text is emitted as-is; every substituted value — the
+provider's own answers, and the engine's `{{SOURCE}}`/`{{WORKDIR}}` — is
+encoded as a YAML-safe scalar first. `{{SCRIPTS}}` is the one exception: it
+is `enroll`'s own rendering of the `agent:`/`script:` choice for every
+distinct script name a stage asks for, spliced in verbatim and indented to
+whatever column its placeholder sits at. A malformed template — an
+unresolved placeholder, a prompt never named in `template:`, a duplicate or
+reserved prompt name, a name shaped like a secret (`token`, `secret`,
+`password`, `key`, `credential`, case-insensitively) — is a refusal naming
+the file and the offending entry, never a partial draft: `enroll` prints
+everything it collects, on stdout, in the clear, so a credential belongs in
+the drafted source's `env:` by hand instead.
+
 ## 4. Transition order
 
 Moving an item from stage A to stage B is always, in this order:

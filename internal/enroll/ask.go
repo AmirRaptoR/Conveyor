@@ -74,15 +74,20 @@ func (a *Asker) Ask(name, prompt, example, def string) (string, error) {
 			return "", fmt.Errorf("no answer for %q and no terminal to ask on (use -answer %s=...)", name, name)
 		}
 		line, err := a.In.ReadString('\n')
-		if err != nil && line == "" {
-			return "", fmt.Errorf("no answer for %q: %w", name, err)
-		}
 		line = strings.TrimRight(line, "\r\n")
 		if line != "" {
+			// A piped stream's last line, with no trailing newline, still
+			// reads as an EOF-bearing ReadString — and still counts as an
+			// answer.
 			return line, nil
 		}
 		if def != "" {
 			return def, nil
+		}
+		if err != nil {
+			// EOF (or another read failure) with nothing left to fall back
+			// on: re-asking would only hit the same EOF again.
+			return "", fmt.Errorf("no answer for %q: %w", name, err)
 		}
 		fmt.Fprintf(a.Out, "  %q needs an answer\n", name)
 	}
