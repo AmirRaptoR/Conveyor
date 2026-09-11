@@ -111,7 +111,7 @@ func newModeServer(t *testing.T, cfg *config.Config, r *runner.Runner, mode Mode
 	s.state.Mode = string(mode)
 	s.mu.Unlock()
 	s.cop = http.NewCrossOriginProtection()
-	h, err := s.handler()
+	h, _, err := s.handler()
 	if err != nil {
 		t.Fatal(err)
 	}

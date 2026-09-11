@@ -478,6 +478,12 @@ type Server struct {
 	// pick a port) so a test can dial a real, running server rather than
 	// reaching into its internals. Nil in production; Run skips the send.
 	listening chan string
+	// socketListening is listening's counterpart for the local Unix socket:
+	// when set before Run is called, Run reports the socket's absolute path
+	// once bind-and-chmod succeeded, or "" once that step finished without a
+	// socket (a warning already went to stderr) — either way, once startup's
+	// socket step is over, so a test never races it. Nil in production.
+	socketListening chan string
 
 	// drainGrace bounds Run's shutdown wait, defaulted in New and overridden
 	// only by tests — there is no config key for it, the same way there is
