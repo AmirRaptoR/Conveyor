@@ -9,7 +9,7 @@
 // never be mistaken for the scheduler's own order or a provider write.
 import { $, esc } from "./dom.js";
 import { attentionCategory, attentionAction, filterItems, sourceDegraded, isHttpUrl } from "./pure.js";
-import { state, nowMs } from "./shared.js";
+import { state, nowMs, sourceFilter, setSourceFilter } from "./shared.js";
 import { blocks, tone, questionsOf, durSpan } from "./board.js";
 import { openAsk } from "./report.js";
 import { inspect } from "./panel.js";
@@ -47,7 +47,10 @@ function switchSubtab(next) {
 $("#inbox-tab-attention").onclick = () => switchSubtab("attention");
 $("#inbox-tab-done").onclick = () => switchSubtab("done");
 $("#inbox-search").oninput = () => renderInbox();
-$("#inbox-source").onchange = () => renderInbox();
+// The source filter is shared with the Pipeline view's chips (#93): choosing
+// a source here reaches them through the one value both read (shared.js's
+// sourceFilter), rather than this select owning a filter of its own.
+$("#inbox-source").onchange = () => setSourceFilter($("#inbox-source").value);
 
 // The set of source names whose data is not to be trusted as current right
 // now — the same rule board.js applies per source chip, read here per item
@@ -111,16 +114,19 @@ function doneRow(it) {
   </article>`;
 }
 
-// Rebuilds #inbox-source's own options from the sources on the board,
-// preserving whatever is currently selected — a poll that adds no new source
-// must not reset a filter someone already set.
+// Rebuilds #inbox-source's own options from the sources on the board, then
+// sets its value from the shared filter (#93) — never read back off the
+// select itself, which is what makes the chips and this one control agree
+// even when a poll rebuilds these options out from under it. A source that
+// has vanished has already been reconciled to "" by draw() before this runs
+// (see shared.js's reconcileSourceFilter), so there is nothing left to do
+// here for that case.
 function renderSourceOptions() {
   const sel = $("#inbox-source");
-  const cur = sel.value;
   const names = (state?.sources || []).map(s => s.name);
   sel.innerHTML = `<option value="">All sources</option>` +
     names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
-  if (names.includes(cur)) sel.value = cur;
+  sel.value = sourceFilter;
 }
 
 // Rebuilds only #inbox-list — never the search box, the select or the tabs
@@ -130,7 +136,7 @@ export function renderInbox() {
   renderSourceOptions();
   const stale = staleSourceNames();
   const wait = state.waiting || {};
-  const source = $("#inbox-source").value;
+  const source = sourceFilter;
   const query = $("#inbox-search").value;
 
   let list;
