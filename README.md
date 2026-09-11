@@ -176,27 +176,30 @@ systemd-run --on-active=60 --unit=conveyor-probe --collect \
   /path/to/conveyor probe -c /path/to/conveyor.yaml
 ```
 
-Paired with, in `conveyor.service`:
+Paired with, in `deploy/conveyor.service.example`:
 
 ```ini
 Restart=always
 ```
 
-`conveyor.service` ships `Restart=on-failure`, which is not what left the
-board down for hours on 2026-09-06 — that failure was `auth.origins`
-rejecting every real route, and `probe` above is what catches it. What
-`on-failure` misses is smaller and separate: the engine can also exit 0 on
-its own, and `on-failure` then leaves it dead, indistinguishable on the board
-from a deliberate stop, until someone notices. `Restart=always` does not mask
-an actual deliberate stop, though: systemd does not restart a service that
-was stopped with `systemctl stop`, whatever `Restart=` says (`systemd.service(5)`) —
-so `always` only ever covers the clean self-exit, the case that left the
-engine sitting dead for 22 minutes with nothing distinguishing it from an
-idle line.
+That template ships `Restart=always` directly, not the weaker
+`Restart=on-failure` an earlier, unit file predating this template used to
+carry — which is not what left the board down for hours on 2026-09-06 — that
+failure was `auth.origins` rejecting every real route, and `probe` above is
+what catches it. What `on-failure` misses is smaller and separate: the engine
+can also exit 0 on its own, and `on-failure` then leaves it dead,
+indistinguishable on the board from a deliberate stop, until someone notices.
+`Restart=always` does not mask an actual deliberate stop, though: systemd
+does not restart a service that was stopped with `systemctl stop`, whatever
+`Restart=` says (`systemd.service(5)`) — so `always` only ever covers the
+clean self-exit, the case that left the engine sitting dead for 22 minutes
+with nothing distinguishing it from an idle line.
 
-Both of these — the `systemd-run` line and the `Restart=always` change — are
-machine state, not project source, so no PR against this repository can ship
-them; they are pasted in by whoever operates the box.
+The `systemd-run` line above is still machine state, not project source — it
+names paths specific to one box — and is pasted in by whoever operates it.
+`Restart=always` no longer has to be: it ships in the template, copied to
+`/etc/systemd/system/conveyor.service` and pointed at a real config and
+binary path (see docs/INSTALL.md).
 
 ## Configuration
 
@@ -286,8 +289,17 @@ that is not a shipped agent — absolute, `~/`, or relative to the config.
 
 Swapping an agent is one line, and it changes only that source. Nothing is
 written into the repository being worked, so an agent told to "commit and push"
-cannot sweep the pipeline into its own pull request. Scripts still *run* in the
-source's workdir, so `claude` there resolves that repo's `.claude/skills/`.
+cannot sweep the pipeline into its own pull request. `claude` resolves skills
+two ways at once: from the user-level `~/.claude/skills`, and from whichever
+directory it is actually invoked in — the worked repository's own
+`.claude/skills/`, when that repository has one. Which directory that is
+differs by stage: `refine` and `deploy` run in the source's own checkout;
+`implement` and `review` `cd` into the item's own worktree first
+(`agents/_worktree`), so a skill sitting only in the Conveyor checkout itself
+never resolves from either path. The pipeline's own skills
+(`agents/claude/skills/`) are installed to the user-level directory by
+`agents/claude/install-skills` and so resolve everywhere, regardless of which
+directory a given stage happens to run in.
 
 **`env:` and `params:` are different scopes**, and the difference matters:
 
@@ -348,6 +360,13 @@ person can run it by hand. The body is written into the run directory, so the
 exact text that ran is archived with its own logs.
 
 ### Onboarding a GitHub repository
+
+`conveyor.github.example.yaml` is a complete, active config for exactly this —
+every key a real GitHub pipeline needs, wired to the vendored
+`agents/claude/skills/` slash commands, with a placeholder `workdir:` and
+`REPO:` so it can never act on a real repository as shipped. See
+docs/INSTALL.md for the full clone-to-running-board sequence it is one step
+of.
 
 Every label the pipeline needs, in one command — the stage labels, the mark, the
 onboarding tag and one per kind of stop:
