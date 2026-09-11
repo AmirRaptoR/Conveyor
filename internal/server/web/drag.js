@@ -118,12 +118,18 @@ const clearMarks = () =>
 // unfiltered order (the same one station()/terminus() rank against);
 // `applyVisibleOrder` merges the two, so a hidden item keeps the exact index
 // it already held and only the ids that were actually shown get permuted.
-export async function saveOrder() {
+//
+// `override`, when given (`{stage, ids}`), is panel.js's moveItem() moving an
+// item the filter hides: there is no DOM to read for that one stage, so its
+// already-reordered full id list is used verbatim instead of being derived
+// from the DOM.
+export async function saveOrder(override) {
   const stages = state?.stages || [];
   const flow = stages.filter(st => !st.terminal).reverse();
   const bucket = bucketByStage(stages, state?.items || [], state?.active || []);
   const ids = flow.flatMap(st => {
     const fullIds = (bucket[st.name] || []).map(it => it.id);
+    if (override && override.stage === st.name) return override.ids;
     const visibleIds = [...document.querySelectorAll(`.queue[data-stage="${CSS.escape(st.name)}"] .item`)]
       .map(el => el.dataset.id);
     return applyVisibleOrder(fullIds, visibleIds);

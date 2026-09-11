@@ -1,8 +1,8 @@
 import { $, esc } from "./dom.js";
 import { nextQueueIndex, controlsForMode } from "./pure.js";
 import { state, load, focusDescriptor, findFocusTarget } from "./shared.js";
-import { blocks, tone, questionsOf, formatDuration, durSpan } from "./board.js";
-import { queueOf, stageBy, startable, startItem, saveOrder, handBack } from "./drag.js";
+import { blocks, tone, questionsOf, formatDuration, durSpan, bucketByStage } from "./board.js";
+import { stageBy, startable, startItem, saveOrder, handBack } from "./drag.js";
 import { openAsk, openReport } from "./report.js";
 
 export let openItemId = null, openItemTitle = null, followRun = null;
@@ -67,26 +67,63 @@ export function refreshOpenStop(id, isInitialOpen) {
   }
 }
 
+// An item's rail card, scoped to a `.queue[data-stage]` ancestor so a hidden
+// item's Inbox row — also `.item`, but never inside a `.queue` — can never be
+// mistaken for it (#93). querySelectorAll, not querySelector: an item the
+// filter hides has no rail card at all, and only an empty list can say that
+// (see shared.js's findFocusTarget, whose card case reads the same way for
+// the same reason).
+function railCardOf(id) {
+  const matches = [...document.querySelectorAll(`.queue[data-stage] .item[data-id="${CSS.escape(id)}"]`)];
+  return matches[0] || null;
+}
+
+// The stage an item is in right now, folding in the active-stage override —
+// the same rule bucketByStage applies (board.js), needed here for an item
+// the filter hides, which has no rendered card to read `data-stage` off of.
+function currentStageOf(it) {
+  const a = (state?.active || []).find(x => x.itemId === it.id);
+  return a ? a.stage : it.stage;
+}
+
 // The keyboard/touch equivalents of the two drag gestures (#44), as ordinary
 // buttons in the panel rather than chrome on every card — the panel is
 // already the per-item surface a tap or a Tab reaches, and has the room a
 // 236px card does not. Re-rendered from draw() as well as from inspect() so
 // the buttons track the item's actual position and stage rather than the
 // snapshot from whenever the panel opened.
+//
+// Read from `state.items`, not the DOM: the source filter (#93) can hide an
+// item's rail card entirely, and this still has to offer Start/actions/move
+// for an item opened from #needs, a deep link, or the Inbox. Move up/down
+// still measure against the DOM when a rail card exists (queueEls only ever
+// holds the cards the filter shows, so that is already "among the visible
+// cards" with no extra work) and against the stage's full, unfiltered order
+// when it does not.
 export function renderPanelActions(id) {
   const box = $("#pactions");
-  const card = document.querySelector(`.item[data-id="${CSS.escape(id)}"]`);
-  if (!card) { box.innerHTML = ""; return; }
-  const title = card.dataset.title, stage = card.dataset.stage;
+  const it = (state?.items || []).find(x => x.id === id);
+  if (!it) { box.innerHTML = ""; return; }
+  const title = it.title, stage = currentStageOf(it);
   const parts = [];
-  const q = queueOf(card);
-  if (q) {
-    const items = queueEls(q);
-    const idx = items.indexOf(card);
+  const stageDef = stageBy(stage);
+  if (stageDef && !stageDef.terminal) {
+    const card = railCardOf(id);
+    let idx, total;
+    if (card) {
+      const items = queueEls(stage);
+      idx = items.indexOf(card);
+      total = items.length;
+    } else {
+      const bucket = bucketByStage(state?.stages || [], state?.items || [], state?.active || []);
+      const ids = (bucket[stage] || []).map(x => x.id);
+      idx = ids.indexOf(id);
+      total = ids.length;
+    }
     parts.push(`<button class="ctl" data-act="up" ${idx <= 0 ? "disabled" : ""}
-        aria-label="Move ${esc(title)} up in ${esc(q)}">Move up</button>`);
-    parts.push(`<button class="ctl" data-act="down" ${idx < 0 || idx >= items.length - 1 ? "disabled" : ""}
-        aria-label="Move ${esc(title)} down in ${esc(q)}">Move down</button>`);
+        aria-label="Move ${esc(title)} up in ${esc(stage)}">Move up</button>`);
+    parts.push(`<button class="ctl" data-act="down" ${idx < 0 || idx >= total - 1 ? "disabled" : ""}
+        aria-label="Move ${esc(title)} down in ${esc(stage)}">Move down</button>`);
   }
   const first = (state?.stages || [])[0];
   const into = stageBy(stage)?.next;
@@ -151,20 +188,39 @@ const queueEls = stage => [...document.querySelectorAll(`.queue[data-stage="${CS
 // Mutates the DOM the same way `ondrop`'s `insertBefore` does, then goes
 // through the same `saveOrder()` the drag uses — never `justDragged`, which
 // exists only to suppress the click a drop generates and would otherwise
-// swallow the very next Enter/Space on this card.
-function moveItem(id, dir) {
-  const card = document.querySelector(`.item[data-id="${CSS.escape(id)}"]`);
-  if (!card) return;
-  const stage = queueOf(card);
-  if (!stage) return;
-  const items = queueEls(stage);
-  const from = items.indexOf(card);
-  const to = nextQueueIndex(from, items.length, dir);
+// swallow the very next Enter/Space on this card. When the item is hidden by
+// the source filter (#93) there is no DOM node to move at all, so this
+// reorders the stage's full, unfiltered id order directly instead, and tells
+// saveOrder() to save exactly that for this one stage.
+export function moveItem(id, dir) {
+  const it = (state?.items || []).find(x => x.id === id);
+  if (!it) return;
+  const stage = currentStageOf(it);
+  if (stageBy(stage)?.terminal) return;
+  const title = it.title || id;
+  const card = railCardOf(id);
+  if (card) {
+    const items = queueEls(stage);
+    const from = items.indexOf(card);
+    const to = nextQueueIndex(from, items.length, dir);
+    if (to === null) return;
+    card.parentNode.insertBefore(card, dir < 0 ? items[to] : items[to].nextSibling);
+    saveOrder();
+    renderPanelActions(id);
+    announce(`${title} moved to position ${to + 1} of ${items.length} in ${stage}`);
+    return;
+  }
+  const bucket = bucketByStage(state?.stages || [], state?.items || [], state?.active || []);
+  const ids = (bucket[stage] || []).map(x => x.id);
+  const from = ids.indexOf(id);
+  const to = nextQueueIndex(from, ids.length, dir);
   if (to === null) return;
-  card.parentNode.insertBefore(card, dir < 0 ? items[to] : items[to].nextSibling);
-  saveOrder();
+  const reordered = [...ids];
+  const [moved] = reordered.splice(from, 1);
+  reordered.splice(to, 0, moved);
+  saveOrder({ stage, ids: reordered });
   renderPanelActions(id);
-  announce(`${card.dataset.title || id} moved to position ${to + 1} of ${items.length} in ${stage}`);
+  announce(`${title} moved to position ${to + 1} of ${ids.length} in ${stage}`);
 }
 
 // The one polite live region left once #log and #history stop being
