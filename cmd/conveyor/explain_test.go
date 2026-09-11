@@ -199,6 +199,58 @@ func TestPrintChecklistReadsResultAndSkipsOnSuccess(t *testing.T) {
 	}
 }
 
+// An absent, unreadable or invalid result.json is "no data" per the script
+// contract — not an error — so the checklist must print neither a reason
+// nor a summary line, and must not fail or panic doing it.
+func TestPrintChecklistNoDataOnMissingOrInvalidResult(t *testing.T) {
+	cases := []struct {
+		name  string
+		write func(t *testing.T, runDir string)
+	}{
+		{"absent", func(t *testing.T, runDir string) {}},
+		{"invalid json", func(t *testing.T, runDir string) {
+			os.WriteFile(filepath.Join(runDir, "result.json"), []byte("not json"), 0o644)
+		}},
+		{"empty file", func(t *testing.T, runDir string) {
+			os.WriteFile(filepath.Join(runDir, "result.json"), []byte(""), 0o644)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			runDir := filepath.Join(dir, "runs", "2026-09-10", "run1")
+			if err := os.MkdirAll(runDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			meta := model.Run{ExitCode: 0, TimedOut: false, Outcome: model.OutcomeSuccess}
+			b, _ := json.Marshal(meta)
+			os.WriteFile(filepath.Join(runDir, "meta.json"), b, 0o644)
+			tc.write(t, runDir)
+
+			cfg := &config.Config{}
+			r := runner.New(filepath.Join(dir, "runs"))
+			tr := &pipeline.Transition{Stage: "working", Outcome: model.OutcomeSuccess, RunDir: runDir}
+
+			old := os.Stdout
+			rp, wp, _ := os.Pipe()
+			os.Stdout = wp
+			printChecklist(context.Background(), cfg, r, "s1", tr)
+			wp.Close()
+			os.Stdout = old
+			var out bytes.Buffer
+			out.ReadFrom(rp)
+
+			got := out.String()
+			if strings.Contains(got, "reason:") {
+				t.Errorf("no result.json data should print no reason line:\n%s", got)
+			}
+			if strings.Contains(got, "summary:") {
+				t.Errorf("no result.json data should print no summary line:\n%s", got)
+			}
+		})
+	}
+}
+
 func TestPrintChecklistOnFailureShowsRemainingSetupProblems(t *testing.T) {
 	dir := t.TempDir()
 	writeExec(t, filepath.Join(dir, "providers", "fake", "list.sh"), "#!/bin/sh\nexit 0\n")
