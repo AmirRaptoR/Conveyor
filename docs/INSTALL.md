@@ -101,10 +101,14 @@ EOF
 )" providers/github/onboard.sh
 ```
 
-Because `conveyor.github.example.yaml` sits inside this checkout, its
-`providers:` and `agents:` keys resolve automatically. A config kept outside
-the checkout (as copied above) needs `providers:` pointed back at it — see
-the comment at the top of `conveyor.example.yaml`.
+`providers:` and `agents:` need nothing set here: unset, both resolve beside
+the *binary* first (falling back to beside the config only if that lookup
+finds no directory there), and `./conveyor` throughout this sequence is the
+one built in step 2, inside this checkout — where the config being kept
+outside the checkout does not change that. They only need pointing back at
+this checkout for a `conveyor` binary copied somewhere without this
+checkout's `providers/`/`agents/` alongside it — see the comment at the top
+of `conveyor.example.yaml`.
 
 ### 5. Validate
 
