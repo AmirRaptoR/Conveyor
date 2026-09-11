@@ -88,4 +88,80 @@ export function sourceDegraded(s, updatedAtMs, pollNs, nowMsVal) {
   if (isNaN(at)) return true;
   return nowMsVal - at > staleThresholdMs(pollNs);
 }
+
+// The inbox's (#40) own classification: one word for why a card belongs
+// there at all. Built on the same facts board.js's tone()/WAITING already
+// read — never a second vocabulary for the same mark. `dependency` and
+// `limit` get their own category because the issue asks readers to tell a
+// sequencing wait from a quota wait at a glance; every other WAITING kind
+// (turns, unfinished, worktree) folds into the generic "waiting". A `pending`
+// item is not blocked at all — it is a resting item (exit 10, e.g. approve's
+// quiet-PR wait for CI to finish) with an entry in state.waiting, which is
+// the one case worth surfacing here even though the engine never marked it.
+export function attentionCategory(it, block, pendingWait) {
+  if (!it) return null;
+  if (it.blocked) {
+    const b = block || {};
+    if (b.asked) return "question";
+    if (b.kind === "dependency") return "dependency";
+    if (b.kind === "limit") return "limit";
+    if (b.kind === "turns" || b.kind === "unfinished" || b.kind === "worktree") return "waiting";
+    return "failure";
+  }
+  return pendingWait ? "pending" : null;
+}
+
+// The one primary action a category's row offers, in the vocabulary the issue
+// asks for. A failed check (block.kind === "checks") is the one failure with
+// somewhere else to look — GitHub's own check run — so it reads "View failed
+// check" rather than the generic "Retry stage" every other failure gets.
+// Every label here names a control that already exists (the panel's Answer/
+// hand-back, or an external link) — this never invents a new one.
+export function attentionAction(category, block) {
+  if (category === "question") return "Answer question";
+  if (category === "failure") return (block || {}).kind === "checks" ? "View failed check" : "Retry stage";
+  if (category === "dependency") return "View dependency";
+  if (category === "limit") return "View limit";
+  if (category === "waiting") return "View status";
+  if (category === "pending") return "View progress";
+  return "View";
+}
+
+// A plain array filter — no ordering rule of its own, no fetch — so this can
+// never be mistaken for the scheduler's own order (pipeline.Order) or a write
+// to provider state. `source` empty matches every source; `query` matches the
+// title or the id, case-insensitively, against a plain substring.
+export function filterItems(items, source, query) {
+  const q = (query || "").trim().toLowerCase();
+  return (items || []).filter(it => {
+    if (source && it.source !== source) return false;
+    if (!q) return true;
+    return (it.title || "").toLowerCase().includes(q) || (it.id || "").toLowerCase().includes(q);
+  });
+}
+
+// Reordering touches only visible items (#93): a drag or a Move up/down inside
+// a filtered column must leave every hidden item's place in the saved manual
+// order untouched. `fullIds` is one stage's complete, unfiltered id order
+// before the move; `visibleIds` is the same stage's visible subset, in the
+// order it now has after the move. Every position in `fullIds` that held one
+// of `visibleIds`' members is replaced, in order, with the next id off
+// `visibleIds` — so a hidden id keeps the exact index it already had, and only
+// the visible ones are permuted, among the indices they already held.
+export function applyVisibleOrder(fullIds, visibleIds) {
+  const visible = new Set(visibleIds);
+  let i = 0;
+  return (fullIds || []).map(id => (visible.has(id) ? visibleIds[i++] : id));
+}
+
+// The empty text a working station shows under the filter (#93). A degraded
+// board always wins — "the picture is incomplete" is a fact about discovery,
+// true regardless of what is selected — and only when nothing is degraded
+// does an active filter get to say whose items are missing, rather than
+// reading as "the pipeline has nothing here at all".
+export function stationEmptyText(degraded, sourceFilter) {
+  if (degraded) return "Picture incomplete — discovery is degraded";
+  if (sourceFilter) return `Nothing here from ${sourceFilter}`;
+  return "Nothing here";
+}
 // ---- end pure helpers -------------------------------------------------------

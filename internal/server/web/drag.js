@@ -1,7 +1,7 @@
 import { $ } from "./dom.js";
-import { startableRule, controlsForMode } from "./pure.js";
+import { startableRule, controlsForMode, applyVisibleOrder } from "./pure.js";
 import { state, fault, startDoctor } from "./shared.js";
-import { draw, blocks, flushPendingRedraw } from "./board.js";
+import { draw, blocks, flushPendingRedraw, bucketByStage } from "./board.js";
 
 // Dragging ends in a click; without this, dropping a card also opens it.
 export let dragging = null, justDragged = false;
@@ -111,15 +111,35 @@ const clearMarks = () =>
 // one that has not started, so the queues are read from the end of the line
 // back towards the start. Reading them left to right says the opposite: it
 // ranks the whole backlog above work already under way.
-export async function saveOrder() {
-  const flow = (state?.stages || []).filter(st => !st.terminal).reverse();
-  const ids = flow.flatMap(st =>
-    [...document.querySelectorAll(`.queue[data-stage="${CSS.escape(st.name)}"] .item`)]
-      .map(el => el.dataset.id));
-  // Never save an empty order while the board holds cards. A selector that
-  // stops matching would otherwise wipe a hand-made arrangement silently —
-  // which is exactly what a missing data-stage attribute once did.
-  if (!ids.length && document.querySelectorAll(".queue[data-stage] .item").length) {
+//
+// The source filter (#93) only ever hides cards, never re-renders them
+// out of order, so `.queue[data-stage] .item` is exactly the *visible*
+// subset's new order after a drag. `bucketByStage` gives each stage's full,
+// unfiltered order (the same one station()/terminus() rank against);
+// `applyVisibleOrder` merges the two, so a hidden item keeps the exact index
+// it already held and only the ids that were actually shown get permuted.
+//
+// `override`, when given (`{stage, ids}`), is panel.js's moveItem() moving an
+// item the filter hides: there is no DOM to read for that one stage, so its
+// already-reordered full id list is used verbatim instead of being derived
+// from the DOM.
+export async function saveOrder(override) {
+  const stages = state?.stages || [];
+  const flow = stages.filter(st => !st.terminal).reverse();
+  const bucket = bucketByStage(stages, state?.items || [], state?.active || []);
+  const ids = flow.flatMap(st => {
+    const fullIds = (bucket[st.name] || []).map(it => it.id);
+    if (override && override.stage === st.name) return override.ids;
+    const visibleIds = [...document.querySelectorAll(`.queue[data-stage="${CSS.escape(st.name)}"] .item`)]
+      .map(el => el.dataset.id);
+    return applyVisibleOrder(fullIds, visibleIds);
+  });
+  // Never save an empty order while the board holds (unfiltered) cards — a
+  // filter that hides every visible one is not the same as the board being
+  // empty, and this counts the unfiltered flow columns, never the DOM, to
+  // tell those apart.
+  const totalUnfiltered = flow.reduce((n, st) => n + (bucket[st.name]?.length || 0), 0);
+  if (!ids.length && totalUnfiltered) {
     console.warn("refusing to save an empty order");
     return;
   }

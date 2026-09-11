@@ -37,6 +37,12 @@ version: 1
 #   # here.
 #   origins:
 #     - "https://board.example.com"
+#
+# Regardless of auth: above, serve also always listens on a Unix socket at
+# <data>/api.sock, mode 0600 and no password — the OS user this process runs
+# as already has full authority over the data directory, and loopback TCP
+# stays behind auth.users no matter the peer, because a same-host proxy
+# (Caddy, a tunnel) looks exactly as local as that user does.
 
 concurrency:
   perSource: 1        # items in flight per this source. Safe above 1 too: an
