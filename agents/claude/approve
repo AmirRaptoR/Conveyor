@@ -436,9 +436,6 @@ state of the branch, redoing whatever investigation already happened."
 		git commit --quiet -m "Address review feedback on #$pr"
 	fi
 	after=$(git rev-parse HEAD)
-	if [[ "$after" == "$before" ]]; then
-		blocked no-output "the agent finished but made no change to address the review threads on #$pr."
-	fi
 
 	# The dispositions the model actually reported, restricted to the thread
 	# ids this run named — a disposition is a non-empty string, and any id
@@ -456,10 +453,20 @@ state of the branch, redoing whatever investigation already happened."
 		[to_entries[] | select((.value | type) == "string" and (.value | length) > 0)
 			| select(.key as $k | $known | index($k) != null)]' <<<"$dispositions")
 
-	run_tests "$wt"
+	# No commit and no disposition is a run that did nothing. No commit *with*
+	# dispositions is the model saying the branch already answers the threads —
+	# the prompt invites exactly that — so they are replied to and resolved
+	# below with nothing to test or push. Marking it used to make the mark
+	# permanent: every resume said the same true thing and was marked again.
+	if [[ "$after" == "$before" && "$(jq 'length' <<<"$disposed")" -eq 0 ]]; then
+		blocked no-output "the agent finished but made no change to address the review threads on #$pr."
+	fi
 
-	if ! git push origin "HEAD:$head_ref" 2>&1; then
-		blocked error "pushing the fix for #$pr to $head_ref was rejected."
+	if [[ "$after" != "$before" ]]; then
+		run_tests "$wt"
+		if ! git push origin "HEAD:$head_ref" 2>&1; then
+			blocked error "pushing the fix for #$pr to $head_ref was rejected."
+		fi
 	fi
 
 	# Reply to, and resolve, only the threads just disposed — never the ones
@@ -481,7 +488,7 @@ $SENTINEL" >/dev/null
 			}' -F id="$tid" >/dev/null
 	done < <(jq -r '.[] | [.key, .value] | @tsv' <<<"$disposed")
 
-	echo "pushed a fix for #$pr and resolved $(jq 'length' <<<"$disposed") of $(jq 'length' <<<"$threads") thread(s)" >&2
+	echo "addressed #$pr and resolved $(jq 'length' <<<"$disposed") of $(jq 'length' <<<"$threads") thread(s)" >&2
 	exit 10
 }
 

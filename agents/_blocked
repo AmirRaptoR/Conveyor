@@ -128,7 +128,9 @@ decision_brief() {
 	here, so the file is how you ask. A person answers on the board and the
 	reply reaches this same conversation. Do not stop for something you can
 	verify yourself, and do not stop because a dependency is open — say so in
-	one line and continue with what does not depend on it.
+	one line and continue with what does not depend on it. Nothing wakes this
+	conversation when a background command finishes, so run long commands in
+	the foreground and wait for them there.
 	BRIEF
 }
 

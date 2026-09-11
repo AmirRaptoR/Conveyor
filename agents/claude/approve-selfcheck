@@ -651,6 +651,24 @@ chk "(11) none disposed still defers"         "$(run_real)" "10"
 chk "     T1 is left alone"                   "$(touches_for T1)" "0"
 chk "     T2 is left alone"                   "$(touches_for T2)" "0"
 
+# All threads disposed with no edit at all: the branch already answered them,
+# which the prompt invites the model to say. Nothing to push, but the threads
+# are still replied to and resolved, and the run defers rather than marking —
+# a mark here was permanent, since every resume said the same true thing.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
+printf '{"dispositions":{"T1":"already fixed X","T2":"already fixed Y"}}' >"$tmp/scene/claude_result"
+reset_wt_clean
+chk "(11) disposed with no change defers"     "$(run_real)" "10"
+chk "     T1 is replied to and resolved"      "$(touches_for T1)" "2"
+chk "     T2 is replied to and resolved"      "$(touches_for T2)" "2"
+
+# No edit and no disposition is still a run that did nothing.
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
+printf '{}' >"$tmp/scene/claude_result"
+reset_wt_clean
+chk "(11) no change, no disposition marks"    "$(run_real)" "20"
+chk "     T1 is left alone"                   "$(touches_for T1)" "0"
+
 # A disposition naming a thread id outside this run's unanswered set is
 # ignored, not acted on — it names a thread this run was never asked about.
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
