@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import {
   focusKeyOf, nextQueueIndex, shouldDeferDraw, startableRule, staleThresholdMs, sourceDegraded,
   controlsForMode, isHttpUrl, attentionCategory, attentionAction, filterItems,
+  applyVisibleOrder, stationEmptyText,
 } from "./pure.js";
 
 test("focusKeyOf: a card and its .open link are different keys", () => {
@@ -245,4 +246,43 @@ test("filterItems: source and query compose (both must match)", () => {
 
 test("filterItems: whitespace-only query is the same as no query", () => {
   assert.deepEqual(filterItems(items, "", "   "), items);
+});
+
+// ---- applyVisibleOrder (#93's reorder rule) ---------------------------------
+// The rule a filtered drag or Move up/down obeys: only the visible ids move,
+// each hidden id keeps the exact index it already held.
+
+test("applyVisibleOrder: the issue's own example — s1 selected, s1:2 dragged above s1:1", () => {
+  const full = ["s2:1", "s1:1", "s2:2", "s1:2"];
+  const visibleNewOrder = ["s1:2", "s1:1"]; // s1:2 now precedes s1:1
+  assert.deepEqual(applyVisibleOrder(full, visibleNewOrder), ["s2:1", "s1:2", "s2:2", "s1:1"]);
+});
+
+test("applyVisibleOrder: no filter (every id visible) behaves like a plain reorder", () => {
+  const full = ["a", "b", "c"];
+  assert.deepEqual(applyVisibleOrder(full, ["c", "a", "b"]), ["c", "a", "b"]);
+});
+
+test("applyVisibleOrder: an unchanged visible order leaves the full list unchanged", () => {
+  const full = ["s2:1", "s1:1", "s2:2", "s1:2"];
+  assert.deepEqual(applyVisibleOrder(full, ["s1:1", "s1:2"]), full);
+});
+
+test("applyVisibleOrder: an empty visible set (everything filtered out) leaves the full list untouched", () => {
+  const full = ["s2:1", "s2:2"];
+  assert.deepEqual(applyVisibleOrder(full, []), full);
+});
+
+// ---- stationEmptyText (#93) --------------------------------------------------
+
+test("stationEmptyText: degraded wins over a filter", () => {
+  assert.equal(stationEmptyText(true, "s1"), "Picture incomplete — discovery is degraded");
+});
+
+test("stationEmptyText: a filter with no degradation names the source", () => {
+  assert.equal(stationEmptyText(false, "s1"), "Nothing here from s1");
+});
+
+test("stationEmptyText: no filter and no degradation is today's plain text", () => {
+  assert.equal(stationEmptyText(false, ""), "Nothing here");
 });

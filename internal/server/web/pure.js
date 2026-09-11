@@ -139,4 +139,29 @@ export function filterItems(items, source, query) {
     return (it.title || "").toLowerCase().includes(q) || (it.id || "").toLowerCase().includes(q);
   });
 }
+
+// Reordering touches only visible items (#93): a drag or a Move up/down inside
+// a filtered column must leave every hidden item's place in the saved manual
+// order untouched. `fullIds` is one stage's complete, unfiltered id order
+// before the move; `visibleIds` is the same stage's visible subset, in the
+// order it now has after the move. Every position in `fullIds` that held one
+// of `visibleIds`' members is replaced, in order, with the next id off
+// `visibleIds` — so a hidden id keeps the exact index it already had, and only
+// the visible ones are permuted, among the indices they already held.
+export function applyVisibleOrder(fullIds, visibleIds) {
+  const visible = new Set(visibleIds);
+  let i = 0;
+  return (fullIds || []).map(id => (visible.has(id) ? visibleIds[i++] : id));
+}
+
+// The empty text a working station shows under the filter (#93). A degraded
+// board always wins — "the picture is incomplete" is a fact about discovery,
+// true regardless of what is selected — and only when nothing is degraded
+// does an active filter get to say whose items are missing, rather than
+// reading as "the pipeline has nothing here at all".
+export function stationEmptyText(degraded, sourceFilter) {
+  if (degraded) return "Picture incomplete — discovery is degraded";
+  if (sourceFilter) return `Nothing here from ${sourceFilter}`;
+  return "Nothing here";
+}
 // ---- end pure helpers -------------------------------------------------------
