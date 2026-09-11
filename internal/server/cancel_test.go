@@ -185,4 +185,10 @@ func TestCancelReapsOnlyTheSelectedRunsChildren(t *testing.T) {
 		t.Fatalf("cleanup cancel of s2 = %d, want 202", w.Code)
 	}
 	waitFor(t, "s2's grandchild to die", func() bool { return !alive(pid2) })
+	// And the run itself, not just its process: runOne keeps writing to its
+	// run directory (under dir/runs/...) until s.eng.Advance returns, well
+	// after the process is dead. Returning before s.working clears races
+	// t.TempDir's cleanup against that write and intermittently fails it with
+	// "directory not empty" rather than anything this test means to assert.
+	waitFor(t, "s2's transition to finish", func() bool { _, running := s.working.Load("s2:1"); return !running })
 }
