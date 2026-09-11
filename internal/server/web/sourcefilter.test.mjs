@@ -240,6 +240,52 @@ test("sources: a vanished source resets both controls to All", async () => {
   assert.match(p.el("#sources").innerHTML, /class="src-chip all selected"/);
 });
 
+// ---- one shared filter, driven from either control ---------------------------
+
+test("sources: selecting a source by chip sets #inbox-source and narrows the inbox list", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [
+      { id: "s1:1", source: "s1", stage: "backlog", title: "s1 needs you", blocked: true },
+      { id: "s2:1", source: "s2", stage: "backlog", title: "s2 needs you", blocked: true },
+    ],
+    blocks: { "s1:1": { kind: "error" }, "s2:1": { kind: "error" } },
+  }));
+  p.mod.setSourceFilter("s1");
+  assert.equal(p.el("#inbox-source").value, "s1");
+  const inboxHtml = p.el("#inbox-list").innerHTML;
+  assert.match(inboxHtml, /s1 needs you/);
+  assert.doesNotMatch(inboxHtml, /s2 needs you/);
+});
+
+test("sources: changing #inbox-source marks the matching chip pressed and filters the rail", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [
+      { id: "s1:1", source: "s1", stage: "backlog", title: "s1 first" },
+      { id: "s2:1", source: "s2", stage: "backlog", title: "s2 first" },
+    ],
+  }));
+  p.el("#inbox-source").value = "s2";
+  p.el("#inbox-source").onchange();
+  const railHtml = p.el("#rail").innerHTML;
+  assert.match(railHtml, /s2 first/);
+  assert.doesNotMatch(railHtml, /s1 first/);
+  assert.match(p.el("#sources").innerHTML, /data-source="s2" aria-pressed="true"/);
+});
+
+test("sources: choosing 'All sources' in the select presses All", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:1", source: "s1", stage: "backlog", title: "s1 first" }],
+  }));
+  p.mod.setSourceFilter("s1");
+  p.el("#inbox-source").value = "";
+  p.el("#inbox-source").onchange();
+  assert.match(p.el("#sources").innerHTML, /class="src-chip all selected"/);
+  assert.match(p.el("#rail").innerHTML, /s1 first/);
+});
+
 // ---- no network ---------------------------------------------------------------
 
 test("sources: selecting or clearing the filter makes no fetch call", async () => {
