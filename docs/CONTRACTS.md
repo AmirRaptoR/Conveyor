@@ -40,6 +40,13 @@ arrive in this shape.
                                 // the item is actually in (§6).
   "blockKind": null,            // optional. The same stop in one word.
   "priority": 2,                // 0 = most urgent. null = unranked.
+  "dependsOn": ["midgame:33"],  // items this one is sequenced behind, by id.
+                                // The provider translates its own vocabulary
+                                // ("Depends on #33" in a GitHub issue body);
+                                // the engine only ever compares ids, the same
+                                // way it never sees a label name. Omitted or
+                                // empty means nothing gates this item. See §5
+                                // for the rule this enforces.
   "assignee": null,
   "createdAt": "2026-08-20T10:00:00Z",
   "updatedAt": "2026-08-27T11:00:00Z",
@@ -361,8 +368,9 @@ already reflects reality and the item is not handed out twice.
 The scheduler works the line **from its far end backwards**. Rungs, most
 decisive first:
 
-1. has anywhere to go at all — a marked item, a terminal stage or a queue with
-   no exit is not in the running
+1. has anywhere to go at all — a marked item, a terminal stage, a queue with
+   no exit, or an item sequenced behind something that has not reached the
+   stage it wants to enter, is not in the running
 2. **how far along it is**: the position, in the config's stage list, of the
    stage it is heading into. Further along wins
 3. recovery — a stage that runs a script, found holding an item, is an
@@ -372,6 +380,19 @@ decisive first:
    scheduled at all and orders instead by `finishedAt` descending (falling
    back to listing order when it is empty or unparseable), so the done column
    reads newest-finished first and merges every source into one ledger
+
+An item declaring `dependsOn` may enter a stage its dependency has already
+entered, and no further. It may share that stage — a line where every follower
+waited for its predecessor to *finish* would run one item deep and give away
+the throughput that makes it a pipeline — but it may never pass it, and it may
+not enter a stage its dependency is marked in: a mark means that station did
+not finish, and putting a second item into it is the case this rule exists to
+prevent. The chain needs no transitive closure: every link is enforced, so a
+family sequences itself one edge at a time, and child 3 declares only its
+immediate predecessor. An id absent from the listing, a self-edge, a cycle, or
+a dependency sitting in a stage this config does not declare all fail open —
+the edge is dropped, never treated as holding forever, because a typo in an
+issue body must not be able to wedge the line.
 
 Rung 2 is the point of the whole thing: finish an item before starting another.
 Every half-finished item holds a worktree, a branch and an open pull request
@@ -654,6 +675,24 @@ in bulk — `Unblock all`, `retryStalled`, an agent's quota returning. **A quest
 is never cleared in bulk**, and is not counted towards a stall either: a board
 holding nothing but questions is stopped on purpose. Only answering it on its
 own card takes it off.
+
+**`Unblock all` also leaves standing whatever the sequencing rule (§4a rung 1)
+would hold anyway.** A marked item whose dependency has not yet reached the
+stage it is marked in gets no provider write from this button — clearing the
+mark would only have the scheduler refuse it again on the next pass, spending a
+write to learn what `pipeline.Deps` already knows. The question this asks is
+"would this item be held if it were not marked", never `pipeline.Target`, which
+refuses a marked item on its own mark before the sequencing gate is ever
+reached — and it is decided from `dependsOn` and the current listing alone,
+never from the mark's own kind, because a mark's vocabulary belongs to the
+script that wrote it. The response reports this count separately
+(`heldByDependencies`), distinct from the questions the button already leaves
+standing (`waitingOnYou`); an item that is both is counted once, under
+`waitingOnYou`. The one gap this accepts: a dependency the listing cannot see
+at all (an un-onboarded issue, another repository) is not something the engine
+can compute a hold for, so that item is still cleared here — `agents/_deps`
+remains the backstop that re-marks it at `implement` time, before the worktree
+and before any model run.
 
 **Only a person clears a mark**, with three exceptions. The first two are the
 outside world coming back rather than a decision being made; the third is the

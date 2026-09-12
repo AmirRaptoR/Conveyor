@@ -268,6 +268,27 @@ peer, and the socket is the only door with no password on it (#94).
   before the worktree with a `dependency` mark, a condition the doctor clears
   once every named issue is closed. The agent is also told not to stop for an
   open dependency itself — nine of one week's seventeen "decisions" were that.
+- **A follower never passes what it depends on.** `pipeline.Deps` is built from
+  the full listing each pass and gates rung 1 of `pipeline.Target`: an item may
+  enter a stage its dependency has already entered, may share it, may never
+  pass it, and may not walk into a stage its dependency is marked in. Stated
+  once, in `Target`, so `Pick`, `Order` and the drag endpoint's 409 cannot
+  disagree about it. Every unusable edge — an unknown id, a self-edge, a stage
+  the config does not declare, a cycle — is dropped rather than held, because
+  the alternative is a pipeline a person wedges shut by mistyping one line of
+  an issue body; only the edges inside a cycle go, so an unrelated dependency
+  off the same item still holds. This is the line's own sequencing and is not
+  `agents/_deps`, which still asks GitHub about issues the board cannot see —
+  narrower (an un-onboarded sibling gates nothing here) and later (it catches
+  what the engine could not see, immediately before the worktree). `Unblock
+  all` asks the same rule directly — would this item be held if it were not
+  marked — rather than through `Target`, which would refuse it on its own mark
+  first; a marked item still held this way gets no provider write and is
+  reported separately (`heldByDependencies`), never through the mark's own
+  kind, which stays the scripts' vocabulary. A hold is drawn on the board grey,
+  in `.item.held` — reusing the tone of a condition that passes on its own, but
+  never the `dependency` mark kind, because nobody clears a hold and a mark is
+  a decision waiting on a person; the two must never be drawn the same way.
 - **A merge conflict is work before it is a decision.** `approve` tries one
   mechanical rebase in the worktree review left behind, pushed with a lease.
   If that does not apply cleanly, and `CONFLICT_RESOLVE` has not disabled it,
