@@ -45,7 +45,10 @@ chmod +x "$tmp/stub/claude"
 # deletes its own temp file, since --body-file names a path the stub does not
 # otherwise get to see again. `issue view` answers with $GH_VIEW_JSON — the
 # adapter's fresh read of labels and body — so a test can simulate a person
-# having edited the issue while the (stubbed) model was "still running".
+# having edited the issue while the (stubbed) model was "still running". A
+# non-zero $GH_VIEW_FAIL simulates that read itself failing (network,
+# permissions), the case neither GH_VIEW_JSON nor the stdin listing can stand
+# in for safely — see ../prioritise on why it falls back to neither.
 cat >"$tmp/stub/gh" <<'STUB'
 #!/usr/bin/env bash
 echo "gh $*" >>"$GH_LOG"
@@ -57,7 +60,9 @@ case "$*" in
 			prev=$a
 		done
 		exit 0 ;;
-	*"issue view"*) printf '%s\n' "${GH_VIEW_JSON:-{\"labels\":[],\"body\":\"the body\"}}" ;;
+	*"issue view"*)
+		[[ "${GH_VIEW_FAIL:-0}" == "1" ]] && exit 1
+		printf '%s\n' "${GH_VIEW_JSON:-{\"labels\":[],\"body\":\"the body\"}}" ;;
 	*)              echo "[]" ;;
 esac
 STUB
@@ -71,7 +76,7 @@ item() { # item <ref> <body> [priority]
 
 default_view='{"labels":[],"body":"the body"}'
 
-run() { # run <ref> <body> [priority] [gh_view_json]
+run() { # run <ref> <body> [priority] [gh_view_json] [gh_view_fail]
 	: >"$GH_LOG"
 	: >"$BODY_LOG"
 	# Never inherited from a previous case: the adapter must see either a fresh
@@ -81,7 +86,7 @@ run() { # run <ref> <body> [priority] [gh_view_json]
 	CONVEYOR_SOURCE=conveyor CONVEYOR_STAGE=prioritising \
 	CONVEYOR_ITEM_REF="$1" CONVEYOR_RESULT="$tmp/result.json" \
 	REPO="owner/repo" PROMPT="/prioritise \$REF" \
-	GH_VIEW_JSON="${4:-$default_view}" \
+	GH_VIEW_JSON="${4:-$default_view}" GH_VIEW_FAIL="${5:-0}" \
 		./prioritise <<<"$(item "$1" "$2" "${3:-}")" >"$tmp/out.log" 2>&1
 }
 
@@ -155,6 +160,18 @@ check "a priority set mid-run is not doubled up" \
 	"0" "$(grep -c -- '--add-label' "$GH_LOG")"
 check "the marker still gets written even when the priority race skips the label" \
 	"1" "$(grep -c -- '<!-- conveyor:sequence standalone -->' "$BODY_LOG")"
+
+# The fresh read itself can fail (network, permissions) rather than showing a
+# person's edit. Falling back to the stdin listing here would reopen exactly
+# the two races just closed above, so both writes are skipped instead — same
+# as this item arriving here fresh next poll.
+CLAUDE_RESPONSE='{"after": 34, "part": 3, "of": 5, "priority": 2}' \
+	run 41 "no marker here" "" "$default_view" 1
+check "a failed fresh read still exits 0" "0" "$?"
+check "a failed fresh read skips the body write" \
+	"0" "$(grep -c -- '--body-file' "$GH_LOG")"
+check "a failed fresh read skips the priority write" \
+	"0" "$(grep -c -- '--add-label' "$GH_LOG")"
 
 if [[ $fail -eq 0 ]]; then echo "prioritise: all checks passed"; else echo "prioritise: FAILED"; fi
 exit $fail
