@@ -18,6 +18,10 @@ type Hold struct {
 	Stage   string `json:"stage"`   // where that item is standing
 	Target  string `json:"target"`  // the stage this item wanted to enter
 	Blocked bool   `json:"blocked"` // and whether it is marked there
+	// Until is the stage the dependency has to reach before the hold lifts:
+	// Target itself under the default rule, or the target stage's
+	// `dependenciesAt` when it declares one.
+	Until string `json:"until"`
 }
 
 // standing is where an item stands, as the gate needs it.
@@ -42,6 +46,10 @@ type Deps struct {
 	at     map[string]standing
 	stages map[string]int
 	edges  map[string][]string
+	// until is, per stage that declares `dependenciesAt`, the name of the
+	// stage a dependency must have reached before an item may enter it.
+	// A stage absent here uses the default rule: the target stage itself.
+	until map[string]string
 	// Cycles names every dependency cycle found and dropped, one line each,
 	// for the board's warning strip.
 	Cycles []string
@@ -63,6 +71,17 @@ func NewDeps(cfg *config.Config, items []model.Item) Deps {
 		at:     make(map[string]standing, len(items)),
 		stages: stageDepths(cfg),
 		edges:  make(map[string][]string, len(items)),
+		until:  make(map[string]string),
+	}
+	if cfg != nil {
+		for _, s := range cfg.Stages {
+			// Validation already refused a name the config does not declare;
+			// checked again here so a hand-built config cannot turn the
+			// gate into a hold nothing ever satisfies.
+			if _, ok := d.stages[s.DependenciesAt]; s.DependenciesAt != "" && ok {
+				d.until[s.Name] = s.DependenciesAt
+			}
+		}
 	}
 	for i, it := range items {
 		// A stage the config does not declare has no position on the line.
@@ -182,6 +201,14 @@ func (d *Deps) dropCycles() {
 // that station did not finish, and putting a second item into it is the case
 // this rule exists to prevent.
 //
+// A stage may ask for more than sharing. `dependenciesAt: merged` on the
+// implement stage means a follower enters it only once every dependency has
+// reached `merged` or gone past it — because implementing on top of code
+// that is not on main yet produces a pull request that cannot merge on its
+// own, and a line that lets that happen fills its columns with items nothing
+// can finish. The comparison is the same one; only the bar moves, from the
+// target stage to the stage the config names.
+//
 // Several dependencies hold until all of them permit. The most restrictive —
 // the one at the lowest depth, i.e. the one least far along — is the one
 // reported; ties are broken by listing order, so the reported holder is
@@ -190,6 +217,10 @@ func (d Deps) Held(it *model.Item, target string) (Hold, bool) {
 	want, ok := d.stages[target]
 	if !ok {
 		return Hold{}, false
+	}
+	until := target
+	if u, ok := d.until[target]; ok {
+		until, want = u, d.stages[u]
 	}
 	var best standing
 	var bestBy string
@@ -208,5 +239,5 @@ func (d Deps) Held(it *model.Item, target string) (Hold, bool) {
 	if !found {
 		return Hold{}, false
 	}
-	return Hold{By: bestBy, Stage: best.stage, Target: target, Blocked: best.blocked}, true
+	return Hold{By: bestBy, Stage: best.stage, Target: target, Blocked: best.blocked, Until: until}, true
 }

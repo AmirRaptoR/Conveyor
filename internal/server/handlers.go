@@ -765,6 +765,10 @@ func (s *Server) whyStuck(it model.Item, deps pipeline.Deps) string {
 				return fmt.Sprintf("%s is held behind %s, which is marked in %s — clear that mark and this moves on its own",
 					it.ID, hold.By, hold.Stage)
 			}
+			if hold.Until != "" && hold.Until != hold.Target {
+				return fmt.Sprintf("%s is held behind %s, which is still in %s — it must reach %s before this enters %s",
+					it.ID, hold.By, hold.Stage, hold.Until, hold.Target)
+			}
 			return fmt.Sprintf("%s is held behind %s, which is still in %s — it cannot enter %s first",
 				it.ID, hold.By, hold.Stage, hold.Target)
 		}

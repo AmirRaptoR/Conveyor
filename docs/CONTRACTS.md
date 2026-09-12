@@ -42,11 +42,13 @@ arrive in this shape.
   "priority": 2,                // 0 = most urgent. null = unranked.
   "dependsOn": ["midgame:33"],  // items this one is sequenced behind, by id.
                                 // The provider translates its own vocabulary
-                                // ("Depends on #33" in a GitHub issue body);
-                                // the engine only ever compares ids, the same
-                                // way it never sees a label name. Omitted or
-                                // empty means nothing gates this item. See §5
-                                // for the rule this enforces.
+                                // ("Depends on #33" in a GitHub issue body, or
+                                // a bare "Depends on:" line followed by one
+                                // list item per predecessor); the engine only
+                                // ever compares ids, the same way it never
+                                // sees a label name. Omitted or empty means
+                                // nothing gates this item. See §5 for the
+                                // rule this enforces.
   "assignee": null,
   "createdAt": "2026-08-20T10:00:00Z",
   "updatedAt": "2026-08-27T11:00:00Z",
@@ -393,6 +395,19 @@ immediate predecessor. An id absent from the listing, a self-edge, a cycle, or
 a dependency sitting in a stage this config does not declare all fail open —
 the edge is dropped, never treated as holding forever, because a typo in an
 issue body must not be able to wedge the line.
+
+A stage may raise that bar for itself with `dependenciesAt: <stage>`: an item
+enters it only once every dependency has reached the named stage or gone past
+it (and is not marked there). Sharing is the right default for stages that
+only read their own item; it is the wrong one for the stage that builds on
+the dependency's code. An item implemented while its dependency is still in
+review is built on a branch that is not on `main`, and the pull request it
+produces cannot merge on its own — so `dependenciesAt: merged` on the
+implement stage is what makes "every issue is deliverable by itself" a rule
+the line enforces rather than a hope the spec expresses. The hold carries
+`until`, the stage the dependency has to reach, so the board and `run
+-explain` can say "must reach merged" rather than "cannot enter in-progress".
+The name must be a declared stage, checked at load.
 
 Rung 2 is the point of the whole thing: finish an item before starting another.
 Every half-finished item holds a worktree, a branch and an open pull request

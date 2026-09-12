@@ -62,6 +62,8 @@ After the first commit, push and open the draft PR (step 4), then keep going. Th
 
 **If a criterion cannot be implemented as written** — it contradicts another, or the codebase makes it impossible — stop, state the conflict concretely, and ask. Do not pick the nearest achievable thing.
 
+**If the scope needs code that is not on `main`** — a sibling issue's branch, an unmerged pull request, a module the spec says "#N adds" — stop before writing anything, with kind `dependency`, naming the issues. Do not build the one slice that happens to be independent and open a pull request for it: a pull request that covers part of an issue and says `Closes #N` closes the issue with the rest unbuilt, and one that does not say it leaves an item nothing can finish. The dependency belongs on the issue as a `Depends on #N` line so the line holds the item until that work merges; if the issue does not declare it, say so in the stop reason — that is a refinement gap, not something to work around here.
+
 ### 4. Draft PR, early
 
 After the first commit:

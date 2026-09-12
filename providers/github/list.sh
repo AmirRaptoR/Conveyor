@@ -208,19 +208,44 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 			# "depends on"/"blocked by"/"blocks on" also occurs later in the
 			# same sentence. Only a sentence that does not open with the
 			# anchored pair falls through to the phrase-anywhere cut.
+			#
+			# A declaration may also open a list: a keyword sentence that
+			# names nothing itself and ends its line ("Depends on:") donates
+			# the numbers from each markdown list item on the lines that
+			# follow — first sentence of each — until the first line that
+			# is not a list item. Blank lines before the first item are
+			# allowed; one after the list has started ends it. That is the
+			# shape a refined issue writes, and it used to declare nothing.
 			| ([
 				$body
-				| [splits("\n")]
-				| map(splits("(?<=[.!?])[ \t]+"))
-				| .[]
-				| if test("^[\\s*_~`>+-]*(requires|after)\\b"; "i") then
-					sub("^[\\s*_~`>+-]*(?:requires|after)\\b"; ""; "i")
-				elif test("\\b(depends on|blocked by|blocks on)\\b"; "i") then
-					sub("^.*?\\b(?:depends on|blocked by|blocks on)\\b"; ""; "i")
-				else
-					empty
-				end
-				| scan("#[0-9]+")
+				| reduce ([splits("\n")] | .[]) as $line
+					({pending: false, inlist: false, refs: []};
+					if ($line | test("^[ \t]*$")) then .inlist = false
+					else
+						(if (.pending or .inlist)
+							and ($line | test("^[ \t]*(?:[-*+]|[0-9]+[.)])[ \t]+")) then
+							.inlist = true | .pending = false
+							| .refs += ($line
+								| sub("^[ \t]*(?:[-*+]|[0-9]+[.)])[ \t]+"; "")
+								| ([splits("(?<=[.!?])[ \t]+")] | .[0] // "")
+								| [scan("#[0-9]+")])
+						else .inlist = false | .pending = false end)
+						| ($line | [splits("(?<=[.!?])[ \t]+")]) as $ss
+						| reduce range(0; $ss | length) as $i (.;
+							($ss[$i]
+								| if test("^[\\s*_~`>+-]*(requires|after)\\b"; "i") then
+									sub("^[\\s*_~`>+-]*(?:requires|after)\\b"; ""; "i")
+								elif test("\\b(depends on|blocked by|blocks on)\\b"; "i") then
+									sub("^.*?\\b(?:depends on|blocked by|blocks on)\\b"; ""; "i")
+								else null end) as $rest
+							| if $rest == null then .
+							else .refs += ($rest | [scan("#[0-9]+")])
+								| if $i == ($ss | length) - 1
+									and ($rest | test("^[\\s:*_~`.!?-]*$")) then .pending = true
+								else . end
+							end)
+					end)
+				| .refs[]
 			] | map(ltrimstr("#")) | unique | map("\($source):\(.)")) as $deps
 			# Opt-in, and these are the three ways in: the pipeline put
 			# it here, a person handed it over, or it stopped.
