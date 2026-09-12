@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Mock prioritiser: a deterministic stand-in for agents/claude/prioritise, so
+# the demo pipeline drains with no GitHub and no model.
+#
+# Reads the part number straight out of the title — which is exactly what the
+# real stage asks a model to do, for the cases where a regex would have been
+# enough — and sequences the item behind the ref one lower. Always exits 0,
+# the same as the real adapter: this stage never blocks and never waits.
+set -euo pipefail
+payload=$(cat)
+ref=$(jq -r '.item.ref' <<<"$payload")
+title=$(jq -r '.item.title' <<<"$payload")
+
+echo "prioritising $ref — $title"
+part=$(grep -oiE '(child|part|batch|step)[[:space:]]*([0-9]+)' <<<"$title" | grep -oE '[0-9]+' | head -1 || true)
+if [[ -n "$part" && "$part" -gt 1 ]]; then
+	echo "  part $part; sequenced behind #$((ref - 1))"
+	jq -n --argjson a "$((ref - 1))" --argjson p "$part" '{after:$a, part:$p, priority:2}' >"$CONVEYOR_RESULT"
+else
+	echo "  standalone"
+	jq -n '{priority:2}' >"$CONVEYOR_RESULT"
+fi
+exit 0

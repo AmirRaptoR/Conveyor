@@ -352,6 +352,7 @@ func TestEnrollAgainstMockTemplateProducesAValidExampleConfig(t *testing.T) {
 		"-answer", "PROVIDER=mock",
 		"-answer", "GREETING=hello from the enrolled example",
 		"-answer", "refine=agent:mock",
+		"-answer", "prioritise=agent:mock",
 		"-answer", "implement=agent:mock",
 		"-answer", "cleanup=agent:git",
 		"-answer", "DOCTOR_ENABLED=n",

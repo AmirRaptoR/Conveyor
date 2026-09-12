@@ -7,6 +7,19 @@ that: the pipeline is deterministic and human-authored; the AI is a worker insid
 one stage.** A stage either exits 0 or it does not. The engine moves the card and
 writes the provider state — never the model.
 
+The `prioritising` stage is the one place this brushes against the thesis
+rather than restating it. A numbered family of issues ("child 1..5") arrives
+with the order nowhere but the titles, and something has to write it down.
+`agents/claude/prioritise` runs a model to read that order once per item,
+ever, and writes ONE durable, human-readable line into the issue — `Depends
+on #N`, naming only the immediate predecessor. The **engine** is what
+enforces it from then on, deterministically, off `Item.DependsOn`
+(`pipeline.Deps`, CONTRACTS.md §5); a person can correct or delete the line
+and the pipeline obeys either way. The model never chooses where an item goes
+— it chooses what one line in a GitHub issue says, which is exactly the same
+authority `/refine` already has over acceptance criteria. It stays a worker
+inside one stage.
+
 Non-goal, stated up front so scope does not creep: this is **not** a general
 workflow engine. The unit of work is always an item from a source, and every
 transition is a stage change. When someone asks for cron triggers or matrix
