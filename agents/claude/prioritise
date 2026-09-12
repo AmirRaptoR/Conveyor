@@ -122,13 +122,29 @@ if [[ -n "$after" ]]; then
 	line="Depends on #${after}"
 fi
 
-# Read the body back rather than reusing the one on stdin: the listing that
-# produced it is up to a poll old, and a person may have edited the issue
-# since. A failure here (network, permissions) leaves nothing written and the
-# item still moves on — the marker is missing, so a later re-entry into this
-# stage gets another try, instead of the item being held here forever.
-current=$(gh issue view "$ref" --repo "$REPO" --json body --jq .body 2>/dev/null)
-if [[ $? -eq 0 ]]; then
+# Read the body and labels back rather than reusing the ones on stdin — the
+# listing that produced them is up to a poll old, and the model itself just
+# spent up to MAX_TURNS turns deciding, which is long enough for a person to
+# have edited the issue meanwhile: added their own marker to override the
+# model, or set the priority themselves. move.sh fetches the same pair for the
+# same reason (providers/github/move.sh). A failure here (network,
+# permissions) falls back to the stdin copies rather than writing nothing —
+# stale-but-best-effort, matching this stage's exit-0 stance throughout.
+if view=$(gh issue view "$ref" --repo "$REPO" --json labels,body 2>/dev/null); then
+	current=$(jq -r '.body // ""' <<<"$view")
+	current_prio=$(jq -r '[.labels[]?.name | select(test("^priority:p[0-3]$"))][0] // empty' <<<"$view")
+else
+	echo "could not read #$ref back; using the listing's own body and priority" >&2
+	current=$body
+	current_prio=$existing_prio
+fi
+
+# A person may have written their own marker (or corrected the model's) while
+# it was still running: never lay a second one on top of it, which is what an
+# unconditional append would do.
+if grep -q '<!-- conveyor:sequence' <<<"$current"; then
+	echo "#$ref already carries a sequence marker as of the write; leaving it as a person left it" >&2
+else
 	tmp=$(mktemp)
 	printf '%s\n\n%s\n%s\n' "$current" "$line" "$marker" >"$tmp"
 	if gh issue edit "$ref" --repo "$REPO" --body-file "$tmp" >/dev/null 2>&1; then
@@ -137,13 +153,13 @@ if [[ $? -eq 0 ]]; then
 		echo "could not write the sequence marker for #$ref; leaving it unmarked" >&2
 	fi
 	rm -f "$tmp"
-else
-	echo "could not read #$ref back to write the sequence marker; leaving it unmarked" >&2
 fi
 
 # Keep an existing priority label untouched; add exactly one when there is
-# none, defaulting to 2 if the model gave nothing usable either.
-if [[ -z "$existing_prio" || "$existing_prio" == "null" ]]; then
+# none, defaulting to 2 if the model gave nothing usable either. Checked
+# against $current_prio (fresh), not $existing_prio (stdin), for the same
+# race: a person's own priority set mid-run must not be doubled up.
+if [[ -z "$current_prio" || "$current_prio" == "null" ]]; then
 	[[ "$prio" =~ ^[0-3]$ ]] || prio=2
 	if gh issue edit "$ref" --repo "$REPO" --add-label "priority:p${prio}" >/dev/null 2>&1; then
 		echo "labelled $CONVEYOR_SOURCE #$ref priority:p${prio}"
