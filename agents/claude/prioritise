@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Record where an item sits in its sequence, once, and let the engine enforce
+# it from then on.
+#
+# The engine holds a follower behind what it depends on (pipeline.Deps), but
+# only if something wrote the dependency down. That is this stage's whole job:
+# turn "Improvement child 3" into a line the provider can translate and a
+# person can correct.
+#
+# **The model runs once per item, ever.** An item already carrying the
+# `<!-- conveyor:sequence ... -->` marker is passed straight through — the same
+# trick agents/claude/approve uses for its own conflict marker, and for the
+# same reason: without it, every poll is a model run.
+#
+# **This stage never blocks and never waits.** Every other adapter here treats
+# a usage limit or an exhausted turn budget as a reason to stop and ask a
+# person (agents/_blocked). This one does not: a family that fails to get
+# sequenced this poll is simply unsequenced, not stuck — the engine, not this
+# script, is what enforces order, and an item with nothing to enforce is no
+# worse off than one that arrived here standalone. It always exits 0: whatever
+# the model manages to decide (or fails to) gets written, and the item moves on
+# to `ready` regardless. `blocked`/`asks` are deliberately not sourced here.
+#
+# This is the one place the pipeline lets a model influence order, so the
+# defence has to be explicit. The model writes ONE durable, human-readable line
+# into the issue; the ENGINE reads only that line, deterministically; a person
+# can correct or delete it and the pipeline obeys. The model is a worker inside
+# one stage, which is the thesis in CLAUDE.md rather than an exception to it.
+#
+# Configuration, from the source's scripts.prioritise.params:
+#   PROMPT           what to decide. Required. "$REF" is expanded.
+#   ALLOWED_TOOLS    --allowedTools (default: read-only plus gh via Bash)
+#   MODEL            --model (a cheap one: this is a small judgement)
+#   MAX_TURNS        --max-turns (default 30)
+set -uo pipefail
+
+source "$(dirname "$0")/_stream"
+
+: "${PROMPT:?PROMPT is required (set it in the source scripts: block)}"
+: "${REPO:?REPO is required (set it in the source env: block)}"
+
+payload=$(cat)
+ref=$(jq -r '.item.ref' <<<"$payload")
+title=$(jq -r '.item.title' <<<"$payload")
+body=$(jq -r '.item.description // ""' <<<"$payload")
+existing_prio=$(jq -r '.item.priority // empty' <<<"$payload")
+
+# Already decided — nothing to run, nothing to write. Whatever a person did to
+# this marker since (correct it, remove it) is what the engine will read; the
+# model is never consulted twice.
+if grep -q '<!-- conveyor:sequence' <<<"$body"; then
+	echo "$CONVEYOR_SOURCE #$ref already carries a sequence marker; no model run"
+	exit 0
+fi
+
+echo "prioritising $CONVEYOR_SOURCE #$ref — $title"
+
+task=${PROMPT//\$REF/$ref}
+full="${task}
+
+--- the item, as the pipeline sees it ---
+Item #${ref} in ${REPO}: ${title}
+${body}
+--- end item ---
+
+Decide two things and write them to \$CONVEYOR_RESULT as one JSON object.
+
+1. Whether this item is part of a sequence of issues that must be worked in
+   order — a numbered family (\"child 3\", \"part 2 of 5\", \"batch 4\"), or an
+   unnumbered series whose parts plainly build on one another. Look at the
+   other open issues in ${REPO} to decide. If it is, name the ONE issue that
+   must come immediately before it as {\"after\": N}. Never a whole chain:
+   each link is enforced separately, so naming only the predecessor is both
+   sufficient and easier for a person to correct. Omit \"after\" entirely if
+   this item stands alone.
+2. A priority 0-3, as {\"priority\": N}: 0 users are broken right now, 1 a
+   committed promise or a daily bug, 2 normal work, 3 nice to have. Default 2.
+
+Also give {\"part\": N, \"of\": M} when you found a numbered family.
+
+This stage never stops to ask a person and is never resumed: decide with
+whatever you can see, defaulting to \"stands alone\" when genuinely unsure.
+Do not open, close, edit or comment on any issue yourself — this script writes
+the result back. Report what you concluded and why in your normal output."
+
+# Best-effort from here on. A quota limit, an exhausted turn budget, a crash,
+# or a $CONVEYOR_RESULT the model never wrote is treated exactly like "found no
+# predecessor" — logged, never turned into a mark, because this stage has no
+# waiting to do (see the header comment).
+MAX_TURNS="${MAX_TURNS:-30}" \
+	ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Glob,Grep}" \
+	run_claude "$full"
+rc=$?
+
+record_model
+
+if hit_limit; then
+	echo "out of quota before deciding the sequence for #$ref; leaving it unsequenced this poll" >&2
+elif hit_max_turns; then
+	echo "hit the ${MAX_TURNS:-30}-turn budget before deciding the sequence for #$ref; leaving it unsequenced this poll" >&2
+elif [[ $rc -ne 0 ]]; then
+	echo "the agent exited $rc before deciding the sequence for #$ref; leaving it unsequenced this poll" >&2
+fi
+
+after="" part="" of="" prio=""
+if [[ -s "${CONVEYOR_RESULT:-}" ]] && jq -e . "$CONVEYOR_RESULT" >/dev/null 2>&1; then
+	after=$(jq -r '.after // empty' "$CONVEYOR_RESULT" 2>/dev/null)
+	part=$(jq -r '.part // empty' "$CONVEYOR_RESULT" 2>/dev/null)
+	of=$(jq -r '.of // empty' "$CONVEYOR_RESULT" 2>/dev/null)
+	prio=$(jq -r '.priority // empty' "$CONVEYOR_RESULT" 2>/dev/null)
+fi
+
+# An item cannot be sequenced behind itself, whatever the model decided. The
+# engine drops a self-edge anyway; refusing to write one keeps the issue body
+# honest for the person who reads it.
+[[ "$after" == "$ref" ]] && after=""
+
+marker="<!-- conveyor:sequence standalone -->"
+line=""
+if [[ -n "$after" ]]; then
+	marker="<!-- conveyor:sequence ${part:-?}/${of:-?} after:#${after} -->"
+	line="Depends on #${after}"
+fi
+
+# Read the body back rather than reusing the one on stdin: the listing that
+# produced it is up to a poll old, and a person may have edited the issue
+# since. A failure here (network, permissions) leaves nothing written and the
+# item still moves on — the marker is missing, so a later re-entry into this
+# stage gets another try, instead of the item being held here forever.
+current=$(gh issue view "$ref" --repo "$REPO" --json body --jq .body 2>/dev/null)
+if [[ $? -eq 0 ]]; then
+	tmp=$(mktemp)
+	printf '%s\n\n%s\n%s\n' "$current" "$line" "$marker" >"$tmp"
+	if gh issue edit "$ref" --repo "$REPO" --body-file "$tmp" >/dev/null 2>&1; then
+		echo "sequenced $CONVEYOR_SOURCE #$ref: ${line:-standalone}"
+	else
+		echo "could not write the sequence marker for #$ref; leaving it unmarked" >&2
+	fi
+	rm -f "$tmp"
+else
+	echo "could not read #$ref back to write the sequence marker; leaving it unmarked" >&2
+fi
+
+# Keep an existing priority label untouched; add exactly one when there is
+# none, defaulting to 2 if the model gave nothing usable either.
+if [[ -z "$existing_prio" || "$existing_prio" == "null" ]]; then
+	[[ "$prio" =~ ^[0-3]$ ]] || prio=2
+	if gh issue edit "$ref" --repo "$REPO" --add-label "priority:p${prio}" >/dev/null 2>&1; then
+		echo "labelled $CONVEYOR_SOURCE #$ref priority:p${prio}"
+	else
+		echo "could not add a priority label to #$ref" >&2
+	fi
+fi
+
+# Always 0. See the header comment: this stage has no waiting to do, and no
+# outcome above is this item's fault.
+exit 0
