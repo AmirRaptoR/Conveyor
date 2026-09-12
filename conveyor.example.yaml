@@ -142,10 +142,23 @@ stages:
     script: refine            # conveyor.d/<source>/refine — the stage and the
                               # script need not share a name
     timeout: 30m
-    onSuccess: ready          # explicit; would default to the next stage anyway
+    onSuccess: prioritising   # was: ready
                               # There is no onFailure. A refine that fails stops
                               # where it is, wearing a blocked mark, and resumes
                               # there when a human clears it.
+
+  - name: prioritising
+    script: prioritise
+    timeout: 15m
+    onSuccess: ready
+    # Where an item's place in its sequence gets written down — "Improvement
+    # child 3" becomes a durable "Depends on #N" line the engine can enforce
+    # (docs/CONTRACTS.md §5). The model runs once per item, ever: an item
+    # already carrying a `<!-- conveyor:sequence ... -->` marker passes
+    # straight through with no model run. This is the one place a model
+    # influences order, and the defence is that it writes one durable line a
+    # person can read and correct while the engine still reads only that
+    # line — see agents/claude/prioritise.
 
   - name: ready
     # --- reserved for v2, inert in v1 ---
@@ -270,6 +283,8 @@ sources:
           # Reach this script only. Two stages can both take a PROMPT without
           # colliding, which is why params sit here and not in env.
           NOTE: "refining"
+      prioritise:
+        agent: mock
       implement:
         agent: mock
         params:
@@ -300,6 +315,7 @@ sources:
   #     params:
   #       STAGE_LABELS: |
   #         refining=status:refining
+  #         prioritising=status:prioritising
   #         ready=status:ready
   #         in-progress=status:in-progress
   #       # The mark, in GitHub's vocabulary. Not a stage: an issue wearing it
@@ -325,6 +341,17 @@ sources:
   #         PROMPT: |
   #           Refine this issue until it is ready to implement.
   #           ...
+  #     prioritise:
+  #       agent: claude
+  #       params:
+  #         ALLOWED_TOOLS: "Bash,Read,Glob,Grep"
+  #         # A small judgement about ordering, not a spec. The cheap model is
+  #         # the point: this runs once per item and the expensive one is
+  #         # spent in refine, where a bad answer costs a whole implement
+  #         # cycle.
+  #         MAX_TURNS: "30"
+  #         MODEL: claude-haiku-4-5-20251001
+  #         PROMPT: "/prioritise $REF"
   #     implement:
   #       agent: claude
   #       params:

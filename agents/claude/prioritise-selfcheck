@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Self-check for agents/claude/prioritise. Runs the adapter against a stubbed
+# `gh` and a stubbed `claude`, so it touches no network, no repository and no
+# model — the approve-selfcheck precedent, and for the same reason: most of
+# these cases cannot be reproduced against a live repository on demand.
+#
+#   ./agents/claude/prioritise-selfcheck
+set -euo pipefail
+cd "$(dirname "$0")"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+fail=0
+
+check() { # check <label> <expected> <actual>
+	if [[ "$2" == "$3" ]]; then
+		echo "  ok   $1"
+	else
+		echo "  FAIL $1"
+		echo "       want: $2"
+		echo "       got:  $3"
+		fail=1
+	fi
+}
+
+mkdir -p "$tmp/stub"
+
+# The model is stubbed, so this checks the adapter's plumbing — marker
+# detection, the write-back, the label, always-exit-0 — and never the model's
+# judgement, which is not testable here. $CLAUDE_RESPONSE carries the JSON one
+# run should decide; unset means "decided nothing" (a stand-in for a crash, a
+# quota limit, or a turn-budget exhaustion, all of which this stage treats the
+# same way — see the header comment in ../prioritise).
+cat >"$tmp/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+echo "decided"
+if [[ -n "${CLAUDE_RESPONSE:-}" ]]; then
+	printf '%s' "$CLAUDE_RESPONSE" >"$CONVEYOR_RESULT"
+fi
+STUB
+chmod +x "$tmp/stub/claude"
+
+# Captures the body an `edit --body-file` call would write, before the adapter
+# deletes its own temp file, since --body-file names a path the stub does not
+# otherwise get to see again. `issue view` answers with $GH_VIEW_JSON — the
+# adapter's fresh read of labels and body — so a test can simulate a person
+# having edited the issue while the (stubbed) model was "still running". A
+# non-zero $GH_VIEW_FAIL simulates that read itself failing (network,
+# permissions), the case neither GH_VIEW_JSON nor the stdin listing can stand
+# in for safely — see ../prioritise on why it falls back to neither.
+cat >"$tmp/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+echo "gh $*" >>"$GH_LOG"
+case "$*" in
+	*"issue edit"*)
+		prev=""
+		for a in "$@"; do
+			[[ "$prev" == "--body-file" ]] && cp "$a" "$BODY_LOG"
+			prev=$a
+		done
+		exit 0 ;;
+	*"issue view"*)
+		[[ "${GH_VIEW_FAIL:-0}" == "1" ]] && exit 1
+		printf '%s\n' "${GH_VIEW_JSON:-{\"labels\":[],\"body\":\"the body\"}}" ;;
+	*)              echo "[]" ;;
+esac
+STUB
+chmod +x "$tmp/stub/gh"
+
+item() { # item <ref> <body> [priority]
+	local prio=${3:-null}
+	jq -n --arg ref "$1" --arg body "$2" --argjson prio "$prio" \
+		'{item:{id:"conveyor:\($ref)",ref:$ref,title:"Improvement child 3",description:$body,url:"",priority:$prio}}'
+}
+
+default_view='{"labels":[],"body":"the body"}'
+
+run() { # run <ref> <body> [priority] [gh_view_json] [gh_view_fail]
+	: >"$GH_LOG"
+	: >"$BODY_LOG"
+	# Never inherited from a previous case: the adapter must see either a fresh
+	# decision or a genuinely absent result, not the last test's leftovers.
+	rm -f "$tmp/result.json"
+	PATH="$tmp/stub:$PATH" \
+	CONVEYOR_SOURCE=conveyor CONVEYOR_STAGE=prioritising \
+	CONVEYOR_ITEM_REF="$1" CONVEYOR_RESULT="$tmp/result.json" \
+	REPO="owner/repo" PROMPT="/prioritise \$REF" \
+	GH_VIEW_JSON="${4:-$default_view}" GH_VIEW_FAIL="${5:-0}" \
+		./prioritise <<<"$(item "$1" "$2" "${3:-}")" >"$tmp/out.log" 2>&1
+}
+
+export GH_LOG="$tmp/gh.log" BODY_LOG="$tmp/body.log"
+
+echo "prioritise"
+
+# A fresh item, part of a family: the model runs, and what it decided is
+# written into the issue so the next poll — and every later stage — can read
+# it without a model.
+CLAUDE_RESPONSE='{"after": 34, "part": 3, "of": 5, "priority": 2}' run 35 "no marker here"
+check "exits 0 so the item moves on to ready" "0" "$?"
+check "writes the dependency line into the body" \
+	"1" "$(grep -c -- '--body-file' "$GH_LOG")"
+check "the body names the immediate predecessor" \
+	"Depends on #34" "$(grep -o 'Depends on #34' "$BODY_LOG")"
+check "the body carries the sequence marker" \
+	"1" "$(grep -c -- '<!-- conveyor:sequence 3/5 after:#34 -->' "$BODY_LOG")"
+check "labels the priority the model chose" \
+	"1" "$(grep -c -- '--add-label priority:p2' "$GH_LOG")"
+
+# A standalone issue: the model names no predecessor.
+CLAUDE_RESPONSE='{"priority": 3}' run 36 "no marker here either"
+check "a standalone item still exits 0" "0" "$?"
+check "a standalone item is marked standalone, not given a Depends on line" \
+	"1" "$(grep -c -- '<!-- conveyor:sequence standalone -->' "$BODY_LOG")"
+check "a standalone item names no predecessor" \
+	"0" "$(grep -c 'Depends on' "$BODY_LOG")"
+check "a standalone item is labelled the priority the model chose" \
+	"1" "$(grep -c -- '--add-label priority:p3' "$GH_LOG")"
+
+# The marker is what makes the model run once and never again. approve uses
+# the same trick for the same reason: without it, every poll is a model run.
+run 35 "body
+<!-- conveyor:sequence 3/5 after:#34 -->"
+check "an item already carrying a marker exits 0" "0" "$?"
+check "an item already carrying a marker calls gh not at all" \
+	"" "$(cat "$GH_LOG")"
+
+# An item that already has a priority label is left alone, whatever the model
+# would have chosen. The label is what the fresh `issue view` shows, not what
+# the (possibly stale) stdin listing said — see the next two cases for why.
+CLAUDE_RESPONSE='{"priority": 1}' run 37 "no marker" 2 \
+	'{"labels":[{"name":"priority:p2"}],"body":"the body"}'
+check "an existing priority is kept, not overwritten" \
+	"0" "$(grep -c -- '--add-label' "$GH_LOG")"
+
+# The model hit its quota, its turn budget, or simply wrote nothing usable —
+# this stage never blocks or waits on any of that, unlike every other adapter.
+# result.json is removed before every run() (see above), so this exercises a
+# genuinely absent result, not a previous case's leftovers.
+run 38 "no marker, no decision this time"
+check "no decision reached still exits 0" "0" "$?"
+check "no decision reached still writes the standalone marker" \
+	"1" "$(grep -c -- '<!-- conveyor:sequence standalone -->' "$BODY_LOG")"
+
+# A person can write (or correct) the marker themselves in the minutes the
+# model is running. The adapter re-reads the body right before writing — see
+# ../prioritise — precisely so it never lays a second marker over a person's.
+CLAUDE_RESPONSE='{"after": 10, "part": 2, "of": 3, "priority": 2}' \
+	run 39 "no marker here" "" \
+	'{"labels":[],"body":"the body\n<!-- conveyor:sequence 2/3 after:#10 -->"}'
+check "a marker written mid-run is not laid over a second time" \
+	"0" "$(grep -c -- '--body-file' "$GH_LOG")"
+
+# The same race, for the priority label: a person can set it themselves while
+# the model is still deciding one of its own.
+CLAUDE_RESPONSE='{"priority": 3}' run 40 "no marker here" "" \
+	'{"labels":[{"name":"priority:p1"}],"body":"the body"}'
+check "a priority set mid-run is not doubled up" \
+	"0" "$(grep -c -- '--add-label' "$GH_LOG")"
+check "the marker still gets written even when the priority race skips the label" \
+	"1" "$(grep -c -- '<!-- conveyor:sequence standalone -->' "$BODY_LOG")"
+
+# The fresh read itself can fail (network, permissions) rather than showing a
+# person's edit. Falling back to the stdin listing here would reopen exactly
+# the two races just closed above, so both writes are skipped instead — same
+# as this item arriving here fresh next poll.
+CLAUDE_RESPONSE='{"after": 34, "part": 3, "of": 5, "priority": 2}' \
+	run 41 "no marker here" "" "$default_view" 1
+check "a failed fresh read still exits 0" "0" "$?"
+check "a failed fresh read skips the body write" \
+	"0" "$(grep -c -- '--body-file' "$GH_LOG")"
+check "a failed fresh read skips the priority write" \
+	"0" "$(grep -c -- '--add-label' "$GH_LOG")"
+
+if [[ $fail -eq 0 ]]; then echo "prioritise: all checks passed"; else echo "prioritise: FAILED"; fi
+exit $fail
