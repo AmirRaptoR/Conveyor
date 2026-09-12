@@ -644,3 +644,31 @@ func TestOrderPutsHeldItemsBehindTheOnesThatCanRun(t *testing.T) {
 		t.Fatalf("held items lost their listing order: %s then %s", got[1].ID, got[2].ID)
 	}
 }
+
+// Two held siblings still answer to manual order first, the same as two
+// workable ones do — being held changes nowhere to go, not which rung breaks
+// the tie between them.
+func TestOrderBreaksATieBetweenHeldSiblingsByManualOrderThenPriority(t *testing.T) {
+	cfg := line()
+	dep := model.Item{ID: "s:0", Stage: "ready"} // holds both followers below
+	two := model.Item{ID: "s:2", Stage: "ready", DependsOn: []string{"s:0"}}
+	three := model.Item{ID: "s:3", Stage: "ready", DependsOn: []string{"s:0"}}
+	items := []model.Item{dep, two, three} // listing order: s:2 before s:3
+
+	d := NewDeps(cfg, items)
+	// Manual order names s:3 first, against listing order — it must still win.
+	got := Order(cfg, items, []string{"s:3", "s:2"}, d)
+	if got[1].ID != "s:3" || got[2].ID != "s:2" {
+		t.Fatalf("manual order lost between held siblings: got %s then %s", got[1].ID, got[2].ID)
+	}
+
+	// With no manual order at all, priority breaks the tie instead.
+	p0, p1 := 0, 1
+	two.Priority, three.Priority = &p1, &p0
+	items = []model.Item{dep, two, three}
+	d = NewDeps(cfg, items)
+	got = Order(cfg, items, nil, d)
+	if got[1].ID != "s:3" || got[2].ID != "s:2" {
+		t.Fatalf("priority lost between held siblings: got %s then %s", got[1].ID, got[2].ID)
+	}
+}
