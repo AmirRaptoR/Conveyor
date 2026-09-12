@@ -20,8 +20,10 @@ import (
 // declineReason composes why pipeline.Target would not move this item,
 // naming the item and the config fact that stopped it. Target's own
 // signature stays (string, bool); this is run's own job to assemble from
-// the same cases Target itself switches on.
-func declineReason(cfg *config.Config, it *model.Item) string {
+// the same cases Target itself switches on — including the dependency gate,
+// so `run -explain` on a held item names the dependency and its stage rather
+// than falling through to a generic refusal.
+func declineReason(cfg *config.Config, it *model.Item, d pipeline.Deps) string {
 	if it.Blocked {
 		return fmt.Sprintf("item %s is marked; only a person clears that", it.ID)
 	}
@@ -32,8 +34,18 @@ func declineReason(cfg *config.Config, it *model.Item) string {
 	if stage.Terminal {
 		return fmt.Sprintf("stage %q is terminal", it.Stage)
 	}
-	if !stage.Runs() && stage.OnSuccess == "" {
+	next := stage.OnSuccess
+	if stage.Runs() {
+		next = stage.Name
+	} else if next == "" {
 		return fmt.Sprintf("stage %q is a queue with no onSuccess; items rest there", it.Stage)
+	}
+	if hold, held := d.Held(it, next); held {
+		if hold.Blocked {
+			return fmt.Sprintf("held behind %s, which is marked in %s", hold.By, hold.Stage)
+		}
+		return fmt.Sprintf("held behind %s, which is still in %s and has not reached %s",
+			hold.By, hold.Stage, next)
 	}
 	return fmt.Sprintf("stage %q has nowhere to go", it.Stage)
 }

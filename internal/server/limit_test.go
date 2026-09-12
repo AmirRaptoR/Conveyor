@@ -413,3 +413,74 @@ sources:
 		t.Errorf("the stage script ran %d times, want 1", countLines(started))
 	}
 }
+
+// Unblock all considers the sequence: a marked item the sequencing rule
+// would still hold anyway gets no provider write and stays marked, reported
+// under heldByDependencies rather than unblocked. An item that is both asked
+// and held is counted once, under waitingOnYou — the question skip comes
+// first. A marked item that is not held, and one whose dependency the
+// listing cannot see at all, are both cleared exactly as before.
+func TestUnblockAllConsidersTheSequence(t *testing.T) {
+	cfg, r, _ := pipelineFor(t)
+	s := New(cfg, r)
+	s.ctx = context.Background()
+
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"}, // the dependency: not marked, still in backlog
+		// held: moving on to "working" would overtake s1:1, which is still in backlog
+		{ID: "s1:2", Ref: "2", Source: "s1", Stage: "backlog", Blocked: true, DependsOn: []string{"s1:1"}},
+		// held AND asked: must be counted once, under waitingOnYou
+		{ID: "s1:3", Ref: "3", Source: "s1", Stage: "backlog", Blocked: true, DependsOn: []string{"s1:1"}},
+		// marked, not held: an ordinary fault with no dependency at all
+		{ID: "s1:4", Ref: "4", Source: "s1", Stage: "working", Blocked: true},
+		// marked, dependency absent from the listing: the residual gap —
+		// still cleared here; agents/_deps re-marks it at implement time.
+		{ID: "s1:5", Ref: "5", Source: "s1", Stage: "backlog", Blocked: true, DependsOn: []string{"nobody:1"}},
+	}
+	s.blocks = map[string]Block{
+		"s1:2": {Kind: "worktree", Reason: "dirty checkout"},
+		"s1:3": {Kind: "decision", Reason: "which one?", Asked: true},
+		"s1:4": {Kind: "error", Reason: "it failed"},
+		"s1:5": {Kind: "worktree", Reason: "dirty checkout"},
+	}
+
+	req := httptest.NewRequest("POST", "/api/unblock", nil)
+	w := httptest.NewRecorder()
+	s.handleUnblockAll(w, req)
+
+	var got struct {
+		Unblocking         int `json:"unblocking"`
+		WaitingOnYou       int `json:"waitingOnYou"`
+		HeldByDependencies int `json:"heldByDependencies"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Unblocking != 2 {
+		t.Errorf("unblocking = %d, want 2 (s1:4 and s1:5)", got.Unblocking)
+	}
+	if got.WaitingOnYou != 1 {
+		t.Errorf("waitingOnYou = %d, want 1 (s1:3, held and asked, counted once)", got.WaitingOnYou)
+	}
+	if got.HeldByDependencies != 1 {
+		t.Errorf("heldByDependencies = %d, want 1 (s1:2)", got.HeldByDependencies)
+	}
+
+	waitFor(t, "the two non-held marks to clear", func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		_, four := s.blocks["s1:4"]
+		_, five := s.blocks["s1:5"]
+		return !four && !five
+	})
+	s.mu.RLock()
+	_, stillHeld := s.blocks["s1:2"]
+	_, stillAsked := s.blocks["s1:3"]
+	s.mu.RUnlock()
+	if !stillHeld {
+		t.Error("s1:2 was unblocked despite the sequencing rule still holding it")
+	}
+	if !stillAsked {
+		t.Error("s1:3's question was cleared in bulk")
+	}
+}

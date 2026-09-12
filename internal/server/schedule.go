@@ -125,6 +125,10 @@ func (s *Server) launch(ctx context.Context) int {
 	}
 	s.mu.RUnlock()
 	order := s.order.IDs()
+	// Built from the full board, not from `free` below: a dependency that is
+	// running or marked has already been filtered out of `free`, and it is
+	// exactly the one that must still hold its followers.
+	deps := pipeline.NewDeps(s.cfg, items)
 
 	n := 0
 	// Refused axes. A refusal means that source or that stage is genuinely full,
@@ -141,7 +145,7 @@ func (s *Server) launch(ctx context.Context) int {
 	for {
 		free := items[:0:0]
 		for _, it := range items {
-			target, ok := pipeline.Target(s.cfg, &it)
+			target, ok := pipeline.Target(s.cfg, &it, deps)
 			if !ok || fullSrc[it.Source] || fullStage[target] || busy[it.ID] ||
 				s.eng.Locks().Busy(it.Source, target, s.cfg.ResourcesFor(it.Source, target)...) {
 				continue
@@ -183,7 +187,7 @@ func (s *Server) launch(ctx context.Context) int {
 			}
 			free = append(free, it)
 		}
-		item, target := pipeline.Pick(s.cfg, free, order)
+		item, target := pipeline.Pick(s.cfg, free, order, deps)
 		if item == nil {
 			return n
 		}
@@ -430,7 +434,7 @@ func (s *Server) advance(ctx context.Context) bool {
 	items := append([]model.Item(nil), s.state.Items...)
 	s.mu.RUnlock()
 
-	item, target := pipeline.Pick(s.cfg, items, s.order.IDs())
+	item, target := pipeline.Pick(s.cfg, items, s.order.IDs(), pipeline.NewDeps(s.cfg, items))
 	if item == nil {
 		return false
 	}

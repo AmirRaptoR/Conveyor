@@ -58,7 +58,7 @@ sources:
 func TestDeclineReasonMarked(t *testing.T) {
 	cfg := explainCfg(t)
 	it := &model.Item{ID: "s1:1", Stage: "working", Blocked: true}
-	got := declineReason(cfg, it)
+	got := declineReason(cfg, it, pipeline.Deps{})
 	if !strings.Contains(got, "marked") {
 		t.Errorf("declineReason = %q, want it to say marked", got)
 	}
@@ -67,7 +67,7 @@ func TestDeclineReasonMarked(t *testing.T) {
 func TestDeclineReasonTerminal(t *testing.T) {
 	cfg := explainCfg(t)
 	it := &model.Item{ID: "s1:1", Stage: "done"}
-	got := declineReason(cfg, it)
+	got := declineReason(cfg, it, pipeline.Deps{})
 	if !strings.Contains(got, "terminal") {
 		t.Errorf("declineReason = %q, want it to say terminal", got)
 	}
@@ -76,7 +76,7 @@ func TestDeclineReasonTerminal(t *testing.T) {
 func TestDeclineReasonUnknownStage(t *testing.T) {
 	cfg := explainCfg(t)
 	it := &model.Item{ID: "s1:1", Stage: "nonexistent"}
-	got := declineReason(cfg, it)
+	got := declineReason(cfg, it, pipeline.Deps{})
 	if !strings.Contains(got, "not in this config") {
 		t.Errorf("declineReason = %q, want it to say the stage is unknown", got)
 	}
@@ -111,9 +111,22 @@ sources:
 		t.Fatal(err)
 	}
 	it := &model.Item{ID: "s1:1", Stage: "parked"}
-	got := declineReason(cfg, it)
+	got := declineReason(cfg, it, pipeline.Deps{})
 	if !strings.Contains(got, "queue with no onSuccess") {
 		t.Errorf("declineReason = %q, want it to name the queue", got)
+	}
+}
+
+// run -explain on a held item names the dependency and its stage rather than
+// falling through to the generic "has nowhere to go" refusal.
+func TestDeclineReasonHeldBehindADependency(t *testing.T) {
+	cfg := explainCfg(t)
+	dependency := model.Item{ID: "s1:1", Stage: "backlog"}
+	follower := model.Item{ID: "s1:2", Stage: "backlog", DependsOn: []string{"s1:1"}}
+	d := pipeline.NewDeps(cfg, []model.Item{dependency, follower})
+	got := declineReason(cfg, &follower, d)
+	if !strings.Contains(got, "s1:1") || !strings.Contains(got, "backlog") {
+		t.Errorf("declineReason = %q, want it to name the dependency and its stage", got)
 	}
 }
 
