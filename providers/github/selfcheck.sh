@@ -68,22 +68,7 @@ data='[
   "url":"https://example.test/21","assignees":[]},
  {"number":27,"title":"Closed mid-flight","body":"","state":"CLOSED",
   "labels":[{"name":"status:in-progress"}],
-  "url":"https://example.test/27","assignees":[],"closedAt":"2026-08-29T00:00:00Z"},
- {"state":"OPEN","number":33,"title":"Improvement child 3","body":"Depends on #31\n",
-  "labels":[{"name":"conveyor"}],
-  "url":"https://example.test/33","assignees":[]},
- {"state":"OPEN","number":35,"title":"Two at once","body":"Blocked by: #31, #33\n",
-  "labels":[{"name":"conveyor"}],
-  "url":"https://example.test/35","assignees":[]},
- {"state":"OPEN","number":37,"title":"Not a dependency","body":"Related: #9\nthe record the board depends on: x\nDepends on: ADR 9 (merged). Blocks: #12, #13 depend on this one\n",
-  "labels":[{"name":"conveyor"}],
-  "url":"https://example.test/37","assignees":[]},
- {"state":"OPEN","number":39,"title":"Mid-line, not line-start","body":"Part of the live duel epic (#8). Depends on #31, #33 and #35, all still open.\n",
-  "labels":[{"name":"conveyor"}],
-  "url":"https://example.test/39","assignees":[]},
- {"state":"OPEN","number":41,"title":"Anchored and phrase-anywhere in one sentence","body":"Requires #31, blocked by #33\n",
-  "labels":[{"name":"conveyor"}],
-  "url":"https://example.test/41","assignees":[]}
+  "url":"https://example.test/27","assignees":[],"closedAt":"2026-08-29T00:00:00Z"}
 ]'
 case "$*" in
 	*"--state open"*)   jq '[.[] | select(.state == "OPEN")]' <<<"$data" ;;
@@ -128,31 +113,48 @@ check "a marked issue keeps the stage it stopped in" \
 check "an unmarked issue is not blocked" \
 	"false" "$(jq -r '.[0].blocked' "$tmp/out.json")"
 
-# The body is the only place a sequence is written down, and the provider is
-# the only thing that reads it: the engine never learns what "#31" means.
-check "a dependency line becomes an item id" \
-	"midgame:31" "$(jq -r '.[] | select(.ref == "33") | .dependsOn | join(",")' "$tmp/out.json")"
-check "two numbers on one line become two ids" \
-	"midgame:31,midgame:33" "$(jq -r '.[] | select(.ref == "35") | .dependsOn | join(",")' "$tmp/out.json")"
-# Three traps in one body, and none of them is a dependency: a "Related:" line,
-# the word "depends" mid-sentence, and a sentence whose own dependency clause
-# ends before it starts — "Blocks: #12, #13 depend on this one" describes who
-# depends on IT, in the sentence right after "Depends on: ADR 9 (merged)."
-# agents/_deps splits into sentences for exactly this reason.
-check "prose that merely says 'depends' is not a dependency" \
-	"" "$(jq -r '.[] | select(.ref == "37") | .dependsOn // [] | join(",")' "$tmp/out.json")"
 check "an issue declaring nothing has no dependencies key at all" \
 	"null" "$(jq -r '.[] | select(.ref == "19") | .dependsOn' "$tmp/out.json")"
-# The declaring sentence is reached only after an earlier, unrelated one on
-# the same line — the case a line-start anchor alone would miss, and the one
-# both parsers have to keep agreeing on as they evolve.
-check "a mid-line declaration is read, not just a line-start one" \
-	"midgame:31,midgame:33,midgame:35" "$(jq -r '.[] | select(.ref == "39") | .dependsOn | join(",")' "$tmp/out.json")"
-# The anchored keyword opens the sentence, so it is always the earliest
-# possible cut point — the whole rest of the sentence counts, including a
-# phrase-anywhere keyword that also occurs later in it.
-check "an anchored keyword at the start still donates a later phrase-anywhere match" \
-	"midgame:31,midgame:33" "$(jq -r '.[] | select(.ref == "41") | .dependsOn | join(",")' "$tmp/out.json")"
+
+# The body is the only place a sequence is written down, and the provider is
+# the only thing that reads it: the engine never learns what "#31" means.
+#
+# agents/_deps-fixtures.jsonl is the one corpus both this suite and
+# agents/_deps-selfcheck read — providers and agents are separately-resolvable
+# roots and providers must not reach into agents, so the parse is stated twice
+# on purpose, but a change to either regex must fail the OTHER suite's test
+# too, not just its own, or the two drift silently apart. Each fixture gets
+# its own one-issue listing, tagged with the bare onboarding label so it needs
+# no stage mapping, and its want[] is checked against dependsOn translated
+# into this fixture's own item ids.
+mkdir -p "$tmp/stub2"
+cat >"$tmp/stub2/gh" <<'STUB'
+#!/usr/bin/env bash
+data=$(cat "$FIXTURE_DATA")
+case "$*" in
+	*"--state open"*)   jq '[.[] | select(.state == "OPEN")]' <<<"$data" ;;
+	*"--state closed"*) jq '[.[] | select(.state == "CLOSED")]' <<<"$data" ;;
+	*)                  echo "$data" ;;
+esac
+STUB
+chmod +x "$tmp/stub2/gh"
+
+n=1001
+while IFS= read -r fixture; do
+	[[ -n "$fixture" ]] || continue
+	name=$(jq -r '.name' <<<"$fixture")
+	want=$(jq -r '[.want[] | "midgame:\(.)"] | join(",")' <<<"$fixture")
+	jq -n --argjson n "$n" --arg body "$(jq -r '.body' <<<"$fixture")" \
+		'[{state:"OPEN", number:$n, title:"corpus fixture", body:$body,
+		   labels:[{name:"conveyor"}], url:"https://example.test/corpus",
+		   assignees:[]}]' >"$tmp/fixture.json"
+	FIXTURE_DATA="$tmp/fixture.json" \
+	PATH="$tmp/stub2:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/corpus-out.json" \
+		./list.sh <<<'{"terminalStages":["ready"]}' >/dev/null 2>&1
+	got=$(jq -r --argjson n "$n" '.[] | select(.ref == ($n|tostring)) | .dependsOn // [] | join(",")' "$tmp/corpus-out.json")
+	check "corpus: $name" "$want" "$got"
+	n=$((n + 1))
+done <"../../agents/_deps-fixtures.jsonl"
 
 # There is no ignore list any more, because not listing is what happens by
 # default: an issue is left alone by saying nothing about it. The old opt-out
