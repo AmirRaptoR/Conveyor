@@ -44,8 +44,12 @@ func declineReason(cfg *config.Config, it *model.Item, d pipeline.Deps) string {
 		if hold.Blocked {
 			return fmt.Sprintf("held behind %s, which is marked in %s", hold.By, hold.Stage)
 		}
+		until := hold.Until
+		if until == "" {
+			until = next
+		}
 		return fmt.Sprintf("held behind %s, which is still in %s and has not reached %s",
-			hold.By, hold.Stage, next)
+			hold.By, hold.Stage, until)
 	}
 	return fmt.Sprintf("stage %q has nowhere to go", it.Stage)
 }

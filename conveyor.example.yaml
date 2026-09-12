@@ -185,6 +185,13 @@ stages:
                               # it stands. Unset means one: the first failure
                               # marks it, because a failure that neither routed
                               # nor marked would be re-run on every poll forever.
+    dependenciesAt: done      # an item enters here only once everything it
+                              # declares "Depends on" has reached this stage or
+                              # passed it. Unset, a follower may share a stage
+                              # with its dependency — right for a stage that
+                              # only reads its own item, wrong for the one that
+                              # builds on the dependency's code. Must name a
+                              # declared stage; a GitHub pipeline says `merged`.
 
   - name: announcing
     # The other form: a body written here instead of a name resolved per source.

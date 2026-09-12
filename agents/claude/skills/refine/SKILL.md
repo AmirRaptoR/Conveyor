@@ -17,6 +17,7 @@ Take one GitHub issue from rough note to implementable spec. Ask questions until
 4. **Do not write a spec you are not sure of.** If it cannot be refined, label it `blocked` and stop. A confident-sounding wrong spec is worse than no spec.
 5. **Codex gets exactly one round.** No back-and-forth, no second pass.
 6. **A parent (split) issue is never itself implementable.** No acceptance criteria a PR could close, no `conveyor:*` stage label, and nothing in its body that reads as a closing keyword next to its own number — not even in a sentence denying it (`"does not close #101"` still matches a PR-body closing-keyword scanner; say "does not finish" or "is not the last PR for" instead). Only children get built and closed.
+7. **Every issue is deliverable on its own.** One pull request that merges and releases, even when the issue is one slice of a bigger feature. The test is: with every dependency it declares merged, can this scope be built against `main` and shipped? If the honest answer is "only after #A, #B and #C land" then #A, #B and #C are its dependencies — declare them (§3) and the line holds the item until they merge. If the answer is "not even then", the scope is wrong: reslice it until it stands on its own, hiding unfinished surface behind the repo's kill switch or a flag. A spec is never allowed to say "implementation starts once #N merges", "has no useful subset without X", or "land the rest in follow-ups" — those sentences describe an item that cannot be finished, and the line will fill with them.
 
 ## Workflow
 
@@ -51,7 +52,23 @@ Loop — live, batching 3-5 questions per `AskUserQuestion` call if attended; se
 
 **The 90% bar, concretely:** you are at 90% when every acceptance criterion could be handed to someone who has never seen the issue and they could verify it without asking you anything. Not a feeling — check the criteria one by one.
 
-**If this issue's own text, its parent, or the codebase says it is sequenced behind another issue, write `Depends on #N` naming the immediate predecessor** — into the body, not only into "Technical notes" prose. The pipeline reads that exact line (`agents/_deps`, and the GitHub provider's own listing) to hold this item behind the one it names; recording it here is what makes an already-known dependency enforced instead of merely documented. Only the immediate predecessor: a chain of siblings each naming the one before it needs no closure computed. This is not the same job as inferring an unstated order across a family of sibling issues nothing declares — that is a later, separate stage's business.
+**If this issue's own text, its parent, or the codebase says it is sequenced behind another issue, write a `Depends on #N` line into the body** — not only into "Technical notes" prose. The pipeline reads exactly two shapes (`agents/_deps`, and the GitHub provider's own listing) to hold this item behind the ones it names, and anything else is invisible to it:
+
+```markdown
+Depends on #12, #13
+```
+
+or a bare keyword line followed by one list item per predecessor, which is the shape to use when each one needs a word of explanation:
+
+```markdown
+Depends on:
+- #12 — the match document and `MatchStore`
+- #13 — `endMatch` and the leave guard
+```
+
+Only the first sentence of each list item is read, so put the number first and any cross-references after a full stop. A declared dependency is what makes the line **hold this item out of implementation until every one of them has merged** — an item whose spec merely mentions its prerequisites in prose gets picked, half-built on a branch that is not on `main`, and parked. Only the immediate predecessor: a chain of siblings each naming the one before it needs no closure computed. This is not the same job as inferring an unstated order across a family of sibling issues nothing declares — that is a later, separate stage's business.
+
+Then apply Iron Rule 7: with those dependencies merged, the rest of the scope must be buildable and shippable on its own. If it is not, reslice before drafting.
 
 Ask about **requirements**, not implementation. "What should happen when the token is already expired?" is refinement. "Should we use Redis or Postgres for this?" is design — only ask (or self-answer) if the answer changes the acceptance criteria.
 
@@ -176,6 +193,8 @@ If the title no longer describes the refined scope, propose a new one (attended)
 ## Red flags — stop
 
 - About to edit a file, create a branch, or open a PR → you are refining, not implementing. Stop.
+- Writing "implementation starts once #N merges", "no useful subset without X", or "the rest lands in follow-ups" into a spec → that is Iron Rule 7 failing. Declare the dependency in one of the two shapes §3 shows and make sure what is left is deliverable on its own; reslice if it is not.
+- A dependency written only in prose, a table, or "Technical notes" → invisible to the pipeline; the item will be picked and half-built. Move it to a `Depends on` line or list.
 - Ran `codex exec` without `-s read-only` → stop, rerun correctly
 - Second Codex round → one round only
 - Writing a spec while questions remain unanswered (and unattended can't resolve them from the codebase) → label `blocked` instead

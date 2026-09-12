@@ -3,3 +3,10 @@
 {"name": "three traps in one body donate nothing", "body": "Related: #9\nthe record the board depends on: x\nDepends on: ADR 9 (merged). Blocks: #12, #13 depend on this one", "want": []}
 {"name": "a mid-line declaration is read, not just a line-start one", "body": "Part of the live duel epic (#8). Depends on #21, #23 and #25, all still open.", "want": ["21", "23", "25"]}
 {"name": "an anchored keyword at the start still donates a later phrase-anywhere match", "body": "Requires #21, blocked by #23", "want": ["21", "23"]}
+{"name": "a bare keyword line opens a list and each item donates its first number", "body": "Parent: #129 · Depends on:\n- **#123** — the match document, `MatchStore`, the base rules.\n- **#130** — `endMatch` and the leave guard\n\nProse mentioning #99", "want": ["123", "130"]}
+{"name": "a list item donates only its first sentence", "body": "Depends on:\n- #12 — the parser. See also #99.\n- #13", "want": ["12", "13"]}
+{"name": "blank lines before the first item are allowed, one after the list ends it", "body": "Blocked by:\n\n- #21\n- #22\n\n- #99 is unrelated", "want": ["21", "22"]}
+{"name": "numbered items open a list too", "body": "**Requires:**\n1. #4\n2) #5\nnot an item #6", "want": ["4", "5"]}
+{"name": "a keyword line that names something itself opens no list", "body": "Depends on: nothing yet.\n- #12 is a related note", "want": []}
+{"name": "a keyword line with a number does not also read the list below it", "body": "Depends on #7\n- #12 is a related note", "want": ["7"]}
+{"name": "a list with no keyword line above it donates nothing", "body": "Related:\n- #12\n- #13", "want": []}

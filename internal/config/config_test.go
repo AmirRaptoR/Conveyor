@@ -916,3 +916,42 @@ func TestPreflightScriptAmbiguous(t *testing.T) {
 		t.Errorf("ambiguous preflight script became a Source.Problem: %v", cfg.Sources[0].Problems)
 	}
 }
+
+// dependenciesAt is a stage name like onSuccess, and a name the config does
+// not declare is refused at load for the same reason: a bar nothing can ever
+// reach would hold every follower forever, silently.
+func TestDependenciesAtMustNameADeclaredStage(t *testing.T) {
+	dir := t.TempDir()
+	provider(t, dir)
+	script(t, filepath.Join(dir, "agents", "claude", "refine"))
+	workdir(t, filepath.Join(dir, "repo"))
+	path := filepath.Join(dir, "conveyor.yaml")
+	body := "version: 1\nstages:\n  - name: backlog\n  - name: refining\n" +
+		"    script: refine\n    onSuccess: done\n    dependenciesAt: merged\n" +
+		"  - name: done\n    terminal: true\nsources:\n" + declared
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("dependenciesAt naming an unknown stage loaded without complaint")
+	}
+	for _, want := range []string{"dependenciesAt", "unknown stage", "merged"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %v, want it to mention %q", err, want)
+		}
+	}
+
+	// And a declared one loads, carrying the name through to the stage.
+	body = strings.Replace(body, "dependenciesAt: merged", "dependenciesAt: done", 1)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("a declared dependenciesAt failed to load: %v", err)
+	}
+	if st, ok := cfg.Stage("refining"); !ok || st.DependenciesAt != "done" {
+		t.Fatalf("refining.DependenciesAt = %q, want done", st.DependenciesAt)
+	}
+}
