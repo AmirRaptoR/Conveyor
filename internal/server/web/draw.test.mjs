@@ -350,3 +350,35 @@ test("draw: a blocked item is never also drawn held", async () => {
   assert.match(rendered, /class="item[^"]*\bblocked\b[^"]*"/);
   assert.doesNotMatch(rendered, /class="item[^"]*\bheld\b[^"]*"/);
 });
+
+// Every dependency a card declares is drawn on it by number, hold or no
+// hold: "behind 1" says what stops a card today, "needs" says what it is
+// waiting for at all. A dependency that has finished (a terminal stage, or
+// gone from the listing) is dimmed, not dropped; the one holding the card is
+// singled out; and the card's own source is never repeated in the numbers.
+test("draw: a card lists what it depends on, by number", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [
+      { id: "s1:1", source: "s1", stage: "backlog", title: "the dependency" },
+      { id: "s1:3", source: "s1", stage: "done", title: "already finished" },
+      { id: "s1:2", source: "s1", stage: "backlog", title: "the follower",
+        dependsOn: ["s1:1", "s1:3", "s1:9"] },
+    ],
+    held: { "s1:2": { by: "s1:1", stage: "backlog", target: "working", blocked: false, until: "working" } },
+  }));
+  const rendered = p.el("#rail").innerHTML;
+  assert.match(rendered, /class="needs"[^>]*>needs /);
+  assert.match(rendered, /class="holding"[^>]*>1</);
+  assert.match(rendered, /class="met"[^>]*>3</);
+  assert.match(rendered, /class="met"[^>]*>9</);
+  assert.doesNotMatch(rendered, /needs [^<]*s1:/);
+});
+
+test("draw: a card declaring nothing has no needs chip", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:1", source: "s1", stage: "backlog", title: "free to run" }],
+  }));
+  assert.doesNotMatch(p.el("#rail").innerHTML, /class="needs"/);
+});

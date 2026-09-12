@@ -42,10 +42,72 @@
 # direction — it marks a healthy item `dependency` until some unrelated issue
 # happens to close — so the anchor stays even now that the other three no
 # longer need one.
+#
+# A declaration may also open a list. A keyword sentence that names nothing
+# itself and ends its line — "Depends on:", "**Blocked by:**", or "Parent:
+# #8 · Depends on:" — donates the numbers from each markdown list item that
+# follows it (`-`, `*`, `+`, or `1.`/`1)`), one item per line, until the
+# first line that is not a list item; the first sentence of each item is
+# read, so "- **#12** — the base rules. See also #99." donates only #12.
+# Blank lines between the opener and its first item are allowed, since that
+# is how GitHub's editor lays a list out; a blank line after the list has
+# started ends it. This is the shape a refined issue actually writes
+# ("Depends on:" then one bullet per predecessor), and a body written that
+# way used to declare nothing at all — the keyword line had no number on
+# it, and a line break is a sentence break in both directions.
 dependency_refs() {
-	sed -E 's/([.!?])[[:space:]]+/\1\n/g' <<<"$1" |
-		grep -ioE '\b(depends on|blocked by|blocks on)\b.*|^[[:space:]*_~`>+-]*(requires|after)\b.*' |
-		grep -oE '#[0-9]+' | tr -d '#' | sort -un
+	awk '
+	# emit prints every "#N" in s, one number per line.
+	function emit(s) {
+		while (match(s, /#[0-9]+/)) {
+			print substr(s, RSTART + 1, RLENGTH - 1)
+			s = substr(s, RSTART + RLENGTH)
+		}
+	}
+	# check reads one sentence. The anchored pair is tried first, then the
+	# phrase-anywhere trio at its leftmost occurrence; only the text from the
+	# keyword onward counts. A last sentence whose remainder is nothing but
+	# punctuation opens a list for the lines that follow.
+	function check(s, last,    l, rest) {
+		l = tolower(s)
+		if (match(l, /^[ \t*_~`>+-]*(requires|after)([^a-z0-9_]|$)/)) {
+			rest = l
+			sub(/^[ \t*_~`>+-]*(requires|after)/, "", rest)
+		} else if (match(l, /(^|[^a-z0-9_])(depends on|blocked by|blocks on)([^a-z0-9_]|$)/)) {
+			rest = substr(l, RSTART)
+			sub(/^[^a-z0-9_]?(depends on|blocked by|blocks on)/, "", rest)
+		} else {
+			return
+		}
+		emit(rest)
+		if (last && rest ~ /^[ \t:*_~`.!?-]*$/) pending = 1
+	}
+	BEGIN { pending = 0; inlist = 0 }
+	{
+		line = $0
+		if (line ~ /^[ \t]*$/) { inlist = 0; next }
+		if ((pending || inlist) && line ~ /^[ \t]*([-*+]|[0-9]+[.)])[ \t]+/) {
+			inlist = 1; pending = 0
+			item = line
+			sub(/^[ \t]*([-*+]|[0-9]+[.)])[ \t]+/, "", item)
+			if (match(item, /[.!?][ \t]+/)) item = substr(item, 1, RSTART)
+			emit(item)
+		} else {
+			inlist = 0; pending = 0
+		}
+		rest = line
+		while (1) {
+			if (match(rest, /[.!?][ \t]+/)) {
+				s = substr(rest, 1, RSTART)
+				rest = substr(rest, RSTART + RLENGTH)
+			} else {
+				s = rest
+				rest = ""
+			}
+			check(s, rest == "")
+			if (rest == "") break
+		}
+	}' <<<"$1" | sort -un
 }
 
 # open_dependencies <body> — "#12 #13" for every named dependency that is

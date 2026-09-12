@@ -264,16 +264,27 @@ peer, and the socket is the only door with no password on it (#94).
   work on; it only ever answers whether this item is already done, and stays
   the one place both implement and review ask that question.
 - **An item sequenced behind an open issue is not started.** `agents/_deps`
-  reads "Depends on #N" / "Blocked by #N" lines from the body; implement stops
-  before the worktree with a `dependency` mark, a condition the doctor clears
-  once every named issue is closed. The agent is also told not to stop for an
-  open dependency itself — nine of one week's seventeen "decisions" were that.
+  reads "Depends on #N" / "Blocked by #N" lines from the body — inline, or a
+  bare "Depends on:" line followed by one markdown list item per predecessor,
+  which is the shape a refined issue actually writes and which used to
+  declare nothing (the keyword line had no number on it, and a line break is
+  a sentence break); implement stops before the worktree with a `dependency`
+  mark, a condition the doctor clears once every named issue is closed. The
+  agent is also told not to stop for an open dependency itself — nine of one
+  week's seventeen "decisions" were that. The GitHub provider's `list.sh`
+  restates the same parse for `dependsOn`, and `agents/_deps-fixtures.jsonl`
+  is the one corpus both selfchecks read so the two cannot drift.
 - **A follower never passes what it depends on.** `pipeline.Deps` is built from
   the full listing each pass and gates rung 1 of `pipeline.Target`: an item may
   enter a stage its dependency has already entered, may share it, may never
   pass it, and may not walk into a stage its dependency is marked in. Stated
   once, in `Target`, so `Pick`, `Order` and the drag endpoint's 409 cannot
-  disagree about it. Every unusable edge — an unknown id, a self-edge, a stage
+  disagree about it. A stage raises that bar for itself with `dependenciesAt:
+  <stage>` — the implement stage says `merged`, because an item built while
+  its dependency is still on a branch produces a pull request that cannot
+  merge on its own, and every issue must be deliverable by itself even as a
+  slice of a bigger feature. The hold carries `until` so the board can say
+  "must reach merged" instead of "cannot enter in-progress". Every unusable edge — an unknown id, a self-edge, a stage
   the config does not declare, a cycle — is dropped rather than held, because
   the alternative is a pipeline a person wedges shut by mistyping one line of
   an issue body; only the edges inside a cycle go, so an unrelated dependency

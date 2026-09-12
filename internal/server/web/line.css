@@ -192,6 +192,16 @@
 .item.held .title { color:var(--dim); }
 .item .behind { color:var(--faint); }
 
+/* What a card is sequenced behind, by number — always shown, hold or no
+   hold, so the shape of a family is readable across a column. A dependency
+   already finished is dimmed rather than dropped: the list is the issue's
+   own declaration and stays whole. The one holding the card right now is
+   the only number drawn in the stop colour, since it is the only one a
+   person could act on. */
+.item .needs { color:var(--faint); }
+.item .needs .met { text-decoration:line-through; opacity:.6; }
+.item .needs .holding { color:var(--stop); font-weight:600; }
+
 /* Terminal stations sit after a gap, joined by a short spur. A terminal
    column takes a pipeline station's own basis and gutter, so its card is
    the same width as any other column's no matter what is in it; the gap

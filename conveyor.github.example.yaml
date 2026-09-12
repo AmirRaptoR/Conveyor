@@ -68,6 +68,15 @@ stages:
     onSuccess: review
     resources: [claude]
     maxAttempts: 2
+    # An item enters here only once everything it declares "Depends on" has
+    # reached `done` — in this pipeline `approving` merges, and the merge
+    # closes the issue, so `done` is the first stage at which the dependency's
+    # code is on main. The default rule lets a follower share a stage with
+    # its dependency, which is right for review and wrong for implement: code
+    # built on a branch that is not on main yet is a pull request that cannot
+    # merge on its own. Every issue must be deliverable by itself. A pipeline
+    # with a separate `merged` stage names that instead.
+    dependenciesAt: done
 
   - name: review
     script: review

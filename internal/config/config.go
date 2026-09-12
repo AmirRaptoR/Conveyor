@@ -173,6 +173,19 @@ type Stage struct {
 	// is: a non-zero exit marks it blocked in place, and a mark is not a
 	// destination.
 	OnSuccess string `yaml:"onSuccess"`
+	// DependenciesAt names the stage every dependency of an item must have
+	// reached before the item may enter THIS stage. Unset keeps the default
+	// sequencing rule: a follower may enter a stage its dependency has
+	// already entered, and no further.
+	//
+	// The default is right for stages that only read their own item. It is
+	// wrong for the one that builds on the dependency's code: an item
+	// implemented while its dependency is still in review is built on a
+	// branch that is not on main, and a pull request that cannot merge on
+	// its own is not a deliverable. `dependenciesAt: merged` on the implement
+	// stage says so in the config, where the line's order already lives,
+	// rather than in a script that would discover it one run at a time.
+	DependenciesAt string `yaml:"dependenciesAt"`
 	// MaxAttempts is how many times a failing stage is re-run before the item is
 	// marked. Unset means one — the first failure marks it — because a failure
 	// that neither routes nor marks would be re-run on every poll forever.
@@ -994,6 +1007,9 @@ func (c *Config) Validate() []string {
 	for _, s := range c.Stages {
 		if s.OnSuccess != "" && !seen[s.OnSuccess] {
 			add("stage %q: onSuccess points at unknown stage %q", s.Name, s.OnSuccess)
+		}
+		if s.DependenciesAt != "" && !seen[s.DependenciesAt] {
+			add("stage %q: dependenciesAt points at unknown stage %q", s.Name, s.DependenciesAt)
 		}
 	}
 
