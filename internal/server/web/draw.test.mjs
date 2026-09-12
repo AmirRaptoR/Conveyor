@@ -304,3 +304,49 @@ test("draw: an elapsed countdown says any moment", async () => {
   }));
   assert.match(p.el("#rail").innerHTML, /any moment/);
 });
+
+// ---- held (sequencing) ------------------------------------------------------
+
+test("draw: a held item draws the same grey tone as a self-clearing condition, with no mark chip", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [
+      { id: "s1:1", source: "s1", stage: "backlog", title: "the dependency" },
+      { id: "s1:2", source: "s1", stage: "backlog", title: "the follower" },
+    ],
+    held: { "s1:2": { by: "s1:1", stage: "backlog", target: "working", blocked: false } },
+  }));
+  const rendered = p.el("#rail").innerHTML;
+  assert.match(rendered, /class="item[^"]*\bheld\b[^"]*"/);
+  // A hold is never drawn as a mark: no "blocked" class, no .why chip.
+  assert.doesNotMatch(rendered, /class="item[^"]*\bblocked\b[^"]*"/);
+  assert.doesNotMatch(rendered, /class="why/);
+  assert.match(rendered, /class="behind"/);
+  assert.match(rendered, /behind 1</);
+});
+
+test("draw: an item with no held entry renders exactly as it does today", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:1", source: "s1", stage: "backlog", title: "free to run" }],
+  }));
+  const rendered = p.el("#rail").innerHTML;
+  assert.doesNotMatch(rendered, /\bheld\b/);
+  assert.doesNotMatch(rendered, /class="behind"/);
+});
+
+// A mark always wins the class list: an item that is somehow both marked and
+// named in `held` is drawn blocked, never held — Blocked is the mark, and a
+// hold behind a mark says nothing on its own (heldOf on the server already
+// skips a marked item's own hold for the same reason).
+test("draw: a blocked item is never also drawn held", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:2", source: "s1", stage: "backlog", title: "stuck", blocked: true }],
+    blocks: { "s1:2": { kind: "worktree", reason: "dirty checkout" } },
+    held: { "s1:2": { by: "s1:1", stage: "backlog", target: "working", blocked: false } },
+  }));
+  const rendered = p.el("#rail").innerHTML;
+  assert.match(rendered, /class="item[^"]*\bblocked\b[^"]*"/);
+  assert.doesNotMatch(rendered, /class="item[^"]*\bheld\b[^"]*"/);
+});

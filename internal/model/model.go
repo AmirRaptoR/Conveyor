@@ -40,6 +40,17 @@ type Item struct {
 	// stage it stopped in, and the work resumes there instead of restarting.
 	Blocked bool `json:"blocked,omitempty"`
 
+	// DependsOn names the items this one is sequenced behind, by item ID. The
+	// engine never parses it out of anything: the provider translates its own
+	// vocabulary ("Depends on #33" in a GitHub issue body) into IDs, exactly
+	// as it already does for Priority and Blocked.
+	//
+	// An ID absent from the listing is ignored rather than held forever — a
+	// dependency on an un-onboarded issue, another repository, or a typo must
+	// not stop the line. agents/_deps still catches those at implement time,
+	// which is where a fact about the outside world belongs.
+	DependsOn []string `json:"dependsOn,omitempty"`
+
 	// BlockReason is a listing-supplied reason for Blocked, read only when no
 	// run in history produced one — a mark this pipeline did not itself make
 	// (a closed issue found sitting in a non-terminal stage) has no run to

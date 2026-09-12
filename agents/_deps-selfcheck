@@ -17,6 +17,21 @@ chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2]
 # space so it compares against chk's single-line expectation.
 refs() { dependency_refs "$1" | tr '\n' ' ' | sed -E 's/ $//'; }
 
+# --- the corpus shared with providers/github/selfcheck.sh -------------------
+# _deps-fixtures.jsonl is the one file both suites read. It exists because
+# agents/ and providers/ are separately-resolvable roots and providers must
+# not reach into agents — so the two parses are stated twice on purpose — but
+# a change to either regex must fail the *other* suite's test, not just its
+# own, or the two drift silently. This corpus is what keeps them honest: a
+# change to dependency_refs that this suite alone would miss is exactly the
+# case list.sh's own selfcheck (reading the same file) exists to catch.
+while IFS= read -r line; do
+	body=$(jq -r '.body' <<<"$line")
+	name=$(jq -r '.name' <<<"$line")
+	want=$(jq -r '.want | join(" ")' <<<"$line")
+	chk "corpus: $name" "$(refs "$body")" "$want"
+done <"$here/_deps-fixtures.jsonl"
+
 # --- a dependency at the start of its own line still matches ----------------
 chk "a line-start declaration matches"     "$(refs 'Depends on #12')" "12"
 chk "a list-item declaration matches"      "$(refs '- depends on #12')" "12"
@@ -41,9 +56,9 @@ chk "a mid-line declaration with nothing before it" \
 # --- the sentence-break cut is relative to the keyword, not the line --------
 # "Depends on: ADR 9 (merged)." ends its own sentence before "Blocks: #12,
 # #13 depend on this one" starts; the second clause's "depend on" (no s) is
-# not a keyword of its own, so #12 and #13 are never donated.
-chk "a later clause's own numbers are not donated by an earlier keyword" \
-	"$(refs 'Depends on: ADR 9 (merged). Blocks: #12, #13 depend on this one')" ""
+# not a keyword of its own, so #12 and #13 are never donated. Moved into the
+# shared corpus above ("three traps in one body donate nothing") rather than
+# duplicated here.
 
 # A number named earlier in the very same clause as the keyword — not cut
 # off by a sentence break at all — is still not donated: only the text from

@@ -396,3 +396,149 @@ func TestStallRetryClearsATotallyStalledBoard(t *testing.T) {
 		return !s.state.Items[0].Blocked && !s.state.Items[1].Blocked
 	})
 }
+
+// A held item is not a blocked item. Blocked is a mark somebody has to
+// clear; held disappears on its own when the dependency moves. The board is
+// told which is which, or it lies about what needs a person.
+func TestHeldIsReportedAndIsNotAMark(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Source: "s1", Stage: "backlog"},
+		{ID: "s1:2", Source: "s1", Stage: "backlog", DependsOn: []string{"s1:1"}},
+	}
+
+	w := httptest.NewRecorder()
+	s.handleState(w, httptest.NewRequest("GET", "/api/state", nil))
+	var got State
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+
+	h, ok := got.Held["s1:2"]
+	if !ok {
+		t.Fatal("the follower was not reported as held")
+	}
+	if h.By != "s1:1" || h.Stage != "backlog" || h.Target != "working" {
+		t.Fatalf("hold = %+v, want by s1:1 in backlog, target working", h)
+	}
+	if h.Blocked {
+		t.Fatal("an unmarked dependency was reported as blocked")
+	}
+	if _, ok := got.Held["s1:1"]; ok {
+		t.Fatal("the item at the head of the sequence was reported as held")
+	}
+	// blocked:false and no entry in blocks — a hold is never drawn as a mark.
+	if got.Items[1].Blocked {
+		t.Fatal("a held item must not itself be reported blocked")
+	}
+	if _, inBlocks := got.Blocks["s1:2"]; inBlocks {
+		t.Fatal("a held item must carry no Blocks entry")
+	}
+}
+
+// held is computed fresh on every request, never cached: once the dependency
+// itself moves on, the follower's entry must be gone from the very next
+// /api/state — no stale hold left drawn on a card that is free to move.
+func TestHeldEntryDisappearsOnceTheDependencyMovesOn(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Source: "s1", Stage: "backlog"},
+		{ID: "s1:2", Source: "s1", Stage: "backlog", DependsOn: []string{"s1:1"}},
+	}
+	w := httptest.NewRecorder()
+	s.handleState(w, httptest.NewRequest("GET", "/api/state", nil))
+	var first State
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	if _, held := first.Held["s1:2"]; !held {
+		t.Fatal("setup: the follower should start out held")
+	}
+
+	// The dependency moves on to "working" — s1:2 may now share that stage.
+	s.mu.Lock()
+	s.state.Items[0].Stage = "working"
+	s.mu.Unlock()
+
+	w2 := httptest.NewRecorder()
+	s.handleState(w2, httptest.NewRequest("GET", "/api/state", nil))
+	var second State
+	if err := json.Unmarshal(w2.Body.Bytes(), &second); err != nil {
+		t.Fatal(err)
+	}
+	if _, held := second.Held["s1:2"]; held {
+		t.Fatal("the follower is still reported held after its dependency moved on")
+	}
+}
+
+// A held item cannot be dragged to start early either: the start endpoint
+// refuses with 409 and names the dependency and its stage.
+func TestStartRefusesAHeldItem(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Source: "s1", Stage: "backlog"},
+		{ID: "s1:2", Source: "s1", Stage: "backlog", DependsOn: []string{"s1:1"}},
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/items/s1:2/start", nil)
+	req.SetPathValue("id", "s1:2")
+	s.handleStart(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d (%s), want 409", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "s1:1") || !strings.Contains(w.Body.String(), "backlog") {
+		t.Errorf("refusal = %q, want it to name the dependency and its stage", w.Body.String())
+	}
+}
+
+// A dependency cycle is a person's mistake in an issue body, not a fault the
+// pipeline should wedge on: every item in it stays workable, and the board is
+// told once, by name, through the same Warnings strip a listing failure
+// already uses. Computed fresh from the current listing on every request, the
+// same as Held, so a cycle a person has since repaired is simply gone from
+// the very next /api/state.
+func TestCycleWarningAppearsAndClearsItself(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Source: "s1", Stage: "backlog", DependsOn: []string{"s1:2"}},
+		{ID: "s1:2", Source: "s1", Stage: "backlog", DependsOn: []string{"s1:1"}},
+	}
+
+	w := httptest.NewRecorder()
+	s.handleState(w, httptest.NewRequest("GET", "/api/state", nil))
+	var got State
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly one cycle warning", got.Warnings)
+	}
+	if !strings.Contains(got.Warnings[0], "s1:1") || !strings.Contains(got.Warnings[0], "s1:2") {
+		t.Errorf("warning %q does not name both items in the cycle", got.Warnings[0])
+	}
+	// A cycle is dropped, not held: both items stay workable.
+	if _, held := got.Held["s1:1"]; held {
+		t.Error("an item in a dropped cycle was reported held")
+	}
+
+	// The person fixes it by hand: s1:2 no longer names s1:1.
+	s.mu.Lock()
+	s.state.Items[1].DependsOn = nil
+	s.mu.Unlock()
+
+	w2 := httptest.NewRecorder()
+	s.handleState(w2, httptest.NewRequest("GET", "/api/state", nil))
+	var second State
+	if err := json.Unmarshal(w2.Body.Bytes(), &second); err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Warnings) != 0 {
+		t.Errorf("warnings = %v, want none once the cycle is repaired", second.Warnings)
+	}
+}

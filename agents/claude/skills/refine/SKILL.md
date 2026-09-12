@@ -51,6 +51,8 @@ Loop — live, batching 3-5 questions per `AskUserQuestion` call if attended; se
 
 **The 90% bar, concretely:** you are at 90% when every acceptance criterion could be handed to someone who has never seen the issue and they could verify it without asking you anything. Not a feeling — check the criteria one by one.
 
+**If this issue's own text, its parent, or the codebase says it is sequenced behind another issue, write `Depends on #N` naming the immediate predecessor** — into the body, not only into "Technical notes" prose. The pipeline reads that exact line (`agents/_deps`, and the GitHub provider's own listing) to hold this item behind the one it names; recording it here is what makes an already-known dependency enforced instead of merely documented. Only the immediate predecessor: a chain of siblings each naming the one before it needs no closure computed. This is not the same job as inferring an unstated order across a family of sibling issues nothing declares — that is a later, separate stage's business.
+
 Ask about **requirements**, not implementation. "What should happen when the token is already expired?" is refinement. "Should we use Redis or Postgres for this?" is design — only ask (or self-answer) if the answer changes the acceptance criteria.
 
 Keep looping while questions remain. Do not stop at "clear enough".

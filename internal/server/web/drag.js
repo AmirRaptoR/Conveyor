@@ -232,6 +232,15 @@ $("#unblock-all").onclick = async e => {
     fault(msg);
     return;
   }
+  // The response is the authoritative count, not the pre-flight estimate
+  // above: a marked item the sequencing rule is still holding got no
+  // provider write at all, and only the server knows how many of those
+  // there were.
+  const body = typeof res.json === "function" ? await res.json().catch(() => ({})) : {};
+  if (body.heldByDependencies) {
+    alert(`${body.unblocking || 0} item${body.unblocking === 1 ? "" : "s"} handed back. `
+      + `${body.heldByDependencies} left marked — still sequenced behind something that has not caught up yet.`);
+  }
   setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 2000);
 };
 

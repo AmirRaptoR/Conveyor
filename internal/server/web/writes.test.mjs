@@ -218,6 +218,38 @@ test("#unblock-all: a rejected fetch re-enables without waiting on the 2s timer"
   assert.equal(btn.textContent, "Unblock all (1)");
 });
 
+// The response is the authoritative count: a marked item the sequencing rule
+// is still holding got no provider write at all, and only the server's own
+// heldByDependencies figure — never the pre-flight estimate computed before
+// the request — says how many of those there were.
+test("#unblock-all: a response naming heldByDependencies is reported once the request returns", async () => {
+  const p = await page();
+  await withState(p, { items: [{ id: "issue-9", blocked: true }] });
+  p.setFetch(async () => ({
+    ok: true, status: 200,
+    text: async () => "", json: async () => ({ unblocking: 2, waitingOnYou: 0, heldByDependencies: 1 }),
+  }));
+  const btn = p.el("#unblock-all");
+  btn.textContent = "Unblock all (3)";
+  await btn.onclick({ target: btn });
+  assert.equal(p.calls.alert.length, 1);
+  assert.match(p.calls.alert[0], /2 items? handed back/);
+  assert.match(p.calls.alert[0], /1 left marked/);
+});
+
+// A stub fetch response with no .json() at all (nothing this codebase's own
+// tests exercised before this feature) must not throw — only a real response
+// naming heldByDependencies triggers the report.
+test("#unblock-all: a response with no json() method is not reported and does not throw", async () => {
+  const p = await page();
+  await withState(p, { items: [{ id: "issue-9", blocked: true }] });
+  p.setFetch(async () => ({ ok: true, status: 200, text: async () => "" }));
+  const btn = p.el("#unblock-all");
+  btn.textContent = "Unblock all (1)";
+  await assert.doesNotReject(btn.onclick({ target: btn }));
+  assert.equal(p.calls.alert.length, 0);
+});
+
 test("#unblock-all: a 2xx response keeps the existing (timer-based) re-enable", async () => {
   const p = await page();
   await withState(p, { items: [{ id: "issue-9", blocked: true }] });

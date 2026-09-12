@@ -183,6 +183,45 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 			| (((.state // "OPEN") | ascii_downcase) == "closed") as $isClosed
 			| ((.stateReason // "") | ascii_downcase) as $why
 			| (.body // "") as $body
+			# The sequence, translated out of GitHubs vocabulary and into
+			# item ids — the engine must never see a "#". Same syntax
+			# agents/_deps reads, and stated twice on purpose: providers and
+			# agents are separately-resolvable roots, and coupling them to
+			# share a regex would be worse than the duplication. The shared
+			# fixture corpus both selfchecks read is what keeps the two from
+			# drifting.
+			#
+			# The body is split into sentences — at a line break, or at
+			# "." / "!" / "?" followed by whitespace — before a sentence is
+			# checked for a keyword, so a declaration reached only after an
+			# earlier, unrelated sentence on the same line is still read, and
+			# a sentence that merely shares a line with a declaration is
+			# not. "depends on" / "blocked by" / "blocks on" match anywhere
+			# in the sentence; "requires" / "after" are ordinary English
+			# words, so they match only where the sentence opens (after
+			# markdown noise). Only the numbers from the keyword onward,
+			# within that sentence, are taken.
+			#
+			# The anchored branch is checked first: when a sentence opens
+			# with "requires"/"after", that keyword is always the earliest
+			# possible match in it, so the cut is taken there even if
+			# "depends on"/"blocked by"/"blocks on" also occurs later in the
+			# same sentence. Only a sentence that does not open with the
+			# anchored pair falls through to the phrase-anywhere cut.
+			| ([
+				$body
+				| [splits("\n")]
+				| map(splits("(?<=[.!?])[ \t]+"))
+				| .[]
+				| if test("^[\\s*_~`>+-]*(requires|after)\\b"; "i") then
+					sub("^[\\s*_~`>+-]*(?:requires|after)\\b"; ""; "i")
+				elif test("\\b(depends on|blocked by|blocks on)\\b"; "i") then
+					sub("^.*?\\b(?:depends on|blocked by|blocks on)\\b"; ""; "i")
+				else
+					empty
+				end
+				| scan("#[0-9]+")
+			] | map(ltrimstr("#")) | unique | map("\($source):\(.)")) as $deps
 			# Opt-in, and these are the three ways in: the pipeline put
 			# it here, a person handed it over, or it stopped.
 			| select($mapped != null
@@ -258,6 +297,10 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 				  blockReason: ($body | block_said | .reason // "")}
 					| with_entries(select(.value != "")))
 			end)
+			# Omitted entirely when the body declares nothing, rather
+			# than an empty array: absence is what the item schema
+			# already uses for "this field has nothing to say".
+			+ (if ($deps | length) > 0 then {dependsOn: $deps} else {} end)
 			# What the labels would have to say for this listing to be
 			# reproducible. Only ever set when they do not already say it.
 			+ (if $stage != ($mapped // $default) then {reconcile: $stage} else {} end))

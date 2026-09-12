@@ -113,6 +113,49 @@ check "a marked issue keeps the stage it stopped in" \
 check "an unmarked issue is not blocked" \
 	"false" "$(jq -r '.[0].blocked' "$tmp/out.json")"
 
+check "an issue declaring nothing has no dependencies key at all" \
+	"null" "$(jq -r '.[] | select(.ref == "19") | .dependsOn' "$tmp/out.json")"
+
+# The body is the only place a sequence is written down, and the provider is
+# the only thing that reads it: the engine never learns what "#31" means.
+#
+# agents/_deps-fixtures.jsonl is the one corpus both this suite and
+# agents/_deps-selfcheck read — providers and agents are separately-resolvable
+# roots and providers must not reach into agents, so the parse is stated twice
+# on purpose, but a change to either regex must fail the OTHER suite's test
+# too, not just its own, or the two drift silently apart. Each fixture gets
+# its own one-issue listing, tagged with the bare onboarding label so it needs
+# no stage mapping, and its want[] is checked against dependsOn translated
+# into this fixture's own item ids.
+mkdir -p "$tmp/stub2"
+cat >"$tmp/stub2/gh" <<'STUB'
+#!/usr/bin/env bash
+data=$(cat "$FIXTURE_DATA")
+case "$*" in
+	*"--state open"*)   jq '[.[] | select(.state == "OPEN")]' <<<"$data" ;;
+	*"--state closed"*) jq '[.[] | select(.state == "CLOSED")]' <<<"$data" ;;
+	*)                  echo "$data" ;;
+esac
+STUB
+chmod +x "$tmp/stub2/gh"
+
+n=1001
+while IFS= read -r fixture; do
+	[[ -n "$fixture" ]] || continue
+	name=$(jq -r '.name' <<<"$fixture")
+	want=$(jq -r '[.want[] | "midgame:\(.)"] | join(",")' <<<"$fixture")
+	jq -n --argjson n "$n" --arg body "$(jq -r '.body' <<<"$fixture")" \
+		'[{state:"OPEN", number:$n, title:"corpus fixture", body:$body,
+		   labels:[{name:"conveyor"}], url:"https://example.test/corpus",
+		   assignees:[]}]' >"$tmp/fixture.json"
+	FIXTURE_DATA="$tmp/fixture.json" \
+	PATH="$tmp/stub2:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/corpus-out.json" \
+		./list.sh <<<'{"terminalStages":["ready"]}' >/dev/null 2>&1
+	got=$(jq -r --argjson n "$n" '.[] | select(.ref == ($n|tostring)) | .dependsOn // [] | join(",")' "$tmp/corpus-out.json")
+	check "corpus: $name" "$want" "$got"
+	n=$((n + 1))
+done <"../../agents/_deps-fixtures.jsonl"
+
 # There is no ignore list any more, because not listing is what happens by
 # default: an issue is left alone by saying nothing about it. The old opt-out
 # label is now an ordinary word a repository may keep or delete, and it decides

@@ -81,6 +81,7 @@ func (s *Server) stalled(ctx context.Context, every time.Duration) {
 			continue
 		}
 		s.mu.RLock()
+		deps := pipeline.NewDeps(s.cfg, s.state.Items)
 		var held []model.Item
 		moving := 0
 		for _, it := range s.state.Items {
@@ -96,7 +97,7 @@ func (s *Server) stalled(ctx context.Context, every time.Duration) {
 					held = append(held, it)
 				}
 			default:
-				if _, ok := pipeline.Target(s.cfg, &it); ok {
+				if _, ok := pipeline.Target(s.cfg, &it, deps); ok {
 					moving++
 				}
 			}

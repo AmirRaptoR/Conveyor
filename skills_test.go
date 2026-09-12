@@ -177,6 +177,29 @@ func TestImplementSkillDefersToItsBranch(t *testing.T) {
 	}
 }
 
+// The engine holds a follower behind what it depends on (pipeline.Deps), but
+// only if something wrote the dependency down. The refine skill is where an
+// issue's body gets written in the first place, so it has to be the one that
+// records a dependency the issue's own text, its parent, or the codebase
+// already states — issue #98.
+func TestRefineSkillRecordsAStatedDependency(t *testing.T) {
+	path := filepath.Join(skillsDir(t), "refine", "SKILL.md")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(raw)
+	if !strings.Contains(body, "Depends on #N") {
+		t.Errorf("%s: does not state the `Depends on #N` line a sequenced issue must carry", path)
+	}
+	if !strings.Contains(body, "immediate predecessor") {
+		t.Errorf("%s: does not say the line names only the immediate predecessor", path)
+	}
+	if !strings.Contains(body, "pipeline reads") {
+		t.Errorf("%s: does not say why — the pipeline reads that line to enforce the sequence", path)
+	}
+}
+
 // slashCommand matches a PROMPT that leads with a slash command, e.g.
 // "/refine $REF" or "/implement $REF auto" — the adapters treat a leading
 // "/" specially (it must lead the message, per agents/claude/refine), so

@@ -24,7 +24,12 @@ import (
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	st := s.state
-	st.Items = pipeline.Order(s.cfg, s.state.Items, s.state.Order)
+	deps := pipeline.NewDeps(s.cfg, s.state.Items)
+	st.Items = pipeline.Order(s.cfg, s.state.Items, s.state.Order, deps)
+	st.Held = heldOf(s.cfg, s.state.Items, deps)
+	if len(deps.Cycles) > 0 {
+		st.Warnings = append(append([]string(nil), s.state.Warnings...), deps.Cycles...)
+	}
 	bySrc, byStage, held, max, perSrc, perStage := s.eng.Locks().Snapshot()
 	st.Slots = SlotsView{BySource: bySrc, ByStage: byStage, Global: held, GlobalMax: max,
 		PerSource: perSrc, PerStage: perStage, Running: int(s.inFlight.Load()),
@@ -167,15 +172,18 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	// Built while the listing is still held: the full board, not this one
+	// item, is what the gate needs to answer whether it is held.
+	deps := pipeline.NewDeps(s.cfg, s.state.Items)
 	s.mu.RUnlock()
 	if !found {
 		http.Error(w, "no item "+id+" on the board", http.StatusNotFound)
 		return
 	}
 
-	target, ok := pipeline.Target(s.cfg, &item)
+	target, ok := pipeline.Target(s.cfg, &item, deps)
 	if !ok {
-		http.Error(w, s.whyStuck(item), http.StatusConflict)
+		http.Error(w, s.whyStuck(item, deps), http.StatusConflict)
 		return
 	}
 	if body.Stage != "" && body.Stage != target {
@@ -379,8 +387,9 @@ func (s *Server) answerThenUnblock(ctx context.Context, item model.Item, answer 
 // request. The board is republished as they land.
 func (s *Server) handleUnblockAll(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
-	var held []model.Item
-	skipped := 0
+	deps := pipeline.NewDeps(s.cfg, s.state.Items)
+	var toUnblock []model.Item
+	waitingOnYou, heldByDependencies := 0, 0
 	for _, it := range s.state.Items {
 		if !it.Blocked {
 			continue
@@ -390,16 +399,58 @@ func (s *Server) handleUnblockAll(w http.ResponseWriter, r *http.Request) {
 		// checkout, an agent that was over its limit all night. None of that
 		// answers a question, and handing one back unanswered spends an agent
 		// run to be asked it a second time. A question is cleared by answering
-		// it on its own card, which is the only thing that resolves it.
+		// it on its own card, which is the only thing that resolves it. This
+		// skip comes first: an item that is both asked and held is counted
+		// once, under waitingOnYou — the question is what needs a person.
 		if s.blocks[it.ID].Asked {
-			skipped++
+			waitingOnYou++
 			continue
 		}
-		held = append(held, it)
+		// The sequencing rule is asked directly — "would this item be held
+		// if it were not marked" — never through pipeline.Target, which
+		// refuses a marked item on its own mark before the gate is ever
+		// reached. Decided from DependsOn and the listing alone: nothing
+		// here reads the mark's own kind or the word "dependency" to decide
+		// it — Scripts own that vocabulary, the engine never interprets it.
+		//
+		// The residual: a dependency the listing cannot see (an
+		// un-onboarded issue, another repository) is not a hold the engine
+		// can compute, so the item is still cleared here. agents/_deps
+		// re-marks it at implement time, before the worktree and before any
+		// model run, which is the accepted cost of that gap.
+		if next, ok := nextStage(s.cfg, it.Stage); ok {
+			if _, held := deps.Held(&it, next); held {
+				heldByDependencies++
+				continue
+			}
+		}
+		toUnblock = append(toUnblock, it)
 	}
 	s.mu.RUnlock()
-	s.spawn(func() { s.unblockAll(s.ctx, held) })
-	writeJSON(w, map[string]int{"unblocking": len(held), "waitingOnYou": skipped})
+	s.spawn(func() { s.unblockAll(s.ctx, toUnblock) })
+	writeJSON(w, map[string]int{
+		"unblocking":         len(toUnblock),
+		"waitingOnYou":       waitingOnYou,
+		"heldByDependencies": heldByDependencies,
+	})
+}
+
+// nextStage is the stage an item would move into were it not marked — the
+// same "OnSuccess, or its own name on a re-run" logic Target and heldOf both
+// use, needed here because a marked item's own path through Target is
+// refused before it ever reaches that computation.
+func nextStage(cfg *config.Config, stageName string) (string, bool) {
+	st, ok := cfg.Stage(stageName)
+	if !ok || st.Terminal {
+		return "", false
+	}
+	if st.Runs() {
+		return st.Name, true
+	}
+	if st.OnSuccess == "" {
+		return "", false
+	}
+	return st.OnSuccess, true
 }
 
 // unblockAll clears marks one at a time. Sequentially on purpose: perSource is
@@ -689,7 +740,11 @@ func (s *Server) unblock(ctx context.Context, item model.Item) error {
 }
 
 // whyStuck says why an item has nowhere to go, in the operator's terms.
-func (s *Server) whyStuck(it model.Item) string {
+//
+// deps is the graph the caller already built from the full listing — never
+// rebuilt here, since s.mu must already be released by the time this is
+// called (see handleStart) and a fresh build would need the lock again.
+func (s *Server) whyStuck(it model.Item, deps pipeline.Deps) string {
 	if it.Blocked {
 		return it.ID + " is waiting for a person — clear its mark and the pipeline takes it back"
 	}
@@ -700,7 +755,50 @@ func (s *Server) whyStuck(it model.Item) string {
 	case st.Terminal:
 		return fmt.Sprintf("%s is in %s, the end of the line", it.ID, it.Stage)
 	}
+	next := st.OnSuccess
+	if st.Runs() {
+		next = st.Name
+	}
+	if next != "" {
+		if hold, held := deps.Held(&it, next); held {
+			if hold.Blocked {
+				return fmt.Sprintf("%s is held behind %s, which is marked in %s — clear that mark and this moves on its own",
+					it.ID, hold.By, hold.Stage)
+			}
+			return fmt.Sprintf("%s is held behind %s, which is still in %s — it cannot enter %s first",
+				it.ID, hold.By, hold.Stage, hold.Target)
+		}
+	}
 	return fmt.Sprintf("%s has nowhere to go from %s", it.ID, it.Stage)
+}
+
+// heldOf is every item the sequencing rule is currently holding, keyed by id.
+//
+// Computed rather than remembered: a hold is a fact about where two items
+// are standing right now, so a cached one would be wrong the moment either
+// moves. deps must come from the same, full listing items was drawn from.
+func heldOf(cfg *config.Config, items []model.Item, deps pipeline.Deps) map[string]pipeline.Hold {
+	out := map[string]pipeline.Hold{}
+	for i := range items {
+		it := &items[i]
+		if it.Blocked {
+			continue // a mark is the whole story; a hold behind it says nothing
+		}
+		stage, ok := cfg.Stage(it.Stage)
+		if !ok || stage.Terminal {
+			continue
+		}
+		next := stage.OnSuccess
+		if stage.Runs() {
+			next = stage.Name
+		} else if next == "" {
+			continue
+		}
+		if h, held := deps.Held(it, next); held {
+			out[it.ID] = h
+		}
+	}
+	return out
 }
 
 // whyBusy names what is holding the slot, in the operator's terms.

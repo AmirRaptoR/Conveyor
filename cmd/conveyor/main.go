@@ -368,9 +368,13 @@ func cmdRun(args []string) error {
 
 	stage := *stageName
 	if stage == "" {
-		target, ok := pipeline.Target(cfg, item)
+		// Built from this source's full listing, the same one item was found
+		// in — the dependency that must hold it is as likely to be sitting
+		// in this list as anywhere.
+		deps := pipeline.NewDeps(cfg, res.Items)
+		target, ok := pipeline.Target(cfg, item, deps)
 		if !ok {
-			return fmt.Errorf("no stage to run: %s", declineReason(cfg, item))
+			return fmt.Errorf("no stage to run: %s", declineReason(cfg, item, deps))
 		}
 		stage = target
 	}
@@ -425,7 +429,11 @@ func cmdTick(args []string) error {
 			}
 			// The same order the board writes, so a tick from the terminal and
 			// a tick from the button choose the same item.
-			item, target := pipeline.Pick(cfg, res.Items, order.IDs())
+			// The graph comes from the full listing, never from a subset:
+			// the dependency that must hold a follower is often the very
+			// item a filter has already dropped.
+			deps := pipeline.NewDeps(cfg, res.Items)
+			item, target := pipeline.Pick(cfg, res.Items, order.IDs(), deps)
 			if item == nil {
 				fmt.Printf("%s: nothing to do\n", s.Name)
 				break

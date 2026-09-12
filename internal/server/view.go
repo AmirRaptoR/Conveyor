@@ -33,6 +33,14 @@ type State struct {
 	// provider is the authority on *whether* an item is marked; this is the
 	// engine's own note on *why*, recovered from the run that marked it.
 	Blocks map[string]Block `json:"blocks,omitempty"`
+	// Held is why an item with somewhere to go is not going there: it is
+	// sequenced behind something that has not reached that stage yet. A
+	// sibling of Blocks, and deliberately not the same thing — nobody has to
+	// clear this, and it disappears on its own when the dependency moves.
+	// Computed fresh from the current listing on every request, never
+	// cached: a dependency that moves on, marks, unmarks, or leaves the
+	// listing entirely is reflected in the very next /api/state.
+	Held map[string]pipeline.Hold `json:"held,omitempty"`
 	// Times is how long each item has been in the stage it is in, keyed by
 	// item id — a sibling of Blocks, kept the same way: written the moment a
 	// transition lands an item somewhere new, recovered from run history for

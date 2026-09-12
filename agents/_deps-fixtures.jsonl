@@ -1,0 +1,5 @@
+{"name": "a dependency line becomes a ref", "body": "Depends on #21", "want": ["21"]}
+{"name": "several numbers on one line become several refs", "body": "Blocked by: #21, #23", "want": ["21", "23"]}
+{"name": "three traps in one body donate nothing", "body": "Related: #9\nthe record the board depends on: x\nDepends on: ADR 9 (merged). Blocks: #12, #13 depend on this one", "want": []}
+{"name": "a mid-line declaration is read, not just a line-start one", "body": "Part of the live duel epic (#8). Depends on #21, #23 and #25, all still open.", "want": ["21", "23", "25"]}
+{"name": "an anchored keyword at the start still donates a later phrase-anywhere match", "body": "Requires #21, blocked by #23", "want": ["21", "23"]}

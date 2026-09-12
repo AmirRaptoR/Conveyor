@@ -77,7 +77,7 @@ func (s *Server) handleDoctorStart(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.RLock()
 	var marked []string
-	for _, it := range pipeline.Order(s.cfg, s.state.Items, s.state.Order) {
+	for _, it := range pipeline.Order(s.cfg, s.state.Items, s.state.Order, pipeline.NewDeps(s.cfg, s.state.Items)) {
 		if it.Blocked {
 			marked = append(marked, it.ID)
 		}
