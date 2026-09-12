@@ -68,7 +68,22 @@ data='[
   "url":"https://example.test/21","assignees":[]},
  {"number":27,"title":"Closed mid-flight","body":"","state":"CLOSED",
   "labels":[{"name":"status:in-progress"}],
-  "url":"https://example.test/27","assignees":[],"closedAt":"2026-08-29T00:00:00Z"}
+  "url":"https://example.test/27","assignees":[],"closedAt":"2026-08-29T00:00:00Z"},
+ {"state":"OPEN","number":33,"title":"Improvement child 3","body":"Depends on #31\n",
+  "labels":[{"name":"conveyor"}],
+  "url":"https://example.test/33","assignees":[]},
+ {"state":"OPEN","number":35,"title":"Two at once","body":"Blocked by: #31, #33\n",
+  "labels":[{"name":"conveyor"}],
+  "url":"https://example.test/35","assignees":[]},
+ {"state":"OPEN","number":37,"title":"Not a dependency","body":"Related: #9\nthe record the board depends on: x\nDepends on: ADR 9 (merged). Blocks: #12, #13 depend on this one\n",
+  "labels":[{"name":"conveyor"}],
+  "url":"https://example.test/37","assignees":[]},
+ {"state":"OPEN","number":39,"title":"Mid-line, not line-start","body":"Part of the live duel epic (#8). Depends on #31, #33 and #35, all still open.\n",
+  "labels":[{"name":"conveyor"}],
+  "url":"https://example.test/39","assignees":[]},
+ {"state":"OPEN","number":41,"title":"Anchored and phrase-anywhere in one sentence","body":"Requires #31, blocked by #33\n",
+  "labels":[{"name":"conveyor"}],
+  "url":"https://example.test/41","assignees":[]}
 ]'
 case "$*" in
 	*"--state open"*)   jq '[.[] | select(.state == "OPEN")]' <<<"$data" ;;
@@ -112,6 +127,32 @@ check "a marked issue keeps the stage it stopped in" \
 	"in-progress" "$(jq -r '.[] | select(.ref == "11") | .stage' "$tmp/out.json")"
 check "an unmarked issue is not blocked" \
 	"false" "$(jq -r '.[0].blocked' "$tmp/out.json")"
+
+# The body is the only place a sequence is written down, and the provider is
+# the only thing that reads it: the engine never learns what "#31" means.
+check "a dependency line becomes an item id" \
+	"midgame:31" "$(jq -r '.[] | select(.ref == "33") | .dependsOn | join(",")' "$tmp/out.json")"
+check "two numbers on one line become two ids" \
+	"midgame:31,midgame:33" "$(jq -r '.[] | select(.ref == "35") | .dependsOn | join(",")' "$tmp/out.json")"
+# Three traps in one body, and none of them is a dependency: a "Related:" line,
+# the word "depends" mid-sentence, and a sentence whose own dependency clause
+# ends before it starts — "Blocks: #12, #13 depend on this one" describes who
+# depends on IT, in the sentence right after "Depends on: ADR 9 (merged)."
+# agents/_deps splits into sentences for exactly this reason.
+check "prose that merely says 'depends' is not a dependency" \
+	"" "$(jq -r '.[] | select(.ref == "37") | .dependsOn // [] | join(",")' "$tmp/out.json")"
+check "an issue declaring nothing has no dependencies key at all" \
+	"null" "$(jq -r '.[] | select(.ref == "19") | .dependsOn' "$tmp/out.json")"
+# The declaring sentence is reached only after an earlier, unrelated one on
+# the same line — the case a line-start anchor alone would miss, and the one
+# both parsers have to keep agreeing on as they evolve.
+check "a mid-line declaration is read, not just a line-start one" \
+	"midgame:31,midgame:33,midgame:35" "$(jq -r '.[] | select(.ref == "39") | .dependsOn | join(",")' "$tmp/out.json")"
+# The anchored keyword opens the sentence, so it is always the earliest
+# possible cut point — the whole rest of the sentence counts, including a
+# phrase-anywhere keyword that also occurs later in it.
+check "an anchored keyword at the start still donates a later phrase-anywhere match" \
+	"midgame:31,midgame:33" "$(jq -r '.[] | select(.ref == "41") | .dependsOn | join(",")' "$tmp/out.json")"
 
 # There is no ignore list any more, because not listing is what happens by
 # default: an issue is left alone by saying nothing about it. The old opt-out
