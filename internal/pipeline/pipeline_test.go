@@ -125,16 +125,16 @@ func TestAMarkedItemIsNeverPicked(t *testing.T) {
 		{Name: "done", Terminal: true},
 	}}
 	held := model.Item{ID: "a:1", Source: "a", Stage: "refining", Title: "needs a human", Blocked: true}
-	if _, ok := Target(cfg, &held); ok {
+	if _, ok := Target(cfg, &held, Deps{}); ok {
 		t.Error("a marked item was given a target")
 	}
-	if got, _ := Pick(cfg, []model.Item{held}, nil); got != nil {
+	if got, _ := Pick(cfg, []model.Item{held}, nil, Deps{}); got != nil {
 		t.Errorf("picked %v, want nothing — it is waiting for a person", got)
 	}
 
 	// And clearing the mark hands the job straight back, where it stopped.
 	held.Blocked = false
-	got, target := Pick(cfg, []model.Item{held}, nil)
+	got, target := Pick(cfg, []model.Item{held}, nil, Deps{})
 	if got == nil || target != "refining" {
 		t.Fatalf("after unblocking: picked %v for %q, want a:1 re-run in refining", got, target)
 	}
@@ -155,7 +155,7 @@ func TestRecoveryOutranksTheOrderedBacklog(t *testing.T) {
 		{ID: "a:2", Source: "a", Stage: "refining", Title: "interrupted mid-stage"},
 	}
 	// a:1 is first in the manual order and would otherwise win outright.
-	got, target := Pick(cfg, items, []string{"a:1", "a:2"})
+	got, target := Pick(cfg, items, []string{"a:1", "a:2"}, Deps{})
 	if got == nil || got.ID != "a:2" {
 		t.Fatalf("picked %v, want the interrupted a:2", got)
 	}
@@ -191,14 +191,14 @@ func TestLaterStagesAreWorkedFirst(t *testing.T) {
 
 	want := []string{"a:4", "a:3", "a:2", "a:1"}
 	var got []string
-	for _, it := range Order(cfg, items, order) {
+	for _, it := range Order(cfg, items, order, Deps{}) {
 		got = append(got, it.ID)
 	}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("Order = %v, want %v — furthest along first", got, want)
 	}
 
-	first, target := Pick(cfg, items, order)
+	first, target := Pick(cfg, items, order, Deps{})
 	if first == nil || first.ID != "a:4" {
 		t.Fatalf("picked %v, want a:4 — the item closest to done", first)
 	}
@@ -221,7 +221,7 @@ func TestRecoveryWinsAtEqualDepth(t *testing.T) {
 		{ID: "a:1", Source: "a", Stage: "ready", Title: "next up, dragged to the top"},
 		{ID: "a:2", Source: "a", Stage: "in-progress", Title: "interrupted mid-stage"},
 	}
-	got, target := Pick(cfg, items, []string{"a:1", "a:2"})
+	got, target := Pick(cfg, items, []string{"a:1", "a:2"}, Deps{})
 	if got == nil || got.ID != "a:2" {
 		t.Fatalf("picked %v, want the interrupted a:2", got)
 	}
@@ -247,7 +247,7 @@ func TestOrderStillDecidesWithinAStage(t *testing.T) {
 		{ID: "a:3", Source: "a", Stage: "backlog", Title: "urgent but lower", Priority: &p0},
 	}
 	var got []string
-	for _, it := range Order(cfg, items, []string{"a:2", "a:3"}) {
+	for _, it := range Order(cfg, items, []string{"a:2", "a:3"}, Deps{}) {
 		got = append(got, it.ID)
 	}
 	if strings.Join(got, ",") != "a:1,a:2,a:3" {
@@ -267,7 +267,7 @@ func TestOrderStillDecidesWithoutRecovery(t *testing.T) {
 		{ID: "a:1", Source: "a", Stage: "backlog", Title: "dragged to the top"},
 		{ID: "a:2", Source: "a", Stage: "backlog", Title: "urgent but lower", Priority: &p0},
 	}
-	got, _ := Pick(cfg, items, []string{"a:1", "a:2"})
+	got, _ := Pick(cfg, items, []string{"a:1", "a:2"}, Deps{})
 	if got == nil || got.ID != "a:1" {
 		t.Fatalf("picked %v, want a:1 — the order beats priority", got)
 	}
@@ -298,7 +298,7 @@ func TestOrderIsRepeatedPick(t *testing.T) {
 	var want []string
 	rest := append([]model.Item(nil), items...)
 	for len(rest) > 0 {
-		got, _ := Pick(cfg, rest, order)
+		got, _ := Pick(cfg, rest, order, Deps{})
 		if got == nil {
 			break
 		}
@@ -312,7 +312,7 @@ func TestOrderIsRepeatedPick(t *testing.T) {
 		rest = out
 	}
 
-	sorted := Order(cfg, items, order)
+	sorted := Order(cfg, items, order, Deps{})
 	var got []string
 	for _, it := range sorted[:len(want)] {
 		got = append(got, it.ID)
@@ -338,7 +338,7 @@ func TestUnworkableItemsKeepListingOrderAtTheBack(t *testing.T) {
 		{ID: "a:2", Source: "a", Stage: "refining", Title: "waiting for a human", Blocked: true},
 		{ID: "a:3", Source: "a", Stage: "backlog", Title: "workable"},
 	}
-	got := Order(cfg, items, nil)
+	got := Order(cfg, items, nil, Deps{})
 	if got[0].ID != "a:3" {
 		t.Errorf("first = %q, want a:3 — the only one with anywhere to go", got[0].ID)
 	}
@@ -365,7 +365,7 @@ func TestTerminalItemsOrderByFinishedAtNotManualOrder(t *testing.T) {
 	// a:8 finished first of the three but is the one named in the persisted
 	// manual order — exactly the drag that used to hoist it to the top.
 	var got []string
-	for _, it := range Order(cfg, items, []string{"a:8"}) {
+	for _, it := range Order(cfg, items, []string{"a:8"}, Deps{}) {
 		got = append(got, it.ID)
 	}
 	want := []string{"a:21", "a:14", "a:8"}
@@ -382,7 +382,7 @@ func TestTerminalItemsIgnorePriority(t *testing.T) {
 		{ID: "a:1", Source: "a", Stage: "done", Title: "urgent but stale", Priority: &p0, FinishedAt: "2026-09-01T00:00:00Z"},
 		{ID: "a:2", Source: "a", Stage: "done", Title: "unranked but recent", FinishedAt: "2026-09-05T00:00:00Z"},
 	}
-	got := Order(cfg, items, nil)
+	got := Order(cfg, items, nil, Deps{})
 	if got[0].ID != "a:2" {
 		t.Errorf("first = %q, want a:2 — finished more recently; priority 0 does not outrank it", got[0].ID)
 	}
@@ -401,7 +401,7 @@ func TestTerminalItemsMergeAcrossSources(t *testing.T) {
 		{ID: "b:2", Source: "b", Stage: "done", FinishedAt: "2026-09-02T00:00:00Z"},
 	}
 	var got []string
-	for _, it := range Order(cfg, items, nil) {
+	for _, it := range Order(cfg, items, nil, Deps{}) {
 		got = append(got, it.ID)
 	}
 	want := []string{"a:1", "b:1", "a:2", "b:2"}
@@ -421,7 +421,7 @@ func TestTerminalItemsWithNoUsableFinishSortLast(t *testing.T) {
 		{ID: "a:3", Source: "a", Stage: "done", Title: "has one", FinishedAt: "2026-09-01T00:00:00Z"},
 	}
 	var got []string
-	for _, it := range Order(cfg, items, nil) {
+	for _, it := range Order(cfg, items, nil, Deps{}) {
 		got = append(got, it.ID)
 	}
 	want := []string{"a:3", "a:1", "a:2"}
@@ -440,7 +440,7 @@ func TestTerminalItemsWithEqualFinishedAtKeepListingOrder(t *testing.T) {
 		{ID: "a:2", Source: "a", Stage: "done", FinishedAt: "2026-09-01T00:00:00Z"},
 	}
 	var got []string
-	for _, it := range Order(cfg, items, nil) {
+	for _, it := range Order(cfg, items, nil, Deps{}) {
 		got = append(got, it.ID)
 	}
 	want := []string{"a:1", "a:2"}
@@ -460,14 +460,14 @@ func TestWorkableItemOutranksAFinishedTerminalItem(t *testing.T) {
 		{ID: "a:1", Source: "a", Stage: "done", Title: "finished just now", FinishedAt: "2026-09-05T00:00:00Z"},
 		{ID: "a:2", Source: "a", Stage: "backlog", Title: "not started, no timestamp at all"},
 	}
-	got, target := Pick(cfg, items, nil)
+	got, target := Pick(cfg, items, nil, Deps{})
 	if got == nil || got.ID != "a:2" {
 		t.Fatalf("picked %v, want a:2 — the only workable item", got)
 	}
 	if target != "done" {
 		t.Errorf("target = %q, want done", target)
 	}
-	if ordered := Order(cfg, items, nil); ordered[0].ID != "a:2" {
+	if ordered := Order(cfg, items, nil, Deps{}); ordered[0].ID != "a:2" {
 		t.Errorf("first = %q, want a:2 — workable outranks a finished terminal item", ordered[0].ID)
 	}
 }
@@ -489,7 +489,7 @@ func TestOtherUnworkableItemsSortAfterTerminalOnes(t *testing.T) {
 		{ID: "a:3", Source: "a", Stage: "done", Title: "finished", FinishedAt: "2026-09-01T00:00:00Z"},
 	}
 	var got []string
-	for _, it := range Order(cfg, items, nil) {
+	for _, it := range Order(cfg, items, nil, Deps{}) {
 		got = append(got, it.ID)
 	}
 	want := []string{"a:3", "a:1", "a:2"}
@@ -510,7 +510,7 @@ func TestOrderLeavesTheListingAlone(t *testing.T) {
 		{ID: "a:1", Source: "a", Stage: "backlog"},
 		{ID: "a:2", Source: "a", Stage: "backlog", Priority: &p0},
 	}
-	Order(cfg, items, nil)
+	Order(cfg, items, nil, Deps{})
 	if items[0].ID != "a:1" || items[1].ID != "a:2" {
 		t.Errorf("listing was reordered in place: %q,%q", items[0].ID, items[1].ID)
 	}
@@ -584,5 +584,63 @@ func TestAnInlineStageKeepsItsOwnTimeout(t *testing.T) {
 	}}
 	if got := timeoutFor(src, stage); got != 2*time.Minute {
 		t.Errorf("inline stage = %s, want the stage's 2m", got)
+	}
+}
+
+// The gate belongs at rung 1 — "has anywhere to go at all" — so one statement
+// of the rule covers the scheduler, the board's ordering and the drag
+// endpoint at once. A held item has nowhere to go, and Target says so.
+func TestTargetRefusesAnOvertakingMove(t *testing.T) {
+	cfg := line()
+	one := model.Item{ID: "s:1", Stage: "ready"}
+	two := model.Item{ID: "s:2", Stage: "ready", DependsOn: []string{"s:1"}}
+	d := NewDeps(cfg, []model.Item{one, two})
+
+	if _, ok := Target(cfg, &one, d); !ok {
+		t.Fatal("the item at the head of the sequence was refused")
+	}
+	if target, ok := Target(cfg, &two, d); ok {
+		t.Fatalf("the follower was sent to %q while its dependency sat in ready", target)
+	}
+}
+
+// Pick is handed a FILTERED slice by the scheduler's own launch loop — a
+// dependency that is running or marked has already been dropped from it.
+// Deps must therefore come from the full listing, or the one item that
+// should hold its followers is exactly the one Pick cannot see.
+func TestPickHoldsEvenWhenTheDependencyIsNotInTheSlice(t *testing.T) {
+	cfg := line()
+	one := model.Item{ID: "s:1", Stage: "ready"}
+	two := model.Item{ID: "s:2", Stage: "ready", DependsOn: []string{"s:1"}}
+	d := NewDeps(cfg, []model.Item{one, two}) // full listing
+
+	// `free` excludes s:1 — it is already being worked.
+	got, _ := Pick(cfg, []model.Item{two}, nil, d)
+	if got != nil {
+		t.Fatalf("Pick chose %s past a dependency missing from the slice", got.ID)
+	}
+}
+
+// A held item is not in the queue, so it sorts with the rest of the tail —
+// but it keeps its relative place among its siblings rather than being
+// scrambled, because better() falls through to the same rungs Pick would use.
+func TestOrderPutsHeldItemsBehindTheOnesThatCanRun(t *testing.T) {
+	cfg := line()
+	// Listing order is s:1, s:2, s:3 — the criterion is "manual order, then
+	// priority, then listing position" for two held siblings, so with
+	// neither manual order nor priority set, listing position decides and
+	// s:2 (listed first) keeps its place ahead of s:3.
+	items := []model.Item{
+		{ID: "s:1", Stage: "ready"},
+		{ID: "s:2", Stage: "ready", DependsOn: []string{"s:1"}},
+		{ID: "s:3", Stage: "ready", DependsOn: []string{"s:2"}},
+	}
+	d := NewDeps(cfg, items)
+	got := Order(cfg, items, nil, d)
+	if got[0].ID != "s:1" {
+		t.Fatalf("the runnable item sorted %s first, want s:1", got[0].ID)
+	}
+	if got[1].ID != "s:2" || got[2].ID != "s:3" {
+		t.Fatalf("held items lost their listing order: %s then %s", got[1].ID, got[2].ID)
 	}
 }

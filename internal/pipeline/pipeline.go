@@ -644,7 +644,7 @@ func given(data json.RawMessage) said {
 // that has a script means a previous run did not finish — the engine writes
 // provider state before running, so this is what a crash looks like — and the
 // right answer is to run that stage again rather than skip past it.
-func Target(cfg *config.Config, it *model.Item) (string, bool) {
+func Target(cfg *config.Config, it *model.Item, d Deps) (string, bool) {
 	// A marked item is waiting for a person, and not picking it is the whole
 	// mechanism: it is what stops the stage it stopped in from being re-run on
 	// every poll, which is the job the old terminal `blocked` stage did by
@@ -656,13 +656,21 @@ func Target(cfg *config.Config, it *model.Item) (string, bool) {
 	if !ok || stage.Terminal {
 		return "", false
 	}
-	if stage.Runs() {
-		return stage.Name, true // re-run: recover an interrupted stage
+	next := stage.Name
+	if !stage.Runs() {
+		if stage.OnSuccess == "" {
+			return "", false // a queue with nowhere to go: items rest here
+		}
+		next = stage.OnSuccess
 	}
-	if stage.OnSuccess == "" {
-		return "", false // a queue with nowhere to go: items rest here
+	// An item sequenced behind something has nowhere to go until that thing
+	// gets there first. Here, rather than only in `rate`, so the drag
+	// endpoint and the stall counter get the same answer the scheduler does
+	// — one statement of the rule, not three.
+	if _, held := d.Held(it, next); held {
+		return "", false
 	}
-	return stage.OnSuccess, true
+	return next, true
 }
 
 // The ladder below is the whole of v1's scheduling.
@@ -692,7 +700,7 @@ func Target(cfg *config.Config, it *model.Item) (string, bool) {
 // dragging a backlog card can no longer jump the queue past work in flight.
 //
 // Pick chooses the next item to work from a listing. It is the head of Order.
-func Pick(cfg *config.Config, items []model.Item, order []string) (*model.Item, string) {
+func Pick(cfg *config.Config, items []model.Item, order []string, d Deps) (*model.Item, string) {
 	pos := index(order)
 	depths := stageDepths(cfg)
 	best := -1
@@ -700,7 +708,7 @@ func Pick(cfg *config.Config, items []model.Item, order []string) (*model.Item, 
 	var bestC candidate
 
 	for i := range items {
-		c, target := rate(cfg, &items[i], i, pos, depths)
+		c, target := rate(cfg, &items[i], i, pos, depths, d)
 		if !c.workable {
 			continue
 		}
@@ -731,12 +739,12 @@ func Pick(cfg *config.Config, items []model.Item, order []string) (*model.Item, 
 // rungs Pick would use if they were workable — manual order, then priority,
 // then listing order — which is the doctor sweep's order too, unaffected by
 // any of this since it only ever walks marked items.
-func Order(cfg *config.Config, items []model.Item, order []string) []model.Item {
+func Order(cfg *config.Config, items []model.Item, order []string, d Deps) []model.Item {
 	pos := index(order)
 	depths := stageDepths(cfg)
 	rated := make([]candidate, len(items))
 	for i := range items {
-		rated[i], _ = rate(cfg, &items[i], i, pos, depths)
+		rated[i], _ = rate(cfg, &items[i], i, pos, depths, d)
 	}
 	seq := make([]int, len(items))
 	for i := range items {
@@ -777,8 +785,8 @@ func stageDepths(cfg *config.Config) map[string]int {
 }
 
 // rate scores one item's claim on being next, and reports where it would go.
-func rate(cfg *config.Config, it *model.Item, listed int, pos map[string]int, depth map[string]int) (candidate, string) {
-	target, ok := Target(cfg, it)
+func rate(cfg *config.Config, it *model.Item, listed int, pos map[string]int, depth map[string]int, d Deps) (candidate, string) {
+	target, ok := Target(cfg, it, d)
 	oi, ordered := pos[it.ID]
 	prio := 1 << 30
 	if it.Priority != nil {
