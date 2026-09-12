@@ -177,6 +177,21 @@
 }
 .count .held { color:var(--stop); }
 
+/* Held, not stopped. The item is sequenced behind something that has not
+   reached its next stage yet — nobody has to clear this and it goes away by
+   itself the moment the dependency moves, so it borrows the grey tone of a
+   condition that passes on its own (.item.blocked.waiting) rather than the
+   red of a mark. Drawing it as blocked would make the board lie about what
+   needs a person, which is the first question it answers. No mark chip: a
+   hold is never the `dependency` mark kind, which is a script's word for a
+   different, GitHub-level check. */
+.item.held {
+  border-color:var(--rule);
+  background:color-mix(in srgb, var(--dim) 7%, var(--raised));
+}
+.item.held .title { color:var(--dim); }
+.item .behind { color:var(--faint); }
+
 /* Terminal stations sit after a gap, joined by a short spur. A terminal
    column takes a pipeline station's own basis and gutter, so its card is
    the same width as any other column's no matter what is in it; the gap

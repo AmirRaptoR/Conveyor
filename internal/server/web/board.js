@@ -17,6 +17,10 @@ let pendingRedraw = false;
 // Why each marked item is marked, keyed by item id — the engine's note, not the
 // provider's. See State.Blocks.
 export let blocks = {};
+// Why each held item is not moving, keyed by item id — the sequencing rule's
+// own note, and deliberately not a mark: nobody clears this, and it is gone
+// the moment the dependency moves on. See State.Held.
+export let heldBy = {};
 
 // Buckets every item into the stage it is actually in right now, folding in
 // the active-stage override so a card mid-transition shows in the stage it is
@@ -60,6 +64,7 @@ export function draw() {
   // A list, because stages run in parallel: one entry per transition in flight.
   const active = state.active || [];
   blocks = state.blocks || {};
+  heldBy = state.held || {};
 
   // A source that vanished from `state.sources` (removed from the config, or
   // simply absent this poll) cannot go on filtering the board forever — reset
@@ -422,8 +427,10 @@ function card(it, active, place) {
   const hasPrio = it.priority !== null && it.priority !== undefined;
   const inHand = active.find(a => a.itemId === it.id);
   const working = !!inHand;
+  const hold = !it.blocked && heldBy[it.id];
   const cls = ["item", hasPrio ? "p" + it.priority : "", working ? "working" : "",
-               it.blocked ? "blocked " + tone(blocks[it.id]) : "", ranked ? "ranked" : ""].filter(Boolean).join(" ");
+               it.blocked ? "blocked " + tone(blocks[it.id]) : "",
+               hold ? "held" : "", ranked ? "ranked" : ""].filter(Boolean).join(" ");
   return `<article class="${cls}" draggable="true" tabindex="0" role="button"
       style="--src:${sourceColour(it.source)}"
       data-id="${esc(it.id)}" data-title="${esc(it.title)}" data-stage="${esc(it.stage)}">
@@ -431,6 +438,7 @@ function card(it, active, place) {
     <span class="foot">
       ${working ? `<span class="working-tag">working ${durSpan(new Date(inHand.startedAt).getTime(), false)}</span>` : ""}
       ${it.blocked ? why(it) : ""}
+      ${hold ? `<span class="behind">behind ${esc(hold.by.split(":").pop())}</span>` : ""}
       ${ranked && !working && !it.blocked ? `<span class="rank">${place + 1}</span>` : ""}
       ${hasPrio ? `<span class="prio">p${it.priority}</span>` : ""}
       ${working ? "" : waitChip(it)}
