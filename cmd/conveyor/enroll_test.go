@@ -11,6 +11,7 @@ import (
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/enroll"
+	"github.com/AmirRaptoR/Conveyor/internal/release"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 )
 
@@ -219,7 +220,7 @@ func TestCheckDraftRunsPreflightAgainstDraftedSourceOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	checks, err := checkDraft(context.Background(), cfg, r, cfgPath, "", name, block)
+	checks, err := checkDraft(context.Background(), cfg, r, release.Info{}, cfgPath, name, block)
 	if err != nil {
 		t.Fatalf("checkDraft: %v", err)
 	}
@@ -244,6 +245,43 @@ func TestCheckDraftRunsPreflightAgainstDraftedSourceOnly(t *testing.T) {
 	raw, _ := os.ReadFile(cfgPath)
 	if strings.Contains(string(raw), name) {
 		t.Errorf("the real config file was modified: %s", raw)
+	}
+}
+
+func TestCheckDraftKeepsManagedReleaseRoots(t *testing.T) {
+	cfg, cfgPath := enrollTestCfg(t)
+	root := filepath.Dir(cfgPath)
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = []byte(strings.Replace(string(raw), "version: 1\n", `version: 1
+providers: /mutable/checkout/providers
+agents: /mutable/checkout/agents
+`, 1))
+	if err := os.WriteFile(cfgPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = config.LoadFromRoots(cfgPath, filepath.Join(root, "providers"), filepath.Join(root, "agents"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	asker := &enroll.Asker{Answers: fullAnswers(), Out: &bytes.Buffer{}}
+	name, block, err := enrollFlow(cfg, asker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks, err := checkDraft(context.Background(), cfg, runner.New(filepath.Join(t.TempDir(), "runs")),
+		release.Info{Managed: true, Dir: root}, cfgPath, name, block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, check := range checks {
+		found = found || (check.Name == "ok" && check.Status == "pass")
+	}
+	if !found {
+		t.Fatalf("managed draft checks did not use packaged provider: %+v", checks)
 	}
 }
 

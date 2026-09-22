@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d)
+cleanup() {
+  status=$?
+  if (( status != 0 )) && [[ -s "$tmp/real.log" ]]; then
+    echo "install-release-selfcheck: real server log follows" >&2
+    sed 's/^/  /' "$tmp/real.log" >&2
+  fi
+  if [[ -f "$tmp/real.pid" ]]; then
+    kill "$(cat "$tmp/real.pid")" 2>/dev/null || true
+    wait "$(cat "$tmp/real.pid")" 2>/dev/null || true
+  fi
+  chmod -R u+w "$tmp" 2>/dev/null || true
+  rm -rf "$tmp"
+  return "$status"
+}
+trap cleanup EXIT
+
+calls="$tmp/systemctl.log"
+health_state="$tmp/health-state"
+health_calls="$tmp/health-calls"
+
+cat >"$tmp/systemctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$CALLS"
+SH
+cat >"$tmp/health" <<'SH'
+#!/usr/bin/env bash
+mode=$(cat "$HEALTH_STATE")
+case "$mode" in
+  pass)
+    printf '{"release":{"managed":true,"revision":"%s"}}\n' "$2"
+    ;;
+  flaky)
+    n=0
+    [[ -f "$HEALTH_CALLS" ]] && n=$(cat "$HEALTH_CALLS")
+    n=$((n + 1))
+    printf '%s\n' "$n" >"$HEALTH_CALLS"
+    if (( n == 1 )); then exit 1; fi
+    printf '{"release":{"managed":true,"revision":"%s"}}\n' "$2"
+    ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$tmp/systemctl" "$tmp/health"
+
+deploy() {
+  local prefix=$1 revision=$2
+  CONVEYOR_PREFIX="$prefix" \
+  CONVEYOR_CONFIG="$repo/conveyor.example.yaml" \
+  CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
+  CONVEYOR_HEALTHCHECK="$tmp/health" \
+  CONVEYOR_HEALTH_ATTEMPTS=2 \
+  CONVEYOR_REVISION="$revision" \
+  CONVEYOR_ALLOW_DIRTY=1 \
+  CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" \
+    "$repo/deploy/install-release"
+}
+
+# Successful swaps retain the old release, and a transient health failure gets
+# the same retry grace whether it comes from the built-in check or a hook.
+prefix="$tmp/prefix"
+echo pass >"$health_state"
+deploy "$prefix" selfcheck-one >/dev/null
+[[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-one" ]]
+CONVEYOR_RELEASE_DIR="$prefix/current" "$prefix/current/conveyor" version | grep -q 'selfcheck-one'
+
+echo flaky >"$health_state"
+rm -f "$health_calls"
+deploy "$prefix" selfcheck-two >/dev/null
+[[ $(cat "$health_calls") == 2 ]]
+[[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-two" ]]
+[[ $(readlink -f "$prefix/previous") == "$prefix/releases/selfcheck-one" ]]
+
+# A failed activation restores the last verified release.
+echo fail >"$health_state"
+if deploy "$prefix" selfcheck-three >/dev/null 2>&1; then
+  echo "install-release-selfcheck: an unhealthy release was accepted" >&2
+  exit 1
+fi
+[[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-two" ]]
+
+# Re-activating the current revision must use `previous` as its rollback target,
+# not call the same unhealthy release a successful restoration.
+if deploy "$prefix" selfcheck-two >/dev/null 2>&1; then
+  echo "install-release-selfcheck: unhealthy same-revision deploy was accepted" >&2
+  exit 1
+fi
+[[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-one" ]]
+echo pass >"$health_state"
+deploy "$prefix" selfcheck-two >/dev/null
+
+# Installed bytes are verified in place, not merely while staging.
+chmod u+w "$prefix/releases/selfcheck-one/agents/mock/refine"
+printf '\n# tampered\n' >>"$prefix/releases/selfcheck-one/agents/mock/refine"
+if CONVEYOR_RELEASE_DIR="$prefix/releases/selfcheck-one" \
+    "$prefix/releases/selfcheck-one/conveyor" version >/dev/null 2>&1; then
+  echo "install-release-selfcheck: a modified release still verified" >&2
+  exit 1
+fi
+
+# If the previous target itself no longer verifies, a failed activation leaves
+# no crash-looping current link and stops the service explicitly.
+chmod u+w "$prefix/releases/selfcheck-two/agents/mock/refine"
+printf '\n# tampered\n' >>"$prefix/releases/selfcheck-two/agents/mock/refine"
+echo fail >"$health_state"
+if deploy "$prefix" selfcheck-four >/dev/null 2>&1; then
+  echo "install-release-selfcheck: deploy unexpectedly passed with failed health" >&2
+  exit 1
+fi
+[[ ! -e "$prefix/current" ]]
+grep -q '^stop conveyor$' "$calls"
+
+# A first deployment with no rollback target also removes current and stops.
+first="$tmp/first"
+if deploy "$first" first-bad >/dev/null 2>&1; then
+  echo "install-release-selfcheck: unhealthy first deploy was accepted" >&2
+  exit 1
+fi
+[[ ! -e "$first/current" ]]
+
+# Exercise the production health path: a real Conveyor process, its local Unix
+# socket, and identity validation of the revision returned by /api/state.
+real_prefix="$tmp/real-prefix"
+real_dir="$tmp/real-config"
+mkdir -p "$real_dir"
+cp "$repo/conveyor.example.yaml" "$real_dir/conveyor.yaml"
+cat >"$tmp/systemctl-real" <<'SH'
+#!/usr/bin/env bash
+stop_running() {
+  [[ -f "$REAL_PID" ]] || return 0
+  pid=$(cat "$REAL_PID")
+  kill "$pid" 2>/dev/null || return 0
+  # This controller is a fresh process on every invocation, so the service is
+  # not its child and `wait` cannot synchronize shutdown. Poll the PID instead
+  # to ensure its owner lock is gone before launching the replacement.
+  for _ in {1..50}; do
+    if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
+    sleep 0.1
+  done
+  echo "test service $pid did not stop" >&2
+  return 1
+}
+case "$1" in
+  restart)
+    stop_running
+    CONVEYOR_RELEASE_DIR="$REAL_PREFIX/current" MOCK_STORE="$REAL_MOCK_STORE" \
+      "$REAL_PREFIX/current/conveyor" serve -c "$REAL_CONFIG" -addr 127.0.0.1:0 -mode observe \
+      >"$REAL_LOG" 2>&1 &
+    printf '%s\n' "$!" >"$REAL_PID"
+    ;;
+  stop)
+    stop_running
+    ;;
+esac
+SH
+chmod +x "$tmp/systemctl-real"
+CONVEYOR_PREFIX="$real_prefix" \
+CONVEYOR_CONFIG="$real_dir/conveyor.yaml" \
+CONVEYOR_SYSTEMCTL="$tmp/systemctl-real" \
+CONVEYOR_HEALTH_ATTEMPTS=15 \
+CONVEYOR_REVISION=real-health \
+CONVEYOR_ALLOW_DIRTY=1 \
+REAL_PREFIX="$real_prefix" REAL_CONFIG="$real_dir/conveyor.yaml" \
+REAL_PID="$tmp/real.pid" REAL_LOG="$tmp/real.log" REAL_MOCK_STORE="$tmp/mock.json" \
+  "$repo/deploy/install-release" >/dev/null
+curl --silent --fail --unix-socket "$real_dir/data/api.sock" http://localhost/api/state |
+  jq -e '.release.managed == true and .release.revision == "real-health"' >/dev/null
+# A second deploy proves the service-controller child did not inherit fd 9 and
+# keep the deployment flock alive after the installer exited.
+CONVEYOR_PREFIX="$real_prefix" \
+CONVEYOR_CONFIG="$real_dir/conveyor.yaml" \
+CONVEYOR_SYSTEMCTL="$tmp/systemctl-real" \
+CONVEYOR_HEALTH_ATTEMPTS=15 \
+CONVEYOR_REVISION=real-health \
+CONVEYOR_ALLOW_DIRTY=1 \
+REAL_PREFIX="$real_prefix" REAL_CONFIG="$real_dir/conveyor.yaml" \
+REAL_PID="$tmp/real.pid" REAL_LOG="$tmp/real.log" REAL_MOCK_STORE="$tmp/mock.json" \
+  "$repo/deploy/install-release" >/dev/null
+
+echo "install-release selfcheck: ok"

@@ -6,8 +6,8 @@ stage depends on either lives in this repository already, or is named here
 with the one command that proves it is present.
 
 Nothing here installs a prerequisite. An installer that reaches for a package
-manager is a different, riskier program than this one; every command below
-only checks.
+manager is a different, riskier program than this one; prerequisite commands
+below only check, and the release installer only packages this checkout.
 
 ## Prerequisites
 
@@ -24,6 +24,7 @@ rather than later, unexplained.
 | bash | every provider and agent script | `bash --version` |
 | `gh`, authenticated | every GitHub provider script and agent shells out to it | `gh auth status` |
 | `jq` | every script parses the item and `$CONVEYOR_RESULT` with it | `jq --version` |
+| `flock` | serializes production release installation | `flock --version` |
 | `claude` CLI | the shipped `agents/claude/*` adapters run it headlessly | `claude --version` |
 
 ### Optional, tied to a capability
@@ -38,7 +39,12 @@ depends on all of them at once.
 | systemd | running the engine as a service (`deploy/conveyor.service.example`) | `systemctl --version` |
 | Caddy | TLS in front of the board, required for Web Push (a secure origin) | `caddy version` |
 
-## Sequence: clone to a running board
+## Development sequence: clone to a running board
+
+This sequence runs from a checkout and is intentionally reported as a `dev`
+build on the board. Use the immutable production deployment below for an
+unattended service; a checkout can change underneath a running process and is
+not a release boundary.
 
 Each step names the command that proves it worked before moving to the next.
 
@@ -135,23 +141,172 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/
 set `auth.users` (`401` means it did, and is asking; see README.md,
 "Configuration"). Anything else is not running yet.
 
-### 7. Optional: run as a service
+### 7. Keep it running
+
+Do not point a long-running service at this mutable checkout. Continue with the
+production sequence below; its service unit and deploy command make the health
+check and rollback part of every release.
+
+## Production: immutable releases with automatic rollback
+
+`deploy/install-release` packages the binary, `agents/` and `providers/` into
+one read-only directory under `/opt/conveyor/releases`. It writes a manifest
+containing the build revision, supported config schema, SHA-256 digest and
+permission bits of every executable asset. Setting `CONVEYOR_RELEASE_DIR`
+makes the process verify that manifest before it reads the config or starts a
+server. A missing, edited or mixed-version file is therefore a startup error,
+not a partly upgraded board.
+
+Keep configuration and engine data outside the release tree. One conventional
+layout is:
+
+```text
+/opt/conveyor/
+  current  -> releases/<revision>
+  previous -> releases/<previous-revision>
+  releases/<revision>/{conveyor,release.json,agents/,providers/}
+/var/lib/conveyor/
+  conveyor.yaml
+  data/
+```
+
+Prepare the directories and config once, granting the service/deploy user the
+ownership appropriate for this machine:
+
+```bash
+sudo install -d -o conveyor -g conveyor /opt/conveyor/releases /var/lib/conveyor
+sudo install -o conveyor -g conveyor -m 0600 conveyor.github.example.yaml /var/lib/conveyor/conveyor.yaml
+sudo -u conveyor $EDITOR /var/lib/conveyor/conveyor.yaml
+```
+
+Install and enable the unit, but do not start it before a first release exists:
 
 ```bash
 sudo cp deploy/conveyor.service.example /etc/systemd/system/conveyor.service
-sudo $EDITOR /etc/systemd/system/conveyor.service   # fill in User, paths, PATH
+sudo $EDITOR /etc/systemd/system/conveyor.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now conveyor
-systemctl status conveyor
+sudo systemctl enable conveyor
 ```
 
-See README.md's "Post-deploy check: `conveyor probe`" for verifying a restart
-actually left the board reachable, and for what `Restart=always` does and
-does not cover.
+Then, from a clean checkout of the revision to deploy:
+
+```bash
+sudo env \
+  CONVEYOR_PREFIX=/opt/conveyor \
+  CONVEYOR_CONFIG=/var/lib/conveyor/conveyor.yaml \
+  CONVEYOR_SERVICE=conveyor \
+  "$(pwd)/deploy/install-release"
+```
+
+The installer performs these operations in order:
+
+1. Build into a staging directory with the Git revision embedded.
+2. Copy and hash all shipped agents and providers, then make the tree read-only.
+3. Run the staged binary's own manifest check and validate the real config,
+   failing if even one configured source cannot run.
+4. Rename the complete staging directory into `releases/` and atomically swap
+   `current`.
+5. Restart the service, poll its passwordless local Unix socket and require
+   `/api/state` to identify the expected managed revision. An old process, a
+   development-mode process and the wrong release all fail this check.
+6. If restart or health checking fails, atomically restore the old `current`,
+   restart it, and return failure. On success the old target is retained as
+   `previous`.
+
+The defaults match `deploy/conveyor.service.example`. The built-in health check
+uses `curl` and `jq` over `<config directory>/data/api.sock`, which bypasses
+browser authentication but remains accessible only to the service account.
+Automated deployment systems may set `CONVEYOR_HEALTHCHECK` to an executable
+that receives the public state URL and expected revision as arguments and
+prints that endpoint's `/api/state` JSON on stdout. The installer applies the
+same retry window and revision check to that JSON; diagnostic text belongs on
+stderr. Set `CONVEYOR_ADDR` when the URL passed to such a hook differs from
+`127.0.0.1:8090`, and `CONVEYOR_HEALTH_ATTEMPTS` to change the default 30
+attempts. `CONVEYOR_SYSTEMCTL` selects the service-control executable, primarily
+for non-systemd test environments.
+
+Run the installer as root (as above), or as the unit's `User=` when that account
+is authorized to restart the unit. The built-in probe must be able to read the
+service-owned `data/api.sock`; inability to verify health is deliberately a
+failed deployment, never permission to leave an unverified release active. The
+installer checks for `flock`, `jq` and (when using the built-in probe) `curl`
+before it changes `current`.
+
+`CONVEYOR_ALLOW_DIRTY=1` is an emergency/testing escape hatch for packaging a
+modified checkout. Such a manifest records `modified: true`, and `/api/state`
+and the masthead identify the release as `dirty`. Routine production deploys
+must come from a clean checkout and should never set it.
+
+The masthead and `/api/state.release` show the active revision, manifest schema,
+config schema and canonical release directory. In production the badge must say
+`release`, not `dev`.
+
+### Migrating an existing checkout-based service
+
+The data directory is not independently configurable: it is always `data/`
+beside `conveyor.yaml`. Moving only the config would silently discard run
+history, ordering, saved answers, pauses, budgets, push subscriptions and the
+VAPID key. Move the config and data together. Relative `workdir:`, `agents:`,
+`providers:` and `scripts.*.script:` paths also resolve from the config's
+directory, so make operational paths absolute before moving the file.
+
+Release mode overrides the top-level `agents:` and `providers:` roots, and it
+refuses any resolved provider or stage executable outside the verified release.
+Commit custom executables under `agents/` or `providers/` and reference them
+with `agent:`/`provider:`; an external `scripts.*.script:` path is intentionally
+not accepted by a production release. Inline `run:` bodies remain part of the
+operator-owned config.
+
+For an existing `/opt/conveyor/conveyor.yaml` installation, keep the checkout,
+old binary, old config, old data and old unit until migration has passed:
+
+```bash
+old_config=/opt/conveyor/conveyor.yaml
+sudo cp -a /etc/systemd/system/conveyor.service /etc/systemd/system/conveyor.service.pre-release
+sudo systemctl stop conveyor
+sudo install -d -o conveyor -g conveyor /opt/conveyor/releases /var/lib/conveyor/data
+sudo install -o conveyor -g conveyor -m 0600 "$old_config" /var/lib/conveyor/conveyor.yaml
+sudo cp -a "$(dirname "$old_config")/data/." /var/lib/conveyor/data/
+sudo chown -R conveyor:conveyor /var/lib/conveyor/data
+sudo -u conveyor $EDITOR /var/lib/conveyor/conveyor.yaml  # make relative operational paths absolute
+sudo cp deploy/conveyor.service.example /etc/systemd/system/conveyor.service
+sudo $EDITOR /etc/systemd/system/conveyor.service         # fill in User and PATH
+sudo systemctl daemon-reload
+sudo systemctl enable conveyor
+sudo env \
+  CONVEYOR_PREFIX=/opt/conveyor \
+  CONVEYOR_CONFIG=/var/lib/conveyor/conveyor.yaml \
+  CONVEYOR_SERVICE=conveyor \
+  "$(pwd)/deploy/install-release"
+```
+
+Installing and reloading the new unit *before* `install-release` is essential:
+the installer's restart and health check must exercise the new `ExecStart` and
+`CONVEYOR_RELEASE_DIR`, not the old checkout service. If this first deployment
+fails, it stops the new unit. Restore the untouched old setup with:
+
+```bash
+sudo cp -a /etc/systemd/system/conveyor.service.pre-release /etc/systemd/system/conveyor.service
+sudo systemctl daemon-reload
+sudo systemctl start conveyor
+```
+
+To manually roll back later, repoint `current` atomically and restart:
+
+```bash
+old=$(readlink -f /opt/conveyor/previous)
+sudo ln -s "$old" /opt/conveyor/.current.rollback
+sudo mv -Tf /opt/conveyor/.current.rollback /opt/conveyor/current
+sudo systemctl restart conveyor
+```
+
+Each release is read-only and content-verified, so never edit one in place.
+Deploy a new revision instead. Old release directories may be removed only
+after confirming neither `current` nor `previous` points to them.
 
 ## Everything this does not do
 
-- Does not install Go, git, `gh`, `jq`, `claude`, `codex`, Node, systemd or
+- Does not install Go, git, `gh`, `jq`, `flock`, `claude`, `codex`, Node, systemd or
   Caddy — only checks for them.
 - Does not enforce a version or that `gh`/`claude`/`codex` are authenticated —
   `gh auth status` is the command that proves it; nothing here gates on the
@@ -161,4 +316,5 @@ does not cover.
   configured beyond `conveyor validate` — that is #41 (guided enrollment,
   supervised first run) or an operator's, by hand.
 - Ships no binary, no `curl | sh`, no package. `go build` is the only build
-  step, and it is one you run yourself.
+  step, and it is one you run yourself; `deploy/install-release` only packages
+  that local clean checkout.

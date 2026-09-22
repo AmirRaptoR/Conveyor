@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Build and atomically activate one immutable Conveyor release. The caller
+# must be able to write CONVEYOR_PREFIX and restart CONVEYOR_SERVICE.
+set -euo pipefail
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+prefix=${CONVEYOR_PREFIX:-/opt/conveyor}
+config=${CONVEYOR_CONFIG:-/var/lib/conveyor/conveyor.yaml}
+service=${CONVEYOR_SERVICE:-conveyor}
+addr=${CONVEYOR_ADDR:-127.0.0.1:8090}
+systemctl_bin=${CONVEYOR_SYSTEMCTL:-systemctl}
+healthcheck=${CONVEYOR_HEALTHCHECK:-}
+health_attempts=${CONVEYOR_HEALTH_ATTEMPTS:-30}
+
+if [[ ! -f "$config" ]]; then
+  echo "install-release: config does not exist: $config" >&2
+  exit 1
+fi
+config_dir=$(cd "$(dirname "$config")" && pwd)
+config="$config_dir/$(basename "$config")"
+api_socket="$config_dir/data/api.sock"
+
+revision=${CONVEYOR_REVISION:-}
+if [[ -z "$revision" ]]; then
+  revision=$(git -C "$repo" rev-parse HEAD)
+fi
+if [[ -n $(git -C "$repo" status --porcelain) && ${CONVEYOR_ALLOW_DIRTY:-0} != 1 ]]; then
+  echo "install-release: refusing to package a dirty checkout" >&2
+  exit 1
+fi
+if [[ ! "$revision" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$revision" == "." || "$revision" == ".." ]]; then
+  echo "install-release: revision contains unsafe path characters: $revision" >&2
+  exit 1
+fi
+
+releases="$prefix/releases"
+target="$releases/$revision"
+stage="$releases/.${revision}.tmp.$$"
+mkdir -p "$releases"
+for required in flock jq; do
+  if ! command -v "$required" >/dev/null 2>&1; then
+    echo "install-release: $required is required" >&2
+    exit 1
+  fi
+done
+if [[ -z "$healthcheck" ]] && ! command -v curl >/dev/null 2>&1; then
+  echo "install-release: curl is required for the built-in health check" >&2
+  exit 1
+fi
+exec 9>"$prefix/deploy.lock"
+if ! flock -n 9; then
+  echo "install-release: another deployment already holds $prefix/deploy.lock" >&2
+  exit 1
+fi
+manifest_tmp=$(mktemp "${TMPDIR:-/tmp}/conveyor-manifest.XXXXXX")
+probe_err=$(mktemp "${TMPDIR:-/tmp}/conveyor-probe.XXXXXX")
+link_tmp=""
+
+cleanup() {
+  rm -f "$manifest_tmp"
+  rm -f "$probe_err"
+  if [[ -n "$link_tmp" ]]; then rm -f "$link_tmp"; fi
+  if [[ -d "$stage" ]]; then
+    chmod -R u+w "$stage" 2>/dev/null || true
+    rm -rf "$stage"
+  fi
+}
+trap cleanup EXIT
+
+atomic_link() {
+  local value=$1 link=$2
+  link_tmp="${link}.new.$$"
+  rm -f "$link_tmp"
+  ln -s "$value" "$link_tmp"
+  mv -Tf "$link_tmp" "$link"
+  link_tmp=""
+}
+
+state_once() {
+  local expected=$1
+  if [[ -n "$healthcheck" ]]; then
+    "$healthcheck" "http://$addr/api/state" "$expected"
+    return
+  fi
+  curl --silent --show-error --fail --max-time 5 \
+    --unix-socket "$api_socket" http://localhost/api/state
+}
+
+health() {
+	local expected=$1 attempt body last="no response"
+	for ((attempt=1; attempt<=health_attempts; attempt++)); do
+		: >"$probe_err"
+		if body=$(state_once "$expected" 2>"$probe_err"); then
+      if jq -e --arg revision "$expected" \
+        '.release.managed == true and .release.revision == $revision' \
+        <<<"$body" >/dev/null 2>&1; then
+        return 0
+      fi
+      last="response did not identify managed release $expected"
+		else
+			last="state endpoint unavailable"
+			while IFS= read -r detail; do
+				[[ -n "$detail" ]] && last="state endpoint unavailable: $detail"
+			done <"$probe_err"
+    fi
+    if (( attempt < health_attempts )); then sleep 2; fi
+  done
+  echo "install-release: health probe failed: $last" >&2
+  return 1
+}
+
+if [[ ! -e "$target" ]]; then
+  mkdir "$stage"
+  (
+    cd "$repo"
+    go build -trimpath \
+      -ldflags "-X github.com/AmirRaptoR/Conveyor/internal/release.BuildRevision=$revision" \
+      -o "$stage/conveyor" ./cmd/conveyor
+    cp -a agents providers "$stage/"
+  )
+
+  # Record the final, read-only permission bits as well as content hashes.
+  chmod -R a-w "$stage"
+  "$stage/conveyor" release-manifest -dir "$stage" >"$manifest_tmp"
+  chmod u+w "$stage"
+  install -m 0444 "$manifest_tmp" "$stage/release.json"
+  chmod a-w "$stage"
+
+  CONVEYOR_RELEASE_DIR="$stage" "$stage/conveyor" version >/dev/null
+  CONVEYOR_RELEASE_DIR="$stage" "$stage/conveyor" validate -strict-sources -c "$config" >/dev/null
+  mv -T "$stage" "$target"
+else
+  CONVEYOR_RELEASE_DIR="$target" "$target/conveyor" version >/dev/null
+  CONVEYOR_RELEASE_DIR="$target" "$target/conveyor" validate -strict-sources -c "$config" >/dev/null
+fi
+
+current="$prefix/current"
+previous="$prefix/previous"
+old=""
+if [[ -e "$current" && ! -L "$current" ]]; then
+  echo "install-release: $current exists and is not a symlink" >&2
+  exit 1
+fi
+if [[ -L "$current" ]]; then
+  old=$(readlink -f "$current" || true)
+fi
+rollback="$old"
+if [[ -n "$rollback" && "$rollback" == "$target" ]]; then
+  rollback=""
+  if [[ -L "$previous" ]]; then
+    rollback=$(readlink -f "$previous" || true)
+  fi
+fi
+
+atomic_link "$target" "$current"
+if ! "$systemctl_bin" restart "$service" 9>&- || ! health "$revision"; then
+  echo "install-release: activation of $revision failed; rolling back" >&2
+  restored=false
+	if [[ -n "$rollback" && -x "$rollback/conveyor" ]]; then
+		# Refuse to turn an arbitrary old symlink into the rollback target.
+		if CONVEYOR_RELEASE_DIR="$rollback" "$rollback/conveyor" version >/dev/null 2>&1; then
+			old_revision=$(jq -er '.revision' "$rollback/release.json" 2>/dev/null || true)
+			if [[ -n "$old_revision" ]] && atomic_link "$rollback" "$current"; then
+				restored=true
+				if ! "$systemctl_bin" restart "$service" 9>&- || ! health "$old_revision"; then
+          echo "install-release: previous release was restored but did not become healthy" >&2
+        fi
+      fi
+		else
+			echo "install-release: previous release $rollback no longer verifies" >&2
+    fi
+  fi
+  if [[ "$restored" != true ]]; then
+    rm -f "$current"
+		"$systemctl_bin" stop "$service" 9>&- || true
+    echo "install-release: no usable previous release; failed activation removed and service stopped" >&2
+  fi
+  exit 1
+fi
+
+if [[ -n "$old" && "$old" != "$target" ]]; then
+  atomic_link "$old" "$previous"
+fi
+echo "installed Conveyor $revision at $target"

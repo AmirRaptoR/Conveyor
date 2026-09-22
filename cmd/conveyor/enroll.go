@@ -12,6 +12,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/enroll"
 	"github.com/AmirRaptoR/Conveyor/internal/preflight"
+	"github.com/AmirRaptoR/Conveyor/internal/release"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 	"gopkg.in/yaml.v3"
 )
@@ -74,7 +75,7 @@ func cmdEnroll(args []string) error {
 	fmt.Fprintln(os.Stderr, "\nno file was written — paste the block below under this config's sources:")
 	fmt.Fprintln(os.Stdout, block)
 
-	checks, cerr := checkDraft(ctx, cfg, r, *c.cfgPath, *c.providers, name, block)
+	checks, cerr := checkDraft(ctx, cfg, r, c.release, *c.cfgPath, name, block)
 	if cerr != nil {
 		fmt.Fprintf(os.Stderr, "\ncould not check the draft: %v\n", cerr)
 		return nil
@@ -286,7 +287,7 @@ func enrollFlow(cfg *config.Config, asker *enroll.Asker) (name, block string, er
 // silently break providers: and every relative script: — loads it, and
 // returns the same readiness checks conveyor preflight would report, for
 // just the drafted source. The temp file is removed before this returns.
-func checkDraft(ctx context.Context, cfg *config.Config, r *runner.Runner, cfgPath, providersFlag, name, block string) ([]preflight.Check, error) {
+func checkDraft(ctx context.Context, cfg *config.Config, r *runner.Runner, rel release.Info, cfgPath, name, block string) ([]preflight.Check, error) {
 	raw, err := os.ReadFile(cfgPath)
 	if err != nil {
 		return nil, err
@@ -344,9 +345,15 @@ func checkDraft(ctx context.Context, cfg *config.Config, r *runner.Runner, cfgPa
 		return nil, err
 	}
 
-	tmpCfg, err := config.LoadFrom(tmpPath, providersFlag)
+	// Keep the already-verified roots. Re-reading the YAML's own agents:/
+	// providers: values here would let enroll's readiness checks escape a
+	// managed release even though every other command is pinned to it.
+	tmpCfg, err := config.LoadFromRoots(tmpPath, cfg.ProvidersDir(), cfg.AgentsDir())
 	if err != nil {
 		return nil, fmt.Errorf("drafted config does not load: %w", err)
+	}
+	if err := validateReleaseExecutables(tmpCfg, rel); err != nil {
+		return nil, fmt.Errorf("drafted config escapes release: %w", err)
 	}
 	for _, s := range tmpCfg.Sources {
 		if s.Name == name {

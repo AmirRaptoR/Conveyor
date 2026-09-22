@@ -6,11 +6,11 @@
 #   sudo cp deploy/conveyor.service.example /etc/systemd/system/conveyor.service
 #   sudo $EDITOR /etc/systemd/system/conveyor.service   # fill in the paths below
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable --now conveyor
+#   sudo systemctl enable conveyor
+#   deploy/install-release   # creates current, then starts and verifies it
 #
 # See README.md's "Post-deploy check: conveyor probe" for what `Restart=`
-# does and does not cover, and docs/INSTALL.md for the sequence this unit is
-# the last step of.
+# does and does not cover, and docs/INSTALL.md for the migration order.
 [Unit]
 Description=Conveyor — pipeline engine and board
 After=network-online.target
@@ -19,13 +19,13 @@ Wants=network-online.target
 [Service]
 # Fill in for this box:
 User=conveyor
-WorkingDirectory=/opt/conveyor
-ExecStart=/opt/conveyor/conveyor serve -c /opt/conveyor/conveyor.yaml -addr 127.0.0.1:8090
+WorkingDirectory=/var/lib/conveyor
+Environment=CONVEYOR_RELEASE_DIR=/opt/conveyor/current
+ExecStart=/opt/conveyor/current/conveyor serve -c /var/lib/conveyor/conveyor.yaml -addr 127.0.0.1:8090
 # Everything a stage script can reach: go (agents build and test with it),
 # gh (every provider and agent shells out to it), jq (every script parses
-# JSON with it), and claude (what the shipped agents run headlessly). Extend
-# this for anything a source's own scripts additionally need — codex, node,
-# docker.
+# JSON with it), and the configured agent CLI. Extend this for anything a
+# source's own scripts additionally need — opencode, codex, node, docker.
 Environment=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/home/conveyor/.local/bin
 
 # The engine can exit 0 on its own (a deliberate stop is not this), and

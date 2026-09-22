@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
+	"github.com/AmirRaptoR/Conveyor/internal/release"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 	"github.com/AmirRaptoR/Conveyor/internal/server"
 	"github.com/AmirRaptoR/Conveyor/internal/source"
@@ -51,6 +53,10 @@ func main() {
 		err = cmdPasswd(os.Args[2:])
 	case "enroll":
 		err = cmdEnroll(os.Args[2:])
+	case "version":
+		err = cmdVersion(os.Args[2:])
+	case "release-manifest":
+		err = cmdReleaseManifest(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -68,7 +74,8 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `conveyor — run a configurable pipeline over items from configurable sources
 
-  validate                              load and check the config
+  validate  [-strict-sources]           load and check the config; strict mode
+                                        fails if any source cannot run
   list      [-source NAME]              run list scripts, print items
   preflight [-source NAME]              readiness: gh/agent/label checks per
                                         source, exit non-zero if any failed.
@@ -98,6 +105,8 @@ func usage() {
                                         on stdout. Writes no file, starts no
                                         stage, lists no items. -answer
                                         pre-answers a prompt; repeatable.
+  version                               print build and release identity
+  release-manifest -dir DIR            write a staged release's manifest
   
 Common flags:
   -c <config>       path to the config (default conveyor.yaml). Stage scripts
@@ -117,6 +126,7 @@ type common struct {
 	cfgPath   *string
 	providers *string
 	verbose   *bool
+	release   release.Info
 }
 
 func newFlags(name string) *common {
@@ -135,10 +145,11 @@ func (c *common) load(args []string) (*config.Config, *runner.Runner, context.Co
 	if err := c.fs.Parse(args); err != nil {
 		return nil, nil, nil, nil, err
 	}
-	cfg, err := config.LoadFrom(*c.cfgPath, *c.providers)
+	cfg, rel, err := loadProcessConfig(*c.cfgPath, *c.providers)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	c.release = rel
 	r := runner.New(filepath.Join(cfg.DataDir(), "runs"))
 	if *c.verbose {
 		// The UI will do this over SSE; on the CLI it just prints.
@@ -148,6 +159,98 @@ func (c *common) load(args []string) (*config.Config, *runner.Runner, context.Co
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	return cfg, r, ctx, stop, nil
+}
+
+// loadProcessConfig is the one production boundary for executable assets.
+// Once release mode is selected, neither a config key nor a command-line flag
+// can make this process execute an agent or provider from somewhere mutable.
+func loadProcessConfig(path, providers string) (*config.Config, release.Info, error) {
+	rel, err := release.Detect()
+	if err != nil {
+		return nil, release.Info{}, err
+	}
+	agents := ""
+	if rel.Managed {
+		if providers != "" {
+			return nil, release.Info{}, errors.New("-providers cannot override an immutable release")
+		}
+		providers = filepath.Join(rel.Dir, "providers")
+		agents = filepath.Join(rel.Dir, "agents")
+	}
+	cfg, err := config.LoadFromRoots(path, providers, agents)
+	if err != nil {
+		return nil, release.Info{}, err
+	}
+	if err := validateReleaseExecutables(cfg, rel); err != nil {
+		return nil, release.Info{}, err
+	}
+	return cfg, rel, nil
+}
+
+func validateReleaseExecutables(cfg *config.Config, rel release.Info) error {
+	if !rel.Managed {
+		return nil
+	}
+	for _, src := range cfg.Sources {
+		paths := make(map[string]string, len(src.Paths)+2)
+		paths["provider list"] = src.List
+		paths["provider move"] = src.Move
+		for name, path := range src.Paths {
+			paths["script "+name] = path
+		}
+		for name, executable := range paths {
+			if executable == "" {
+				continue
+			}
+			inside, err := release.Contains(rel.Dir, executable)
+			if err != nil {
+				return fmt.Errorf("source %q %s: verify release path: %w", src.Name, name, err)
+			}
+			if !inside {
+				return fmt.Errorf("source %q %s resolves outside immutable release: %s", src.Name, name, executable)
+			}
+		}
+	}
+	return nil
+}
+
+func cmdVersion(args []string) error {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("version takes no arguments")
+	}
+	info, err := release.Detect()
+	if err != nil {
+		return err
+	}
+	mode := "development"
+	if info.Managed {
+		mode = info.Dir
+	}
+	fmt.Printf("conveyor %s (config schema %d, %s)\n", info.Revision, info.ConfigSchema, mode)
+	return nil
+}
+
+func cmdReleaseManifest(args []string) error {
+	fs := flag.NewFlagSet("release-manifest", flag.ContinueOnError)
+	dir := fs.String("dir", "", "staged release directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dir == "" || fs.NArg() != 0 {
+		return errors.New("release-manifest requires exactly -dir DIR")
+	}
+	info := release.Current()
+	m, err := release.Generate(*dir, info.Revision, info.Modified)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(m)
 }
 
 // own claims the data directory for a command that is about to run stages, and
@@ -181,6 +284,7 @@ func own(cfg *config.Config, r *runner.Runner, settle bool) (func(), error) {
 
 func cmdValidate(args []string) error {
 	c := newFlags("validate")
+	strictSources := c.fs.Bool("strict-sources", false, "fail if any configured source is unusable")
 	cfg, _, _, stop, err := c.load(args)
 	if err != nil {
 		return err
@@ -277,6 +381,9 @@ func cmdValidate(args []string) error {
 	case bad > 0:
 		fmt.Printf("\n%d of %d source(s) unusable; the other %d will still be worked\n",
 			bad, len(cfg.Sources), len(cfg.Sources)-bad)
+	}
+	if *strictSources && bad > 0 {
+		return fmt.Errorf("%d of %d source(s) unusable", bad, len(cfg.Sources))
 	}
 	return nil
 }
@@ -515,7 +622,7 @@ func cmdServe(args []string) error {
 		return err
 	}
 	defer release()
-	return server.New(cfg, r).Run(ctx, server.Addr(*addr), mode)
+	return server.New(cfg, r, c.release).Run(ctx, server.Addr(*addr), mode)
 }
 
 // resolveMode turns -mode and -watch into the single Mode Run needs.

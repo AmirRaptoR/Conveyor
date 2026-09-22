@@ -11,6 +11,10 @@
 .degraded { color:var(--run); }
 .degraded b { color:var(--run); }
 .grow { flex:1; }
+#release-badge, #mode-badge {
+  color:var(--dim); border:1px solid var(--rule); padding:4px 8px;
+  font-size:9px; letter-spacing:.1em; text-transform:uppercase;
+}
 
 .lamp { width:6px; height:6px; border-radius:50%; background:var(--faint); display:inline-block; }
 .lamp.idle { background:var(--ok); }

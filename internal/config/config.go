@@ -16,6 +16,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// SchemaVersion is the one configuration format this binary accepts. Release
+// manifests and the board report this exact value; changing the parser cannot
+// silently drift away from the advertised schema.
+const SchemaVersion = 1
+
 type Config struct {
 	Version     int         `yaml:"version"`
 	Concurrency Concurrency `yaml:"concurrency"`
@@ -359,6 +364,13 @@ func Load(path string) (*Config, error) { return LoadFrom(path, "") }
 // line. It must be applied before resolution, not after: resolution is what
 // turns a provider name into script paths.
 func LoadFrom(path, providers string) (*Config, error) {
+	return LoadFromRoots(path, providers, "")
+}
+
+// LoadFromRoots is LoadFrom with both shipped-asset roots fixed by the
+// caller. Production release mode uses this to make config entries incapable
+// of redirecting execution back into a mutable source checkout.
+func LoadFromRoots(path, providers, agents string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -376,6 +388,9 @@ func LoadFrom(path, providers string) (*Config, error) {
 	c.Dir = filepath.Dir(abs)
 	if providers != "" {
 		c.Providers = providers
+	}
+	if agents != "" {
+		c.Agents = agents
 	}
 	c.applyDefaults()
 	c.resolveSources()
@@ -872,8 +887,8 @@ func (c *Config) Validate() []string {
 	var errs []string
 	add := func(f string, a ...any) { errs = append(errs, fmt.Sprintf(f, a...)) }
 
-	if c.Version != 1 {
-		add("version must be 1, got %d", c.Version)
+	if c.Version != SchemaVersion {
+		add("version must be %d, got %d", SchemaVersion, c.Version)
 	}
 	errs = append(errs, c.Auth.validate()...)
 	if c.Concurrency.PerStage < 1 {
