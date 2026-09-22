@@ -40,6 +40,7 @@ type File struct {
 type Manifest struct {
 	Schema       int             `json:"schema"`
 	Revision     string          `json:"revision"`
+	Modified     bool            `json:"modified,omitempty"`
 	ConfigSchema int             `json:"configSchema"`
 	Files        map[string]File `json:"files"`
 }
@@ -89,12 +90,12 @@ func Detect() (Info, error) {
 	if err != nil {
 		return Info{}, fmt.Errorf("release: locate executable: %w", err)
 	}
-	return Verify(dir, exe, info.Revision)
+	return verify(dir, exe, info)
 }
 
 // Generate inventories a staged release. The result is deterministic: paths
 // are slash-separated and JSON's map encoder sorts its keys.
-func Generate(dir, revision string) (Manifest, error) {
+func Generate(dir, revision string, modified ...bool) (Manifest, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
 		return Manifest{}, err
@@ -151,13 +152,18 @@ func Generate(dir, revision string) (Manifest, error) {
 			return Manifest{}, err
 		}
 	}
-	return Manifest{Schema: ManifestSchema, Revision: revision, ConfigSchema: ConfigSchema, Files: files}, nil
+	isModified := len(modified) > 0 && modified[0]
+	return Manifest{Schema: ManifestSchema, Revision: revision, Modified: isModified, ConfigSchema: ConfigSchema, Files: files}, nil
 }
 
 // Verify proves that the running executable and all executable assets are the
 // exact release described by release.json. executable is a parameter so the
 // invariants can be unit-tested without spawning another process.
 func Verify(dir, executable, revision string) (Info, error) {
+	return verify(dir, executable, Info{Revision: revision, ConfigSchema: ConfigSchema})
+}
+
+func verify(dir, executable string, build Info) (Info, error) {
 	realDir, err := canonicalDir(dir)
 	if err != nil {
 		return Info{}, fmt.Errorf("release: %w", err)
@@ -187,17 +193,20 @@ func Verify(dir, executable, revision string) (Info, error) {
 	if want.ConfigSchema != ConfigSchema {
 		return Info{}, fmt.Errorf("release: config schema %d, binary requires %d", want.ConfigSchema, ConfigSchema)
 	}
-	if want.Revision != revision {
-		return Info{}, fmt.Errorf("release: manifest revision %q does not match binary revision %q", want.Revision, revision)
+	if want.Revision != build.Revision {
+		return Info{}, fmt.Errorf("release: manifest revision %q does not match binary revision %q", want.Revision, build.Revision)
 	}
-	got, err := Generate(realDir, revision)
+	if want.Modified != build.Modified {
+		return Info{}, fmt.Errorf("release: manifest modified=%t does not match binary modified=%t", want.Modified, build.Modified)
+	}
+	got, err := Generate(realDir, build.Revision, build.Modified)
 	if err != nil {
 		return Info{}, err
 	}
 	if !reflect.DeepEqual(want.Files, got.Files) {
 		return Info{}, describeDifference(want.Files, got.Files)
 	}
-	return Info{Managed: true, Revision: revision, Dir: realDir, ManifestSchema: ManifestSchema, ConfigSchema: ConfigSchema}, nil
+	return Info{Managed: true, Revision: build.Revision, Modified: build.Modified, Dir: realDir, ManifestSchema: ManifestSchema, ConfigSchema: ConfigSchema}, nil
 }
 
 func canonicalDir(dir string) (string, error) {

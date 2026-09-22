@@ -76,6 +76,16 @@ if deploy "$prefix" selfcheck-three >/dev/null 2>&1; then
 fi
 [[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-two" ]]
 
+# Re-activating the current revision must use `previous` as its rollback target,
+# not call the same unhealthy release a successful restoration.
+if deploy "$prefix" selfcheck-two >/dev/null 2>&1; then
+  echo "install-release-selfcheck: unhealthy same-revision deploy was accepted" >&2
+  exit 1
+fi
+[[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-one" ]]
+echo pass >"$health_state"
+deploy "$prefix" selfcheck-two >/dev/null
+
 # Installed bytes are verified in place, not merely while staging.
 chmod u+w "$prefix/releases/selfcheck-one/agents/mock/refine"
 printf '\n# tampered\n' >>"$prefix/releases/selfcheck-one/agents/mock/refine"
@@ -89,6 +99,7 @@ fi
 # no crash-looping current link and stops the service explicitly.
 chmod u+w "$prefix/releases/selfcheck-two/agents/mock/refine"
 printf '\n# tampered\n' >>"$prefix/releases/selfcheck-two/agents/mock/refine"
+echo fail >"$health_state"
 if deploy "$prefix" selfcheck-four >/dev/null 2>&1; then
   echo "install-release-selfcheck: deploy unexpectedly passed with failed health" >&2
   exit 1
@@ -118,8 +129,8 @@ case "$1" in
       kill "$(cat "$REAL_PID")" 2>/dev/null || true
       wait "$(cat "$REAL_PID")" 2>/dev/null || true
     fi
-    CONVEYOR_RELEASE_DIR="$REAL_PREFIX/current" \
-      "$REAL_PREFIX/current/conveyor" serve -c "$REAL_CONFIG" -addr 127.0.0.1:0 \
+    CONVEYOR_RELEASE_DIR="$REAL_PREFIX/current" MOCK_STORE="$REAL_MOCK_STORE" \
+      "$REAL_PREFIX/current/conveyor" serve -c "$REAL_CONFIG" -addr 127.0.0.1:0 -mode observe \
       >"$REAL_LOG" 2>&1 &
     printf '%s\n' "$!" >"$REAL_PID"
     ;;
@@ -136,9 +147,20 @@ CONVEYOR_HEALTH_ATTEMPTS=15 \
 CONVEYOR_REVISION=real-health \
 CONVEYOR_ALLOW_DIRTY=1 \
 REAL_PREFIX="$real_prefix" REAL_CONFIG="$real_dir/conveyor.yaml" \
-REAL_PID="$tmp/real.pid" REAL_LOG="$tmp/real.log" \
+REAL_PID="$tmp/real.pid" REAL_LOG="$tmp/real.log" REAL_MOCK_STORE="$tmp/mock.json" \
   "$repo/deploy/install-release" >/dev/null
 curl --silent --fail --unix-socket "$real_dir/data/api.sock" http://localhost/api/state |
   jq -e '.release.managed == true and .release.revision == "real-health"' >/dev/null
+# A second deploy proves the service-controller child did not inherit fd 9 and
+# keep the deployment flock alive after the installer exited.
+CONVEYOR_PREFIX="$real_prefix" \
+CONVEYOR_CONFIG="$real_dir/conveyor.yaml" \
+CONVEYOR_SYSTEMCTL="$tmp/systemctl-real" \
+CONVEYOR_HEALTH_ATTEMPTS=15 \
+CONVEYOR_REVISION=real-health \
+CONVEYOR_ALLOW_DIRTY=1 \
+REAL_PREFIX="$real_prefix" REAL_CONFIG="$real_dir/conveyor.yaml" \
+REAL_PID="$tmp/real.pid" REAL_LOG="$tmp/real.log" REAL_MOCK_STORE="$tmp/mock.json" \
+  "$repo/deploy/install-release" >/dev/null
 
 echo "install-release selfcheck: ok"

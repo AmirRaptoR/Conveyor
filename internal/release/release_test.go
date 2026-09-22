@@ -55,6 +55,28 @@ func TestVerifyRejectsRevisionMismatch(t *testing.T) {
 	}
 }
 
+func TestVerifyRejectsModifiedBuildMismatch(t *testing.T) {
+	dir := staged(t, "abc123")
+	path := filepath.Join(dir, ManifestName)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Modified = true
+	raw, _ = json.MarshalIndent(manifest, "", "  ")
+	if err := os.WriteFile(path, append(raw, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Verify(dir, filepath.Join(dir, "conveyor"), "abc123")
+	if err == nil || !strings.Contains(err.Error(), "manifest modified=true does not match binary modified=false") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestVerifyRejectsMissingOrChangedAssets(t *testing.T) {
 	tests := []struct {
 		name string

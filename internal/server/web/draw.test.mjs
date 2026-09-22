@@ -91,6 +91,12 @@ test("draw: an unmanaged binary is visibly a development build", async () => {
   assert.match(p.el("#release-badge").title, /unmanaged development build/);
 });
 
+test("draw: a release built from modified source cannot look clean", async () => {
+  const p = await page();
+  await withState(p, baseState({ release: { managed: true, revision: "abc123", modified: true, configSchema: 1 } }));
+  assert.equal(p.el("#release-badge").textContent, "release abc123 dirty");
+});
+
 test("draw: no source degraded leaves the masthead line unchanged from today", async () => {
   const now = Date.parse("2026-09-06T12:00:05Z");
   const p = await page({ now });

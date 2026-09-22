@@ -24,6 +24,7 @@ rather than later, unexplained.
 | bash | every provider and agent script | `bash --version` |
 | `gh`, authenticated | every GitHub provider script and agent shells out to it | `gh auth status` |
 | `jq` | every script parses the item and `$CONVEYOR_RESULT` with it | `jq --version` |
+| `flock` | serializes production release installation | `flock --version` |
 | `claude` CLI | the shipped `agents/claude/*` adapters run it headlessly | `claude --version` |
 
 ### Optional, tied to a capability
@@ -190,10 +191,11 @@ sudo systemctl enable conveyor
 Then, from a clean checkout of the revision to deploy:
 
 ```bash
-CONVEYOR_PREFIX=/opt/conveyor \
-CONVEYOR_CONFIG=/var/lib/conveyor/conveyor.yaml \
-CONVEYOR_SERVICE=conveyor \
-  deploy/install-release
+sudo env \
+  CONVEYOR_PREFIX=/opt/conveyor \
+  CONVEYOR_CONFIG=/var/lib/conveyor/conveyor.yaml \
+  CONVEYOR_SERVICE=conveyor \
+  "$(pwd)/deploy/install-release"
 ```
 
 The installer performs these operations in order:
@@ -222,6 +224,18 @@ stderr. Set `CONVEYOR_ADDR` when the URL passed to such a hook differs from
 `127.0.0.1:8090`, and `CONVEYOR_HEALTH_ATTEMPTS` to change the default 30
 attempts. `CONVEYOR_SYSTEMCTL` selects the service-control executable, primarily
 for non-systemd test environments.
+
+Run the installer as root (as above), or as the unit's `User=` when that account
+is authorized to restart the unit. The built-in probe must be able to read the
+service-owned `data/api.sock`; inability to verify health is deliberately a
+failed deployment, never permission to leave an unverified release active. The
+installer checks for `flock`, `jq` and (when using the built-in probe) `curl`
+before it changes `current`.
+
+`CONVEYOR_ALLOW_DIRTY=1` is an emergency/testing escape hatch for packaging a
+modified checkout. Such a manifest records `modified: true`, and `/api/state`
+and the masthead identify the release as `dirty`. Routine production deploys
+must come from a clean checkout and should never set it.
 
 The masthead and `/api/state.release` show the active revision, manifest schema,
 config schema and canonical release directory. In production the badge must say
@@ -259,10 +273,11 @@ sudo cp deploy/conveyor.service.example /etc/systemd/system/conveyor.service
 sudo $EDITOR /etc/systemd/system/conveyor.service         # fill in User and PATH
 sudo systemctl daemon-reload
 sudo systemctl enable conveyor
-CONVEYOR_PREFIX=/opt/conveyor \
-CONVEYOR_CONFIG=/var/lib/conveyor/conveyor.yaml \
-CONVEYOR_SERVICE=conveyor \
-  deploy/install-release
+sudo env \
+  CONVEYOR_PREFIX=/opt/conveyor \
+  CONVEYOR_CONFIG=/var/lib/conveyor/conveyor.yaml \
+  CONVEYOR_SERVICE=conveyor \
+  "$(pwd)/deploy/install-release"
 ```
 
 Installing and reloading the new unit *before* `install-release` is essential:
@@ -291,7 +306,7 @@ after confirming neither `current` nor `previous` points to them.
 
 ## Everything this does not do
 
-- Does not install Go, git, `gh`, `jq`, `claude`, `codex`, Node, systemd or
+- Does not install Go, git, `gh`, `jq`, `flock`, `claude`, `codex`, Node, systemd or
   Caddy — only checks for them.
 - Does not enforce a version or that `gh`/`claude`/`codex` are authenticated —
   `gh auth status` is the command that proves it; nothing here gates on the

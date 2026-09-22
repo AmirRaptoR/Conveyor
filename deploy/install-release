@@ -37,8 +37,14 @@ releases="$prefix/releases"
 target="$releases/$revision"
 stage="$releases/.${revision}.tmp.$$"
 mkdir -p "$releases"
-if ! command -v flock >/dev/null 2>&1; then
-  echo "install-release: flock is required to serialize deployments" >&2
+for required in flock jq; do
+  if ! command -v "$required" >/dev/null 2>&1; then
+    echo "install-release: $required is required" >&2
+    exit 1
+  fi
+done
+if [[ -z "$healthcheck" ]] && ! command -v curl >/dev/null 2>&1; then
+  echo "install-release: curl is required for the built-in health check" >&2
   exit 1
 fi
 exec 9>"$prefix/deploy.lock"
@@ -47,10 +53,12 @@ if ! flock -n 9; then
   exit 1
 fi
 manifest_tmp=$(mktemp "${TMPDIR:-/tmp}/conveyor-manifest.XXXXXX")
+probe_err=$(mktemp "${TMPDIR:-/tmp}/conveyor-probe.XXXXXX")
 link_tmp=""
 
 cleanup() {
   rm -f "$manifest_tmp"
+  rm -f "$probe_err"
   if [[ -n "$link_tmp" ]]; then rm -f "$link_tmp"; fi
   if [[ -d "$stage" ]]; then
     chmod -R u+w "$stage" 2>/dev/null || true
@@ -79,17 +87,21 @@ state_once() {
 }
 
 health() {
-  local expected=$1 attempt body last="no response"
-  for ((attempt=1; attempt<=health_attempts; attempt++)); do
-    if body=$(state_once "$expected" 2>/dev/null); then
+	local expected=$1 attempt body last="no response"
+	for ((attempt=1; attempt<=health_attempts; attempt++)); do
+		: >"$probe_err"
+		if body=$(state_once "$expected" 2>"$probe_err"); then
       if jq -e --arg revision "$expected" \
         '.release.managed == true and .release.revision == $revision' \
         <<<"$body" >/dev/null 2>&1; then
         return 0
       fi
       last="response did not identify managed release $expected"
-    else
-      last="state endpoint unavailable"
+		else
+			last="state endpoint unavailable"
+			while IFS= read -r detail; do
+				[[ -n "$detail" ]] && last="state endpoint unavailable: $detail"
+			done <"$probe_err"
     fi
     if (( attempt < health_attempts )); then sleep 2; fi
   done
@@ -132,28 +144,35 @@ fi
 if [[ -L "$current" ]]; then
   old=$(readlink -f "$current" || true)
 fi
+rollback="$old"
+if [[ -n "$rollback" && "$rollback" == "$target" ]]; then
+  rollback=""
+  if [[ -L "$previous" ]]; then
+    rollback=$(readlink -f "$previous" || true)
+  fi
+fi
 
 atomic_link "$target" "$current"
-if ! "$systemctl_bin" restart "$service" || ! health "$revision"; then
+if ! "$systemctl_bin" restart "$service" 9>&- || ! health "$revision"; then
   echo "install-release: activation of $revision failed; rolling back" >&2
   restored=false
-  if [[ -n "$old" && -x "$old/conveyor" ]]; then
-    # Refuse to turn an arbitrary old symlink into the rollback target.
-    if CONVEYOR_RELEASE_DIR="$old" "$old/conveyor" version >/dev/null 2>&1; then
-      old_revision=$(jq -er '.revision' "$old/release.json" 2>/dev/null || true)
-      if [[ -n "$old_revision" ]] && atomic_link "$old" "$current"; then
-        restored=true
-        if ! "$systemctl_bin" restart "$service" || ! health "$old_revision"; then
+	if [[ -n "$rollback" && -x "$rollback/conveyor" ]]; then
+		# Refuse to turn an arbitrary old symlink into the rollback target.
+		if CONVEYOR_RELEASE_DIR="$rollback" "$rollback/conveyor" version >/dev/null 2>&1; then
+			old_revision=$(jq -er '.revision' "$rollback/release.json" 2>/dev/null || true)
+			if [[ -n "$old_revision" ]] && atomic_link "$rollback" "$current"; then
+				restored=true
+				if ! "$systemctl_bin" restart "$service" 9>&- || ! health "$old_revision"; then
           echo "install-release: previous release was restored but did not become healthy" >&2
         fi
       fi
-    else
-      echo "install-release: previous release $old no longer verifies" >&2
+		else
+			echo "install-release: previous release $rollback no longer verifies" >&2
     fi
   fi
   if [[ "$restored" != true ]]; then
     rm -f "$current"
-    "$systemctl_bin" stop "$service" || true
+		"$systemctl_bin" stop "$service" 9>&- || true
     echo "install-release: no usable previous release; failed activation removed and service stopped" >&2
   fi
   exit 1

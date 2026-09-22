@@ -181,29 +181,37 @@ func loadProcessConfig(path, providers string) (*config.Config, release.Info, er
 	if err != nil {
 		return nil, release.Info{}, err
 	}
-	if rel.Managed {
-		for _, src := range cfg.Sources {
-			paths := make(map[string]string, len(src.Paths)+2)
-			paths["provider list"] = src.List
-			paths["provider move"] = src.Move
-			for name, path := range src.Paths {
-				paths["script "+name] = path
+	if err := validateReleaseExecutables(cfg, rel); err != nil {
+		return nil, release.Info{}, err
+	}
+	return cfg, rel, nil
+}
+
+func validateReleaseExecutables(cfg *config.Config, rel release.Info) error {
+	if !rel.Managed {
+		return nil
+	}
+	for _, src := range cfg.Sources {
+		paths := make(map[string]string, len(src.Paths)+2)
+		paths["provider list"] = src.List
+		paths["provider move"] = src.Move
+		for name, path := range src.Paths {
+			paths["script "+name] = path
+		}
+		for name, executable := range paths {
+			if executable == "" {
+				continue
 			}
-			for name, executable := range paths {
-				if executable == "" {
-					continue
-				}
-				inside, err := release.Contains(rel.Dir, executable)
-				if err != nil {
-					return nil, release.Info{}, fmt.Errorf("source %q %s: verify release path: %w", src.Name, name, err)
-				}
-				if !inside {
-					return nil, release.Info{}, fmt.Errorf("source %q %s resolves outside immutable release: %s", src.Name, name, executable)
-				}
+			inside, err := release.Contains(rel.Dir, executable)
+			if err != nil {
+				return fmt.Errorf("source %q %s: verify release path: %w", src.Name, name, err)
+			}
+			if !inside {
+				return fmt.Errorf("source %q %s resolves outside immutable release: %s", src.Name, name, executable)
 			}
 		}
 	}
-	return cfg, rel, nil
+	return nil
 }
 
 func cmdVersion(args []string) error {
@@ -235,7 +243,8 @@ func cmdReleaseManifest(args []string) error {
 	if *dir == "" || fs.NArg() != 0 {
 		return errors.New("release-manifest requires exactly -dir DIR")
 	}
-	m, err := release.Generate(*dir, release.Current().Revision)
+	info := release.Current()
+	m, err := release.Generate(*dir, info.Revision, info.Modified)
 	if err != nil {
 		return err
 	}
