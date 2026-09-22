@@ -444,7 +444,8 @@ function card(it, active, place) {
   const hold = !it.blocked && heldBy[it.id];
   const cls = ["item", hasPrio ? "p" + it.priority : "", working ? "working" : "",
                it.blocked ? "blocked " + tone(blocks[it.id]) : "",
-               hold ? "held" : "", ranked ? "ranked" : ""].filter(Boolean).join(" ");
+               hold ? "held" : "", hold?.invalid ? "dependency-invalid" : "",
+               ranked ? "ranked" : ""].filter(Boolean).join(" ");
   return `<article class="${cls}" draggable="true" tabindex="0" role="button"
       style="--src:${sourceColour(it.source)}"
       data-id="${esc(it.id)}" data-title="${esc(it.title)}" data-stage="${esc(it.stage)}">
@@ -452,7 +453,9 @@ function card(it, active, place) {
     <span class="foot">
       ${working ? `<span class="working-tag">working ${durSpan(new Date(inHand.startedAt).getTime(), false)}</span>` : ""}
       ${it.blocked ? why(it) : ""}
-      ${hold ? `<span class="behind">behind ${esc(hold.by.split(":").pop())}</span>` : ""}
+      ${hold ? (hold.invalid
+        ? `<span class="dependency-error" title="${esc(hold.reason || "invalid dependency graph")}">dependency error</span>`
+        : `<span class="behind">behind ${esc(hold.by.split(":").pop())}${hold.until ? ` · until ${esc(hold.until)}` : ""}</span>`) : ""}
       ${needsChip(it, hold)}
       ${ranked && !working && !it.blocked ? `<span class="rank">${place + 1}</span>` : ""}
       ${hasPrio ? `<span class="prio">p${it.priority}</span>` : ""}
@@ -473,9 +476,10 @@ function card(it, active, place) {
 // this says what the card is waiting for at all, which is the question a
 // person asks when they see a dozen grey cards and want to know which one
 // to finish first. A dependency the board can see is drawn by its stage: one
-// that is not in the listing any more or sits in a terminal stage is done
-// with (`.met`, dimmed), the one currently holding the card is `.holding`,
-// and the rest are simply still ahead of it. The number alone, never the
+// that sits in a terminal stage is done with (`.met`, dimmed); one missing
+// from the listing is an error, never silently treated as complete. The one
+// currently holding the card is `.holding`, and the rest are simply still
+// ahead of it. The number alone, never the
 // source: a card already names its own source in its id, and its
 // dependencies are always in the same repository.
 function needsChip(it, hold) {
@@ -483,8 +487,8 @@ function needsChip(it, hold) {
   if (!deps.length) return "";
   const refs = deps.map(id => {
     const dep = byId.get(id);
-    const met = !dep || terminal.has(dep.stage);
-    const cls = hold && hold.by === id ? "holding" : met ? "met" : "";
+    const met = dep && terminal.has(dep.stage);
+    const cls = hold && hold.by === id ? "holding" : !dep ? "missing" : met ? "met" : "";
     const where = dep ? `${id} is in ${dep.stage}` : `${id} is not on the board`;
     return `<span class="${cls}" title="${esc(where)}">${esc(id.split(":").pop())}</span>`;
   });

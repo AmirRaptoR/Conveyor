@@ -284,11 +284,14 @@ peer, and the socket is the only door with no password on it (#94).
   its dependency is still on a branch produces a pull request that cannot
   merge on its own, and every issue must be deliverable by itself even as a
   slice of a bigger feature. The hold carries `until` so the board can say
-  "must reach merged" instead of "cannot enter in-progress". Every unusable edge — an unknown id, a self-edge, a stage
-  the config does not declare, a cycle — is dropped rather than held, because
-  the alternative is a pipeline a person wedges shut by mistyping one line of
-  an issue body; only the edges inside a cycle go, so an unrelated dependency
-  off the same item still holds. This is the line's own sequencing and is not
+  "must reach merged" instead of "cannot enter in-progress". The threshold
+  remains in force after that stage, which is how a live board reconciles an
+  item already found in review when the gate is enabled: it stops there until
+  the dependency lands, without being moved backwards. Every unusable edge —
+  an unknown id, a self-edge, a stage the config does not declare, a cycle —
+  is a visible invalid hold and fails closed before a run slot is claimed.
+  Repairing the declaration clears it on the next listing; dropping it would
+  silently authorize the order it was meant to forbid. This is the line's own sequencing and is not
   `agents/_deps`, which still asks GitHub about issues the board cannot see —
   narrower (an un-onboarded sibling gates nothing here) and later (it catches
   what the engine could not see, immediately before the worktree). `Unblock

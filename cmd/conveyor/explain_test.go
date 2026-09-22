@@ -130,6 +130,18 @@ func TestDeclineReasonHeldBehindADependency(t *testing.T) {
 	}
 }
 
+func TestDeclineReasonNamesInvalidDependency(t *testing.T) {
+	cfg := explainCfg(t)
+	follower := model.Item{ID: "s1:2", Stage: "backlog", DependsOn: []string{"s1:999"}}
+	d := pipeline.NewDeps(cfg, []model.Item{follower})
+	got := declineReason(cfg, &follower, d)
+	for _, want := range []string{"dependency error", "s1:999", "missing"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("declineReason = %q, want %q", got, want)
+		}
+	}
+}
+
 func TestExplainRunPrintsThePlanAndRunsNothing(t *testing.T) {
 	cfg := explainCfg(t)
 	item := &model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog", Title: "do the thing"}

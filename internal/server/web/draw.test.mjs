@@ -380,9 +380,9 @@ test("draw: a blocked item is never also drawn held", async () => {
 
 // Every dependency a card declares is drawn on it by number, hold or no
 // hold: "behind 1" says what stops a card today, "needs" says what it is
-// waiting for at all. A dependency that has finished (a terminal stage, or
-// gone from the listing) is dimmed, not dropped; the one holding the card is
-// singled out; and the card's own source is never repeated in the numbers.
+// waiting for at all. A dependency that has finished (a terminal stage) is
+// dimmed, one missing from the listing is visibly erroneous, the one holding
+// the card is singled out, and the card's own source is never repeated.
 test("draw: a card lists what it depends on, by number", async () => {
   const p = await page();
   await withState(p, baseState({
@@ -398,8 +398,24 @@ test("draw: a card lists what it depends on, by number", async () => {
   assert.match(rendered, /class="needs"[^>]*>needs /);
   assert.match(rendered, /class="holding"[^>]*>1</);
   assert.match(rendered, /class="met"[^>]*>3</);
-  assert.match(rendered, /class="met"[^>]*>9</);
+  assert.match(rendered, /class="missing"[^>]*>9</);
+  assert.match(rendered, /behind 1 · until working/);
   assert.doesNotMatch(rendered, /needs [^<]*s1:/);
+});
+
+test("draw: an invalid dependency hold is unmistakable and explains itself", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:2", source: "s1", stage: "backlog", title: "the follower",
+      dependsOn: ["s1:999"] }],
+    held: { "s1:2": { by: "s1:999", target: "working", until: "working",
+      invalid: true, reason: "s1:2 depends on missing item s1:999" } },
+  }));
+  const rendered = p.el("#rail").innerHTML;
+  assert.match(rendered, /class="item[^"\n]*dependency-invalid/);
+  assert.match(rendered, /class="dependency-error"[^>]*>dependency error</);
+  assert.match(rendered, /title="s1:2 depends on missing item s1:999"/);
+  assert.doesNotMatch(rendered, /class="behind"/);
 });
 
 test("draw: a card declaring nothing has no needs chip", async () => {

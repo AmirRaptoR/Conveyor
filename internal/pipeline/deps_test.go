@@ -109,21 +109,24 @@ func TestAChainNeedsNoClosure(t *testing.T) {
 	}
 }
 
-// Fail open, every way an edge can be wrong. A typo must never wedge the
-// line, and each case must leave the follower workable — not merely
-// crash-free.
-func TestBadEdgesFailOpen(t *testing.T) {
+// A dependency declaration is scheduling policy, so malformed graphs fail
+// closed and say why. Otherwise a typo silently authorises exactly the work
+// the declaration was meant to prevent.
+func TestBadEdgesFailClosed(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		items []model.Item
+		want  string
 	}{
 		{
 			name:  "an id nobody listed (un-onboarded, another repo, a typo)",
 			items: []model.Item{item("s:2", "ready", "s:999")},
+			want:  "missing item s:999",
 		},
 		{
 			name:  "an item depending on itself",
 			items: []model.Item{item("s:2", "ready", "s:2")},
+			want:  "depends on itself",
 		},
 		{
 			name: "a dependency sitting in a stage the config does not declare",
@@ -131,26 +134,38 @@ func TestBadEdgesFailOpen(t *testing.T) {
 				item("s:1", "somewhere-else"),
 				item("s:2", "ready", "s:1"),
 			},
-		},
-		{
-			name:  "an empty-string id",
-			items: []model.Item{item("s:2", "ready", "")},
+			want: "stage \"somewhere-else\" is not declared",
 		},
 		{
 			name:  "duplicate ids in one DependsOn",
 			items: []model.Item{item("s:2", "ready", "s:999", "s:999")},
+			want:  "missing item s:999",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := NewDeps(line(), tc.items)
 			b := tc.items[len(tc.items)-1]
-			if _, held := d.Held(&b, "in-progress"); held {
-				t.Fatal("a bad edge held the item instead of being dropped")
+			hold, held := d.Held(&b, "in-progress")
+			if !held || !hold.Invalid || !strings.Contains(hold.Reason, tc.want) {
+				t.Fatalf("hold = %+v, %v; want an invalid hold containing %q", hold, held, tc.want)
 			}
-			if target, ok := Target(line(), &b, d); !ok {
-				t.Fatalf("the follower has no target at all: %q", target)
+			if target, ok := Target(line(), &b, d); ok {
+				t.Fatalf("invalid follower remained runnable at %q", target)
+			}
+			if len(d.Errors) != 1 || !strings.Contains(d.Errors[0], tc.want) {
+				t.Fatalf("errors = %v, want one containing %q", d.Errors, tc.want)
 			}
 		})
+	}
+}
+
+// An empty provider value declares nothing. It is not a malformed issue
+// reference and must not invent a permanent error.
+func TestEmptyDependencyValueIsIgnored(t *testing.T) {
+	b := item("s:2", "ready", "")
+	d := NewDeps(line(), []model.Item{b})
+	if _, held := d.Held(&b, "in-progress"); held || len(d.Errors) != 0 {
+		t.Fatalf("empty dependency produced hold/errors: %+v, %v", d, held)
 	}
 }
 
@@ -187,7 +202,7 @@ func TestMultipleDependenciesReportTheMostRestrictive(t *testing.T) {
 // flap between two dependencies that hold equally.
 func TestATiedHoldIsBrokenByListingOrder(t *testing.T) {
 	oneB := item("s:1b", "ready") // listed first
-	one := item("s:1", "ready")  // listed second
+	one := item("s:1", "ready")   // listed second
 	two := item("s:2", "ready", "s:1", "s:1b")
 	d := NewDeps(line(), []model.Item{oneB, one, two})
 
@@ -197,18 +212,18 @@ func TestATiedHoldIsBrokenByListingOrder(t *testing.T) {
 	}
 }
 
-// A cycle is a person's mistake in an issue body. Holding every item in it
-// forever would be a pipeline wedged by a typo, so the edges go and the
-// board is told, once, naming every item involved.
-func TestCyclesAreDroppedAndReported(t *testing.T) {
+// A cycle is a person's mistake in an issue body. Every participant is held
+// until that declaration is repaired, and the board is told once, naming the
+// complete loop.
+func TestCyclesFailClosedAndAreReported(t *testing.T) {
 	two := item("s:2", "ready", "s:1")
 	three := item("s:3", "ready", "s:2")
 	one := item("s:1", "ready", "s:3") // closes the loop
 	d := NewDeps(line(), []model.Item{one, two, three})
 
 	for _, it := range []model.Item{one, two, three} {
-		if _, held := d.Held(&it, "in-progress"); held {
-			t.Fatalf("%s was held by an edge that is part of a cycle", it.ID)
+		if hold, held := d.Held(&it, "in-progress"); !held || !hold.Invalid {
+			t.Fatalf("%s hold = %+v, %v; want invalid cycle hold", it.ID, hold, held)
 		}
 	}
 	if len(d.Cycles) != 1 {
@@ -232,10 +247,11 @@ func TestACycleDoesNotDisarmTheRestOfTheGraph(t *testing.T) {
 	if _, held := d.Held(&five, "in-progress"); !held {
 		t.Fatal("an edge with nothing to do with the cycle was dropped too")
 	}
-	// The A->C edge in "A->B, B->A and A->C" still gates A behind C: only the
-	// edges inside the cycle (A<->B) are dropped, A->C survives.
-	if _, held := d.Held(&one, "in-progress"); !held {
-		t.Fatal("the edge outside the cycle (s:1 -> s:4) was dropped along with it")
+	// The cycle's invalid hold wins deterministically for A; the unrelated
+	// edge remains in the graph and will resume governing once the cycle is
+	// repaired in the next fresh listing.
+	if hold, held := d.Held(&one, "in-progress"); !held || !hold.Invalid {
+		t.Fatalf("cycle participant hold = %+v, %v; want invalid", hold, held)
 	}
 }
 
@@ -246,8 +262,8 @@ func TestThreeCycleIsDroppedAndReported(t *testing.T) {
 	c := item("a:3", "ready", "a:2")
 	d := NewDeps(line(), []model.Item{a, b, c})
 	for _, it := range []model.Item{a, b, c} {
-		if _, held := d.Held(&it, "in-progress"); held {
-			t.Fatalf("%s was held by a 3-cycle edge", it.ID)
+		if hold, held := d.Held(&it, "in-progress"); !held || !hold.Invalid {
+			t.Fatalf("%s hold = %+v, %v; want invalid 3-cycle hold", it.ID, hold, held)
 		}
 	}
 	if len(d.Cycles) != 1 {

@@ -191,6 +191,8 @@
 }
 .item.held .title { color:var(--dim); }
 .item .behind { color:var(--faint); }
+.item.dependency-invalid { border-color:var(--stop); }
+.item .dependency-error { color:var(--stop); font-weight:700; }
 
 /* What a card is sequenced behind, by number — always shown, hold or no
    hold, so the shape of a family is readable across a column. A dependency
@@ -201,6 +203,7 @@
 .item .needs { color:var(--faint); }
 .item .needs .met { text-decoration:line-through; opacity:.6; }
 .item .needs .holding { color:var(--stop); font-weight:600; }
+.item .needs .missing { color:var(--stop); text-decoration:underline wavy; }
 
 /* Terminal stations sit after a gap, joined by a short spur. A terminal
    column takes a pipeline station's own basis and gutter, so its card is

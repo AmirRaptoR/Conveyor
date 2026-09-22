@@ -27,8 +27,8 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	deps := pipeline.NewDeps(s.cfg, s.state.Items)
 	st.Items = pipeline.Order(s.cfg, s.state.Items, s.state.Order, deps)
 	st.Held = heldOf(s.cfg, s.state.Items, deps)
-	if len(deps.Cycles) > 0 {
-		st.Warnings = append(append([]string(nil), s.state.Warnings...), deps.Cycles...)
+	if len(deps.Errors) > 0 {
+		st.Warnings = append(append([]string(nil), s.state.Warnings...), deps.Errors...)
 	}
 	bySrc, byStage, held, max, perSrc, perStage := s.eng.Locks().Snapshot()
 	st.Slots = SlotsView{BySource: bySrc, ByStage: byStage, Global: held, GlobalMax: max,
@@ -761,6 +761,9 @@ func (s *Server) whyStuck(it model.Item, deps pipeline.Deps) string {
 	}
 	if next != "" {
 		if hold, held := deps.Held(&it, next); held {
+			if hold.Invalid {
+				return fmt.Sprintf("%s cannot move because its dependency graph is invalid: %s", it.ID, hold.Reason)
+			}
 			if hold.Blocked {
 				return fmt.Sprintf("%s is held behind %s, which is marked in %s — clear that mark and this moves on its own",
 					it.ID, hold.By, hold.Stage)

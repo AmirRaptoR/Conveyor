@@ -983,3 +983,26 @@ func TestDependenciesAtMustNameADeclaredStage(t *testing.T) {
 		t.Fatalf("refining.DependenciesAt = %q, want done", st.DependenciesAt)
 	}
 }
+
+func TestDependenciesAtCannotPointBackwards(t *testing.T) {
+	dir := t.TempDir()
+	provider(t, dir)
+	script(t, filepath.Join(dir, "agents", "claude", "refine"))
+	workdir(t, filepath.Join(dir, "repo"))
+	path := filepath.Join(dir, "conveyor.yaml")
+	body := "version: 1\nstages:\n  - name: backlog\n  - name: refining\n" +
+		"    script: refine\n    onSuccess: done\n    dependenciesAt: backlog\n" +
+		"  - name: done\n    terminal: true\nsources:\n" + declared
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("backwards dependenciesAt loaded without complaint")
+	}
+	for _, want := range []string{"dependenciesAt", "backlog", "precedes"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %v, want it to mention %q", err, want)
+		}
+	}
+}

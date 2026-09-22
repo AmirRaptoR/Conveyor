@@ -418,8 +418,9 @@ sources:
 // would still hold anyway gets no provider write and stays marked, reported
 // under heldByDependencies rather than unblocked. An item that is both asked
 // and held is counted once, under waitingOnYou — the question skip comes
-// first. A marked item that is not held, and one whose dependency the
-// listing cannot see at all, are both cleared exactly as before.
+// first. A marked item that is not held is cleared; one whose dependency the
+// listing cannot see fails closed and remains marked until its declaration is
+// repaired.
 func TestUnblockAllConsidersTheSequence(t *testing.T) {
 	cfg, r, _ := pipelineFor(t)
 	s := New(cfg, r)
@@ -433,8 +434,8 @@ func TestUnblockAllConsidersTheSequence(t *testing.T) {
 		{ID: "s1:3", Ref: "3", Source: "s1", Stage: "backlog", Blocked: true, DependsOn: []string{"s1:1"}},
 		// marked, not held: an ordinary fault with no dependency at all
 		{ID: "s1:4", Ref: "4", Source: "s1", Stage: "working", Blocked: true},
-		// marked, dependency absent from the listing: the residual gap —
-		// still cleared here; agents/_deps re-marks it at implement time.
+		// marked, dependency absent from the listing: invalid dependency state,
+		// held without relying on an agent to rediscover it later.
 		{ID: "s1:5", Ref: "5", Source: "s1", Stage: "backlog", Blocked: true, DependsOn: []string{"nobody:1"}},
 	}
 	s.blocks = map[string]Block{
@@ -456,31 +457,34 @@ func TestUnblockAllConsidersTheSequence(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Unblocking != 2 {
-		t.Errorf("unblocking = %d, want 2 (s1:4 and s1:5)", got.Unblocking)
+	if got.Unblocking != 1 {
+		t.Errorf("unblocking = %d, want 1 (s1:4)", got.Unblocking)
 	}
 	if got.WaitingOnYou != 1 {
 		t.Errorf("waitingOnYou = %d, want 1 (s1:3, held and asked, counted once)", got.WaitingOnYou)
 	}
-	if got.HeldByDependencies != 1 {
-		t.Errorf("heldByDependencies = %d, want 1 (s1:2)", got.HeldByDependencies)
+	if got.HeldByDependencies != 2 {
+		t.Errorf("heldByDependencies = %d, want 2 (s1:2 and invalid s1:5)", got.HeldByDependencies)
 	}
 
-	waitFor(t, "the two non-held marks to clear", func() bool {
+	waitFor(t, "the non-held mark to clear", func() bool {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
 		_, four := s.blocks["s1:4"]
-		_, five := s.blocks["s1:5"]
-		return !four && !five
+		return !four
 	})
 	s.mu.RLock()
 	_, stillHeld := s.blocks["s1:2"]
 	_, stillAsked := s.blocks["s1:3"]
+	_, stillInvalid := s.blocks["s1:5"]
 	s.mu.RUnlock()
 	if !stillHeld {
 		t.Error("s1:2 was unblocked despite the sequencing rule still holding it")
 	}
 	if !stillAsked {
 		t.Error("s1:3's question was cleared in bulk")
+	}
+	if !stillInvalid {
+		t.Error("s1:5 was unblocked despite its missing dependency")
 	}
 }

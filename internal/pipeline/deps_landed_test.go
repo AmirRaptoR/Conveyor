@@ -57,15 +57,36 @@ func TestDependenciesAtHoldsUntilTheNamedStage(t *testing.T) {
 	}
 }
 
-// Only the stage that declares it is affected. Entering review still follows
-// the default rule, so a follower whose dependency is already in review may
-// join it there — the bar is per stage, not per pipeline.
-func TestDependenciesAtLeavesOtherStagesOnTheDefaultRule(t *testing.T) {
-	a := item("s:1", "review")
-	b := item("s:2", "in-progress", "s:1")
+// Stages before the declared gate retain the ordinary sequencing rule. The
+// stronger threshold starts when an item first attempts the gated stage.
+func TestDependenciesAtLeavesEarlierStagesOnTheDefaultRule(t *testing.T) {
+	a := item("s:1", "ready")
+	b := item("s:2", "backlog", "s:1")
 	d := NewDeps(landedLine(), []model.Item{a, b})
-	if _, held := d.Held(&b, "review"); held {
-		t.Fatal("review declares no dependenciesAt, so sharing it must still be allowed")
+	if _, held := d.Held(&b, "ready"); held {
+		t.Fatal("a stage before the gate should still be shareable")
+	}
+}
+
+// The requirement stays in force after the gated stage. This is the
+// reconciliation path for a live board when dependenciesAt is first enabled:
+// work already found in review is stopped before it can merge until the
+// dependency reaches the configured threshold; it is never silently
+// grandfathered through or moved backwards.
+func TestDependenciesAtReconcilesItemsAlreadyPastTheGate(t *testing.T) {
+	b := item("s:2", "review", "s:1")
+	d := NewDeps(landedLine(), []model.Item{item("s:1", "review"), b})
+	hold, held := d.Held(&b, "review")
+	if !held || hold.Until != "merged" || hold.Target != "review" {
+		t.Fatalf("review hold = %+v, %v; want held there until merged", hold, held)
+	}
+	if target, ok := Target(landedLine(), &b, d); ok {
+		t.Fatalf("in-flight item remained runnable at %q", target)
+	}
+
+	d = NewDeps(landedLine(), []model.Item{item("s:1", "merged"), b})
+	if target, ok := Target(landedLine(), &b, d); !ok || target != "review" {
+		t.Fatalf("reconciled target = %q, %v; want review to resume", target, ok)
 	}
 }
 

@@ -41,6 +41,9 @@ func declineReason(cfg *config.Config, it *model.Item, d pipeline.Deps) string {
 		return fmt.Sprintf("stage %q is a queue with no onSuccess; items rest there", it.Stage)
 	}
 	if hold, held := d.Held(it, next); held {
+		if hold.Invalid {
+			return "dependency error: " + hold.Reason
+		}
 		if hold.Blocked {
 			return fmt.Sprintf("held behind %s, which is marked in %s", hold.By, hold.Stage)
 		}

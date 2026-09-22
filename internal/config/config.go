@@ -189,7 +189,9 @@ type Stage struct {
 	// branch that is not on main, and a pull request that cannot merge on
 	// its own is not a deliverable. `dependenciesAt: merged` on the implement
 	// stage says so in the config, where the line's order already lives,
-	// rather than in a script that would discover it one run at a time.
+	// rather than in a script that would discover it one run at a time. The
+	// named stage must not precede this one: that would weaken nothing and
+	// make the configuration claim a gate it does not enforce.
 	DependenciesAt string `yaml:"dependenciesAt"`
 	// MaxAttempts is how many times a failing stage is re-run before the item is
 	// marked. Unset means one — the first failure marks it — because a failure
@@ -978,6 +980,7 @@ func (c *Config) Validate() []string {
 		add("at least two stages are required, got %d", len(c.Stages))
 	}
 	seen := map[string]bool{}
+	stagePosition := map[string]int{}
 	for i, s := range c.Stages {
 		switch {
 		case s.Name == "":
@@ -988,6 +991,7 @@ func (c *Config) Validate() []string {
 			continue
 		}
 		seen[s.Name] = true
+		stagePosition[s.Name] = i
 
 		if s.Terminal && s.runs() {
 			add("stage %q: terminal stages cannot run a script", s.Name)
@@ -1025,6 +1029,8 @@ func (c *Config) Validate() []string {
 		}
 		if s.DependenciesAt != "" && !seen[s.DependenciesAt] {
 			add("stage %q: dependenciesAt points at unknown stage %q", s.Name, s.DependenciesAt)
+		} else if s.DependenciesAt != "" && stagePosition[s.DependenciesAt] < stagePosition[s.Name] {
+			add("stage %q: dependenciesAt stage %q precedes it; the required stage must be this stage or a later one", s.Name, s.DependenciesAt)
 		}
 	}
 
