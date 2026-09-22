@@ -129,19 +129,30 @@ mkdir -p "$real_dir"
 cp "$repo/conveyor.example.yaml" "$real_dir/conveyor.yaml"
 cat >"$tmp/systemctl-real" <<'SH'
 #!/usr/bin/env bash
+stop_running() {
+  [[ -f "$REAL_PID" ]] || return 0
+  pid=$(cat "$REAL_PID")
+  kill "$pid" 2>/dev/null || return 0
+  # This controller is a fresh process on every invocation, so the service is
+  # not its child and `wait` cannot synchronize shutdown. Poll the PID instead
+  # to ensure its owner lock is gone before launching the replacement.
+  for _ in {1..50}; do
+    if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
+    sleep 0.1
+  done
+  echo "test service $pid did not stop" >&2
+  return 1
+}
 case "$1" in
   restart)
-    if [[ -f "$REAL_PID" ]]; then
-      kill "$(cat "$REAL_PID")" 2>/dev/null || true
-      wait "$(cat "$REAL_PID")" 2>/dev/null || true
-    fi
+    stop_running
     CONVEYOR_RELEASE_DIR="$REAL_PREFIX/current" MOCK_STORE="$REAL_MOCK_STORE" \
       "$REAL_PREFIX/current/conveyor" serve -c "$REAL_CONFIG" -addr 127.0.0.1:0 -mode observe \
       >"$REAL_LOG" 2>&1 &
     printf '%s\n' "$!" >"$REAL_PID"
     ;;
   stop)
-    if [[ -f "$REAL_PID" ]]; then kill "$(cat "$REAL_PID")" 2>/dev/null || true; fi
+    stop_running
     ;;
 esac
 SH
