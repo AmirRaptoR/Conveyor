@@ -3,12 +3,18 @@ set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 tmp=$(mktemp -d)
 cleanup() {
+  status=$?
+  if (( status != 0 )) && [[ -s "$tmp/real.log" ]]; then
+    echo "install-release-selfcheck: real server log follows" >&2
+    sed 's/^/  /' "$tmp/real.log" >&2
+  fi
   if [[ -f "$tmp/real.pid" ]]; then
     kill "$(cat "$tmp/real.pid")" 2>/dev/null || true
     wait "$(cat "$tmp/real.pid")" 2>/dev/null || true
   fi
   chmod -R u+w "$tmp" 2>/dev/null || true
   rm -rf "$tmp"
+  return "$status"
 }
 trap cleanup EXIT
 
