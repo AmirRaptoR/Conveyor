@@ -17,13 +17,15 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+
+	"github.com/AmirRaptoR/Conveyor/internal/config"
 )
 
 const (
 	EnvDir         = "CONVEYOR_RELEASE_DIR"
 	ManifestName   = "release.json"
 	ManifestSchema = 1
-	ConfigSchema   = 1
+	ConfigSchema   = config.SchemaVersion
 )
 
 // BuildRevision is populated by the release build's -ldflags. Source builds
@@ -215,6 +217,28 @@ func canonicalDir(dir string) (string, error) {
 		return "", fmt.Errorf("release directory %s is not a directory", dir)
 	}
 	return dir, nil
+}
+
+// Contains reports whether path resolves inside dir. Both sides are resolved
+// through symlinks so a manifest-managed path cannot escape through an alias.
+func Contains(dir, path string) (bool, error) {
+	realDir, err := canonicalDir(dir)
+	if err != nil {
+		return false, err
+	}
+	realPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false, err
+	}
+	realPath, err = filepath.Abs(realPath)
+	if err != nil {
+		return false, err
+	}
+	rel, err := filepath.Rel(realDir, realPath)
+	if err != nil {
+		return false, err
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)), nil
 }
 
 func hashFile(path string) (string, error) {

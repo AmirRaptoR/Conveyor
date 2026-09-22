@@ -6,11 +6,11 @@
 #   sudo cp deploy/conveyor.service.example /etc/systemd/system/conveyor.service
 #   sudo $EDITOR /etc/systemd/system/conveyor.service   # fill in the paths below
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable --now conveyor
+#   sudo systemctl enable conveyor
+#   deploy/install-release   # creates current, then starts and verifies it
 #
 # See README.md's "Post-deploy check: conveyor probe" for what `Restart=`
-# does and does not cover, and docs/INSTALL.md for the sequence this unit is
-# the last step of.
+# does and does not cover, and docs/INSTALL.md for the migration order.
 [Unit]
 Description=Conveyor — pipeline engine and board
 After=network-online.target

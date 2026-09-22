@@ -16,6 +16,9 @@ if [[ ! -f "$config" ]]; then
   echo "install-release: config does not exist: $config" >&2
   exit 1
 fi
+config_dir=$(cd "$(dirname "$config")" && pwd)
+config="$config_dir/$(basename "$config")"
+api_socket="$config_dir/data/api.sock"
 
 revision=${CONVEYOR_REVISION:-}
 if [[ -z "$revision" ]]; then
@@ -25,7 +28,7 @@ if [[ -n $(git -C "$repo" status --porcelain) && ${CONVEYOR_ALLOW_DIRTY:-0} != 1
   echo "install-release: refusing to package a dirty checkout" >&2
   exit 1
 fi
-if [[ ! "$revision" =~ ^[A-Za-z0-9._-]+$ ]]; then
+if [[ ! "$revision" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$revision" == "." || "$revision" == ".." ]]; then
   echo "install-release: revision contains unsafe path characters: $revision" >&2
   exit 1
 fi
@@ -33,6 +36,16 @@ fi
 releases="$prefix/releases"
 target="$releases/$revision"
 stage="$releases/.${revision}.tmp.$$"
+mkdir -p "$releases"
+if ! command -v flock >/dev/null 2>&1; then
+  echo "install-release: flock is required to serialize deployments" >&2
+  exit 1
+fi
+exec 9>"$prefix/deploy.lock"
+if ! flock -n 9; then
+  echo "install-release: another deployment already holds $prefix/deploy.lock" >&2
+  exit 1
+fi
 manifest_tmp=$(mktemp "${TMPDIR:-/tmp}/conveyor-manifest.XXXXXX")
 link_tmp=""
 
@@ -55,25 +68,35 @@ atomic_link() {
   link_tmp=""
 }
 
-health() {
+state_once() {
+  local expected=$1
   if [[ -n "$healthcheck" ]]; then
-    "$healthcheck" "http://$addr/api/state"
+    "$healthcheck" "http://$addr/api/state" "$expected"
     return
   fi
-  local attempt code
+  curl --silent --show-error --fail --max-time 5 \
+    --unix-socket "$api_socket" http://localhost/api/state
+}
+
+health() {
+  local expected=$1 attempt body last="no response"
   for ((attempt=1; attempt<=health_attempts; attempt++)); do
-    code=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-      --max-time 5 "http://$addr/api/state" || true)
-    if [[ "$code" == 200 || "$code" == 401 ]]; then
-      return 0
+    if body=$(state_once "$expected" 2>/dev/null); then
+      if jq -e --arg revision "$expected" \
+        '.release.managed == true and .release.revision == $revision' \
+        <<<"$body" >/dev/null 2>&1; then
+        return 0
+      fi
+      last="response did not identify managed release $expected"
+    else
+      last="state endpoint unavailable"
     fi
     if (( attempt < health_attempts )); then sleep 2; fi
   done
-  echo "install-release: health probe failed at http://$addr/api/state (HTTP ${code:-none})" >&2
+  echo "install-release: health probe failed: $last" >&2
   return 1
 }
 
-mkdir -p "$releases"
 if [[ ! -e "$target" ]]; then
   mkdir "$stage"
   (
@@ -92,11 +115,11 @@ if [[ ! -e "$target" ]]; then
   chmod a-w "$stage"
 
   CONVEYOR_RELEASE_DIR="$stage" "$stage/conveyor" version >/dev/null
-  CONVEYOR_RELEASE_DIR="$stage" "$stage/conveyor" validate -c "$config" >/dev/null
-  mv "$stage" "$target"
+  CONVEYOR_RELEASE_DIR="$stage" "$stage/conveyor" validate -strict-sources -c "$config" >/dev/null
+  mv -T "$stage" "$target"
 else
   CONVEYOR_RELEASE_DIR="$target" "$target/conveyor" version >/dev/null
-  CONVEYOR_RELEASE_DIR="$target" "$target/conveyor" validate -c "$config" >/dev/null
+  CONVEYOR_RELEASE_DIR="$target" "$target/conveyor" validate -strict-sources -c "$config" >/dev/null
 fi
 
 current="$prefix/current"
@@ -111,20 +134,27 @@ if [[ -L "$current" ]]; then
 fi
 
 atomic_link "$target" "$current"
-if ! "$systemctl_bin" restart "$service" || ! health; then
+if ! "$systemctl_bin" restart "$service" || ! health "$revision"; then
   echo "install-release: activation of $revision failed; rolling back" >&2
+  restored=false
   if [[ -n "$old" && -x "$old/conveyor" ]]; then
     # Refuse to turn an arbitrary old symlink into the rollback target.
-    CONVEYOR_RELEASE_DIR="$old" "$old/conveyor" version >/dev/null
-    atomic_link "$old" "$current"
-    "$systemctl_bin" restart "$service" || true
-    if ! health; then
-      echo "install-release: rollback was restored but its health probe also failed" >&2
+    if CONVEYOR_RELEASE_DIR="$old" "$old/conveyor" version >/dev/null 2>&1; then
+      old_revision=$(jq -er '.revision' "$old/release.json" 2>/dev/null || true)
+      if [[ -n "$old_revision" ]] && atomic_link "$old" "$current"; then
+        restored=true
+        if ! "$systemctl_bin" restart "$service" || ! health "$old_revision"; then
+          echo "install-release: previous release was restored but did not become healthy" >&2
+        fi
+      fi
+    else
+      echo "install-release: previous release $old no longer verifies" >&2
     fi
-  else
+  fi
+  if [[ "$restored" != true ]]; then
     rm -f "$current"
     "$systemctl_bin" stop "$service" || true
-    echo "install-release: no previous release existed; service stopped" >&2
+    echo "install-release: no usable previous release; failed activation removed and service stopped" >&2
   fi
   exit 1
 fi

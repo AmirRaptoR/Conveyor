@@ -16,6 +16,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// SchemaVersion is the one configuration format this binary accepts. Release
+// manifests and the board report this exact value; changing the parser cannot
+// silently drift away from the advertised schema.
+const SchemaVersion = 1
+
 type Config struct {
 	Version     int         `yaml:"version"`
 	Concurrency Concurrency `yaml:"concurrency"`
@@ -882,8 +887,8 @@ func (c *Config) Validate() []string {
 	var errs []string
 	add := func(f string, a ...any) { errs = append(errs, fmt.Sprintf(f, a...)) }
 
-	if c.Version != 1 {
-		add("version must be 1, got %d", c.Version)
+	if c.Version != SchemaVersion {
+		add("version must be %d, got %d", SchemaVersion, c.Version)
 	}
 	errs = append(errs, c.Auth.validate()...)
 	if c.Concurrency.PerStage < 1 {

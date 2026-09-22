@@ -74,7 +74,8 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `conveyor — run a configurable pipeline over items from configurable sources
 
-  validate                              load and check the config
+  validate  [-strict-sources]           load and check the config; strict mode
+                                        fails if any source cannot run
   list      [-source NAME]              run list scripts, print items
   preflight [-source NAME]              readiness: gh/agent/label checks per
                                         source, exit non-zero if any failed.
@@ -180,6 +181,28 @@ func loadProcessConfig(path, providers string) (*config.Config, release.Info, er
 	if err != nil {
 		return nil, release.Info{}, err
 	}
+	if rel.Managed {
+		for _, src := range cfg.Sources {
+			paths := make(map[string]string, len(src.Paths)+2)
+			paths["provider list"] = src.List
+			paths["provider move"] = src.Move
+			for name, path := range src.Paths {
+				paths["script "+name] = path
+			}
+			for name, executable := range paths {
+				if executable == "" {
+					continue
+				}
+				inside, err := release.Contains(rel.Dir, executable)
+				if err != nil {
+					return nil, release.Info{}, fmt.Errorf("source %q %s: verify release path: %w", src.Name, name, err)
+				}
+				if !inside {
+					return nil, release.Info{}, fmt.Errorf("source %q %s resolves outside immutable release: %s", src.Name, name, executable)
+				}
+			}
+		}
+	}
 	return cfg, rel, nil
 }
 
@@ -252,6 +275,7 @@ func own(cfg *config.Config, r *runner.Runner, settle bool) (func(), error) {
 
 func cmdValidate(args []string) error {
 	c := newFlags("validate")
+	strictSources := c.fs.Bool("strict-sources", false, "fail if any configured source is unusable")
 	cfg, _, _, stop, err := c.load(args)
 	if err != nil {
 		return err
@@ -348,6 +372,9 @@ func cmdValidate(args []string) error {
 	case bad > 0:
 		fmt.Printf("\n%d of %d source(s) unusable; the other %d will still be worked\n",
 			bad, len(cfg.Sources), len(cfg.Sources)-bad)
+	}
+	if *strictSources && bad > 0 {
+		return fmt.Errorf("%d of %d source(s) unusable", bad, len(cfg.Sources))
 	}
 	return nil
 }

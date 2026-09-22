@@ -92,3 +92,31 @@ func TestVerifyRejectsExecutableOutsideRelease(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestContainsResolvesSymlinksBeforeCheckingBoundary(t *testing.T) {
+	dir := t.TempDir()
+	inside := filepath.Join(dir, "agents", "run")
+	if err := os.MkdirAll(filepath.Dir(inside), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inside, []byte("inside"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := Contains(dir, inside)
+	if err != nil || !ok {
+		t.Fatalf("Contains(inside) = %v, %v", ok, err)
+	}
+
+	outside := filepath.Join(t.TempDir(), "run")
+	if err := os.WriteFile(outside, []byte("outside"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(dir, "agents", "escape")
+	if err := os.Symlink(outside, alias); err != nil {
+		t.Fatal(err)
+	}
+	ok, err = Contains(dir, alias)
+	if err != nil || ok {
+		t.Fatalf("Contains(escaping symlink) = %v, %v", ok, err)
+	}
+}

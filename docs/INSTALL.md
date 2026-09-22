@@ -178,7 +178,16 @@ sudo install -o conveyor -g conveyor -m 0600 conveyor.github.example.yaml /var/l
 sudo -u conveyor $EDITOR /var/lib/conveyor/conveyor.yaml
 ```
 
-From a clean checkout of the revision to deploy:
+Install and enable the unit, but do not start it before a first release exists:
+
+```bash
+sudo cp deploy/conveyor.service.example /etc/systemd/system/conveyor.service
+sudo $EDITOR /etc/systemd/system/conveyor.service
+sudo systemctl daemon-reload
+sudo systemctl enable conveyor
+```
+
+Then, from a clean checkout of the revision to deploy:
 
 ```bash
 CONVEYOR_PREFIX=/opt/conveyor \
@@ -191,29 +200,28 @@ The installer performs these operations in order:
 
 1. Build into a staging directory with the Git revision embedded.
 2. Copy and hash all shipped agents and providers, then make the tree read-only.
-3. Run the staged binary's own manifest check and validate the real config.
+3. Run the staged binary's own manifest check and validate the real config,
+   failing if even one configured source cannot run.
 4. Rename the complete staging directory into `releases/` and atomically swap
    `current`.
-5. Restart the service and poll `/api/state`. HTTP 200 or an authentication
-   challenge (401) proves the board is serving.
+5. Restart the service, poll its passwordless local Unix socket and require
+   `/api/state` to identify the expected managed revision. An old process, a
+   development-mode process and the wrong release all fail this check.
 6. If restart or health checking fails, atomically restore the old `current`,
    restart it, and return failure. On success the old target is retained as
    `previous`.
 
-The defaults match `deploy/conveyor.service.example`. Set `CONVEYOR_ADDR` when
-the service listens somewhere other than `127.0.0.1:8090`. Automated deployment
-systems may set `CONVEYOR_HEALTHCHECK` to an executable that accepts the state
-URL; the built-in check uses `curl`. `CONVEYOR_SYSTEMCTL` similarly selects the
-service-control executable, primarily for non-systemd test environments.
-
-Install the unit after filling in its `User=` and PATH:
-
-```bash
-sudo cp deploy/conveyor.service.example /etc/systemd/system/conveyor.service
-sudo $EDITOR /etc/systemd/system/conveyor.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now conveyor
-```
+The defaults match `deploy/conveyor.service.example`. The built-in health check
+uses `curl` and `jq` over `<config directory>/data/api.sock`, which bypasses
+browser authentication but remains accessible only to the service account.
+Automated deployment systems may set `CONVEYOR_HEALTHCHECK` to an executable
+that receives the public state URL and expected revision as arguments and
+prints that endpoint's `/api/state` JSON on stdout. The installer applies the
+same retry window and revision check to that JSON; diagnostic text belongs on
+stderr. Set `CONVEYOR_ADDR` when the URL passed to such a hook differs from
+`127.0.0.1:8090`, and `CONVEYOR_HEALTH_ATTEMPTS` to change the default 30
+attempts. `CONVEYOR_SYSTEMCTL` selects the service-control executable, primarily
+for non-systemd test environments.
 
 The masthead and `/api/state.release` show the active revision, manifest schema,
 config schema and canonical release directory. In production the badge must say
@@ -221,12 +229,52 @@ config schema and canonical release directory. In production the badge must say
 
 ### Migrating an existing checkout-based service
 
-Do not delete or alter the old checkout installation during the first deploy.
-Copy its config to `/var/lib/conveyor/conveyor.yaml`, remove no `agents:` or
-`providers:` keys yet (release mode safely overrides both), run the installer,
-then switch the unit to the example above. This makes migration reversible:
-the old unit and binary remain untouched until the new service passes its
-health check.
+The data directory is not independently configurable: it is always `data/`
+beside `conveyor.yaml`. Moving only the config would silently discard run
+history, ordering, saved answers, pauses, budgets, push subscriptions and the
+VAPID key. Move the config and data together. Relative `workdir:`, `agents:`,
+`providers:` and `scripts.*.script:` paths also resolve from the config's
+directory, so make operational paths absolute before moving the file.
+
+Release mode overrides the top-level `agents:` and `providers:` roots, and it
+refuses any resolved provider or stage executable outside the verified release.
+Commit custom executables under `agents/` or `providers/` and reference them
+with `agent:`/`provider:`; an external `scripts.*.script:` path is intentionally
+not accepted by a production release. Inline `run:` bodies remain part of the
+operator-owned config.
+
+For an existing `/opt/conveyor/conveyor.yaml` installation, keep the checkout,
+old binary, old config, old data and old unit until migration has passed:
+
+```bash
+old_config=/opt/conveyor/conveyor.yaml
+sudo cp -a /etc/systemd/system/conveyor.service /etc/systemd/system/conveyor.service.pre-release
+sudo systemctl stop conveyor
+sudo install -d -o conveyor -g conveyor /opt/conveyor/releases /var/lib/conveyor/data
+sudo install -o conveyor -g conveyor -m 0600 "$old_config" /var/lib/conveyor/conveyor.yaml
+sudo cp -a "$(dirname "$old_config")/data/." /var/lib/conveyor/data/
+sudo chown -R conveyor:conveyor /var/lib/conveyor/data
+sudo -u conveyor $EDITOR /var/lib/conveyor/conveyor.yaml  # make relative operational paths absolute
+sudo cp deploy/conveyor.service.example /etc/systemd/system/conveyor.service
+sudo $EDITOR /etc/systemd/system/conveyor.service         # fill in User and PATH
+sudo systemctl daemon-reload
+sudo systemctl enable conveyor
+CONVEYOR_PREFIX=/opt/conveyor \
+CONVEYOR_CONFIG=/var/lib/conveyor/conveyor.yaml \
+CONVEYOR_SERVICE=conveyor \
+  deploy/install-release
+```
+
+Installing and reloading the new unit *before* `install-release` is essential:
+the installer's restart and health check must exercise the new `ExecStart` and
+`CONVEYOR_RELEASE_DIR`, not the old checkout service. If this first deployment
+fails, it stops the new unit. Restore the untouched old setup with:
+
+```bash
+sudo cp -a /etc/systemd/system/conveyor.service.pre-release /etc/systemd/system/conveyor.service
+sudo systemctl daemon-reload
+sudo systemctl start conveyor
+```
 
 To manually roll back later, repoint `current` atomically and restart:
 
