@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'chmod -R u+w "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+
+prefix="$tmp/prefix"
+calls="$tmp/systemctl.log"
+health_state="$tmp/health-state"
+
+cat >"$tmp/systemctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$CALLS"
+SH
+cat >"$tmp/health" <<'SH'
+#!/usr/bin/env bash
+[[ $(cat "$HEALTH_STATE") == pass ]]
+SH
+chmod +x "$tmp/systemctl" "$tmp/health"
+echo pass >"$health_state"
+
+deploy() {
+  CONVEYOR_PREFIX="$prefix" \
+  CONVEYOR_CONFIG="$repo/conveyor.example.yaml" \
+  CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
+  CONVEYOR_HEALTHCHECK="$tmp/health" \
+  CONVEYOR_REVISION="$1" \
+  CONVEYOR_ALLOW_DIRTY=1 \
+  CALLS="$calls" HEALTH_STATE="$health_state" \
+    "$repo/deploy/install-release"
+}
+
+deploy selfcheck-one >/dev/null
+[[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-one" ]]
+CONVEYOR_RELEASE_DIR="$prefix/current" "$prefix/current/conveyor" version | grep -q 'selfcheck-one'
+
+echo fail >"$health_state"
+if deploy selfcheck-two >/dev/null 2>&1; then
+  echo "install-release-selfcheck: an unhealthy release was accepted" >&2
+  exit 1
+fi
+[[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-one" ]]
+CONVEYOR_RELEASE_DIR="$prefix/current" "$prefix/current/conveyor" version | grep -q 'selfcheck-one'
+grep -q '^restart conveyor$' "$calls"
+
+echo "install-release selfcheck: ok"

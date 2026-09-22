@@ -70,6 +70,27 @@ test("draw: a warning with HTML metacharacters renders as text, no element creat
 
 // ---- masthead degraded note --------------------------------------------------
 
+test("draw: the masthead identifies the verified release", async () => {
+  const p = await page();
+  await withState(p, baseState({ release: {
+    managed: true,
+    revision: "0123456789abcdef",
+    dir: "/opt/conveyor/releases/0123456789abcdef",
+    manifestSchema: 1,
+    configSchema: 1,
+  } }));
+  assert.equal(p.el("#release-badge").hidden, false);
+  assert.equal(p.el("#release-badge").textContent, "release 0123456789ab");
+  assert.match(p.el("#release-badge").title, /manifest 1 · config 1/);
+});
+
+test("draw: an unmanaged binary is visibly a development build", async () => {
+  const p = await page();
+  await withState(p, baseState({ release: { managed: false, revision: "abc123", configSchema: 1 } }));
+  assert.equal(p.el("#release-badge").textContent, "dev abc123");
+  assert.match(p.el("#release-badge").title, /unmanaged development build/);
+});
+
 test("draw: no source degraded leaves the masthead line unchanged from today", async () => {
   const now = Date.parse("2026-09-06T12:00:05Z");
   const p = await page({ now });

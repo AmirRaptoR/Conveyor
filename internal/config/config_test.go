@@ -96,6 +96,34 @@ func TestResolvesProviderAndScripts(t *testing.T) {
 	}
 }
 
+func TestLoadFromRootsOverridesMutableAssetPaths(t *testing.T) {
+	dir := t.TempDir()
+	providerRoot := filepath.Join(t.TempDir(), "providers")
+	agentRoot := filepath.Join(t.TempDir(), "agents")
+	script(t, filepath.Join(providerRoot, "github", "list.sh"))
+	script(t, filepath.Join(providerRoot, "github", "move.sh"))
+	script(t, filepath.Join(agentRoot, "claude", "refine"))
+	workdir(t, filepath.Join(dir, "repo"))
+	body := strings.Replace(stages+declared, "version: 1\n", `version: 1
+providers: ./mutable-checkout/providers
+agents: ./mutable-checkout/agents
+`, 1)
+	path := filepath.Join(dir, "conveyor.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFromRoots(path, providerRoot, agentRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Sources[0].List; !strings.HasPrefix(got, providerRoot+string(filepath.Separator)) {
+		t.Errorf("list = %q, want immutable provider root %q", got, providerRoot)
+	}
+	if got := cfg.Sources[0].Paths["refine"]; !strings.HasPrefix(got, agentRoot+string(filepath.Separator)) {
+		t.Errorf("refine = %q, want immutable agent root %q", got, agentRoot)
+	}
+}
+
 // An extension is decoration — the runner execs the file directly.
 func TestAgentScriptExtensionAgnostic(t *testing.T) {
 	for _, name := range []string{"refine", "refine.sh", "refine.py"} {

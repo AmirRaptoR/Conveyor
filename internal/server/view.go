@@ -15,6 +15,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/push"
+	"github.com/AmirRaptoR/Conveyor/internal/release"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 	"github.com/AmirRaptoR/Conveyor/internal/store"
 )
@@ -22,6 +23,10 @@ import (
 // State is one poll of every source, cached so the board is instant and the
 // list scripts run on the poll interval rather than on every page load.
 type State struct {
+	// Release identifies the exact binary, config schema and immutable asset
+	// directory serving this response. Managed=false is an ordinary source
+	// build; production deployments should always be managed.
+	Release release.Info `json:"release"`
 	Stages  []StageView  `json:"stages"`
 	Sources []SourceView `json:"sources"`
 	// Items is in the order the scheduler will work them (pipeline.Order),
@@ -583,7 +588,7 @@ type Server struct {
 	drainGrace time.Duration
 }
 
-func New(cfg *config.Config, r *runner.Runner) *Server {
+func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Server {
 	secureDataDir(cfg.DataDir())
 	s := &Server{
 		cfg:          cfg,
@@ -621,7 +626,12 @@ func New(cfg *config.Config, r *runner.Runner) *Server {
 	s.verify = newAuthVerifier(s.cfg.Auth.Check)
 	s.listedAt = map[string]time.Time{}
 	s.listErr = map[string]string{}
+	rel := release.Current()
+	if len(releaseInfo) > 0 {
+		rel = releaseInfo[0]
+	}
 	s.state = State{
+		Release: rel,
 		Stages:  stageViews(cfg),
 		Sources: sourceViews(cfg, nil, nil),
 		Mode:    string(s.mode),

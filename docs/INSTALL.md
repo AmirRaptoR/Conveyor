@@ -6,8 +6,8 @@ stage depends on either lives in this repository already, or is named here
 with the one command that proves it is present.
 
 Nothing here installs a prerequisite. An installer that reaches for a package
-manager is a different, riskier program than this one; every command below
-only checks.
+manager is a different, riskier program than this one; prerequisite commands
+below only check, and the release installer only packages this checkout.
 
 ## Prerequisites
 
@@ -38,7 +38,12 @@ depends on all of them at once.
 | systemd | running the engine as a service (`deploy/conveyor.service.example`) | `systemctl --version` |
 | Caddy | TLS in front of the board, required for Web Push (a secure origin) | `caddy version` |
 
-## Sequence: clone to a running board
+## Development sequence: clone to a running board
+
+This sequence runs from a checkout and is intentionally reported as a `dev`
+build on the board. Use the immutable production deployment below for an
+unattended service; a checkout can change underneath a running process and is
+not a release boundary.
 
 Each step names the command that proves it worked before moving to the next.
 
@@ -135,19 +140,106 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/
 set `auth.users` (`401` means it did, and is asking; see README.md,
 "Configuration"). Anything else is not running yet.
 
-### 7. Optional: run as a service
+### 7. Keep it running
+
+Do not point a long-running service at this mutable checkout. Continue with the
+production sequence below; its service unit and deploy command make the health
+check and rollback part of every release.
+
+## Production: immutable releases with automatic rollback
+
+`deploy/install-release` packages the binary, `agents/` and `providers/` into
+one read-only directory under `/opt/conveyor/releases`. It writes a manifest
+containing the build revision, supported config schema, SHA-256 digest and
+permission bits of every executable asset. Setting `CONVEYOR_RELEASE_DIR`
+makes the process verify that manifest before it reads the config or starts a
+server. A missing, edited or mixed-version file is therefore a startup error,
+not a partly upgraded board.
+
+Keep configuration and engine data outside the release tree. One conventional
+layout is:
+
+```text
+/opt/conveyor/
+  current  -> releases/<revision>
+  previous -> releases/<previous-revision>
+  releases/<revision>/{conveyor,release.json,agents/,providers/}
+/var/lib/conveyor/
+  conveyor.yaml
+  data/
+```
+
+Prepare the directories and config once, granting the service/deploy user the
+ownership appropriate for this machine:
+
+```bash
+sudo install -d -o conveyor -g conveyor /opt/conveyor/releases /var/lib/conveyor
+sudo install -o conveyor -g conveyor -m 0600 conveyor.github.example.yaml /var/lib/conveyor/conveyor.yaml
+sudo -u conveyor $EDITOR /var/lib/conveyor/conveyor.yaml
+```
+
+From a clean checkout of the revision to deploy:
+
+```bash
+CONVEYOR_PREFIX=/opt/conveyor \
+CONVEYOR_CONFIG=/var/lib/conveyor/conveyor.yaml \
+CONVEYOR_SERVICE=conveyor \
+  deploy/install-release
+```
+
+The installer performs these operations in order:
+
+1. Build into a staging directory with the Git revision embedded.
+2. Copy and hash all shipped agents and providers, then make the tree read-only.
+3. Run the staged binary's own manifest check and validate the real config.
+4. Rename the complete staging directory into `releases/` and atomically swap
+   `current`.
+5. Restart the service and poll `/api/state`. HTTP 200 or an authentication
+   challenge (401) proves the board is serving.
+6. If restart or health checking fails, atomically restore the old `current`,
+   restart it, and return failure. On success the old target is retained as
+   `previous`.
+
+The defaults match `deploy/conveyor.service.example`. Set `CONVEYOR_ADDR` when
+the service listens somewhere other than `127.0.0.1:8090`. Automated deployment
+systems may set `CONVEYOR_HEALTHCHECK` to an executable that accepts the state
+URL; the built-in check uses `curl`. `CONVEYOR_SYSTEMCTL` similarly selects the
+service-control executable, primarily for non-systemd test environments.
+
+Install the unit after filling in its `User=` and PATH:
 
 ```bash
 sudo cp deploy/conveyor.service.example /etc/systemd/system/conveyor.service
-sudo $EDITOR /etc/systemd/system/conveyor.service   # fill in User, paths, PATH
+sudo $EDITOR /etc/systemd/system/conveyor.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now conveyor
-systemctl status conveyor
 ```
 
-See README.md's "Post-deploy check: `conveyor probe`" for verifying a restart
-actually left the board reachable, and for what `Restart=always` does and
-does not cover.
+The masthead and `/api/state.release` show the active revision, manifest schema,
+config schema and canonical release directory. In production the badge must say
+`release`, not `dev`.
+
+### Migrating an existing checkout-based service
+
+Do not delete or alter the old checkout installation during the first deploy.
+Copy its config to `/var/lib/conveyor/conveyor.yaml`, remove no `agents:` or
+`providers:` keys yet (release mode safely overrides both), run the installer,
+then switch the unit to the example above. This makes migration reversible:
+the old unit and binary remain untouched until the new service passes its
+health check.
+
+To manually roll back later, repoint `current` atomically and restart:
+
+```bash
+old=$(readlink -f /opt/conveyor/previous)
+sudo ln -s "$old" /opt/conveyor/.current.rollback
+sudo mv -Tf /opt/conveyor/.current.rollback /opt/conveyor/current
+sudo systemctl restart conveyor
+```
+
+Each release is read-only and content-verified, so never edit one in place.
+Deploy a new revision instead. Old release directories may be removed only
+after confirming neither `current` nor `previous` points to them.
 
 ## Everything this does not do
 
@@ -161,4 +253,5 @@ does not cover.
   configured beyond `conveyor validate` — that is #41 (guided enrollment,
   supervised first run) or an operator's, by hand.
 - Ships no binary, no `curl | sh`, no package. `go build` is the only build
-  step, and it is one you run yourself.
+  step, and it is one you run yourself; `deploy/install-release` only packages
+  that local clean checkout.

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/probe"
 )
 
@@ -53,7 +52,7 @@ func runProbe(args []string, out io.Writer) error {
 		return err
 	}
 
-	cfg, err := config.LoadFrom(*cfgPath, *providers)
+	cfg, _, err := loadProcessConfig(*cfgPath, *providers)
 	if err != nil {
 		return err
 	}

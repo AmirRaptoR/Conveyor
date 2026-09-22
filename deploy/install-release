@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Build and atomically activate one immutable Conveyor release. The caller
+# must be able to write CONVEYOR_PREFIX and restart CONVEYOR_SERVICE.
+set -euo pipefail
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+prefix=${CONVEYOR_PREFIX:-/opt/conveyor}
+config=${CONVEYOR_CONFIG:-/var/lib/conveyor/conveyor.yaml}
+service=${CONVEYOR_SERVICE:-conveyor}
+addr=${CONVEYOR_ADDR:-127.0.0.1:8090}
+systemctl_bin=${CONVEYOR_SYSTEMCTL:-systemctl}
+healthcheck=${CONVEYOR_HEALTHCHECK:-}
+health_attempts=${CONVEYOR_HEALTH_ATTEMPTS:-30}
+
+if [[ ! -f "$config" ]]; then
+  echo "install-release: config does not exist: $config" >&2
+  exit 1
+fi
+
+revision=${CONVEYOR_REVISION:-}
+if [[ -z "$revision" ]]; then
+  revision=$(git -C "$repo" rev-parse HEAD)
+fi
+if [[ -n $(git -C "$repo" status --porcelain) && ${CONVEYOR_ALLOW_DIRTY:-0} != 1 ]]; then
+  echo "install-release: refusing to package a dirty checkout" >&2
+  exit 1
+fi
+if [[ ! "$revision" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "install-release: revision contains unsafe path characters: $revision" >&2
+  exit 1
+fi
+
+releases="$prefix/releases"
+target="$releases/$revision"
+stage="$releases/.${revision}.tmp.$$"
+manifest_tmp=$(mktemp "${TMPDIR:-/tmp}/conveyor-manifest.XXXXXX")
+link_tmp=""
+
+cleanup() {
+  rm -f "$manifest_tmp"
+  if [[ -n "$link_tmp" ]]; then rm -f "$link_tmp"; fi
+  if [[ -d "$stage" ]]; then
+    chmod -R u+w "$stage" 2>/dev/null || true
+    rm -rf "$stage"
+  fi
+}
+trap cleanup EXIT
+
+atomic_link() {
+  local value=$1 link=$2
+  link_tmp="${link}.new.$$"
+  rm -f "$link_tmp"
+  ln -s "$value" "$link_tmp"
+  mv -Tf "$link_tmp" "$link"
+  link_tmp=""
+}
+
+health() {
+  if [[ -n "$healthcheck" ]]; then
+    "$healthcheck" "http://$addr/api/state"
+    return
+  fi
+  local attempt code
+  for ((attempt=1; attempt<=health_attempts; attempt++)); do
+    code=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+      --max-time 5 "http://$addr/api/state" || true)
+    if [[ "$code" == 200 || "$code" == 401 ]]; then
+      return 0
+    fi
+    if (( attempt < health_attempts )); then sleep 2; fi
+  done
+  echo "install-release: health probe failed at http://$addr/api/state (HTTP ${code:-none})" >&2
+  return 1
+}
+
+mkdir -p "$releases"
+if [[ ! -e "$target" ]]; then
+  mkdir "$stage"
+  (
+    cd "$repo"
+    go build -trimpath \
+      -ldflags "-X github.com/AmirRaptoR/Conveyor/internal/release.BuildRevision=$revision" \
+      -o "$stage/conveyor" ./cmd/conveyor
+    cp -a agents providers "$stage/"
+  )
+
+  # Record the final, read-only permission bits as well as content hashes.
+  chmod -R a-w "$stage"
+  "$stage/conveyor" release-manifest -dir "$stage" >"$manifest_tmp"
+  chmod u+w "$stage"
+  install -m 0444 "$manifest_tmp" "$stage/release.json"
+  chmod a-w "$stage"
+
+  CONVEYOR_RELEASE_DIR="$stage" "$stage/conveyor" version >/dev/null
+  CONVEYOR_RELEASE_DIR="$stage" "$stage/conveyor" validate -c "$config" >/dev/null
+  mv "$stage" "$target"
+else
+  CONVEYOR_RELEASE_DIR="$target" "$target/conveyor" version >/dev/null
+  CONVEYOR_RELEASE_DIR="$target" "$target/conveyor" validate -c "$config" >/dev/null
+fi
+
+current="$prefix/current"
+previous="$prefix/previous"
+old=""
+if [[ -e "$current" && ! -L "$current" ]]; then
+  echo "install-release: $current exists and is not a symlink" >&2
+  exit 1
+fi
+if [[ -L "$current" ]]; then
+  old=$(readlink -f "$current" || true)
+fi
+
+atomic_link "$target" "$current"
+if ! "$systemctl_bin" restart "$service" || ! health; then
+  echo "install-release: activation of $revision failed; rolling back" >&2
+  if [[ -n "$old" && -x "$old/conveyor" ]]; then
+    # Refuse to turn an arbitrary old symlink into the rollback target.
+    CONVEYOR_RELEASE_DIR="$old" "$old/conveyor" version >/dev/null
+    atomic_link "$old" "$current"
+    "$systemctl_bin" restart "$service" || true
+    if ! health; then
+      echo "install-release: rollback was restored but its health probe also failed" >&2
+    fi
+  else
+    rm -f "$current"
+    "$systemctl_bin" stop "$service" || true
+    echo "install-release: no previous release existed; service stopped" >&2
+  fi
+  exit 1
+fi
+
+if [[ -n "$old" && "$old" != "$target" ]]; then
+  atomic_link "$old" "$previous"
+fi
+echo "installed Conveyor $revision at $target"

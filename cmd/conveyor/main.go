@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
+	"github.com/AmirRaptoR/Conveyor/internal/release"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 	"github.com/AmirRaptoR/Conveyor/internal/server"
 	"github.com/AmirRaptoR/Conveyor/internal/source"
@@ -51,6 +53,10 @@ func main() {
 		err = cmdPasswd(os.Args[2:])
 	case "enroll":
 		err = cmdEnroll(os.Args[2:])
+	case "version":
+		err = cmdVersion(os.Args[2:])
+	case "release-manifest":
+		err = cmdReleaseManifest(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -98,6 +104,8 @@ func usage() {
                                         on stdout. Writes no file, starts no
                                         stage, lists no items. -answer
                                         pre-answers a prompt; repeatable.
+  version                               print build and release identity
+  release-manifest -dir DIR            write a staged release's manifest
   
 Common flags:
   -c <config>       path to the config (default conveyor.yaml). Stage scripts
@@ -117,6 +125,7 @@ type common struct {
 	cfgPath   *string
 	providers *string
 	verbose   *bool
+	release   release.Info
 }
 
 func newFlags(name string) *common {
@@ -135,10 +144,11 @@ func (c *common) load(args []string) (*config.Config, *runner.Runner, context.Co
 	if err := c.fs.Parse(args); err != nil {
 		return nil, nil, nil, nil, err
 	}
-	cfg, err := config.LoadFrom(*c.cfgPath, *c.providers)
+	cfg, rel, err := loadProcessConfig(*c.cfgPath, *c.providers)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	c.release = rel
 	r := runner.New(filepath.Join(cfg.DataDir(), "runs"))
 	if *c.verbose {
 		// The UI will do this over SSE; on the CLI it just prints.
@@ -148,6 +158,67 @@ func (c *common) load(args []string) (*config.Config, *runner.Runner, context.Co
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	return cfg, r, ctx, stop, nil
+}
+
+// loadProcessConfig is the one production boundary for executable assets.
+// Once release mode is selected, neither a config key nor a command-line flag
+// can make this process execute an agent or provider from somewhere mutable.
+func loadProcessConfig(path, providers string) (*config.Config, release.Info, error) {
+	rel, err := release.Detect()
+	if err != nil {
+		return nil, release.Info{}, err
+	}
+	agents := ""
+	if rel.Managed {
+		if providers != "" {
+			return nil, release.Info{}, errors.New("-providers cannot override an immutable release")
+		}
+		providers = filepath.Join(rel.Dir, "providers")
+		agents = filepath.Join(rel.Dir, "agents")
+	}
+	cfg, err := config.LoadFromRoots(path, providers, agents)
+	if err != nil {
+		return nil, release.Info{}, err
+	}
+	return cfg, rel, nil
+}
+
+func cmdVersion(args []string) error {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("version takes no arguments")
+	}
+	info, err := release.Detect()
+	if err != nil {
+		return err
+	}
+	mode := "development"
+	if info.Managed {
+		mode = info.Dir
+	}
+	fmt.Printf("conveyor %s (config schema %d, %s)\n", info.Revision, info.ConfigSchema, mode)
+	return nil
+}
+
+func cmdReleaseManifest(args []string) error {
+	fs := flag.NewFlagSet("release-manifest", flag.ContinueOnError)
+	dir := fs.String("dir", "", "staged release directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dir == "" || fs.NArg() != 0 {
+		return errors.New("release-manifest requires exactly -dir DIR")
+	}
+	m, err := release.Generate(*dir, release.Current().Revision)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(m)
 }
 
 // own claims the data directory for a command that is about to run stages, and
@@ -515,7 +586,7 @@ func cmdServe(args []string) error {
 		return err
 	}
 	defer release()
-	return server.New(cfg, r).Run(ctx, server.Addr(*addr), mode)
+	return server.New(cfg, r, c.release).Run(ctx, server.Addr(*addr), mode)
 }
 
 // resolveMode turns -mode and -watch into the single Mode Run needs.

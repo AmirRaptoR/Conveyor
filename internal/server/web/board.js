@@ -145,6 +145,13 @@ export function draw() {
   // exists to read — the same condition as the blunter Unblock all.
   $("#diagnose").hidden = !marked || !controls.diagnose;
   $("#tick").hidden = !controls.tick;
+  const releaseBadge = $("#release-badge");
+  const rel = state.release || {};
+  releaseBadge.hidden = !rel.revision;
+  releaseBadge.textContent = `${rel.managed ? "release" : "dev"} ${String(rel.revision || "").slice(0, 12)}`;
+  releaseBadge.title = rel.managed
+    ? `${rel.dir} · manifest ${rel.manifestSchema} · config ${rel.configSchema}`
+    : `unmanaged development build · config ${rel.configSchema || "?"}`;
   const badge = $("#mode-badge");
   badge.hidden = !state.mode || state.mode === "auto";
   badge.textContent = state.mode || "";

@@ -359,6 +359,13 @@ func Load(path string) (*Config, error) { return LoadFrom(path, "") }
 // line. It must be applied before resolution, not after: resolution is what
 // turns a provider name into script paths.
 func LoadFrom(path, providers string) (*Config, error) {
+	return LoadFromRoots(path, providers, "")
+}
+
+// LoadFromRoots is LoadFrom with both shipped-asset roots fixed by the
+// caller. Production release mode uses this to make config entries incapable
+// of redirecting execution back into a mutable source checkout.
+func LoadFromRoots(path, providers, agents string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -376,6 +383,9 @@ func LoadFrom(path, providers string) (*Config, error) {
 	c.Dir = filepath.Dir(abs)
 	if providers != "" {
 		c.Providers = providers
+	}
+	if agents != "" {
+		c.Agents = agents
 	}
 	c.applyDefaults()
 	c.resolveSources()
