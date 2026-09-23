@@ -116,6 +116,79 @@ check "an unmarked issue is not blocked" \
 check "an issue declaring nothing has no dependencies key at all" \
 	"null" "$(jq -r '.[] | select(.ref == "19") | .dependsOn' "$tmp/out.json")"
 
+# Parent/child structure is a separate contract from dependency prose. This
+# fixture file is also consumed by the Go relationship validator, so provider
+# normalization and engine diagnostics cannot quietly drift apart.
+echo "explicit relationships"
+mkdir -p "$tmp/relationships"
+cat >"$tmp/relationships/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+	*"issue view 999 "*)
+		echo 'GraphQL: Could not resolve to an Issue with the number of 999.' >&2
+		exit 1
+		;;
+	*"api --paginate --slurp repos/owner/repo/issues/208/sub_issues"*)
+		if [[ -n "${SUBISSUE_FAIL:-}" ]]; then
+			echo 'Resource not accessible by integration' >&2
+			exit 1
+		fi
+		jq '[.paginatedSubIssues]' "$REL_FIXTURE"
+		;;
+	*"--state open"*) jq '.githubIssues' "$REL_FIXTURE" ;;
+	*"--state closed"*) echo '[]' ;;
+	*) echo "stub gh: unhandled: $*" >&2; exit 97 ;;
+esac
+STUB
+chmod +x "$tmp/relationships/gh"
+REL_FIXTURE="../../testdata/relationships.json" \
+PATH="$tmp/relationships:$PATH" REPO=owner/repo \
+	CONVEYOR_SOURCE=fixture CONVEYOR_RESULT="$tmp/relationships.json" \
+	./list.sh <<<'{"stages":["backlog","done"],"terminalStages":["done"]}' >/dev/null 2>&1
+
+check "native parent is source-qualified" \
+	"fixture:201" "$(jq -r '.items[] | select(.ref == "202") | .parent' "$tmp/relationships.json")"
+check "native children are source-qualified and sorted" \
+	"fixture:202,fixture:203" "$(jq -r '.items[] | select(.ref == "201") | .children | join(",")' "$tmp/relationships.json")"
+check "strict first-line Parent marker is the fallback" \
+	"fixture:201" "$(jq -r '.items[] | select(.ref == "203") | .parent' "$tmp/relationships.json")"
+check "a block section prepended by move.sh does not hide the Parent marker" \
+	"fixture:201" "$(jq -r '.items[] | select(.ref == "209") | .parent' "$tmp/relationships.json")"
+check "the machine marker is not handed to an agent as prose" \
+	"Spec" "$(jq -r '.items[] | select(.ref == "203") | .description' "$tmp/relationships.json")"
+check "native parent wins over a contradictory marker" \
+	"fixture:201" "$(jq -r '.items[] | select(.ref == "204") | .parent' "$tmp/relationships.json")"
+check "a native/marker contradiction is actionable" \
+	"yes" "$(jq -r '[.warnings[] | select(.itemId == "fixture:204" and (.reason | contains("disagrees")))] | if length == 1 then "yes" else "no" end' "$tmp/relationships.json")"
+check "ordinary Parent prose is not inferred as metadata" \
+	"null" "$(jq -r '.items[] | select(.ref == "205") | .parent' "$tmp/relationships.json")"
+check "a confirmed missing marker target is warned" \
+	"yes" "$(jq -r '[.warnings[] | select(.itemId == "fixture:206" and (.reason | contains("missing issue fixture:999")))] | if length == 1 then "yes" else "no" end' "$tmp/relationships.json")"
+check "a cross-repository native parent is not misqualified locally" \
+	"null" "$(jq -r '.items[] | select(.ref == "207") | .parent' "$tmp/relationships.json")"
+check "a cross-repository native parent is warned with its URL" \
+	"yes" "$(jq -r '[.warnings[] | select(.itemId == "fixture:207" and (.reason | contains("https://github.com/other/repo/issues/1")))] | if length == 1 then "yes" else "no" end' "$tmp/relationships.json")"
+check "truncated native children are completed through pagination" \
+	"fixture:202,fixture:203" "$(jq -r '.items[] | select(.ref == "208") | .children | join(",")' "$tmp/relationships.json")"
+check "a paginated cross-repository child warns exactly once" \
+	"1" "$(jq '[.warnings[] | select(.itemId == "fixture:208" and (.reason | contains("another repository")))] | length' "$tmp/relationships.json")"
+
+REL_FIXTURE="../../testdata/relationships.json" SUBISSUE_LOOKUP_LIMIT=0 \
+PATH="$tmp/relationships:$PATH" REPO=owner/repo \
+	CONVEYOR_SOURCE=fixture CONVEYOR_RESULT="$tmp/relationships-capped.json" \
+	./list.sh <<<'{"stages":["backlog","done"],"terminalStages":["done"]}' >/dev/null 2>&1
+check "the sub-issue completion lookup is bounded" \
+	"yes" "$(jq -r '[.warnings[] | select(.itemId == "fixture:208" and (.reason | contains("lookup limit 0")))] | if length == 1 then "yes" else "no" end' "$tmp/relationships-capped.json")"
+check "a capped parent retains its embedded partial children" \
+	"fixture:202" "$(jq -r '.items[] | select(.ref == "208") | .children | join(",")' "$tmp/relationships-capped.json")"
+
+REL_FIXTURE="../../testdata/relationships.json" SUBISSUE_FAIL=1 GH_ATTEMPTS=1 \
+PATH="$tmp/relationships:$PATH" REPO=owner/repo \
+	CONVEYOR_SOURCE=fixture CONVEYOR_RESULT="$tmp/relationships-unavailable.json" \
+	./list.sh <<<'{"stages":["backlog","done"],"terminalStages":["done"]}' >/dev/null 2>&1
+check "a permanent sub-issue endpoint failure is a warning, not a failed listing" \
+	"yes" "$(jq -r '[.warnings[] | select(.itemId == "fixture:208" and (.reason | contains("complete native child set")))] | if length == 1 then "yes" else "no" end' "$tmp/relationships-unavailable.json")"
+
 # The body is the only place a sequence is written down, and the provider is
 # the only thing that reads it: the engine never learns what "#31" means.
 #

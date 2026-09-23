@@ -11,6 +11,52 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 )
 
+func TestListResultAcceptsWarningEnvelopeAndLegacyArray(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		body         string
+		wantWarnings int
+		wantErr      bool
+	}{
+		{name: "legacy array", body: `[{"id":"s1:1","ref":"1","source":"s1","stage":"ready","title":"one"}]`},
+		{name: "warning envelope", body: `{"items":[{"id":"s1:1","ref":"1","source":"s1","stage":"ready","title":"one"}],"warnings":[{"itemId":"s1:1","reason":"native parent disagrees with marker"}]}`, wantWarnings: 1},
+		// `items` is required even when empty. Treating an object typo as an
+		// empty listing would erase that source's last-good board state.
+		{name: "object without items", body: `{"warnings":[]}`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			provider := filepath.Join(dir, "providers", "fake")
+			writeExecFile(t, filepath.Join(provider, "list.sh"), "#!/bin/sh\ncat > \"$CONVEYOR_RESULT\" <<'JSON'\n"+tc.body+"\nJSON\n")
+			writeExecFile(t, filepath.Join(provider, "move.sh"), "#!/bin/sh\nexit 0\n")
+			if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cfgPath := filepath.Join(dir, "conveyor.yaml")
+			if err := os.WriteFile(cfgPath, []byte("version: 1\nstages:\n  - name: ready\n    onSuccess: done\n  - name: done\n    terminal: true\nsources:\n  - name: s1\n    provider: fake\n    workdir: ./repo\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(cfgPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := New(cfg, cfg.Sources[0], runner.New(filepath.Join(dir, "runs"))).List(context.Background())
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("List succeeded with result %+v, want malformed envelope error", res)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(res.Items) != 1 || len(res.Warnings) != tc.wantWarnings {
+				t.Fatalf("result = %+v, want one item and %d warnings", res, tc.wantWarnings)
+			}
+		})
+	}
+}
+
 func testClient(t *testing.T) *Client {
 	t.Helper()
 	cfgPath := filepath.Join(t.TempDir(), "conveyor.yaml")

@@ -93,11 +93,24 @@ func (c *Client) List(ctx context.Context) (*ListResult, error) {
 
 	var raw []model.Item
 	if len(res.Data) > 0 {
+		// The original list contract was a bare item array. Keep accepting it
+		// forever, while allowing providers that discover non-fatal metadata
+		// problems to return an envelope with actionable warnings.
 		if err := json.Unmarshal(res.Data, &raw); err != nil {
-			return out, fmt.Errorf("source %q: result is not a JSON array of items: %w", c.src.Name, err)
+			var envelope struct {
+				Items    []model.Item `json:"items"`
+				Warnings []Warning    `json:"warnings,omitempty"`
+			}
+			if envelopeErr := json.Unmarshal(res.Data, &envelope); envelopeErr != nil || envelope.Items == nil {
+				return out, fmt.Errorf("source %q: result is neither a JSON array of items nor an {items,warnings} object: %w", c.src.Name, err)
+			}
+			raw = envelope.Items
+			out.Warnings = append(out.Warnings, envelope.Warnings...)
 		}
 	}
-	out.Items, out.Warnings = c.validate(raw)
+	var validationWarnings []Warning
+	out.Items, validationWarnings = c.validate(raw)
+	out.Warnings = append(out.Warnings, validationWarnings...)
 	return out, nil
 }
 

@@ -37,6 +37,16 @@
 #   DEPENDENCY_LOOKUP_LIMIT  maximum completed references outside the ordinary
 #                  listing to resolve directly per poll (default: 50). Extra
 #                  references remain missing and therefore fail closed.
+#   RELATIONSHIP_LOOKUP_LIMIT maximum marker-only parents outside the ordinary
+#                  listing to confirm per poll (default: 50). Native GitHub
+#                  relationships need no confirmation call.
+#   SUBISSUE_LOOKUP_LIMIT maximum parents whose truncated native child set is
+#                  completed through the paginated API per poll (default: 20).
+#                  Extra parents retain the embedded partial set and warn.
+#
+# Parent/child structure comes from GitHub native sub-issues. The exact first
+# body line `Parent: #N` is a durable fallback marker for older/imported data;
+# no other issue-number prose is treated as parenthood.
 #
 # Stdin carries model.ListInput — in particular terminalStages, which of the
 # stages STAGE_LABELS maps to are terminal. Listing needs this to tell a
@@ -138,7 +148,7 @@ gh_issues() {
 		# that succeed, and folding it into stdout would hand jq a JSON
 		# document with a line of English in front of it.
 		if out=$(gh issue list --repo "$REPO" "$@" \
-			--json number,title,body,labels,url,assignees,state,stateReason,closedAt \
+			--json number,title,body,labels,url,assignees,state,stateReason,closedAt,parent,subIssues \
 			2>"$work/gh.err"); then
 			printf '%s' "$out"
 			return 0
@@ -161,7 +171,7 @@ gh_issue() {
 	local ref=$1 attempt=1 out
 	while :; do
 		if out=$(gh issue view "$ref" --repo "$REPO" \
-			--json number,title,body,labels,url,assignees,state,stateReason,closedAt \
+			--json number,title,body,labels,url,assignees,state,stateReason,closedAt,parent,subIssues \
 			2>"$work/gh.err"); then
 			printf '%s' "$out"
 			return 0
@@ -174,6 +184,30 @@ gh_issue() {
 			return 1
 		fi
 		echo "gh issue view $ref failed (attempt $attempt): $(cat "$work/gh.err")" >&2
+		sleep $((attempt * 2))
+		attempt=$((attempt + 1))
+	done
+}
+
+# gh_subissues <number> — fetch every page only when the compact issue-list
+# response says its embedded nodes were truncated. Most issues never pay for
+# this call; large tracking parents still cannot silently lose child edges.
+gh_subissues() {
+	local ref=$1 attempt=1 out
+	while :; do
+		if out=$(gh api --paginate --slurp "repos/$REPO/issues/$ref/sub_issues?per_page=100" \
+			2>"$work/gh.err"); then
+			printf '%s' "$out"
+			return 0
+		fi
+		if ((attempt >= ${GH_ATTEMPTS:-3})); then
+			echo "gh api sub-issues for #$ref failed after $attempt attempts: $(cat "$work/gh.err")" >&2
+			if grep -qiE 'not found|could not resolve|HTTP 404|resource not accessible|requires? .*scope|sub-issues .*disabled' "$work/gh.err"; then
+				return 2
+			fi
+			return 1
+		fi
+		echo "gh api sub-issues for #$ref failed (attempt $attempt): $(cat "$work/gh.err")" >&2
 		sleep $((attempt * 2))
 		attempt=$((attempt + 1))
 	done
@@ -194,6 +228,7 @@ gh_issues --state closed --limit "${CLOSED_FETCH_LIMIT:-1000}" |
 		'sort_by(.closedAt) | reverse | .[0:$n] | .[]' >>"$work/items.jsonl"
 
 jq -s --arg source "$CONVEYOR_SOURCE" \
+		--arg repo "$REPO" \
 		--arg default "$DEFAULT_STAGE" \
 		--arg done "$done_stage" \
 		--arg blocked "$BLOCKED_LABEL" \
@@ -208,12 +243,42 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 		def block_said:
 			(capture("<!-- conveyor:block (?<b>[A-Za-z0-9+/=]+) -->")
 				| .b | @base64d | fromjson) // {};
+		# Parent: #N is a machine marker only when it is the complete first
+		# metadata line. Ordinary prose, quotes and later historical copies are
+		# deliberately invisible. Native GitHub relationships win when present.
+		def parent_marker:
+			([capture("^Parent:[ \\t]*#(?<n>[1-9][0-9]*)[ \\t]*(?:\\r?\\n|$)"; "i")] | .[0].n // "");
+		def strip_parent_marker:
+			sub("^Parent:[ \\t]*#[1-9][0-9]*[ \\t]*(?:\\r?\\n)*"; ""; "i");
+		def github_ref:
+			([capture("^https://github\\.com/(?<owner>[^/]+)/(?<name>[^/]+)/issues/(?<ref>[0-9]+)$")] | .[0] // null);
+		def native_id($source; $repo):
+			(.url // "" | github_ref) as $u
+			| if $u != null and (("\($u.owner)/\($u.name)" | ascii_downcase) == ($repo | ascii_downcase))
+				then "\($source):\($u.ref | tonumber)" else "" end;
 		map(
 			(.labels | map(.name)) as $names
 			| ([$names[] | $map[.] // empty] | .[0]) as $mapped
 			| (((.state // "OPEN") | ascii_downcase) == "closed") as $isClosed
 			| ((.stateReason // "") | ascii_downcase) as $why
 			| (.body // "") as $body
+			| ($body | strip_block) as $specBody
+			| ($specBody | parent_marker) as $markerParentRef
+			| (if $markerParentRef == "" then "" else "\($source):\($markerParentRef | tonumber)" end) as $markerParent
+			| (.parent // null) as $nativeParentRaw
+			| (if $nativeParentRaw == null then "" else ($nativeParentRaw | native_id($source; $repo)) end) as $nativeParent
+			| ([.subIssues.nodes[]? | native_id($source; $repo) | select(. != "")] | unique | sort) as $nativeChildren
+			| ((.subIssues.totalCount // 0) > ([.subIssues.nodes[]?] | length)) as $nativeChildrenTruncated
+			| ([if $nativeParentRaw != null and $nativeParent == "" then
+				"native parent " + ($nativeParentRaw.url // "<no URL>") + " is in another repository; cross-repository relationships are not representable until repo-to-source mapping is supported, so this link is omitted"
+				else empty end]
+				+ [if $nativeChildrenTruncated then empty else .subIssues.nodes[]? end
+					| select((native_id($source; $repo)) == "")
+					| "native child " + (.url // "<no URL>") + " is in another repository; cross-repository relationships are not representable until repo-to-source mapping is supported, so this link is omitted"]
+				+ [if $nativeParent != "" and $markerParent != "" and $nativeParent != $markerParent then
+					"native parent " + $nativeParent + " disagrees with Parent marker " + $markerParent + "; native GitHub relationship wins"
+				else empty end]) as $relationWarnings
+			| (if $nativeParent != "" then $nativeParent else $markerParent end) as $parent
 			# The sequence, translated out of GitHubs vocabulary and into
 			# item ids — the engine must never see a "#". Same syntax
 			# agents/_deps reads, and stated twice on purpose: providers and
@@ -329,7 +394,7 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 				# The block section is stripped: it is this pipeline talking to
 				# a person, not part of the specification, and an agent handed
 				# the prompt must not read its own last stop as a requirement.
-				description: ($body | strip_block),
+				description: ($specBody | strip_parent_marker),
 				url:         .url,
 				labels:      $names,
 				# null, not 0: "unranked" and "most urgent" must stay distinct.
@@ -339,7 +404,13 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 				# item done; an open issue has none. closedAt is GitHubs own
 				# vocabulary, only meaningful once an issue is actually closed.
 				finishedAt:  (if $isClosed then (.closedAt // "") else "" end)
-			} + (if $reopened then
+			}
+			+ (if $parent != "" then {parent: $parent} else {} end)
+			+ (if ($nativeChildren | length) > 0 then {children: $nativeChildren} else {} end)
+			+ (if $markerParent != "" and $nativeParent == "" then {_markerParentRef: $markerParentRef} else {} end)
+			+ (if $nativeChildrenTruncated then {_nativeChildrenTruncated: true} else {} end)
+			+ (if ($relationWarnings | length) > 0 then {_relationshipWarnings: $relationWarnings} else {} end)
+			+ (if $reopened then
 				{blockKind: "status",
 				 blockReason: "open on GitHub while labelled \"\($mapped)\", the end of the line: it was reopened, or it was never actually closed. Its status says it is not finished."}
 			elif $closedNonTerminal then
@@ -408,6 +479,122 @@ for ref in "${lookup_refs[@]}"; do
 	fi
 done
 
+# `gh issue list --json subIssues` embeds a bounded connection. Complete only
+# the parents whose totalCount proves that connection was truncated.
+mapfile -t truncated_parent_refs < <(jq -r '.[] | select(._nativeChildrenTruncated) | .ref' "$work/listed.json")
+subissue_lookup_limit=${SUBISSUE_LOOKUP_LIMIT:-20}
+if [[ ! "$subissue_lookup_limit" =~ ^[0-9]+$ ]]; then
+	echo "SUBISSUE_LOOKUP_LIMIT must be a non-negative integer, got: $subissue_lookup_limit" >&2
+	exit 1
+fi
+for ref in "${truncated_parent_refs[@]:0:subissue_lookup_limit}"; do
+	if pages=$(gh_subissues "$ref"); then
+		:
+	else
+		status=$?
+		if ((status != 2)); then exit "$status"; fi
+		jq --arg ref "$ref" '
+			map(if .ref == $ref then
+				._relationshipWarnings = ((._relationshipWarnings // []) +
+					["GitHub would not return the complete native child set; the embedded partial set is retained"])
+			else . end)
+		' "$work/listed.json" >"$work/listed.next"
+		mv "$work/listed.next" "$work/listed.json"
+		continue
+	fi
+	children=$(jq -cn --argjson pages "$pages" --arg source "$CONVEYOR_SOURCE" --arg repo "$REPO" '
+		[$pages[][]
+			| (.html_url // .url // "") as $url
+			| ([$url | capture("^https://github\\.com/(?<owner>[^/]+)/(?<name>[^/]+)/issues/[0-9]+$")] | .[0] // null) as $u
+			| select($u != null and (((($u.owner + "/" + $u.name) | ascii_downcase) == ($repo | ascii_downcase))))
+			| $source + ":" + (.number | tonumber | tostring)]
+		| unique | sort
+	')
+	cross=$(jq -cn --argjson pages "$pages" --arg repo "$REPO" '
+		[$pages[][]
+			| (.html_url // .url // "") as $url
+			| ([$url | capture("^https://github\\.com/(?<owner>[^/]+)/(?<name>[^/]+)/issues/[0-9]+$")] | .[0] // null) as $u
+			| select(($u != null and (((($u.owner + "/" + $u.name) | ascii_downcase) == ($repo | ascii_downcase)))) | not)
+			| "native child " + (if $url == "" then "<no URL>" else $url end)
+				+ " is in another repository; cross-repository relationships are not representable until repo-to-source mapping is supported, so this link is omitted"]
+	')
+	jq --arg ref "$ref" --argjson children "$children" --argjson cross "$cross" '
+		map(if .ref == $ref then
+			.children = $children
+			| ._relationshipWarnings = ((._relationshipWarnings // []) + $cross)
+		else . end)
+	' "$work/listed.json" >"$work/listed.next"
+	mv "$work/listed.next" "$work/listed.json"
+done
+if ((${#truncated_parent_refs[@]} > subissue_lookup_limit)); then
+	for ref in "${truncated_parent_refs[@]:subissue_lookup_limit}"; do
+		jq --arg ref "$ref" --argjson n "$subissue_lookup_limit" '
+			map(if .ref == $ref then
+				._relationshipWarnings = ((._relationshipWarnings // []) +
+					["sub-issue lookup limit " + ($n|tostring) + " reached; the embedded partial child set is retained"])
+			else . end)
+		' "$work/listed.json" >"$work/listed.next"
+		mv "$work/listed.next" "$work/listed.json"
+	done
+fi
+
+# A strict Parent: #N marker is durable fallback metadata, not proof that the
+# target still exists. Confirm marker-only targets that are outside the visible
+# listing. Native relationships already carry a GitHub object and need no
+# extra lookup. Confirmed 404s become actionable warnings; transient failures
+# still fail this listing so last-good state survives.
+mapfile -t marker_parent_refs < <(jq -r '
+	[.[].id] as $ids
+	| [.[] | select(._markerParentRef != null)
+		| select(.parent as $p | ($ids | index($p) | not))
+		| ._markerParentRef]
+	| unique[]
+' "$work/listed.json")
+relationship_lookup_limit=${RELATIONSHIP_LOOKUP_LIMIT:-50}
+if [[ ! "$relationship_lookup_limit" =~ ^[0-9]+$ ]]; then
+	echo "RELATIONSHIP_LOOKUP_LIMIT must be a non-negative integer, got: $relationship_lookup_limit" >&2
+	exit 1
+fi
+for ref in "${marker_parent_refs[@]:0:relationship_lookup_limit}"; do
+	if gh_issue "$ref" >/dev/null; then
+		:
+	else
+		status=$?
+		if ((status != 2)); then exit "$status"; fi
+		jq --arg ref "$ref" --arg source "$CONVEYOR_SOURCE" '
+			map(if ._markerParentRef == $ref then
+				._relationshipWarnings = ((._relationshipWarnings // []) +
+					["Parent marker names missing issue " + $source + ":" + $ref + "; repair or remove the first-line marker"])
+			else . end)
+		' "$work/listed.json" >"$work/listed.next"
+		mv "$work/listed.next" "$work/listed.json"
+	fi
+done
+if ((${#marker_parent_refs[@]} > relationship_lookup_limit)); then
+	for ref in "${marker_parent_refs[@]:relationship_lookup_limit}"; do
+		jq --arg ref "$ref" --argjson n "$relationship_lookup_limit" '
+			map(if ._markerParentRef == $ref then
+				._relationshipWarnings = ((._relationshipWarnings // []) +
+					["relationship lookup limit " + ($n|tostring) + " reached; Parent marker " + $ref + " could not be verified"])
+			else . end)
+		' "$work/listed.json" >"$work/listed.next"
+		mv "$work/listed.next" "$work/listed.json"
+	done
+fi
+
+# A listed child's parent declaration is the fallback source for a parent's
+# child set when GitHub returned no native sub-issues. A non-empty native set
+# remains authoritative. Sorting after inversion makes response order inert.
+jq '
+	. as $all
+	| map(. as $item
+		| ([$all[] | select(.parent == $item.id) | .id] | unique | sort) as $inverse
+		| if ((.children // []) | length) == 0 and ($inverse | length) > 0
+			then .children = $inverse
+			else . end)
+' "$work/listed.json" >"$work/listed.next"
+mv "$work/listed.next" "$work/listed.json"
+
 # The labels catch up with the status, using the one script that writes labels
 # rather than a second copy of its rules here. Rare — an item needs it once,
 # after which its labels say what its status says — and never fatal: a listing
@@ -422,6 +609,12 @@ if jq -e 'any(.reconcile != null)' "$work/listed.json" >/dev/null; then
 	done < <(jq -r '.[] | select(.reconcile) | "\(.ref)\t\(.reconcile)"' "$work/listed.json")
 fi
 
-jq 'map(del(.reconcile))' "$work/listed.json" >"$CONVEYOR_RESULT"
+jq '
+	([.[] as $item | $item._relationshipWarnings[]?
+		| {itemId: $item.id, reason: .}]) as $warnings
+	| (map(del(.reconcile, ._relationshipWarnings, ._markerParentRef, ._nativeChildrenTruncated))) as $items
+	| if ($warnings | length) > 0 then {items: $items, warnings: ($warnings | unique | sort_by(.itemId, .reason))}
+		else $items end
+' "$work/listed.json" >"$CONVEYOR_RESULT"
 
-echo "listed $(jq length "$CONVEYOR_RESULT") item(s) (tag an issue $ONBOARD_LABEL to hand it over)" >&2
+echo "listed $(jq 'if type == "array" then length else (.items | length) end' "$CONVEYOR_RESULT") item(s) (tag an issue $ONBOARD_LABEL to hand it over)" >&2

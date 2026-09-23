@@ -1,0 +1,94 @@
+{
+  "githubIssues": [
+    {
+      "state": "OPEN", "number": 201, "title": "Native parent", "body": "",
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/201", "assignees": [],
+      "parent": null,
+      "subIssues": {"totalCount": 2, "nodes": [
+        {"number": 202, "url": "https://github.com/Owner/Repo/issues/202"},
+        {"number": 203, "url": "https://github.com/Owner/Repo/issues/203"}
+      ]}
+    },
+    {
+      "state": "OPEN", "number": 202, "title": "Native child", "body": "Parent: #201\n\nSpec",
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/202", "assignees": [],
+      "parent": {"number": 201, "url": "https://github.com/Owner/Repo/issues/201"},
+      "subIssues": {"totalCount": 0, "nodes": []}
+    },
+    {
+      "state": "OPEN", "number": 203, "title": "Marker child", "body": "Parent: #201\r\n\r\nSpec",
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/203", "assignees": [],
+      "parent": null, "subIssues": {"totalCount": 0, "nodes": []}
+    },
+    {
+      "state": "OPEN", "number": 204, "title": "Conflict", "body": "Parent: #999\n\nSpec",
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/204", "assignees": [],
+      "parent": {"number": 201, "url": "https://github.com/Owner/Repo/issues/201"},
+      "subIssues": {"totalCount": 0, "nodes": []}
+    },
+    {
+      "state": "OPEN", "number": 205, "title": "Prose is not metadata", "body": "This mentions Parent: #201 later.",
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/205", "assignees": [],
+      "parent": null, "subIssues": {"totalCount": 0, "nodes": []}
+    },
+    {
+      "state": "OPEN", "number": 206, "title": "Missing marker", "body": "Parent: #999\n",
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/206", "assignees": [],
+      "parent": null, "subIssues": {"totalCount": 0, "nodes": []}
+    },
+    {
+      "state": "OPEN", "number": 207, "title": "Cross repository", "body": "",
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/207", "assignees": [],
+      "parent": {"number": 1, "url": "https://github.com/other/repo/issues/1"},
+      "subIssues": {"totalCount": 0, "nodes": []}
+    },
+    {
+      "state": "OPEN", "number": 208, "title": "Paginated parent", "body": "",
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/208", "assignees": [],
+      "parent": null,
+      "subIssues": {"totalCount": 3, "nodes": [
+        {"number": 202, "url": "https://github.com/Owner/Repo/issues/202"},
+        {"number": 7, "url": "https://github.com/other/repo/issues/7"}
+      ]}
+    },
+    {
+      "state": "OPEN", "number": 209, "title": "Blocked marker child",
+      "body": "<!-- conveyor:block e30= -->\n> stopped\n<!-- /conveyor:block -->\n\nParent: #201\n\nSpec",
+      "labels": [{"name": "conveyor"}, {"name": "blocked"}],
+      "url": "https://github.com/Owner/Repo/issues/209", "assignees": [],
+      "parent": null, "subIssues": {"totalCount": 0, "nodes": []}
+    }
+  ],
+  "paginatedSubIssues": [
+    {"number": 202, "html_url": "https://github.com/Owner/Repo/issues/202"},
+    {"number": 203, "html_url": "https://github.com/Owner/Repo/issues/203"},
+    {"number": 7, "html_url": "https://github.com/other/repo/issues/7"}
+  ],
+  "validation": [
+    {
+      "name": "reciprocal same-source hierarchy",
+      "items": [
+        {"id": "s:1", "source": "s", "children": ["s:2"]},
+        {"id": "s:2", "source": "s", "parent": "s:1", "dependsOn": ["s:9"]}
+      ],
+      "warningContains": []
+    },
+    {
+      "name": "cross-source child",
+      "items": [
+        {"id": "s:1", "source": "s", "children": ["other:2"]},
+        {"id": "other:2", "source": "other", "parent": "s:1"}
+      ],
+      "warningContains": ["cross-source child"]
+    },
+    {
+      "name": "contradictory parent and cycle",
+      "items": [
+        {"id": "s:1", "source": "s", "parent": "s:2", "children": ["s:2"]},
+        {"id": "s:2", "source": "s", "parent": "s:1", "children": ["s:1", "s:3"]},
+        {"id": "s:3", "source": "s"}
+      ],
+      "warningContains": ["parent cycle:", "names no parent"]
+    }
+  ]
+}

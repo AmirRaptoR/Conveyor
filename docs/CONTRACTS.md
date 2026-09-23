@@ -40,6 +40,11 @@ arrive in this shape.
                                 // the item is actually in (§6).
   "blockKind": null,            // optional. The same stop in one word.
   "priority": 2,                // 0 = most urgent. null = unranked.
+  "parent": "midgame:30",      // optional tracking parent, by globally
+                                // qualified item id. Informational only.
+  "children": ["midgame:48"],  // optional tracking children, likewise.
+                                // Sorted and unique when the provider can
+                                // supply a deterministic order.
   "dependsOn": ["midgame:33"],  // items this one is sequenced behind, by id.
                                 // The provider translates its own vocabulary
                                 // ("Depends on #33" in a GitHub issue body, or
@@ -74,6 +79,28 @@ Rules the engine enforces:
 - A marked item is never picked. That is the whole mechanism by which a stage
   that asked for a human stops being re-run: nothing carries the item out of the
   line, so nothing has to decide where to put it back.
+- `parent`, `children` and `dependsOn` are three distinct facts. Parentage is
+  tracking structure and never creates a scheduler edge. Providers emit
+  globally-qualified IDs; missing, cross-source, non-reciprocal, self and
+  cyclic parent/child declarations are warned when they can be proved from
+  current authoritative data. A valid parent is allowed to be absent from the
+  work-item listing (tracking parents are intentionally not executable work).
+
+For GitHub, native sub-issue data is authoritative. A child body may carry the
+strict fallback marker `Parent: #123` as its complete first metadata line;
+ordinary prose and later historical copies are never scanned for parenthood.
+A native parent wins over a disagreeing marker and the disagreement is warned.
+Children are the native sub-issue set when non-empty, otherwise the provider
+inverts the marker/native parent fields of listed children. Native relations to
+another repository are not guessed into the current source alias: they are
+omitted with a warning. Cross-repository mapping is not supported today, so an
+operator must keep the hierarchy in one repository or remove that link.
+
+Relationship metadata is durable upstream. Every successful listing re-derives
+it from GitHub native relations or the marker, so refreshes and process restarts
+produce the same item fields. A failed listing retains the running process's
+last-good source state under the ordinary stale-source rule; there is no claim
+that an entirely fresh process can reconstruct GitHub while GitHub is offline.
 
 **The item's own status is the truth about the item, and a listing must not
 argue with it.** A source that has a notion of finished — GitHub closes an
@@ -106,7 +133,7 @@ author learns it once.
 | Channel | Carries |
 | --- | --- |
 | `stdout` + `stderr` | **Logs only.** Streamed live to the UI, line by line, interleaved in order. Never parsed. |
-| `$CONVEYOR_RESULT` | **Structured data only.** A JSON file the script writes. Absent means "no data". |
+| `$CONVEYOR_RESULT` | **Structured data only.** A JSON file the script writes. Absent means "no data". A list script may write the legacy item array or `{ "items": [...], "warnings": [{"itemId":"...", "reason":"..."}] }`; warnings are non-fatal and shown to the operator. |
 
 Logs and data are separated because an AI agent writes megabytes of prose to
 stdout. Parsing data out of that is how this kind of system breaks. If a script
@@ -151,8 +178,9 @@ stage that wrote it. No script is required to write one, and none does today.
 
 ## 3. The script kinds
 
-**`list`** — read items from a provider. Writes a JSON array of items to
-`$CONVEYOR_RESULT`. Exit 0 with `[]` means an empty backlog, which is normal.
+**`list`** — read items from a provider. Writes either a JSON array of items or
+the `{items, warnings}` envelope from §2 to `$CONVEYOR_RESULT`. Exit 0 with
+`[]` or `{"items":[]}` means an empty backlog, which is normal.
 
 What it does not emit does not exist: an item the lister filters out is not on
 the board, not in a count, and nothing will ever be run against it. That is the

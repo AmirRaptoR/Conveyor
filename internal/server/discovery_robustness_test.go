@@ -118,7 +118,7 @@ if [ -e "`+hangFlag+`" ]; then
   sleep 5
 fi
 cat > "$CONVEYOR_RESULT" <<'JSON'
-[{"id":"s1:1","ref":"1","source":"s1","stage":"backlog","title":"s1 item"}]
+[{"id":"s1:1","ref":"1","source":"s1","stage":"backlog","title":"s1 item","parent":"s1:parent","children":["s1:child"]}]
 JSON
 `)
 	writeScript(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\nexit 0\n")
@@ -179,6 +179,19 @@ func TestHungSourceRetainsLastGoodItemsFlaggedStale(t *testing.T) {
 	if !hasItemID(s.state.Items, "s1:1") {
 		t.Fatal("s1's item missing after the first, healthy refresh")
 	}
+	assertRelationships := func(when string) {
+		t.Helper()
+		for _, item := range s.state.Items {
+			if item.ID == "s1:1" {
+				if item.Parent != "s1:parent" || len(item.Children) != 1 || item.Children[0] != "s1:child" {
+					t.Fatalf("%s: relationships were not retained: %+v", when, item)
+				}
+				return
+			}
+		}
+		t.Fatalf("%s: s1:1 is absent", when)
+	}
+	assertRelationships("healthy refresh")
 
 	// s1 now hangs past its 200ms discovery timeout.
 	if err := os.WriteFile(hangFlag, []byte("x"), 0o644); err != nil {
@@ -201,6 +214,7 @@ func TestHungSourceRetainsLastGoodItemsFlaggedStale(t *testing.T) {
 	if !hasItemID(s.state.Items, "s1:1") {
 		t.Error("s1's last-good item vanished instead of being retained while stale")
 	}
+	assertRelationships("failed refresh")
 	if !hasItemID(s.state.Items, "s2:1") {
 		t.Error("s2's own item is missing; a hung sibling source must not affect it")
 	}
@@ -223,6 +237,7 @@ func TestHungSourceRetainsLastGoodItemsFlaggedStale(t *testing.T) {
 	if !hasItemID(s.state.Items, "s1:1") {
 		t.Error("s1's item missing after recovering")
 	}
+	assertRelationships("recovered refresh")
 }
 
 func hasItemID(items []model.Item, id string) bool {

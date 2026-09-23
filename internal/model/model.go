@@ -30,6 +30,14 @@ type Item struct {
 	// with no notion of finishing simply sends nothing.
 	FinishedAt string `json:"finishedAt,omitempty"`
 
+	// Parent and Children describe tracking structure, not execution order.
+	// Every value is a globally-qualified item ID (normally
+	// "<source>:<ref>"). Providers must report both directions when they know
+	// them; the engine warns about missing or contradictory peers but never
+	// turns these fields into scheduling dependencies.
+	Parent   string   `json:"parent,omitempty"`
+	Children []string `json:"children,omitempty"`
+
 	// Blocked is a mark on the item, not a place it goes. An item that needs a
 	// human stays in the stage it stopped in and wears this; the source reports
 	// it in whatever vocabulary the provider has — a label, a field, a column.
