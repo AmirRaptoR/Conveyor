@@ -55,7 +55,7 @@ export function renderPanelRelationships(id) {
     const invalid = !dep || (hold?.invalid && hold.by === depId);
     const status = !dep ? "missing · error" : done ? "complete" : `in ${dep.stage}`;
     return `<div role="listitem" class="dependency-row${done ? " complete" : ""}${invalid ? " invalid" : ""}"
-        aria-label="dependency ${esc(refOf(depId))}: ${esc(status)}">${relatedItem(depId, byId, "dependency")}<small>${esc(status)}</small></div>`;
+        aria-label="dependency ${esc(refOf(depId))}: ${esc(status)}">${relatedItem(depId, byId, "dependency")}${dep ? `<small>${esc(status)}</small>` : ""}</div>`;
   }).join("")}</div>` : `<p class="none">No execution dependencies.</p>`;
 
   box.innerHTML = `<section aria-labelledby="relationships-title">

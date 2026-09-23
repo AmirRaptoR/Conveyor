@@ -141,6 +141,7 @@ test("renderPanelRelationships: family and execution dependencies are separate, 
   assert.match(html, /aria-label="dependency 4: complete"/);
   assert.match(html, /aria-label="dependency 5: in working"/);
   assert.match(html, /aria-label="dependency 8: missing · error"/);
+  assert.doesNotMatch(html, /missing<\/small>[\s\S]*missing · error/);
   assert.match(html, /Current hold[\s\S]*s1:5 is in working; must reach done before this item can enter done\./);
 });
 
