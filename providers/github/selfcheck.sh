@@ -152,6 +152,8 @@ check "native children are source-qualified and sorted" \
 	"fixture:202,fixture:203" "$(jq -r '.items[] | select(.ref == "201") | .children | join(",")' "$tmp/relationships.json")"
 check "strict first-line Parent marker is the fallback" \
 	"fixture:201" "$(jq -r '.items[] | select(.ref == "203") | .parent' "$tmp/relationships.json")"
+check "a block section prepended by move.sh does not hide the Parent marker" \
+	"fixture:201" "$(jq -r '.items[] | select(.ref == "209") | .parent' "$tmp/relationships.json")"
 check "the machine marker is not handed to an agent as prose" \
 	"Spec" "$(jq -r '.items[] | select(.ref == "203") | .description' "$tmp/relationships.json")"
 check "native parent wins over a contradictory marker" \

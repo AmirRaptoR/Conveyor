@@ -20,6 +20,8 @@ func TestListResultAcceptsWarningEnvelopeAndLegacyArray(t *testing.T) {
 	}{
 		{name: "legacy array", body: `[{"id":"s1:1","ref":"1","source":"s1","stage":"ready","title":"one"}]`},
 		{name: "warning envelope", body: `{"items":[{"id":"s1:1","ref":"1","source":"s1","stage":"ready","title":"one"}],"warnings":[{"itemId":"s1:1","reason":"native parent disagrees with marker"}]}`, wantWarnings: 1},
+		// `items` is required even when empty. Treating an object typo as an
+		// empty listing would erase that source's last-good board state.
 		{name: "object without items", body: `{"warnings":[]}`, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

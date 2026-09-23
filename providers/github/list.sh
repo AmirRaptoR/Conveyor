@@ -262,7 +262,8 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 			| (((.state // "OPEN") | ascii_downcase) == "closed") as $isClosed
 			| ((.stateReason // "") | ascii_downcase) as $why
 			| (.body // "") as $body
-			| ($body | parent_marker) as $markerParentRef
+			| ($body | strip_block) as $specBody
+			| ($specBody | parent_marker) as $markerParentRef
 			| (if $markerParentRef == "" then "" else "\($source):\($markerParentRef | tonumber)" end) as $markerParent
 			| (.parent // null) as $nativeParentRaw
 			| (if $nativeParentRaw == null then "" else ($nativeParentRaw | native_id($source; $repo)) end) as $nativeParent
@@ -393,7 +394,7 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 				# The block section is stripped: it is this pipeline talking to
 				# a person, not part of the specification, and an agent handed
 				# the prompt must not read its own last stop as a requirement.
-				description: ($body | strip_block | strip_parent_marker),
+				description: ($specBody | strip_parent_marker),
 				url:         .url,
 				labels:      $names,
 				# null, not 0: "unranked" and "most urgent" must stay distinct.

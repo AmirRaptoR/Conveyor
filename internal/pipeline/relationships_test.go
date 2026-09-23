@@ -141,6 +141,12 @@ func TestRelationshipWarningsAreActionableAndDeterministic(t *testing.T) {
 		"s:1 names child s:3, but s:3 names parent s:8",
 	}
 	joined := strings.Join(got, "\n")
+	// A same-source related item may be an intentionally un-onboarded tracking
+	// parent, so absence from the work listing is not proof it is missing. The
+	// provider warning channel reports confirmed 404s from authoritative data.
+	if strings.Contains(joined, "missing parent") || strings.Contains(joined, "does not exist") {
+		t.Errorf("warnings = %v, treated an off-board tracking parent as missing", got)
+	}
 	for _, want := range wantParts {
 		if !strings.Contains(joined, want) {
 			t.Errorf("warnings = %v, want %q", got, want)
@@ -150,6 +156,13 @@ func TestRelationshipWarningsAreActionableAndDeterministic(t *testing.T) {
 		if got[i-1] > got[i] {
 			t.Fatalf("warnings are not sorted: %v", got)
 		}
+	}
+}
+
+func TestSelfParentWarnsOnceWithoutADuplicateCycle(t *testing.T) {
+	got := RelationshipWarnings([]model.Item{{ID: "s:1", Source: "s", Parent: "s:1"}})
+	if len(got) != 1 || !strings.Contains(got[0], "itself as its parent") {
+		t.Fatalf("warnings = %v, want one self-parent warning", got)
 	}
 }
 

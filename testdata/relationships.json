@@ -50,6 +50,13 @@
         {"number": 202, "url": "https://github.com/Owner/Repo/issues/202"},
         {"number": 7, "url": "https://github.com/other/repo/issues/7"}
       ]}
+    },
+    {
+      "state": "OPEN", "number": 209, "title": "Blocked marker child",
+      "body": "<!-- conveyor:block e30= -->\n> stopped\n<!-- /conveyor:block -->\n\nParent: #201\n\nSpec",
+      "labels": [{"name": "conveyor"}, {"name": "blocked"}],
+      "url": "https://github.com/Owner/Repo/issues/209", "assignees": [],
+      "parent": null, "subIssues": {"totalCount": 0, "nodes": []}
     }
   ],
   "paginatedSubIssues": [

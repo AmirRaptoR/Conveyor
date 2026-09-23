@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -24,10 +25,12 @@ func RelationshipWarnings(items []model.Item) []string {
 	for _, it := range items {
 		if it.Parent != "" {
 			validateRelationID(it, "parent", it.Parent, byID, warn)
-			switch parent, ok := byID[it.Parent]; {
-			case !ok:
-			case !contains(parent.Children, it.ID):
-				warn("%s names parent %s, but %s does not name it as a child", it.ID, it.Parent, it.Parent)
+			if it.Parent != it.ID {
+				switch parent, ok := byID[it.Parent]; {
+				case !ok:
+				case !slices.Contains(parent.Children, it.ID):
+					warn("%s names parent %s, but %s does not name it as a child", it.ID, it.Parent, it.Parent)
+				}
 			}
 		}
 
@@ -39,6 +42,9 @@ func RelationshipWarnings(items []model.Item) []string {
 			}
 			seen[childID] = true
 			validateRelationID(it, "child", childID, byID, warn)
+			if childID == it.ID {
+				continue
+			}
 			if child, ok := byID[childID]; ok && child.Parent != it.ID {
 				if child.Parent == "" {
 					warn("%s names child %s, but %s names no parent", it.ID, childID, childID)
@@ -63,6 +69,9 @@ func RelationshipWarnings(items []model.Item) []string {
 			next, ok := byID[id]
 			if !ok {
 				break
+			}
+			if next.Parent == id {
+				break // already reported as a self-parent; not a second cycle too
 			}
 			id = next.Parent
 		}
@@ -110,13 +119,4 @@ func validateRelationID(it model.Item, kind, id string, byID map[string]model.It
 	if peerSource != it.Source {
 		warn("%s has cross-source %s %s (%s -> %s)", it.ID, kind, id, it.Source, peerSource)
 	}
-}
-
-func contains(ids []string, want string) bool {
-	for _, id := range ids {
-		if id == want {
-			return true
-		}
-	}
-	return false
 }

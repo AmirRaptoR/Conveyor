@@ -178,8 +178,9 @@ stage that wrote it. No script is required to write one, and none does today.
 
 ## 3. The script kinds
 
-**`list`** — read items from a provider. Writes a JSON array of items to
-`$CONVEYOR_RESULT`. Exit 0 with `[]` means an empty backlog, which is normal.
+**`list`** — read items from a provider. Writes either a JSON array of items or
+the `{items, warnings}` envelope from §2 to `$CONVEYOR_RESULT`. Exit 0 with
+`[]` or `{"items":[]}` means an empty backlog, which is normal.
 
 What it does not emit does not exist: an item the lister filters out is not on
 the board, not in a count, and nothing will ever be run against it. That is the
