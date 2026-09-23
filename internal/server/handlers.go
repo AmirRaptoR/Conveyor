@@ -27,8 +27,10 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	deps := pipeline.NewDeps(s.cfg, s.state.Items)
 	st.Items = pipeline.Order(s.cfg, s.state.Items, s.state.Order, deps)
 	st.Held = heldOf(s.cfg, s.state.Items, deps)
-	if len(deps.Errors) > 0 {
+	relationWarnings := pipeline.RelationshipWarnings(s.state.Items)
+	if len(deps.Errors) > 0 || len(relationWarnings) > 0 {
 		st.Warnings = append(append([]string(nil), s.state.Warnings...), deps.Errors...)
+		st.Warnings = append(st.Warnings, relationWarnings...)
 	}
 	bySrc, byStage, held, max, perSrc, perStage := s.eng.Locks().Snapshot()
 	st.Slots = SlotsView{BySource: bySrc, ByStage: byStage, Global: held, GlobalMax: max,

@@ -589,3 +589,26 @@ func TestMissingDependencyFailsClosedAndAppearsInState(t *testing.T) {
 		t.Fatalf("warnings = %v, want missing dependency", got.Warnings)
 	}
 }
+
+func TestStateCarriesRelationshipsAndReportsContradictions(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog", Title: "parent", Children: []string{"s1:2"}},
+		{ID: "s1:2", Ref: "2", Source: "s1", Stage: "backlog", Title: "child", Parent: "s1:9", DependsOn: []string{"s1:1"}},
+	}
+
+	w := httptest.NewRecorder()
+	s.handleState(w, httptest.NewRequest("GET", "/api/state", nil))
+	var got State
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Items[0].Children[0] != "s1:2" || got.Items[1].Parent != "s1:9" || got.Items[1].DependsOn[0] != "s1:1" {
+		t.Fatalf("state lost or conflated relationships: %+v", got.Items)
+	}
+	joined := strings.Join(got.Warnings, "\n")
+	if !strings.Contains(joined, "s1:1 names child s1:2, but s1:2 names parent s1:9") {
+		t.Fatalf("warnings = %v, want contradictory parent/child directions", got.Warnings)
+	}
+}

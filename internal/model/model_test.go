@@ -7,6 +7,34 @@ import (
 	"time"
 )
 
+func TestItemRelationshipsRoundTripAndStayDistinct(t *testing.T) {
+	in := Item{
+		ID: "s:2", Ref: "2", Source: "s", Stage: "ready", Title: "child",
+		Parent: "s:1", Children: []string{"s:3", "s:4"},
+		DependsOn: []string{"s:9"},
+	}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Item
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Parent != in.Parent || strings.Join(got.Children, ",") != "s:3,s:4" ||
+		strings.Join(got.DependsOn, ",") != "s:9" {
+		t.Fatalf("round trip = %+v, want parent, children and dependency preserved independently", got)
+	}
+
+	var old Item
+	if err := json.Unmarshal([]byte(`{"id":"s:1","ref":"1","source":"s","stage":"ready","title":"old"}`), &old); err != nil {
+		t.Fatal(err)
+	}
+	if old.Parent != "" || len(old.Children) != 0 || len(old.DependsOn) != 0 {
+		t.Fatalf("old item invented relationships: %+v", old)
+	}
+}
+
 // The doctor's stdin is deliberately its own shape, not StageInput (whose From
 // means "the previous stage" and would be a lie here) and not []Run (which
 // carries Env and Item — every source parameter, tokens included — and does
