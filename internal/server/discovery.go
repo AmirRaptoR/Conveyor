@@ -396,6 +396,12 @@ func (s *Server) refresh(ctx context.Context) {
 	// good" would let an item spend past its ceiling simply by leaving and
 	// re-entering that window.
 	s.hub.publish(event{Kind: "state"})
+	// A pre-dependenciesAt agent may have marked an item `dependency`. Once
+	// the engine gate is active that mark would outlive the condition forever:
+	// Target sees the mark before it can see the computed hold. Migrate it
+	// after the fresh listing and block recovery, leaving the graph itself to
+	// keep unsafe work stopped.
+	s.releaseDependencyMarks(ctx)
 }
 
 // mergeSourceListing reconciles one source's listing (fresh may be nil, for a

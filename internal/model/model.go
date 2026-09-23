@@ -45,10 +45,10 @@ type Item struct {
 	// vocabulary ("Depends on #33" in a GitHub issue body) into IDs, exactly
 	// as it already does for Priority and Blocked.
 	//
-	// An ID absent from the listing is ignored rather than held forever — a
-	// dependency on an un-onboarded issue, another repository, or a typo must
-	// not stop the line. agents/_deps still catches those at implement time,
-	// which is where a fact about the outside world belongs.
+	// An ID absent from the listing is invalid state and fails closed. Providers
+	// must retain or resolve completed referenced items even when their ordinary
+	// history view is bounded; otherwise a real completed predecessor would be
+	// indistinguishable from a typo.
 	DependsOn []string `json:"dependsOn,omitempty"`
 
 	// BlockReason is a listing-supplied reason for Blocked, read only when no

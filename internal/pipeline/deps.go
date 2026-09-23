@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -18,6 +19,15 @@ type Hold struct {
 	Stage   string `json:"stage"`   // where that item is standing
 	Target  string `json:"target"`  // the stage this item wanted to enter
 	Blocked bool   `json:"blocked"` // and whether it is marked there
+	// Until is the stage the dependency has to reach before the hold lifts:
+	// Target itself under the default rule, or the target stage's
+	// `dependenciesAt` when it declares one.
+	Until string `json:"until"`
+	// Invalid distinguishes a dependency-graph error from an ordinary hold.
+	// It never clears merely because a stage moves: the declaration itself
+	// must be repaired. Reason is safe to show directly to an operator.
+	Invalid bool   `json:"invalid,omitempty"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // standing is where an item stands, as the gate needs it.
@@ -42,29 +52,57 @@ type Deps struct {
 	at     map[string]standing
 	stages map[string]int
 	edges  map[string][]string
+	// until is, per stage that declares `dependenciesAt`, the name of the
+	// stage a dependency must have reached before an item may enter it.
+	// A stage absent here uses the default rule: the target stage itself.
+	until map[string]string
+	// invalid is the first deterministic graph error for each affected item.
+	// Errors carries every unique error for the board-wide warning strip.
+	invalid  map[string]Hold
+	errorSet map[string]bool
+	Errors   []string
 	// Cycles names every dependency cycle found and dropped, one line each,
-	// for the board's warning strip.
+	// retained separately for callers/tests that specifically count cycles.
 	Cycles []string
 }
 
-// NewDeps reads the listing into a graph with every unusable edge already
-// gone, so the gate itself needs no guarding.
-//
-// Five ways an edge can be unusable, and all five drop it rather than hold
-// the item: an id nobody listed (an un-onboarded issue, another repository,
-// a typo), an empty string, an item naming itself, a dependency standing in a
-// stage this config does not declare, and a cycle. Failing open is the same
-// choice agents/_deps already makes — "a number from another repository or a
-// typo must not hold an item forever" — and the reason is that the
-// alternative is a pipeline a person can wedge by mistyping one line in an
-// issue body.
+// NewDeps reads the listing into a graph. Invalid declarations fail closed:
+// a missing item, self-reference, unknown dependency stage, or cycle holds
+// the affected item without consuming an execution slot and produces a
+// visible error. Silently discarding one of those edges would let work run in
+// an order the issue explicitly says is unsafe. Empty provider values are the
+// sole exception: they declare no dependency at all.
 func NewDeps(cfg *config.Config, items []model.Item) Deps {
 	d := Deps{
-		at:     make(map[string]standing, len(items)),
-		stages: stageDepths(cfg),
-		edges:  make(map[string][]string, len(items)),
+		at:       make(map[string]standing, len(items)),
+		stages:   stageDepths(cfg),
+		edges:    make(map[string][]string, len(items)),
+		until:    make(map[string]string),
+		invalid:  make(map[string]Hold),
+		errorSet: make(map[string]bool),
 	}
+	if cfg != nil {
+		// A threshold remains true after the item passes the stage that
+		// declared it. This reconciles items already in flight when a gate is
+		// introduced: an item found in review cannot keep moving if its
+		// implement gate required the dependency to have merged first.
+		for target, targetDepth := range d.stages {
+			required, requiredDepth := target, targetDepth
+			for _, s := range cfg.Stages {
+				gateDepth, gateOK := d.stages[s.Name]
+				atDepth, atOK := d.stages[s.DependenciesAt]
+				if s.DependenciesAt != "" && gateOK && atOK && gateDepth <= targetDepth && atDepth > requiredDepth {
+					required, requiredDepth = s.DependenciesAt, atDepth
+				}
+			}
+			if required != target {
+				d.until[target] = required
+			}
+		}
+	}
+	listed := make(map[string]model.Item, len(items))
 	for i, it := range items {
+		listed[it.ID] = it
 		// A stage the config does not declare has no position on the line.
 		// Recording it as depth 0 would silently hold every follower at the
 		// front, so such an item is simply not in `at` and holds nobody.
@@ -77,18 +115,36 @@ func NewDeps(cfg *config.Config, items []model.Item) Deps {
 	for _, it := range items {
 		seen := map[string]bool{}
 		for _, dep := range it.DependsOn {
-			if dep == "" || dep == it.ID || seen[dep] {
-				continue
-			}
-			if _, known := d.at[dep]; !known {
+			if dep == "" || seen[dep] {
 				continue
 			}
 			seen[dep] = true
+			switch {
+			case dep == it.ID:
+				d.addInvalid(it.ID, dep, fmt.Sprintf("%s depends on itself", it.ID))
+				continue
+			case listed[dep].ID == "":
+				d.addInvalid(it.ID, dep, fmt.Sprintf("%s depends on missing item %s", it.ID, dep))
+				continue
+			case d.at[dep].stage == "":
+				d.addInvalid(it.ID, dep, fmt.Sprintf("%s depends on %s, whose stage %q is not declared", it.ID, dep, listed[dep].Stage))
+				continue
+			}
 			d.edges[it.ID] = append(d.edges[it.ID], dep)
 		}
 	}
 	d.dropCycles()
 	return d
+}
+
+func (d *Deps) addInvalid(id, by, reason string) {
+	if _, exists := d.invalid[id]; !exists {
+		d.invalid[id] = Hold{By: by, Invalid: true, Reason: reason}
+	}
+	if !d.errorSet[reason] {
+		d.errorSet[reason] = true
+		d.Errors = append(d.Errors, reason)
+	}
 }
 
 // dropCycles removes every edge taking part in a cycle, and records what it
@@ -126,8 +182,11 @@ func (d *Deps) dropCycles() {
 					continue
 				}
 				cyc := append([]string(nil), path[at:]...)
-				d.Cycles = append(d.Cycles, "dependency cycle, ignored: "+
-					strings.Join(cyc, " -> ")+" -> "+cyc[0])
+				reason := "dependency cycle: " + strings.Join(cyc, " -> ") + " -> " + cyc[0]
+				d.Cycles = append(d.Cycles, reason)
+				for i, from := range cyc {
+					d.addInvalid(from, cyc[(i+1)%len(cyc)], reason)
+				}
 				for i, from := range cyc {
 					to := cyc[(i+1)%len(cyc)]
 					if drop[from] == nil {
@@ -154,6 +213,7 @@ func (d *Deps) dropCycles() {
 		}
 	}
 	if len(drop) == 0 {
+		sort.Strings(d.Errors)
 		return
 	}
 	for from, gone := range drop {
@@ -166,6 +226,7 @@ func (d *Deps) dropCycles() {
 		d.edges[from] = kept
 	}
 	sort.Strings(d.Cycles)
+	sort.Strings(d.Errors)
 }
 
 // Held reports whether moving it into target would overtake something it is
@@ -182,6 +243,14 @@ func (d *Deps) dropCycles() {
 // that station did not finish, and putting a second item into it is the case
 // this rule exists to prevent.
 //
+// A stage may ask for more than sharing. `dependenciesAt: merged` on the
+// implement stage means a follower enters it only once every dependency has
+// reached `merged` or gone past it — because implementing on top of code
+// that is not on main yet produces a pull request that cannot merge on its
+// own, and a line that lets that happen fills its columns with items nothing
+// can finish. The comparison is the same one; only the bar moves, from the
+// target stage to the stage the config names.
+//
 // Several dependencies hold until all of them permit. The most restrictive —
 // the one at the lowest depth, i.e. the one least far along — is the one
 // reported; ties are broken by listing order, so the reported holder is
@@ -190,6 +259,14 @@ func (d Deps) Held(it *model.Item, target string) (Hold, bool) {
 	want, ok := d.stages[target]
 	if !ok {
 		return Hold{}, false
+	}
+	until := target
+	if u, ok := d.until[target]; ok {
+		until, want = u, d.stages[u]
+	}
+	if invalid, bad := d.invalid[it.ID]; bad {
+		invalid.Target, invalid.Until = target, until
+		return invalid, true
 	}
 	var best standing
 	var bestBy string
@@ -208,5 +285,31 @@ func (d Deps) Held(it *model.Item, target string) (Hold, bool) {
 	if !found {
 		return Hold{}, false
 	}
-	return Hold{By: bestBy, Stage: best.stage, Target: target, Blocked: best.blocked}, true
+	return Hold{By: bestBy, Stage: best.stage, Target: target, Blocked: best.blocked, Until: until}, true
+}
+
+// DependsOnAny reports whether id's declared dependency graph reaches any id
+// in unavailable. It is used by dispatchers for facts orthogonal to stage
+// ordering — notably a provider whose latest listing failed. A dependency's
+// cached stage may still be useful to draw, but it must not authorize work.
+//
+// Cyclic edges have already been removed and their owners fail closed through
+// invalid, but seen keeps this helper total even for a zero-value or partially
+// constructed Deps.
+func (d Deps) DependsOnAny(id string, unavailable map[string]bool) bool {
+	seen := map[string]bool{}
+	var walk func(string) bool
+	walk = func(from string) bool {
+		if seen[from] {
+			return false
+		}
+		seen[from] = true
+		for _, dep := range d.edges[from] {
+			if unavailable[dep] || walk(dep) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(id)
 }

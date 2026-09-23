@@ -80,7 +80,10 @@ pre-answers a prompt so the whole flow can run scripted, with stdin closed.
 runs it — the one supervised, single-item way to watch a source work for
 real. `-stage` is optional: left unset, the stage is whatever
 `pipeline.Target` would pick, the same choice the scheduler makes on its
-own. Add `-explain` to see the plan — source, item, `from -> to`, the
+own. When set, it overrides routing only: dependency holds and invalid
+dependency graphs still refuse the run, so the flag cannot bypass the same
+safety policy the scheduler enforces. Add `-explain` to see the plan — source,
+item, `from -> to`, the
 resolved script, the resources and timeout it would take, and its
 environment with every non-`CONVEYOR_` value redacted — without moving
 anything or running anything. After a real run it prints a short checklist:

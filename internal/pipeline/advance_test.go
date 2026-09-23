@@ -149,3 +149,49 @@ sources:
 		t.Errorf("reason = %q, want it to name the missing script declaration", tr.Reason)
 	}
 }
+
+func TestAdvanceTellsTheStageWhenDependenciesAreEngineGated(t *testing.T) {
+	dir := t.TempDir()
+	writeExec(t, filepath.Join(dir, "providers", "fake", "list.sh"), "#!/bin/sh\nexit 0\n")
+	writeExec(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\nexit 0\n")
+	writeExec(t, filepath.Join(dir, "work.sh"), "#!/bin/sh\nprintf '%s' \"$CONVEYOR_DEPENDENCIES_AT\" > gated\n")
+	if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "conveyor.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`version: 1
+stages:
+  - name: backlog
+  - name: working
+    script: work
+    dependenciesAt: done
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: fake
+    workdir: ./repo
+    scripts:
+      work:
+        script: ./work.sh
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := New(cfg, runner.New(filepath.Join(dir, "runs")))
+	item := &model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"}
+	if _, err := e.Advance(context.Background(), "s1", item, "working", model.Resume{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "repo", "gated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "done" {
+		t.Fatalf("CONVEYOR_DEPENDENCIES_AT = %q, want done", got)
+	}
+}

@@ -375,6 +375,14 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	if resume.Manual != "" {
 		env = mergeEnv(env, map[string]string{"CONVEYOR_MANUAL": resume.Manual})
 	}
+	// A stage that declares the engine gate must not also run an adapter's
+	// legacy provider-side dependency check. The two predicates are not the
+	// same (merged stage versus closed issue) and can otherwise clear/re-mark
+	// the item forever. The value names the actual threshold for logs and for
+	// adapters that want to explain why their older preflight stood down.
+	// Write the empty value too, so a source env cannot impersonate an engine
+	// gate on a stage that has none.
+	env = mergeEnv(env, map[string]string{"CONVEYOR_DEPENDENCIES_AT": stage.DependenciesAt})
 
 	// res always ends up non-nil below unless the failure is one route() has
 	// no run record to route through at all (the run directory itself could

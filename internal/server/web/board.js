@@ -41,6 +41,11 @@ export function bucketByStage(stages, items, active) {
 }
 
 let firstDraw = true;
+// Every item by id, and the names of the terminal stages, as the last draw
+// saw them — what a card's dependency chip reads to say where each
+// dependency stands. Rebuilt on every draw, never accumulated.
+let byId = new Map();
+let terminal = new Set();
 export function draw() {
   if (!state) return;
   // A draw() mid-drag would tear out the very node the drag is holding onto
@@ -65,6 +70,8 @@ export function draw() {
   const active = state.active || [];
   blocks = state.blocks || {};
   heldBy = state.held || {};
+  byId = new Map(items.map(it => [it.id, it]));
+  terminal = new Set(stages.filter(s => s.terminal).map(s => s.name));
 
   // A source that vanished from `state.sources` (removed from the config, or
   // simply absent this poll) cannot go on filtering the board forever — reset
@@ -437,7 +444,8 @@ function card(it, active, place) {
   const hold = !it.blocked && heldBy[it.id];
   const cls = ["item", hasPrio ? "p" + it.priority : "", working ? "working" : "",
                it.blocked ? "blocked " + tone(blocks[it.id]) : "",
-               hold ? "held" : "", ranked ? "ranked" : ""].filter(Boolean).join(" ");
+               hold ? "held" : "", hold?.invalid ? "dependency-invalid" : "",
+               ranked ? "ranked" : ""].filter(Boolean).join(" ");
   return `<article class="${cls}" draggable="true" tabindex="0" role="button"
       style="--src:${sourceColour(it.source)}"
       data-id="${esc(it.id)}" data-title="${esc(it.title)}" data-stage="${esc(it.stage)}">
@@ -445,7 +453,10 @@ function card(it, active, place) {
     <span class="foot">
       ${working ? `<span class="working-tag">working ${durSpan(new Date(inHand.startedAt).getTime(), false)}</span>` : ""}
       ${it.blocked ? why(it) : ""}
-      ${hold ? `<span class="behind">behind ${esc(hold.by.split(":").pop())}</span>` : ""}
+      ${hold ? (hold.invalid
+        ? `<span class="dependency-error" title="${esc(hold.reason || "invalid dependency graph")}">dependency error</span>`
+        : `<span class="behind">behind ${esc(hold.by.split(":").pop())}${hold.until ? ` · until ${esc(hold.until)}` : ""}</span>`) : ""}
+      ${needsChip(it, hold)}
       ${ranked && !working && !it.blocked ? `<span class="rank">${place + 1}</span>` : ""}
       ${hasPrio ? `<span class="prio">p${it.priority}</span>` : ""}
       ${working ? "" : waitChip(it)}
@@ -458,6 +469,34 @@ function card(it, active, place) {
     </span>
     ${refusals.has(it.id) ? `<span class="refused">${esc(refusals.get(it.id))}</span>` : ""}
   </article>`;
+}
+
+// Every item this one is sequenced behind, by number, whether or not any of
+// them is holding it right now. "behind 123" says what stops a card today;
+// this says what the card is waiting for at all, which is the question a
+// person asks when they see a dozen grey cards and want to know which one
+// to finish first. A dependency the board can see is drawn by its stage: one
+// that sits in a terminal stage is done with (`.met`, dimmed); one missing
+// from the listing is an error, never silently treated as complete. The one
+// currently holding the card is `.holding`, and the rest are simply still
+// ahead of it. The number alone, never the
+// source: a card already names its own source in its id, and its
+// dependencies are always in the same repository.
+function needsChip(it, hold) {
+  const deps = Array.isArray(it.dependsOn) ? it.dependsOn : [];
+  if (!deps.length) return "";
+  const refs = deps.map(id => {
+    const dep = byId.get(id);
+    const met = dep && terminal.has(dep.stage);
+    const cls = hold && hold.by === id ? "holding" : !dep ? "missing" : met ? "met" : "";
+    const where = dep ? `${id} is in ${dep.stage}` : `${id} is not on the board`;
+    const status = !dep ? "missing"
+      : met ? `complete in ${dep.stage}`
+      : hold && hold.by === id ? `blocking in ${dep.stage}${hold.until ? ` until ${hold.until}` : ""}`
+      : `in ${dep.stage}`;
+    return `<span class="${cls}" title="${esc(where)}" aria-label="dependency ${esc(id.split(":").pop())}: ${esc(status)}">${esc(id.split(":").pop())}</span>`;
+  });
+  return `<span class="needs" title="depends on ${esc(deps.map(id => id.split(":").pop()).join(", "))}">needs ${refs.join(" ")}</span>`;
 }
 
 // What kind of stop it was, in one word, and nothing else. The reason is a

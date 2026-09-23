@@ -41,13 +41,45 @@ func declineReason(cfg *config.Config, it *model.Item, d pipeline.Deps) string {
 		return fmt.Sprintf("stage %q is a queue with no onSuccess; items rest there", it.Stage)
 	}
 	if hold, held := d.Held(it, next); held {
-		if hold.Blocked {
-			return fmt.Sprintf("held behind %s, which is marked in %s", hold.By, hold.Stage)
-		}
-		return fmt.Sprintf("held behind %s, which is still in %s and has not reached %s",
-			hold.By, hold.Stage, next)
+		return dependencyDeclineReason(hold, next)
 	}
 	return fmt.Sprintf("stage %q has nowhere to go", it.Stage)
+}
+
+func dependencyDeclineReason(hold pipeline.Hold, target string) string {
+	if hold.Invalid {
+		return "dependency error: " + hold.Reason
+	}
+	if hold.Blocked {
+		return fmt.Sprintf("held behind %s, which is marked in %s", hold.By, hold.Stage)
+	}
+	until := hold.Until
+	if until == "" {
+		until = target
+	}
+	return fmt.Sprintf("held behind %s, which is still in %s and has not reached %s",
+		hold.By, hold.Stage, until)
+}
+
+// selectRunStage preserves -stage as an operator routing override, but never
+// as a way around dependency policy. In particular, an invalid graph is a hold
+// for every valid target and is refused before explain or Advance can consume
+// a stage, agent, resource, or budget slot.
+func selectRunStage(cfg *config.Config, item *model.Item, deps pipeline.Deps, requested string) (string, error) {
+	if requested == "" {
+		target, ok := pipeline.Target(cfg, item, deps)
+		if !ok {
+			return "", fmt.Errorf("no stage to run: %s", declineReason(cfg, item, deps))
+		}
+		return target, nil
+	}
+	if _, ok := cfg.Stage(requested); !ok {
+		return "", fmt.Errorf("no stage named %q", requested)
+	}
+	if hold, held := deps.Held(item, requested); held {
+		return "", fmt.Errorf("no stage to run: %s", dependencyDeclineReason(hold, requested))
+	}
+	return requested, nil
 }
 
 func findSourceCLI(cfg *config.Config, name string) (config.Source, bool) {

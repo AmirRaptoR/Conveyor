@@ -26,12 +26,17 @@
 #   DEFAULT_STAGE  where an onboarded issue carrying no mapped label lands
 #                  (default: backlog)
 #   LIMIT          max open issues to fetch per enrolling label (default: 200)
-#   CLOSED_LIMIT   how many of the most recently closed issues to keep, after
-#                  sorting (default: 100)
+#   CLOSED_LIMIT   how many of the most recently closed issues to keep in the
+#                  visible history ledger after sorting (default: 100).
+#                  Completed issues referenced by listed work are resolved
+#                  separately and retained even when older than this window.
 #   CLOSED_FETCH_LIMIT  how many closed issues to fetch before that sort
 #                  (default: 1000) — larger than CLOSED_LIMIT on purpose, so
 #                  the sort has more than an arbitrary CLOSED_LIMIT-sized page
 #                  to choose the newest from.
+#   DEPENDENCY_LOOKUP_LIMIT  maximum completed references outside the ordinary
+#                  listing to resolve directly per poll (default: 50). Extra
+#                  references remain missing and therefore fail closed.
 #
 # Stdin carries model.ListInput — in particular terminalStages, which of the
 # stages STAGE_LABELS maps to are terminal. Listing needs this to tell a
@@ -148,6 +153,32 @@ gh_issues() {
 	done
 }
 
+# gh_issue <number> — resolve one dependency that fell outside CLOSED_LIMIT.
+# A genuine missing issue is reported with status 2 so the engine can expose
+# it as invalid state; transient/API failures still fail the whole listing,
+# preserving last-good state rather than briefly inventing a missing node.
+gh_issue() {
+	local ref=$1 attempt=1 out
+	while :; do
+		if out=$(gh issue view "$ref" --repo "$REPO" \
+			--json number,title,body,labels,url,assignees,state,stateReason,closedAt \
+			2>"$work/gh.err"); then
+			printf '%s' "$out"
+			return 0
+		fi
+		if grep -qiE 'not found|could not resolve|HTTP 404' "$work/gh.err"; then
+			return 2
+		fi
+		if ((attempt >= ${GH_ATTEMPTS:-3})); then
+			echo "gh issue view $ref failed after $attempt attempts: $(cat "$work/gh.err")" >&2
+			return 1
+		fi
+		echo "gh issue view $ref failed (attempt $attempt): $(cat "$work/gh.err")" >&2
+		sleep $((attempt * 2))
+		attempt=$((attempt + 1))
+	done
+}
+
 : >"$work/open.jsonl"
 for label in "${enroll_labels[@]}"; do
 	gh_issues --state open --label "$label" --limit "${LIMIT:-200}" |
@@ -208,20 +239,46 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 			# "depends on"/"blocked by"/"blocks on" also occurs later in the
 			# same sentence. Only a sentence that does not open with the
 			# anchored pair falls through to the phrase-anywhere cut.
+			#
+			# A declaration may also open a list: a keyword sentence that
+			# names nothing itself and ends its line ("Depends on:") donates
+			# the numbers from each markdown list item on the lines that
+			# follow — first sentence of each — until the first line that
+			# is not a list item. Blank lines before the first item are
+			# allowed; one after the list has started ends it. That is the
+			# shape a refined issue writes, and it used to declare nothing.
 			| ([
 				$body
-				| [splits("\n")]
-				| map(splits("(?<=[.!?])[ \t]+"))
-				| .[]
-				| if test("^[\\s*_~`>+-]*(requires|after)\\b"; "i") then
-					sub("^[\\s*_~`>+-]*(?:requires|after)\\b"; ""; "i")
-				elif test("\\b(depends on|blocked by|blocks on)\\b"; "i") then
-					sub("^.*?\\b(?:depends on|blocked by|blocks on)\\b"; ""; "i")
-				else
-					empty
-				end
-				| scan("#[0-9]+")
-			] | map(ltrimstr("#")) | unique | map("\($source):\(.)")) as $deps
+				| reduce ([splits("\n")] | .[]) as $rawline
+					({pending: false, inlist: false, refs: []};
+					($rawline | sub("\r$"; "")) as $line
+					| if ($line | test("^[ \t]*$")) then .inlist = false
+					else
+						(if (.pending or .inlist)
+							and ($line | test("^[ \t]*(?:[-*+]|[0-9]+[.)])[ \t]+")) then
+							.inlist = true | .pending = false
+							| .refs += ($line
+								| sub("^[ \t]*(?:[-*+]|[0-9]+[.)])[ \t]+"; "")
+								| ([splits("(?<=[.!?])[ \t]+")] | .[0] // "")
+								| [scan("#[0-9]+")])
+						else .inlist = false | .pending = false end)
+						| ($line | [splits("(?<=[.!?])[ \t]+")]) as $ss
+						| reduce range(0; $ss | length) as $i (.;
+							($ss[$i]
+								| if test("^[\\s*_~`>+-]*(requires|after)\\b"; "i") then
+									sub("^[\\s*_~`>+-]*(?:requires|after)\\b"; ""; "i")
+								elif test("\\b(depends on|blocked by|blocks on)\\b"; "i") then
+									sub("^.*?\\b(?:depends on|blocked by|blocks on)\\b"; ""; "i")
+								else null end) as $rest
+							| if $rest == null then .
+							else .refs += ($rest | [scan("#[0-9]+")])
+								| if $i == ($ss | length) - 1
+									and ($rest | test("^[\\s:*_~`.!?-]*$")) then .pending = true
+								else . end
+							end)
+					end)
+				| .refs[]
+			] | map(ltrimstr("#") | tonumber | tostring) | unique | map("\($source):\(.)")) as $deps
 			# Opt-in, and these are the three ways in: the pipeline put
 			# it here, a person handed it over, or it stopped.
 			| select($mapped != null
@@ -305,6 +362,51 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 			# reproducible. Only ever set when they do not already say it.
 			+ (if $stage != ($mapped // $default) then {reconcile: $stage} else {} end))
 		)' "$work/items.jsonl" >"$work/listed.json"
+
+# CLOSED_LIMIT bounds the history ledger, not dependency correctness. Resolve
+# any referenced node absent from that bounded slice. A completed issue is
+# added back as a terminal dependency-only record; an open/unresolvable issue
+# remains absent so NewDeps reports the declaration as invalid. The number of
+# extra calls and records is bounded by references on the already-bounded
+# listing, never by repository history.
+mapfile -t missing_refs < <(jq -r '
+	[.[].id] as $ids
+	| [.[].dependsOn[]? | select(. as $d | ($ids | index($d) | not))]
+	| unique[] | split(":")[-1]
+' "$work/listed.json")
+dependency_lookup_limit=${DEPENDENCY_LOOKUP_LIMIT:-50}
+if [[ ! "$dependency_lookup_limit" =~ ^[0-9]+$ ]]; then
+	echo "DEPENDENCY_LOOKUP_LIMIT must be a non-negative integer, got: $dependency_lookup_limit" >&2
+	exit 1
+fi
+if ((${#missing_refs[@]} > dependency_lookup_limit)); then
+	echo "dependency lookup limit $dependency_lookup_limit reached; remaining references stay missing and fail closed" >&2
+fi
+lookup_refs=("${missing_refs[@]:0:dependency_lookup_limit}")
+for ref in "${lookup_refs[@]}"; do
+	issue=""
+	if issue=$(gh_issue "$ref"); then
+		if [[ -n "$done_stage" ]] && jq -e '
+			((.state // "") | ascii_downcase) == "closed"
+			and ((.stateReason // "completed") | ascii_downcase) == "completed"
+		' <<<"$issue" >/dev/null; then
+			jq -c --arg source "$CONVEYOR_SOURCE" --arg done "$done_stage" '
+				(.labels | map(.name)) as $names
+				| {id: "\($source):\(.number)", ref: (.number | tostring), source: $source,
+				   stage: $done, title: .title, blocked: false,
+				   description: (.body // ""), url: .url, labels: $names,
+				   priority: ([$names[] | capture("^priority:p(?<n>[0-3])$") | .n | tonumber] | .[0]),
+				   assignee: (.assignees | map(.login) | .[0] // ""),
+				   finishedAt: (.closedAt // "")}
+			' <<<"$issue" >"$work/resolved.json"
+			jq -s '.[0] + [.[1]]' "$work/listed.json" "$work/resolved.json" >"$work/listed.next"
+			mv "$work/listed.next" "$work/listed.json"
+		fi
+	else
+		status=$?
+		if ((status != 2)); then exit "$status"; fi
+	fi
+done
 
 # The labels catch up with the status, using the one script that writes labels
 # rather than a second copy of its rules here. Rare — an item needs it once,

@@ -27,8 +27,8 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	deps := pipeline.NewDeps(s.cfg, s.state.Items)
 	st.Items = pipeline.Order(s.cfg, s.state.Items, s.state.Order, deps)
 	st.Held = heldOf(s.cfg, s.state.Items, deps)
-	if len(deps.Cycles) > 0 {
-		st.Warnings = append(append([]string(nil), s.state.Warnings...), deps.Cycles...)
+	if len(deps.Errors) > 0 {
+		st.Warnings = append(append([]string(nil), s.state.Warnings...), deps.Errors...)
 	}
 	bySrc, byStage, held, max, perSrc, perStage := s.eng.Locks().Snapshot()
 	st.Slots = SlotsView{BySource: bySrc, ByStage: byStage, Global: held, GlobalMax: max,
@@ -166,6 +166,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	var item model.Item
 	found := false
 	s.mu.RLock()
+	items := append([]model.Item(nil), s.state.Items...)
 	for _, it := range s.state.Items {
 		if it.ID == id {
 			item, found = it, true
@@ -174,10 +175,18 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	// Built while the listing is still held: the full board, not this one
 	// item, is what the gate needs to answer whether it is held.
-	deps := pipeline.NewDeps(s.cfg, s.state.Items)
+	deps := pipeline.NewDeps(s.cfg, items)
+	staleSrc := make(map[string]bool, len(s.listErr))
+	for name := range s.listErr {
+		staleSrc[name] = true
+	}
 	s.mu.RUnlock()
 	if !found {
 		http.Error(w, "no item "+id+" on the board", http.StatusNotFound)
+		return
+	}
+	if dispatchUsesStaleState(item, deps, staleSrc, staleItemIDs(items, staleSrc)) {
+		http.Error(w, id+" cannot start while its source or a dependency source has a stale listing", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -411,13 +420,8 @@ func (s *Server) handleUnblockAll(w http.ResponseWriter, r *http.Request) {
 		// refuses a marked item on its own mark before the gate is ever
 		// reached. Decided from DependsOn and the listing alone: nothing
 		// here reads the mark's own kind or the word "dependency" to decide
-		// it — Scripts own that vocabulary, the engine never interprets it.
-		//
-		// The residual: a dependency the listing cannot see (an
-		// un-onboarded issue, another repository) is not a hold the engine
-		// can compute, so the item is still cleared here. agents/_deps
-		// re-marks it at implement time, before the worktree and before any
-		// model run, which is the accepted cost of that gap.
+		// it — Scripts own that vocabulary. A missing dependency is itself an
+		// invalid computed hold, so it remains fail-closed here too.
 		if next, ok := nextStage(s.cfg, it.Stage); ok {
 			if _, held := deps.Held(&it, next); held {
 				heldByDependencies++
@@ -457,9 +461,13 @@ func nextStage(cfg *config.Config, stageName string) (string, bool) {
 // 1 because a source is a worktree, and while these writes touch no worktree,
 // thirty concurrent `gh` calls against one repository is its own outage.
 func (s *Server) unblockAll(ctx context.Context, held []model.Item) int {
+	return s.unblockAllKind(ctx, held, "")
+}
+
+func (s *Server) unblockAllKind(ctx context.Context, held []model.Item, expectedKind string) int {
 	n := 0
 	for _, it := range held {
-		if err := s.unblock(ctx, it); err != nil {
+		if err := s.unblockKind(ctx, it, expectedKind); err != nil {
 			fmt.Fprintf(os.Stderr, "conveyor: could not unblock %s: %v\n", it.ID, err)
 			continue
 		}
@@ -471,8 +479,9 @@ func (s *Server) unblockAll(ctx context.Context, held []model.Item) int {
 // releaseLimited hands back the items an agent's usage limit stopped, once that
 // agent reports itself well again.
 //
-// This is the only mark the engine clears on its own initiative, and it is a
-// narrow exception on purpose. A `decision` mark is a person's answer
+// This and one-time legacy dependency-mark migration are the only marks the
+// engine clears on its own initiative. This is a narrow exception on purpose.
+// A `decision` mark is a person's answer
 // outstanding, and no amount of waiting produces one — clearing it spends an
 // agent run to be told the same thing. A `limit` is the outside world: nothing
 // was ever wrong with the item, the agent said so itself in the mark, and the
@@ -499,7 +508,7 @@ func (s *Server) releaseLimited(ctx context.Context) int {
 		return 0
 	}
 	fmt.Fprintf(os.Stderr, "conveyor: an agent's quota is back; handing back %d item(s) it stopped\n", len(held))
-	n := s.unblockAll(ctx, held)
+	n := s.unblockAllKind(ctx, held, limitKind)
 	s.wakeUp()
 	return n
 }
@@ -709,10 +718,103 @@ func (s *Server) anyPaused() bool {
 // it, and an agent that never says it simply never gets this behaviour.
 const limitKind = "limit"
 
+// dependencyKind is the legacy script mark superseded by dependenciesAt.
+// Unlike limitKind it is not an ongoing flow-control signal: once a config
+// enables an engine dependency gate, the computed hold owns that state and
+// this old mark must come off or the item can never resume after the hold does.
+const dependencyKind = "dependency"
+
+func hasDependencyGate(cfg *config.Config) bool {
+	for _, st := range cfg.Stages {
+		if st.DependenciesAt != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// releaseDependencyMarks is the automatic migration for boards that used the
+// old agents/_deps mark before dependenciesAt existed. The provider mark is
+// cleared once; an open, missing, self-referential, or cyclic dependency stays
+// stopped by pipeline.Deps, without a model run or capacity claim. A satisfied
+// dependency resumes normally. Other marks and questions remain human-owned.
+func (s *Server) releaseDependencyMarks(ctx context.Context) int {
+	if !hasDependencyGate(s.cfg) {
+		return 0
+	}
+	s.mu.RLock()
+	items := append([]model.Item(nil), s.state.Items...)
+	deps := pipeline.NewDeps(s.cfg, items)
+	staleSrc := make(map[string]bool, len(s.listErr))
+	for name := range s.listErr {
+		staleSrc[name] = true
+	}
+	staleItems := staleItemIDs(items, staleSrc)
+	var legacy []model.Item
+	for _, it := range items {
+		block := s.blocks[it.ID]
+		// A failed listing leaves last-good items on the board. Do not mutate
+		// that source from stale evidence; its next successful listing will
+		// make the migration eligible again.
+		if it.Blocked && block.Kind == dependencyKind && !block.Asked &&
+			!dispatchUsesStaleState(it, deps, staleSrc, staleItems) {
+			legacy = append(legacy, it)
+		}
+	}
+	s.mu.RUnlock()
+	if len(legacy) == 0 {
+		return 0
+	}
+	fmt.Fprintf(os.Stderr, "conveyor: migrating %d legacy dependency mark(s) to computed holds\n", len(legacy))
+	n := 0
+	for _, it := range legacy {
+		if err := s.unblockKind(ctx, it, dependencyKind); err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: could not migrate dependency mark on %s: %v\n", it.ID, err)
+			continue
+		}
+		n++
+	}
+	if n > 0 {
+		s.wakeUp()
+	}
+	return n
+}
+
 // unblock is one provider write: the same move that set the mark, with the mark
 // off. The engine's note goes with it — the run that explains it is still
 // filed, but the item is no longer asking anything of anyone.
 func (s *Server) unblock(ctx context.Context, item model.Item) error {
+	return s.unblockKind(ctx, item, "")
+}
+
+// unblockKind is unblock with an optional compare-and-clear guard. Migration
+// passes dependencyKind so a newer decision/error mark wins instead of being
+// erased by an old snapshot. All clearing writes share the per-item claim,
+// which closes the same race against a concurrent answer or doctor pass.
+func (s *Server) unblockKind(ctx context.Context, item model.Item, expectedKind string) error {
+	if _, busy := s.unblocking.LoadOrStore(item.ID, struct{}{}); busy {
+		return fmt.Errorf("a mark-clearing write is already in progress")
+	}
+	defer s.unblocking.Delete(item.ID)
+
+	s.mu.RLock()
+	current, found := model.Item{}, false
+	for _, it := range s.state.Items {
+		if it.ID == item.ID {
+			current, found = it, true
+			break
+		}
+	}
+	block := s.blocks[item.ID]
+	s.mu.RUnlock()
+	if !found || !current.Blocked {
+		return fmt.Errorf("%s is no longer marked", item.ID)
+	}
+	if expectedKind != "" && (block.Kind != expectedKind || block.Asked) {
+		return fmt.Errorf("%s mark changed from %s to %s", item.ID, expectedKind, block.Kind)
+	}
+	item = current
+
 	client, ok := s.eng.Client(item.Source)
 	if !ok {
 		return fmt.Errorf("%s: no provider client", item.Source)
@@ -761,9 +863,16 @@ func (s *Server) whyStuck(it model.Item, deps pipeline.Deps) string {
 	}
 	if next != "" {
 		if hold, held := deps.Held(&it, next); held {
+			if hold.Invalid {
+				return fmt.Sprintf("%s cannot move because its dependency graph is invalid: %s", it.ID, hold.Reason)
+			}
 			if hold.Blocked {
 				return fmt.Sprintf("%s is held behind %s, which is marked in %s — clear that mark and this moves on its own",
 					it.ID, hold.By, hold.Stage)
+			}
+			if hold.Until != "" && hold.Until != hold.Target {
+				return fmt.Sprintf("%s is held behind %s, which is still in %s — it must reach %s before this enters %s",
+					it.ID, hold.By, hold.Stage, hold.Until, hold.Target)
 			}
 			return fmt.Sprintf("%s is held behind %s, which is still in %s — it cannot enter %s first",
 				it.ID, hold.By, hold.Stage, hold.Target)

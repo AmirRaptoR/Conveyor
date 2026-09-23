@@ -377,3 +377,54 @@ test("draw: a blocked item is never also drawn held", async () => {
   assert.match(rendered, /class="item[^"]*\bblocked\b[^"]*"/);
   assert.doesNotMatch(rendered, /class="item[^"]*\bheld\b[^"]*"/);
 });
+
+// Every dependency a card declares is drawn on it by number, hold or no
+// hold: "behind 1" says what stops a card today, "needs" says what it is
+// waiting for at all. A dependency that has finished (a terminal stage) is
+// dimmed, one missing from the listing is visibly erroneous, the one holding
+// the card is singled out, and the card's own source is never repeated.
+test("draw: a card lists what it depends on, by number", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [
+      { id: "s1:1", source: "s1", stage: "backlog", title: "the dependency" },
+      { id: "s1:3", source: "s1", stage: "done", title: "already finished" },
+      { id: "s1:2", source: "s1", stage: "backlog", title: "the follower",
+        dependsOn: ["s1:1", "s1:3", "s1:9"] },
+    ],
+    held: { "s1:2": { by: "s1:1", stage: "backlog", target: "working", blocked: false, until: "working" } },
+  }));
+  const rendered = p.el("#rail").innerHTML;
+  assert.match(rendered, /class="needs"[^>]*>needs /);
+  assert.match(rendered, /class="holding"[^>]*>1</);
+  assert.match(rendered, /class="met"[^>]*>3</);
+  assert.match(rendered, /class="missing"[^>]*>9</);
+  assert.match(rendered, /behind 1 · until working/);
+  assert.match(rendered, /aria-label="dependency 1: blocking in backlog until working"/);
+  assert.match(rendered, /aria-label="dependency 3: complete in done"/);
+  assert.match(rendered, /aria-label="dependency 9: missing"/);
+  assert.doesNotMatch(rendered, /needs [^<]*s1:/);
+});
+
+test("draw: an invalid dependency hold is unmistakable and explains itself", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:2", source: "s1", stage: "backlog", title: "the follower",
+      dependsOn: ["s1:999"] }],
+    held: { "s1:2": { by: "s1:999", target: "working", until: "working",
+      invalid: true, reason: "s1:2 depends on missing item s1:999" } },
+  }));
+  const rendered = p.el("#rail").innerHTML;
+  assert.match(rendered, /class="item[^"\n]*dependency-invalid/);
+  assert.match(rendered, /class="dependency-error"[^>]*>dependency error</);
+  assert.match(rendered, /title="s1:2 depends on missing item s1:999"/);
+  assert.doesNotMatch(rendered, /class="behind"/);
+});
+
+test("draw: a card declaring nothing has no needs chip", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:1", source: "s1", stage: "backlog", title: "free to run" }],
+  }));
+  assert.doesNotMatch(p.el("#rail").innerHTML, /class="needs"/);
+});

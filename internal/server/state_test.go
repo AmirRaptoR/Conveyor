@@ -496,12 +496,38 @@ func TestStartRefusesAHeldItem(t *testing.T) {
 	}
 }
 
-// A dependency cycle is a person's mistake in an issue body, not a fault the
-// pipeline should wedge on: every item in it stays workable, and the board is
-// told once, by name, through the same Warnings strip a listing failure
-// already uses. Computed fresh from the current listing on every request, the
-// same as Held, so a cycle a person has since repaired is simply gone from
-// the very next /api/state.
+func TestStartRefusesAnInvalidDependencyWithoutClaimingWork(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{
+		{ID: "s1:2", Source: "s1", Stage: "backlog", DependsOn: []string{"s1:999"}},
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/items/s1:2/start", nil)
+	req.SetPathValue("id", "s1:2")
+	s.handleStart(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d (%s), want 409", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "invalid") || !strings.Contains(w.Body.String(), "s1:999") {
+		t.Errorf("refusal = %q, want the missing dependency error", w.Body.String())
+	}
+	if got := s.inFlight.Load(); got != 0 {
+		t.Fatalf("invalid dependency consumed %d run slots", got)
+	}
+	_, _, held, _, _, _ := s.eng.Locks().Snapshot()
+	if held != 0 {
+		t.Fatalf("invalid dependency consumed %d engine slots", held)
+	}
+}
+
+// A dependency cycle is a person's mistake in an issue body. It fails closed
+// without consuming a run slot, and the board is told once, by name, through
+// both its per-item hold and the same Warnings strip a listing failure uses.
+// Computed fresh on every request, the error disappears on the first state
+// response after the issue declaration is repaired.
 func TestCycleWarningAppearsAndClearsItself(t *testing.T) {
 	cfg, r := boardFor(t)
 	s := New(cfg, r)
@@ -522,9 +548,8 @@ func TestCycleWarningAppearsAndClearsItself(t *testing.T) {
 	if !strings.Contains(got.Warnings[0], "s1:1") || !strings.Contains(got.Warnings[0], "s1:2") {
 		t.Errorf("warning %q does not name both items in the cycle", got.Warnings[0])
 	}
-	// A cycle is dropped, not held: both items stay workable.
-	if _, held := got.Held["s1:1"]; held {
-		t.Error("an item in a dropped cycle was reported held")
+	if hold, held := got.Held["s1:1"]; !held || !hold.Invalid || !strings.Contains(hold.Reason, "dependency cycle") {
+		t.Errorf("cycle hold = %+v, %v; want a visible invalid hold", hold, held)
 	}
 
 	// The person fixes it by hand: s1:2 no longer names s1:1.
@@ -540,5 +565,27 @@ func TestCycleWarningAppearsAndClearsItself(t *testing.T) {
 	}
 	if len(second.Warnings) != 0 {
 		t.Errorf("warnings = %v, want none once the cycle is repaired", second.Warnings)
+	}
+}
+
+func TestMissingDependencyFailsClosedAndAppearsInState(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.state.Items = []model.Item{
+		{ID: "s1:2", Source: "s1", Stage: "backlog", DependsOn: []string{"s1:999"}},
+	}
+
+	w := httptest.NewRecorder()
+	s.handleState(w, httptest.NewRequest("GET", "/api/state", nil))
+	var got State
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	hold, held := got.Held["s1:2"]
+	if !held || !hold.Invalid || hold.By != "s1:999" {
+		t.Fatalf("missing dependency hold = %+v, %v", hold, held)
+	}
+	if len(got.Warnings) != 1 || !strings.Contains(got.Warnings[0], "missing item s1:999") {
+		t.Fatalf("warnings = %v, want missing dependency", got.Warnings)
 	}
 }

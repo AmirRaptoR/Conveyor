@@ -42,11 +42,13 @@ arrive in this shape.
   "priority": 2,                // 0 = most urgent. null = unranked.
   "dependsOn": ["midgame:33"],  // items this one is sequenced behind, by id.
                                 // The provider translates its own vocabulary
-                                // ("Depends on #33" in a GitHub issue body);
-                                // the engine only ever compares ids, the same
-                                // way it never sees a label name. Omitted or
-                                // empty means nothing gates this item. See §5
-                                // for the rule this enforces.
+                                // ("Depends on #33" in a GitHub issue body, or
+                                // a bare "Depends on:" line followed by one
+                                // list item per predecessor); the engine only
+                                // ever compares ids, the same way it never
+                                // sees a label name. Omitted or empty means
+                                // nothing gates this item. See §5 for the
+                                // rule this enforces.
   "assignee": null,
   "createdAt": "2026-08-20T10:00:00Z",
   "updatedAt": "2026-08-27T11:00:00Z",
@@ -97,7 +99,7 @@ author learns it once.
 | | |
 | --- | --- |
 | `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "blocked": false, "config": {...}}`, plus `"answer"` and `"session"` when this run follows a stop a person answered (§5a). For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "terminalStages": ["done"], "config": {...}}` — `terminalStages` is which of `stages` are terminal, so a list script can tell a finished item from one that merely stopped without keeping its own copy of the stage graph in source `env:` |
-| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, `CONVEYOR_DEADLINE` (§4b), `CONVEYOR_MANUAL` when a person armed one of this stage's `actions:` for this run (§5b), plus everything in the source's `env:` block |
+| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, `CONVEYOR_DEADLINE` (§4b), `CONVEYOR_DEPENDENCIES_AT` when this stage's dependency policy is engine-owned (§4), `CONVEYOR_MANUAL` when a person armed one of this stage's `actions:` for this run (§5b), plus everything in the source's `env:` block |
 
 **Output** is split deliberately:
 
@@ -390,9 +392,62 @@ not finish, and putting a second item into it is the case this rule exists to
 prevent. The chain needs no transitive closure: every link is enforced, so a
 family sequences itself one edge at a time, and child 3 declares only its
 immediate predecessor. An id absent from the listing, a self-edge, a cycle, or
-a dependency sitting in a stage this config does not declare all fail open —
-the edge is dropped, never treated as holding forever, because a typo in an
-issue body must not be able to wedge the line.
+a dependency sitting in a stage this config does not declare are invalid
+state. They fail closed before any stage, agent, resource, or execution-budget
+slot is claimed. `/api/state` reports both a per-item invalid hold and a
+board-wide warning naming the bad declaration; the board draws the card as a
+dependency error. Repairing the issue body or provider state clears it on the
+next successful listing. Silently dropping the edge would authorize the work
+the declaration was intended to prevent.
+
+If either the item source or any source reached through its dependency graph
+has a failed latest listing, the cached graph remains visible but authorizes
+no dispatch and no legacy-mark migration. Work resumes after those sources
+list successfully. The GitHub provider directly resolves at most
+`DEPENDENCY_LOOKUP_LIMIT` completed references outside its normal history
+window per poll (50 by default); excess references remain missing and visibly
+fail closed rather than causing unbounded API traffic.
+
+A stage may raise that bar for itself with `dependenciesAt: <stage>`: an item
+enters it only once every dependency has reached the named stage or gone past
+it (and is not marked there). Sharing is the right default for stages that
+only read their own item; it is the wrong one for the stage that builds on
+the dependency's code. An item implemented while its dependency is still in
+review is built on a branch that is not on `main`, and the pull request it
+produces cannot merge on its own — so `dependenciesAt: merged` on the
+implement stage is what makes "every issue is deliverable by itself" a rule
+the line enforces rather than a hope the spec expresses. The hold carries
+`until`, the stage the dependency has to reach, so the board and `run
+-explain` can say "must reach merged" rather than "cannot enter in-progress".
+The requirement remains in force after the gated stage, so enabling it on a
+live board also stops an item already found in review before it can continue.
+The name must be this stage or a later declared stage, checked at load; a
+backwards threshold would promise a gate while weakening nothing.
+
+### Enabling `dependenciesAt` on a live board
+
+This is a fail-closed reconciliation, not a relabel migration:
+
+1. Add the threshold and run `conveyor validate -strict-sources -c <config>`.
+2. Deploy in observe mode first and inspect `GET /api/state`. Every affected
+   card has either an ordinary `behind N · must reach <stage>` hold or a red
+   `dependency error`; the JSON equivalents are `.held[ID].until` and
+   `.held[ID].invalid`.
+3. On the first successful listing, Conveyor automatically removes legacy
+   script-written marks whose kind is `dependency`; the computed hold replaces
+   them without launching a stage. Questions and every other mark remain
+   untouched. Repair missing/self/cyclic declarations before enabling
+   automatic work. Do not remove a dependency merely to clear the error:
+   either onboard the missing item or correct the reference.
+4. Items already at or beyond the gated stage are not moved backwards. The
+   inherited threshold holds them where they are until their dependencies
+   reach the required stage, then they resume through the normal recovery
+   path. Review/approval should rebase code built before the dependency
+   landed. A terminal item cannot be reconciled by a scheduler because its
+   work has already shipped; audit it explicitly before rollout.
+
+Because `Target` rejects these items before scheduling, this observation and
+repair period consumes no stage, agent, resource, or budget capacity.
 
 Rung 2 is the point of the whole thing: finish an item before starting another.
 Every half-finished item holds a worktree, a branch and an open pull request

@@ -264,23 +264,47 @@ peer, and the socket is the only door with no password on it (#94).
   work on; it only ever answers whether this item is already done, and stays
   the one place both implement and review ask that question.
 - **An item sequenced behind an open issue is not started.** `agents/_deps`
-  reads "Depends on #N" / "Blocked by #N" lines from the body; implement stops
-  before the worktree with a `dependency` mark, a condition the doctor clears
-  once every named issue is closed. The agent is also told not to stop for an
-  open dependency itself — nine of one week's seventeen "decisions" were that.
+  reads "Depends on #N" / "Blocked by #N" lines from the body — inline, or a
+  bare "Depends on:" line followed by one markdown list item per predecessor,
+  which is the shape a refined issue actually writes and which used to
+  declare nothing (the keyword line had no number on it, and a line break is
+  a sentence break); implement stops before the worktree with a `dependency`
+  mark on configurations that have not enabled the engine gate. Once any
+  stage declares `dependenciesAt`, a successful listing automatically removes
+  those legacy script marks and the computed hold owns the condition instead;
+  questions and other mark kinds remain untouched. A gated stage receives
+  `CONVEYOR_DEPENDENCIES_AT`, and `agents/claude/implement` uses its presence
+  to stand down the older "issue is open" preflight so it cannot recreate the
+  mark after the engine approved a different configured threshold. The
+  agent is also told not to stop for an open dependency itself — nine of one
+  week's seventeen "decisions" were that. The GitHub provider's `list.sh`
+  restates the same parse for `dependsOn`, and `agents/_deps-fixtures.jsonl`
+  is the one corpus both selfchecks read so the two cannot drift.
 - **A follower never passes what it depends on.** `pipeline.Deps` is built from
   the full listing each pass and gates rung 1 of `pipeline.Target`: an item may
   enter a stage its dependency has already entered, may share it, may never
   pass it, and may not walk into a stage its dependency is marked in. Stated
   once, in `Target`, so `Pick`, `Order` and the drag endpoint's 409 cannot
-  disagree about it. Every unusable edge — an unknown id, a self-edge, a stage
-  the config does not declare, a cycle — is dropped rather than held, because
-  the alternative is a pipeline a person wedges shut by mistyping one line of
-  an issue body; only the edges inside a cycle go, so an unrelated dependency
-  off the same item still holds. This is the line's own sequencing and is not
-  `agents/_deps`, which still asks GitHub about issues the board cannot see —
-  narrower (an un-onboarded sibling gates nothing here) and later (it catches
-  what the engine could not see, immediately before the worktree). `Unblock
+  disagree about it. A stage raises that bar for itself with `dependenciesAt:
+  <stage>` — the implement stage says `merged`, because an item built while
+  its dependency is still on a branch produces a pull request that cannot
+  merge on its own, and every issue must be deliverable by itself even as a
+  slice of a bigger feature. The hold carries `until` so the board can say
+  "must reach merged" instead of "cannot enter in-progress". The threshold
+  remains in force after that stage, which is how a live board reconciles an
+  item already found in review when the gate is enabled: it stops there until
+  the dependency lands, without being moved backwards. Every unusable edge —
+  an unknown id, a self-edge, a stage the config does not declare, a cycle —
+  is a visible invalid hold and fails closed before a run slot is claimed.
+  Repairing the declaration clears it on the next listing; dropping it would
+  silently authorize the order it was meant to forbid. The GitHub provider
+  resolves completed referenced issues that fell outside `CLOSED_LIMIT`, so
+  old finished predecessors remain distinguishable from typos. This is the
+  line's own sequencing and is not `agents/_deps`, which remains a final
+  script-side check for configurations that have not enabled an engine gate.
+  The supervised `conveyor run -stage` command asks this same rule about its
+  requested destination, so its routing override cannot become a dependency
+  override. `Unblock
   all` asks the same rule directly — would this item be held if it were not
   marked — rather than through `Target`, which would refuse it on its own mark
   first; a marked item still held this way gets no provider write and is
@@ -389,7 +413,13 @@ peer, and the socket is the only door with no password on it (#94).
   call is server-side filtered; there is nothing to push it behind. Closed
   history stays a single listing, but is sorted newest-`closedAt`-first
   *before* `CLOSED_LIMIT` cuts it down, so that is the N most recently closed
-  rather than an arbitrary N `gh` happened to return first.
+  rather than an arbitrary N `gh` happened to return first. A listed item's
+  dependency that falls outside that ledger is resolved directly; a completed
+  predecessor is added back as a terminal dependency-only record, while a
+  missing, open-but-unenrolled, or abandoned reference remains absent and is
+  surfaced by the engine as invalid state. Direct resolution is capped by
+  `DEPENDENCY_LOOKUP_LIMIT` (50 by default); excess references stay missing
+  and fail closed instead of turning one issue body into an unbounded API job.
 - **`list` reads closed issues it labelled, and only those.** A finished item is
   a closed issue — the pull request says `Closes #N` — so listing open ones
   alone left the last stages empty: an item did not arrive in `done`, it

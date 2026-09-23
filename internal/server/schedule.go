@@ -99,6 +99,24 @@ func (s *Server) claimAndLaunch(ctx context.Context, item model.Item, target str
 	return r
 }
 
+func staleItemIDs(items []model.Item, staleSources map[string]bool) map[string]bool {
+	ids := make(map[string]bool)
+	for _, it := range items {
+		if staleSources[it.Source] {
+			ids[it.ID] = true
+		}
+	}
+	return ids
+}
+
+// dispatchUsesStaleState applies "stale state is for reading, never acting"
+// to the whole dependency graph, not just the candidate's own source. A
+// cached dependency at merged must not authorize fresh work after its provider
+// becomes unreadable and the real issue is reopened or moved backwards.
+func dispatchUsesStaleState(it model.Item, deps pipeline.Deps, staleSources, staleItems map[string]bool) bool {
+	return staleSources[it.Source] || deps.DependsOnAny(it.ID, staleItems)
+}
+
 // launch starts every transition the locks currently permit and returns how
 // many it started. Candidates whose source or target stage is already busy are
 // skipped rather than queued, so a slow stage never holds up a free one.
@@ -129,6 +147,7 @@ func (s *Server) launch(ctx context.Context) int {
 	// running or marked has already been filtered out of `free`, and it is
 	// exactly the one that must still hold its followers.
 	deps := pipeline.NewDeps(s.cfg, items)
+	staleItems := staleItemIDs(items, staleSrc)
 
 	n := 0
 	// Refused axes. A refusal means that source or that stage is genuinely full,
@@ -150,8 +169,8 @@ func (s *Server) launch(ctx context.Context) int {
 				s.eng.Locks().Busy(it.Source, target, s.cfg.ResourcesFor(it.Source, target)...) {
 				continue
 			}
-			if staleSrc[it.Source] {
-				continue // its items are its last-good listing, not this poll's
+			if dispatchUsesStaleState(it, deps, staleSrc, staleItems) {
+				continue // it or a dependency is last-good, not confirmed this poll
 			}
 			if spends(s.cfg.ResourcesFor(it.Source, target), fullResource) {
 				continue // something it needs is already all in use
@@ -432,9 +451,21 @@ func (s *Server) advance(ctx context.Context) bool {
 	}
 	s.mu.RLock()
 	items := append([]model.Item(nil), s.state.Items...)
+	staleSrc := make(map[string]bool, len(s.listErr))
+	for name := range s.listErr {
+		staleSrc[name] = true
+	}
 	s.mu.RUnlock()
 
-	item, target := pipeline.Pick(s.cfg, items, s.order.IDs(), pipeline.NewDeps(s.cfg, items))
+	deps := pipeline.NewDeps(s.cfg, items)
+	staleItems := staleItemIDs(items, staleSrc)
+	eligible := items[:0:0]
+	for _, it := range items {
+		if !dispatchUsesStaleState(it, deps, staleSrc, staleItems) {
+			eligible = append(eligible, it)
+		}
+	}
+	item, target := pipeline.Pick(s.cfg, eligible, s.order.IDs(), deps)
 	if item == nil {
 		return false
 	}

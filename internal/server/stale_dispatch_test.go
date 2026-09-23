@@ -2,11 +2,14 @@ package server
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
+	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 )
 
@@ -51,6 +54,77 @@ sources:
 		t.Fatal(err)
 	}
 	return c, runner.New(filepath.Join(dir, "runs")), ran
+}
+
+func TestLaunchSkipsAFreshItemWhoseDependencySourceIsStale(t *testing.T) {
+	cfg, r, ran := staleDependencyDispatchPipeline(t)
+	s := New(cfg, r)
+	s.state.Items = staleDependencyItems()
+	s.listErr["s2"] = "boom"
+
+	if n := s.launch(context.Background()); n != 0 {
+		t.Fatalf("launch() = %d, want 0 while dependency source is stale", n)
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Fatal("fresh follower ran using its dependency source's last-good state")
+	}
+
+	delete(s.listErr, "s2")
+	if n := s.launch(context.Background()); n != 1 {
+		t.Fatalf("launch() after dependency recovery = %d, want 1", n)
+	}
+	waitFor(t, "the transition to finish", func() bool { return s.inFlight.Load() == 0 })
+}
+
+func staleDependencyDispatchPipeline(t *testing.T) (*config.Config, *runner.Runner, string) {
+	t.Helper()
+	cfg, r, ran := staleDispatchPipeline(t)
+	// The dependency is read-only in this test. Cloning the resolved source
+	// gives the engine a valid second client without adding another fixture.
+	s2 := cfg.Sources[0]
+	s2.Name = "s2"
+	cfg.Sources = append(cfg.Sources, s2)
+	return cfg, r, ran
+}
+
+func staleDependencyItems() []model.Item {
+	return []model.Item{
+		{ID: "s2:1", Ref: "1", Source: "s2", Stage: "done"},
+		{ID: "s1:2", Ref: "2", Source: "s1", Stage: "backlog", DependsOn: []string{"s2:1"}},
+	}
+}
+
+func TestStartRefusesAFreshItemWhoseDependencySourceIsStale(t *testing.T) {
+	cfg, r, ran := staleDependencyDispatchPipeline(t)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = staleDependencyItems()
+	s.listErr["s2"] = "boom"
+
+	req := httptest.NewRequest(http.MethodPost, "/api/items/s1:2/start", nil)
+	req.SetPathValue("id", "s1:2")
+	w := httptest.NewRecorder()
+	s.handleStart(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("start status = %d, want %d: %s", w.Code, http.StatusServiceUnavailable, w.Body.String())
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Fatal("manual start ran using a dependency source's last-good state")
+	}
+}
+
+func TestAdvanceSkipsAFreshItemWhoseDependencySourceIsStale(t *testing.T) {
+	cfg, r, ran := staleDependencyDispatchPipeline(t)
+	s := New(cfg, r)
+	s.state.Items = staleDependencyItems()
+	s.listErr["s2"] = "boom"
+
+	if s.advance(context.Background()) {
+		t.Fatal("tick advanced an item using a dependency source's last-good state")
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Fatal("tick ran the stage script using stale dependency state")
+	}
 }
 
 // Engine: the scheduler refuses to dispatch work for a source whose items are

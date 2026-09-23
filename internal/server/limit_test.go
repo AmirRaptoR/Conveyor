@@ -13,6 +13,7 @@ import (
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 )
 
@@ -50,6 +51,140 @@ func TestQuotaRecoveryReleasesOnlyLimitMarks(t *testing.T) {
 	if _, held := s.blocks["s1:2"]; !held {
 		t.Error("the decision mark was cleared: a person's answer was thrown away")
 	}
+}
+
+func TestDependencyGateMigratesLegacyMarksToComputedHolds(t *testing.T) {
+	cfg, r := boardFor(t)
+	for i := range cfg.Stages {
+		if cfg.Stages[i].Name == "working" {
+			cfg.Stages[i].DependenciesAt = "done"
+		}
+	}
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{
+		{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"},
+		{ID: "s1:2", Ref: "2", Source: "s1", Stage: "backlog", Blocked: true, DependsOn: []string{"s1:1"}},
+		{ID: "s1:3", Ref: "3", Source: "s1", Stage: "backlog", Blocked: true},
+		{ID: "s1:4", Ref: "4", Source: "s1", Stage: "backlog", Blocked: true, DependsOn: []string{"s1:1"}},
+	}
+	s.blocks = map[string]Block{
+		"s1:2": {Kind: dependencyKind, Reason: "waiting for #1"},
+		"s1:3": {Kind: "error", Reason: "real failure"},
+		"s1:4": {Kind: dependencyKind, Reason: "which dependency?", Asked: true},
+	}
+
+	if n := s.releaseDependencyMarks(s.ctx); n != 1 {
+		t.Fatalf("migrated %d mark(s), want only s1:2", n)
+	}
+	s.mu.RLock()
+	items := append([]model.Item(nil), s.state.Items...)
+	_, oldMark := s.blocks["s1:2"]
+	_, realFailure := s.blocks["s1:3"]
+	_, question := s.blocks["s1:4"]
+	s.mu.RUnlock()
+	if oldMark || items[1].Blocked {
+		t.Fatal("legacy dependency mark survived migration")
+	}
+	if !realFailure || !question {
+		t.Fatal("migration cleared a non-dependency mark or a question")
+	}
+	deps := pipeline.NewDeps(cfg, items)
+	if hold, held := deps.Held(&items[1], "working"); !held || hold.By != "s1:1" || hold.Until != "done" {
+		t.Fatalf("computed hold after migration = %+v, %v", hold, held)
+	}
+	if _, ok := pipeline.Target(cfg, &items[1], deps); ok {
+		t.Fatal("migrated item became runnable before its dependency reached done")
+	}
+	if n := s.releaseDependencyMarks(s.ctx); n != 0 {
+		t.Fatalf("migration repeated and cleared %d more marks", n)
+	}
+}
+
+func TestDependencyMarksStayOwnedByScriptsWithoutAnEngineGate(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.state.Items = []model.Item{{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog", Blocked: true}}
+	s.blocks = map[string]Block{"s1:1": {Kind: dependencyKind, Reason: "waiting"}}
+	if n := s.releaseDependencyMarks(t.Context()); n != 0 {
+		t.Fatalf("released %d marks without dependenciesAt", n)
+	}
+	if !s.state.Items[0].Blocked {
+		t.Fatal("legacy config lost its script-owned dependency mark")
+	}
+}
+
+func TestDependencyMarkMigrationWaitsForAFreshSourceListing(t *testing.T) {
+	cfg, r := boardFor(t)
+	for i := range cfg.Stages {
+		if cfg.Stages[i].Name == "working" {
+			cfg.Stages[i].DependenciesAt = "done"
+		}
+	}
+	s := New(cfg, r)
+	s.state.Items = []model.Item{
+		{ID: "s2:9", Ref: "9", Source: "s2", Stage: "done"},
+		{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog", Blocked: true, DependsOn: []string{"s2:9"}},
+	}
+	s.blocks = map[string]Block{"s1:1": {Kind: dependencyKind, Reason: "waiting"}}
+	s.listErr["s2"] = "dependency provider unavailable"
+	if n := s.releaseDependencyMarks(t.Context()); n != 0 {
+		t.Fatalf("released %d stale mark(s)", n)
+	}
+	if !s.state.Items[1].Blocked {
+		t.Fatal("migration trusted a stale dependency source")
+	}
+	delete(s.listErr, "s2")
+	if n := s.releaseDependencyMarks(t.Context()); n != 1 {
+		t.Fatalf("released %d mark(s) after recovery, want 1", n)
+	}
+}
+
+func TestDependencyMarkMigrationDoesNotClearANewerMarkKind(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.state.Items = []model.Item{{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog", Blocked: true}}
+	s.blocks = map[string]Block{"s1:1": {Kind: "decision", Reason: "newer question", Asked: true}}
+
+	err := s.unblockKind(t.Context(), s.state.Items[0], dependencyKind)
+	if err == nil {
+		t.Fatal("dependency migration cleared a newer decision mark")
+	}
+	if !s.state.Items[0].Blocked || s.blocks["s1:1"].Kind != "decision" {
+		t.Fatal("compare-and-clear changed the current mark")
+	}
+}
+
+func TestRefreshRunsDependencyMarkMigration(t *testing.T) {
+	cfg, r := boardFor(t)
+	for i := range cfg.Stages {
+		if cfg.Stages[i].Name == "working" {
+			cfg.Stages[i].DependenciesAt = "done"
+		}
+	}
+	writeScript(t, cfg.Sources[0].List, `#!/bin/sh
+cat >"$CONVEYOR_RESULT" <<'JSON'
+[
+  {"id":"s1:1","ref":"1","source":"s1","stage":"done","title":"foundation"},
+  {"id":"s1:2","ref":"2","source":"s1","stage":"backlog","title":"follower","blocked":true,"blockKind":"dependency","blockReason":"waiting","dependsOn":["s1:1"]}
+]
+JSON
+`)
+	s := New(cfg, r)
+	s.refresh(t.Context())
+
+	for _, it := range s.state.Items {
+		if it.ID == "s1:2" {
+			if it.Blocked {
+				t.Fatal("refresh left the legacy dependency mark in place")
+			}
+			if _, found := s.blocks[it.ID]; found {
+				t.Fatal("refresh left the legacy dependency note cached")
+			}
+			return
+		}
+	}
+	t.Fatal("refresh did not list the follower")
 }
 
 // Answering is one gesture with unblocking, which means the session has to be
@@ -418,8 +553,9 @@ sources:
 // would still hold anyway gets no provider write and stays marked, reported
 // under heldByDependencies rather than unblocked. An item that is both asked
 // and held is counted once, under waitingOnYou — the question skip comes
-// first. A marked item that is not held, and one whose dependency the
-// listing cannot see at all, are both cleared exactly as before.
+// first. A marked item that is not held is cleared; one whose dependency the
+// listing cannot see fails closed and remains marked until its declaration is
+// repaired.
 func TestUnblockAllConsidersTheSequence(t *testing.T) {
 	cfg, r, _ := pipelineFor(t)
 	s := New(cfg, r)
@@ -433,8 +569,8 @@ func TestUnblockAllConsidersTheSequence(t *testing.T) {
 		{ID: "s1:3", Ref: "3", Source: "s1", Stage: "backlog", Blocked: true, DependsOn: []string{"s1:1"}},
 		// marked, not held: an ordinary fault with no dependency at all
 		{ID: "s1:4", Ref: "4", Source: "s1", Stage: "working", Blocked: true},
-		// marked, dependency absent from the listing: the residual gap —
-		// still cleared here; agents/_deps re-marks it at implement time.
+		// marked, dependency absent from the listing: invalid dependency state,
+		// held without relying on an agent to rediscover it later.
 		{ID: "s1:5", Ref: "5", Source: "s1", Stage: "backlog", Blocked: true, DependsOn: []string{"nobody:1"}},
 	}
 	s.blocks = map[string]Block{
@@ -456,31 +592,34 @@ func TestUnblockAllConsidersTheSequence(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Unblocking != 2 {
-		t.Errorf("unblocking = %d, want 2 (s1:4 and s1:5)", got.Unblocking)
+	if got.Unblocking != 1 {
+		t.Errorf("unblocking = %d, want 1 (s1:4)", got.Unblocking)
 	}
 	if got.WaitingOnYou != 1 {
 		t.Errorf("waitingOnYou = %d, want 1 (s1:3, held and asked, counted once)", got.WaitingOnYou)
 	}
-	if got.HeldByDependencies != 1 {
-		t.Errorf("heldByDependencies = %d, want 1 (s1:2)", got.HeldByDependencies)
+	if got.HeldByDependencies != 2 {
+		t.Errorf("heldByDependencies = %d, want 2 (s1:2 and invalid s1:5)", got.HeldByDependencies)
 	}
 
-	waitFor(t, "the two non-held marks to clear", func() bool {
+	waitFor(t, "the non-held mark to clear", func() bool {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
 		_, four := s.blocks["s1:4"]
-		_, five := s.blocks["s1:5"]
-		return !four && !five
+		return !four
 	})
 	s.mu.RLock()
 	_, stillHeld := s.blocks["s1:2"]
 	_, stillAsked := s.blocks["s1:3"]
+	_, stillInvalid := s.blocks["s1:5"]
 	s.mu.RUnlock()
 	if !stillHeld {
 		t.Error("s1:2 was unblocked despite the sequencing rule still holding it")
 	}
 	if !stillAsked {
 		t.Error("s1:3's question was cleared in bulk")
+	}
+	if !stillInvalid {
+		t.Error("s1:5 was unblocked despite its missing dependency")
 	}
 }
