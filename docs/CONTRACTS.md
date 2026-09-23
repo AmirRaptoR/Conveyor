@@ -93,7 +93,8 @@ A native parent wins over a disagreeing marker and the disagreement is warned.
 Children are the native sub-issue set when non-empty, otherwise the provider
 inverts the marker/native parent fields of listed children. Native relations to
 another repository are not guessed into the current source alias: they are
-omitted with a warning until an explicit repo-to-source mapping exists.
+omitted with a warning. Cross-repository mapping is not supported today, so an
+operator must keep the hierarchy in one repository or remove that link.
 
 Relationship metadata is durable upstream. Every successful listing re-derives
 it from GitHub native relations or the marker, so refreshes and process restarts

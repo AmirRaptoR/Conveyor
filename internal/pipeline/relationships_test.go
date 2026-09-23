@@ -3,12 +3,84 @@ package pipeline
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 )
+
+func TestGitHubFixtureOutputPassesThroughEngineValidation(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(root, "testdata", "relationships.json")
+	tmp := t.TempDir()
+	stub := filepath.Join(tmp, "gh")
+	stubBody := `#!/usr/bin/env bash
+case "$*" in
+  *"issue view 999 "*)
+    echo 'GraphQL: Could not resolve to an Issue with the number of 999.' >&2
+    exit 1 ;;
+  *"api --paginate --slurp repos/owner/repo/issues/208/sub_issues"*)
+    jq '[.paginatedSubIssues]' "$REL_FIXTURE" ;;
+  *"--state open"*) jq '.githubIssues' "$REL_FIXTURE" ;;
+  *"--state closed"*) echo '[]' ;;
+  *) echo "stub gh: unhandled: $*" >&2; exit 97 ;;
+esac
+`
+	if err := os.WriteFile(stub, []byte(stubBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result := filepath.Join(tmp, "result.json")
+	cmd := exec.Command("bash", filepath.Join(root, "providers", "github", "list.sh"))
+	cmd.Dir = filepath.Join(root, "providers", "github")
+	cmd.Stdin = strings.NewReader(`{"stages":["backlog","done"],"terminalStages":["done"]}`)
+	cmd.Env = []string{
+		"PATH=" + tmp + ":" + os.Getenv("PATH"),
+		"REL_FIXTURE=" + fixture,
+		"REPO=owner/repo",
+		"CONVEYOR_SOURCE=fixture",
+		"CONVEYOR_RESULT=" + result,
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("list.sh: %v\n%s", err, out)
+	}
+	b, err := os.ReadFile(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope struct {
+		Items []model.Item `json:"items"`
+	}
+	if err := json.Unmarshal(b, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if len(envelope.Items) == 0 {
+		t.Fatalf("provider emitted no items: %s", b)
+	}
+	byID := map[string]model.Item{}
+	for _, item := range envelope.Items {
+		byID[item.ID] = item
+	}
+	if byID["fixture:202"].Parent != "fixture:201" {
+		t.Fatalf("mixed-case native repo URL lost its parent: %+v", byID["fixture:202"])
+	}
+	if got := strings.Join(byID["fixture:208"].Children, ","); got != "fixture:202,fixture:203" {
+		t.Fatalf("paginated children = %q", got)
+	}
+	warnings := strings.Join(RelationshipWarnings(envelope.Items), "\n")
+	for _, want := range []string{
+		"fixture:204 names parent fixture:201, but fixture:201 does not name it as a child",
+		"fixture:208 names child fixture:202, but fixture:202 names parent fixture:201",
+	} {
+		if !strings.Contains(warnings, want) {
+			t.Errorf("engine warnings = %q, want provider-derived contradiction %q", warnings, want)
+		}
+	}
+}
 
 func TestSharedRelationshipValidationFixtures(t *testing.T) {
 	var corpus struct {

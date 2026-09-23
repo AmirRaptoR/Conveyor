@@ -2,58 +2,60 @@
   "githubIssues": [
     {
       "state": "OPEN", "number": 201, "title": "Native parent", "body": "",
-      "labels": [{"name": "conveyor"}], "url": "https://github.com/owner/repo/issues/201", "assignees": [],
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/201", "assignees": [],
       "parent": null,
       "subIssues": {"totalCount": 2, "nodes": [
-        {"number": 202, "url": "https://github.com/owner/repo/issues/202"},
-        {"number": 203, "url": "https://github.com/owner/repo/issues/203"}
+        {"number": 202, "url": "https://github.com/Owner/Repo/issues/202"},
+        {"number": 203, "url": "https://github.com/Owner/Repo/issues/203"}
       ]}
     },
     {
       "state": "OPEN", "number": 202, "title": "Native child", "body": "Parent: #201\n\nSpec",
-      "labels": [{"name": "conveyor"}], "url": "https://github.com/owner/repo/issues/202", "assignees": [],
-      "parent": {"number": 201, "url": "https://github.com/owner/repo/issues/201"},
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/202", "assignees": [],
+      "parent": {"number": 201, "url": "https://github.com/Owner/Repo/issues/201"},
       "subIssues": {"totalCount": 0, "nodes": []}
     },
     {
       "state": "OPEN", "number": 203, "title": "Marker child", "body": "Parent: #201\r\n\r\nSpec",
-      "labels": [{"name": "conveyor"}], "url": "https://github.com/owner/repo/issues/203", "assignees": [],
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/203", "assignees": [],
       "parent": null, "subIssues": {"totalCount": 0, "nodes": []}
     },
     {
       "state": "OPEN", "number": 204, "title": "Conflict", "body": "Parent: #999\n\nSpec",
-      "labels": [{"name": "conveyor"}], "url": "https://github.com/owner/repo/issues/204", "assignees": [],
-      "parent": {"number": 201, "url": "https://github.com/owner/repo/issues/201"},
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/204", "assignees": [],
+      "parent": {"number": 201, "url": "https://github.com/Owner/Repo/issues/201"},
       "subIssues": {"totalCount": 0, "nodes": []}
     },
     {
       "state": "OPEN", "number": 205, "title": "Prose is not metadata", "body": "This mentions Parent: #201 later.",
-      "labels": [{"name": "conveyor"}], "url": "https://github.com/owner/repo/issues/205", "assignees": [],
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/205", "assignees": [],
       "parent": null, "subIssues": {"totalCount": 0, "nodes": []}
     },
     {
       "state": "OPEN", "number": 206, "title": "Missing marker", "body": "Parent: #999\n",
-      "labels": [{"name": "conveyor"}], "url": "https://github.com/owner/repo/issues/206", "assignees": [],
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/206", "assignees": [],
       "parent": null, "subIssues": {"totalCount": 0, "nodes": []}
     },
     {
       "state": "OPEN", "number": 207, "title": "Cross repository", "body": "",
-      "labels": [{"name": "conveyor"}], "url": "https://github.com/owner/repo/issues/207", "assignees": [],
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/207", "assignees": [],
       "parent": {"number": 1, "url": "https://github.com/other/repo/issues/1"},
       "subIssues": {"totalCount": 0, "nodes": []}
     },
     {
       "state": "OPEN", "number": 208, "title": "Paginated parent", "body": "",
-      "labels": [{"name": "conveyor"}], "url": "https://github.com/owner/repo/issues/208", "assignees": [],
+      "labels": [{"name": "conveyor"}], "url": "https://github.com/Owner/Repo/issues/208", "assignees": [],
       "parent": null,
-      "subIssues": {"totalCount": 2, "nodes": [
-        {"number": 202, "url": "https://github.com/owner/repo/issues/202"}
+      "subIssues": {"totalCount": 3, "nodes": [
+        {"number": 202, "url": "https://github.com/Owner/Repo/issues/202"},
+        {"number": 7, "url": "https://github.com/other/repo/issues/7"}
       ]}
     }
   ],
   "paginatedSubIssues": [
-    {"number": 202, "html_url": "https://github.com/owner/repo/issues/202"},
-    {"number": 203, "html_url": "https://github.com/owner/repo/issues/203"}
+    {"number": 202, "html_url": "https://github.com/Owner/Repo/issues/202"},
+    {"number": 203, "html_url": "https://github.com/Owner/Repo/issues/203"},
+    {"number": 7, "html_url": "https://github.com/other/repo/issues/7"}
   ],
   "validation": [
     {

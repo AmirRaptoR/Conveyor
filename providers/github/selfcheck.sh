@@ -129,6 +129,10 @@ case "$*" in
 		exit 1
 		;;
 	*"api --paginate --slurp repos/owner/repo/issues/208/sub_issues"*)
+		if [[ -n "${SUBISSUE_FAIL:-}" ]]; then
+			echo 'Resource not accessible by integration' >&2
+			exit 1
+		fi
 		jq '[.paginatedSubIssues]' "$REL_FIXTURE"
 		;;
 	*"--state open"*) jq '.githubIssues' "$REL_FIXTURE" ;;
@@ -164,6 +168,24 @@ check "a cross-repository native parent is warned with its URL" \
 	"yes" "$(jq -r '[.warnings[] | select(.itemId == "fixture:207" and (.reason | contains("https://github.com/other/repo/issues/1")))] | if length == 1 then "yes" else "no" end' "$tmp/relationships.json")"
 check "truncated native children are completed through pagination" \
 	"fixture:202,fixture:203" "$(jq -r '.items[] | select(.ref == "208") | .children | join(",")' "$tmp/relationships.json")"
+check "a paginated cross-repository child warns exactly once" \
+	"1" "$(jq '[.warnings[] | select(.itemId == "fixture:208" and (.reason | contains("another repository")))] | length' "$tmp/relationships.json")"
+
+REL_FIXTURE="../../testdata/relationships.json" SUBISSUE_LOOKUP_LIMIT=0 \
+PATH="$tmp/relationships:$PATH" REPO=owner/repo \
+	CONVEYOR_SOURCE=fixture CONVEYOR_RESULT="$tmp/relationships-capped.json" \
+	./list.sh <<<'{"stages":["backlog","done"],"terminalStages":["done"]}' >/dev/null 2>&1
+check "the sub-issue completion lookup is bounded" \
+	"yes" "$(jq -r '[.warnings[] | select(.itemId == "fixture:208" and (.reason | contains("lookup limit 0")))] | if length == 1 then "yes" else "no" end' "$tmp/relationships-capped.json")"
+check "a capped parent retains its embedded partial children" \
+	"fixture:202" "$(jq -r '.items[] | select(.ref == "208") | .children | join(",")' "$tmp/relationships-capped.json")"
+
+REL_FIXTURE="../../testdata/relationships.json" SUBISSUE_FAIL=1 GH_ATTEMPTS=1 \
+PATH="$tmp/relationships:$PATH" REPO=owner/repo \
+	CONVEYOR_SOURCE=fixture CONVEYOR_RESULT="$tmp/relationships-unavailable.json" \
+	./list.sh <<<'{"stages":["backlog","done"],"terminalStages":["done"]}' >/dev/null 2>&1
+check "a permanent sub-issue endpoint failure is a warning, not a failed listing" \
+	"yes" "$(jq -r '[.warnings[] | select(.itemId == "fixture:208" and (.reason | contains("complete native child set")))] | if length == 1 then "yes" else "no" end' "$tmp/relationships-unavailable.json")"
 
 # The body is the only place a sequence is written down, and the provider is
 # the only thing that reads it: the engine never learns what "#31" means.

@@ -40,6 +40,9 @@
 #   RELATIONSHIP_LOOKUP_LIMIT maximum marker-only parents outside the ordinary
 #                  listing to confirm per poll (default: 50). Native GitHub
 #                  relationships need no confirmation call.
+#   SUBISSUE_LOOKUP_LIMIT maximum parents whose truncated native child set is
+#                  completed through the paginated API per poll (default: 20).
+#                  Extra parents retain the embedded partial set and warn.
 #
 # Parent/child structure comes from GitHub native sub-issues. The exact first
 # body line `Parent: #N` is a durable fallback marker for older/imported data;
@@ -199,6 +202,9 @@ gh_subissues() {
 		fi
 		if ((attempt >= ${GH_ATTEMPTS:-3})); then
 			echo "gh api sub-issues for #$ref failed after $attempt attempts: $(cat "$work/gh.err")" >&2
+			if grep -qiE 'not found|could not resolve|HTTP 404|resource not accessible|requires? .*scope|sub-issues .*disabled' "$work/gh.err"; then
+				return 2
+			fi
 			return 1
 		fi
 		echo "gh api sub-issues for #$ref failed (attempt $attempt): $(cat "$work/gh.err")" >&2
@@ -248,7 +254,7 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 			([capture("^https://github\\.com/(?<owner>[^/]+)/(?<name>[^/]+)/issues/(?<ref>[0-9]+)$")] | .[0] // null);
 		def native_id($source; $repo):
 			(.url // "" | github_ref) as $u
-			| if $u != null and "\($u.owner)/\($u.name)" == $repo
+			| if $u != null and (("\($u.owner)/\($u.name)" | ascii_downcase) == ($repo | ascii_downcase))
 				then "\($source):\($u.ref | tonumber)" else "" end;
 		map(
 			(.labels | map(.name)) as $names
@@ -263,11 +269,11 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 			| ([.subIssues.nodes[]? | native_id($source; $repo) | select(. != "")] | unique | sort) as $nativeChildren
 			| ((.subIssues.totalCount // 0) > ([.subIssues.nodes[]?] | length)) as $nativeChildrenTruncated
 			| ([if $nativeParentRaw != null and $nativeParent == "" then
-				"native parent " + ($nativeParentRaw.url // "<no URL>") + " is outside source " + $source + "; add a configured repo-to-source mapping before linking it"
+				"native parent " + ($nativeParentRaw.url // "<no URL>") + " is in another repository; cross-repository relationships are not representable until repo-to-source mapping is supported, so this link is omitted"
 				else empty end]
-				+ [.subIssues.nodes[]?
+				+ [if $nativeChildrenTruncated then empty else .subIssues.nodes[]? end
 					| select((native_id($source; $repo)) == "")
-					| "native child " + (.url // "<no URL>") + " is outside source " + $source + "; add a configured repo-to-source mapping before linking it"]
+					| "native child " + (.url // "<no URL>") + " is in another repository; cross-repository relationships are not representable until repo-to-source mapping is supported, so this link is omitted"]
 				+ [if $nativeParent != "" and $markerParent != "" and $nativeParent != $markerParent then
 					"native parent " + $nativeParent + " disagrees with Parent marker " + $markerParent + "; native GitHub relationship wins"
 				else empty end]) as $relationWarnings
@@ -475,21 +481,41 @@ done
 # `gh issue list --json subIssues` embeds a bounded connection. Complete only
 # the parents whose totalCount proves that connection was truncated.
 mapfile -t truncated_parent_refs < <(jq -r '.[] | select(._nativeChildrenTruncated) | .ref' "$work/listed.json")
-for ref in "${truncated_parent_refs[@]}"; do
-	pages=$(gh_subissues "$ref")
+subissue_lookup_limit=${SUBISSUE_LOOKUP_LIMIT:-20}
+if [[ ! "$subissue_lookup_limit" =~ ^[0-9]+$ ]]; then
+	echo "SUBISSUE_LOOKUP_LIMIT must be a non-negative integer, got: $subissue_lookup_limit" >&2
+	exit 1
+fi
+for ref in "${truncated_parent_refs[@]:0:subissue_lookup_limit}"; do
+	if pages=$(gh_subissues "$ref"); then
+		:
+	else
+		status=$?
+		if ((status != 2)); then exit "$status"; fi
+		jq --arg ref "$ref" '
+			map(if .ref == $ref then
+				._relationshipWarnings = ((._relationshipWarnings // []) +
+					["GitHub would not return the complete native child set; the embedded partial set is retained"])
+			else . end)
+		' "$work/listed.json" >"$work/listed.next"
+		mv "$work/listed.next" "$work/listed.json"
+		continue
+	fi
 	children=$(jq -cn --argjson pages "$pages" --arg source "$CONVEYOR_SOURCE" --arg repo "$REPO" '
 		[$pages[][]
 			| (.html_url // .url // "") as $url
-			| select($url | startswith("https://github.com/" + $repo + "/issues/"))
+			| ([$url | capture("^https://github\\.com/(?<owner>[^/]+)/(?<name>[^/]+)/issues/[0-9]+$")] | .[0] // null) as $u
+			| select($u != null and (((($u.owner + "/" + $u.name) | ascii_downcase) == ($repo | ascii_downcase))))
 			| $source + ":" + (.number | tonumber | tostring)]
 		| unique | sort
 	')
 	cross=$(jq -cn --argjson pages "$pages" --arg repo "$REPO" '
 		[$pages[][]
 			| (.html_url // .url // "") as $url
-			| select(($url | startswith("https://github.com/" + $repo + "/issues/")) | not)
+			| ([$url | capture("^https://github\\.com/(?<owner>[^/]+)/(?<name>[^/]+)/issues/[0-9]+$")] | .[0] // null) as $u
+			| select(($u != null and (((($u.owner + "/" + $u.name) | ascii_downcase) == ($repo | ascii_downcase)))) | not)
 			| "native child " + (if $url == "" then "<no URL>" else $url end)
-				+ " is outside configured repository " + $repo + "; add a repo-to-source mapping before linking it"]
+				+ " is in another repository; cross-repository relationships are not representable until repo-to-source mapping is supported, so this link is omitted"]
 	')
 	jq --arg ref "$ref" --argjson children "$children" --argjson cross "$cross" '
 		map(if .ref == $ref then
@@ -499,6 +525,17 @@ for ref in "${truncated_parent_refs[@]}"; do
 	' "$work/listed.json" >"$work/listed.next"
 	mv "$work/listed.next" "$work/listed.json"
 done
+if ((${#truncated_parent_refs[@]} > subissue_lookup_limit)); then
+	for ref in "${truncated_parent_refs[@]:subissue_lookup_limit}"; do
+		jq --arg ref "$ref" --argjson n "$subissue_lookup_limit" '
+			map(if .ref == $ref then
+				._relationshipWarnings = ((._relationshipWarnings // []) +
+					["sub-issue lookup limit " + ($n|tostring) + " reached; the embedded partial child set is retained"])
+			else . end)
+		' "$work/listed.json" >"$work/listed.next"
+		mv "$work/listed.next" "$work/listed.json"
+	done
+fi
 
 # A strict Parent: #N marker is durable fallback metadata, not proof that the
 # target still exists. Confirm marker-only targets that are outside the visible
