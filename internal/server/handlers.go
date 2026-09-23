@@ -461,9 +461,13 @@ func nextStage(cfg *config.Config, stageName string) (string, bool) {
 // 1 because a source is a worktree, and while these writes touch no worktree,
 // thirty concurrent `gh` calls against one repository is its own outage.
 func (s *Server) unblockAll(ctx context.Context, held []model.Item) int {
+	return s.unblockAllKind(ctx, held, "")
+}
+
+func (s *Server) unblockAllKind(ctx context.Context, held []model.Item, expectedKind string) int {
 	n := 0
 	for _, it := range held {
-		if err := s.unblock(ctx, it); err != nil {
+		if err := s.unblockKind(ctx, it, expectedKind); err != nil {
 			fmt.Fprintf(os.Stderr, "conveyor: could not unblock %s: %v\n", it.ID, err)
 			continue
 		}
@@ -504,7 +508,7 @@ func (s *Server) releaseLimited(ctx context.Context) int {
 		return 0
 	}
 	fmt.Fprintf(os.Stderr, "conveyor: an agent's quota is back; handing back %d item(s) it stopped\n", len(held))
-	n := s.unblockAll(ctx, held)
+	n := s.unblockAllKind(ctx, held, limitKind)
 	s.wakeUp()
 	return n
 }
