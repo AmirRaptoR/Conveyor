@@ -272,7 +272,10 @@ peer, and the socket is the only door with no password on it (#94).
   mark on configurations that have not enabled the engine gate. Once any
   stage declares `dependenciesAt`, a successful listing automatically removes
   those legacy script marks and the computed hold owns the condition instead;
-  questions and other mark kinds remain untouched. The
+  questions and other mark kinds remain untouched. A gated stage receives
+  `CONVEYOR_DEPENDENCIES_AT`, and `agents/claude/implement` uses its presence
+  to stand down the older "issue is open" preflight so it cannot recreate the
+  mark after the engine approved a different configured threshold. The
   agent is also told not to stop for an open dependency itself — nine of one
   week's seventeen "decisions" were that. The GitHub provider's `list.sh`
   restates the same parse for `dependsOn`, and `agents/_deps-fixtures.jsonl`
@@ -414,7 +417,9 @@ peer, and the socket is the only door with no password on it (#94).
   dependency that falls outside that ledger is resolved directly; a completed
   predecessor is added back as a terminal dependency-only record, while a
   missing, open-but-unenrolled, or abandoned reference remains absent and is
-  surfaced by the engine as invalid state.
+  surfaced by the engine as invalid state. Direct resolution is capped by
+  `DEPENDENCY_LOOKUP_LIMIT` (50 by default); excess references stay missing
+  and fail closed instead of turning one issue body into an unbounded API job.
 - **`list` reads closed issues it labelled, and only those.** A finished item is
   a closed issue — the pull request says `Closes #N` — so listing open ones
   alone left the last stages empty: an item did not arrive in `done`, it

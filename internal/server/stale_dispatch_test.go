@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
+	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 )
 
@@ -51,6 +52,34 @@ sources:
 		t.Fatal(err)
 	}
 	return c, runner.New(filepath.Join(dir, "runs")), ran
+}
+
+func TestLaunchSkipsAFreshItemWhoseDependencySourceIsStale(t *testing.T) {
+	cfg, r, ran := staleDispatchPipeline(t)
+	// The dependency is read-only in this test. Cloning the resolved source
+	// gives the engine a valid second client without adding another fixture.
+	s2 := cfg.Sources[0]
+	s2.Name = "s2"
+	cfg.Sources = append(cfg.Sources, s2)
+	s := New(cfg, r)
+	s.state.Items = []model.Item{
+		{ID: "s2:1", Ref: "1", Source: "s2", Stage: "done"},
+		{ID: "s1:2", Ref: "2", Source: "s1", Stage: "backlog", DependsOn: []string{"s2:1"}},
+	}
+	s.listErr["s2"] = "boom"
+
+	if n := s.launch(context.Background()); n != 0 {
+		t.Fatalf("launch() = %d, want 0 while dependency source is stale", n)
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Fatal("fresh follower ran using its dependency source's last-good state")
+	}
+
+	delete(s.listErr, "s2")
+	if n := s.launch(context.Background()); n != 1 {
+		t.Fatalf("launch() after dependency recovery = %d, want 1", n)
+	}
+	waitFor(t, "the transition to finish", func() bool { return s.inFlight.Load() == 0 })
 }
 
 // Engine: the scheduler refuses to dispatch work for a source whose items are

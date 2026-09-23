@@ -60,7 +60,9 @@ dependency_refs() {
 	# emit prints every "#N" in s, one number per line.
 	function emit(s) {
 		while (match(s, /#[0-9]+/)) {
-			print substr(s, RSTART + 1, RLENGTH - 1)
+			# GitHub canonicalises #0001 to issue 1. Emit the same identity so
+			# the script and provider cannot disagree about that edge.
+			print substr(s, RSTART + 1, RLENGTH - 1) + 0
 			s = substr(s, RSTART + RLENGTH)
 		}
 	}

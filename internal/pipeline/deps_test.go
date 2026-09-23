@@ -109,6 +109,25 @@ func TestAChainNeedsNoClosure(t *testing.T) {
 	}
 }
 
+func TestDependsOnAnyFindsDirectAndTransitiveUnavailableNodes(t *testing.T) {
+	one := item("a:1", "done")
+	two := item("b:2", "review", "a:1")
+	three := item("c:3", "ready", "b:2")
+	unrelated := item("d:4", "ready")
+	d := NewDeps(line(), []model.Item{one, two, three, unrelated})
+
+	unavailable := map[string]bool{"a:1": true}
+	if !d.DependsOnAny("b:2", unavailable) {
+		t.Fatal("direct unavailable dependency was not found")
+	}
+	if !d.DependsOnAny("c:3", unavailable) {
+		t.Fatal("transitive unavailable dependency was not found")
+	}
+	if d.DependsOnAny("d:4", unavailable) {
+		t.Fatal("an unrelated item inherited another graph's unavailability")
+	}
+}
+
 // A dependency declaration is scheduling policy, so malformed graphs fail
 // closed and say why. Otherwise a typo silently authorises exactly the work
 // the declaration was meant to prevent.
@@ -256,7 +275,7 @@ func TestACycleDoesNotDisarmTheRestOfTheGraph(t *testing.T) {
 }
 
 // A 3-cycle is dropped the same way a 2-cycle is.
-func TestThreeCycleIsDroppedAndReported(t *testing.T) {
+func TestThreeCycleFailsClosedAndIsReported(t *testing.T) {
 	a := item("a:1", "ready", "a:3")
 	b := item("a:2", "ready", "a:1")
 	c := item("a:3", "ready", "a:2")

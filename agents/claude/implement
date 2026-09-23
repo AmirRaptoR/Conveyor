@@ -70,12 +70,17 @@ if [[ -n "${REPO:-}" ]]; then
 		;;
 	esac
 
-	# Before the worktree and long before the model: an item sequenced behind
-	# an open issue is not startable, and finding that out is not worth a run.
-	waiting=$(open_dependencies "$body")
-	if [[ -n "$waiting" ]]; then
-		blocked dependency "waits on $waiting, still open. Nothing is wrong with \
+	# Before the worktree and long before the model: on legacy configurations,
+	# an item sequenced behind an open issue is not startable. When the stage
+	# declares dependenciesAt, the engine already made the stronger configured
+	# decision from the complete board; repeating a different "issue closed"
+	# predicate here can clear/re-mark the same item forever.
+	if [[ -z "${CONVEYOR_DEPENDENCIES_AT:-}" ]]; then
+		waiting=$(open_dependencies "$body")
+		if [[ -n "$waiting" ]]; then
+			blocked dependency "waits on $waiting, still open. Nothing is wrong with \
 this item; Diagnose clears it once they close."
+		fi
 	fi
 
 	pr_lookup "$ref" open

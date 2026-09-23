@@ -484,6 +484,10 @@ type Server struct {
 	// collision worktrees exist to prevent — and whichever exited first had its
 	// outcome routed as though it were the other's.
 	working sync.Map // itemID -> struct{}, held for the life of a transition
+	// unblocking serialises provider writes that clear one item's mark. A
+	// migration, doctor sweep and human answer can otherwise race from the
+	// same snapshot and let an older clear erase a newer decision.
+	unblocking sync.Map // itemID -> struct{}, held for one mark-clearing write
 	// resting is the items left alone until the next listing, by ID.
 	//
 	// Exit 10 means "leave the item where it is, try again next poll"

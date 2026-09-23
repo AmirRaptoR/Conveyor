@@ -166,9 +166,11 @@ cat >"$tmp/stub3/gh" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
 	*"issue view 1 "*)
+		echo 1 >>"$LOOKUPS"
 		echo '{"state":"CLOSED","stateReason":"COMPLETED","number":1,"title":"Old foundation","body":"","labels":[],"url":"https://example.test/1","assignees":[],"closedAt":"2024-01-01T00:00:00Z"}'
 		;;
 	*"issue view 999 "*)
+		echo 999 >>"$LOOKUPS"
 		echo 'GraphQL: Could not resolve to an Issue with the number of 999.' >&2
 		exit 1
 		;;
@@ -180,8 +182,10 @@ case "$*" in
 esac
 STUB
 chmod +x "$tmp/stub3/gh"
+: >"$tmp/lookups"
 echo '{"stages":["backlog","ready"],"terminalStages":["ready"]}' |
-	PATH="$tmp/stub3:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/old-dependency.json" \
+	PATH="$tmp/stub3:$PATH" LOOKUPS="$tmp/lookups" DEPENDENCY_LOOKUP_LIMIT=1 \
+		CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/old-dependency.json" \
 		./list.sh 2>/dev/null
 check "a referenced completion older than CLOSED_LIMIT is retained" \
 	"ready" "$(jq -r '.[] | select(.ref == "1") | .stage' "$tmp/old-dependency.json")"
@@ -191,6 +195,8 @@ check "the follower keeps both declared graph edges" \
 	'midgame:1,midgame:999' "$(jq -r '.[] | select(.ref == "61") | .dependsOn | join(",")' "$tmp/old-dependency.json")"
 check "a nonexistent dependency is not invented as completed" \
 	"" "$(jq -r '.[] | select(.ref == "999") | .ref' "$tmp/old-dependency.json")"
+check "old-dependency API lookups are bounded per poll" \
+	"1" "$(wc -l <"$tmp/lookups" | tr -d ' ')"
 
 # There is no ignore list any more, because not listing is what happens by
 # default: an issue is left alone by saying nothing about it. The old opt-out

@@ -99,7 +99,7 @@ author learns it once.
 | | |
 | --- | --- |
 | `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "blocked": false, "config": {...}}`, plus `"answer"` and `"session"` when this run follows a stop a person answered (§5a). For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "terminalStages": ["done"], "config": {...}}` — `terminalStages` is which of `stages` are terminal, so a list script can tell a finished item from one that merely stopped without keeping its own copy of the stage graph in source `env:` |
-| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, `CONVEYOR_DEADLINE` (§4b), `CONVEYOR_MANUAL` when a person armed one of this stage's `actions:` for this run (§5b), plus everything in the source's `env:` block |
+| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, `CONVEYOR_DEADLINE` (§4b), `CONVEYOR_DEPENDENCIES_AT` when this stage's dependency policy is engine-owned (§4), `CONVEYOR_MANUAL` when a person armed one of this stage's `actions:` for this run (§5b), plus everything in the source's `env:` block |
 
 **Output** is split deliberately:
 
@@ -399,6 +399,14 @@ board-wide warning naming the bad declaration; the board draws the card as a
 dependency error. Repairing the issue body or provider state clears it on the
 next successful listing. Silently dropping the edge would authorize the work
 the declaration was intended to prevent.
+
+If either the item source or any source reached through its dependency graph
+has a failed latest listing, the cached graph remains visible but authorizes
+no dispatch and no legacy-mark migration. Work resumes after those sources
+list successfully. The GitHub provider directly resolves at most
+`DEPENDENCY_LOOKUP_LIMIT` completed references outside its normal history
+window per poll (50 by default); excess references remain missing and visibly
+fail closed rather than causing unbounded API traffic.
 
 A stage may raise that bar for itself with `dependenciesAt: <stage>`: an item
 enters it only once every dependency has reached the named stage or gone past

@@ -34,6 +34,9 @@
 #                  (default: 1000) — larger than CLOSED_LIMIT on purpose, so
 #                  the sort has more than an arbitrary CLOSED_LIMIT-sized page
 #                  to choose the newest from.
+#   DEPENDENCY_LOOKUP_LIMIT  maximum completed references outside the ordinary
+#                  listing to resolve directly per poll (default: 50). Extra
+#                  references remain missing and therefore fail closed.
 #
 # Stdin carries model.ListInput — in particular terminalStages, which of the
 # stages STAGE_LABELS maps to are terminal. Listing needs this to tell a
@@ -246,9 +249,10 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 			# shape a refined issue writes, and it used to declare nothing.
 			| ([
 				$body
-				| reduce ([splits("\n")] | .[]) as $line
+				| reduce ([splits("\n")] | .[]) as $rawline
 					({pending: false, inlist: false, refs: []};
-					if ($line | test("^[ \t]*$")) then .inlist = false
+					($rawline | sub("\r$"; "")) as $line
+					| if ($line | test("^[ \t]*$")) then .inlist = false
 					else
 						(if (.pending or .inlist)
 							and ($line | test("^[ \t]*(?:[-*+]|[0-9]+[.)])[ \t]+")) then
@@ -274,7 +278,7 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 							end)
 					end)
 				| .refs[]
-			] | map(ltrimstr("#")) | unique | map("\($source):\(.)")) as $deps
+			] | map(ltrimstr("#") | tonumber | tostring) | unique | map("\($source):\(.)")) as $deps
 			# Opt-in, and these are the three ways in: the pipeline put
 			# it here, a person handed it over, or it stopped.
 			| select($mapped != null
@@ -370,7 +374,16 @@ mapfile -t missing_refs < <(jq -r '
 	| [.[].dependsOn[]? | select(. as $d | ($ids | index($d) | not))]
 	| unique[] | split(":")[-1]
 ' "$work/listed.json")
-for ref in "${missing_refs[@]}"; do
+dependency_lookup_limit=${DEPENDENCY_LOOKUP_LIMIT:-50}
+if [[ ! "$dependency_lookup_limit" =~ ^[0-9]+$ ]]; then
+	echo "DEPENDENCY_LOOKUP_LIMIT must be a non-negative integer, got: $dependency_lookup_limit" >&2
+	exit 1
+fi
+if ((${#missing_refs[@]} > dependency_lookup_limit)); then
+	echo "dependency lookup limit $dependency_lookup_limit reached; remaining references stay missing and fail closed" >&2
+fi
+lookup_refs=("${missing_refs[@]:0:dependency_lookup_limit}")
+for ref in "${lookup_refs[@]}"; do
 	issue=""
 	if issue=$(gh_issue "$ref"); then
 		if [[ -n "$done_stage" ]] && jq -e '

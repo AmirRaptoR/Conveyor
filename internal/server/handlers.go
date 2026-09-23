@@ -166,6 +166,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	var item model.Item
 	found := false
 	s.mu.RLock()
+	items := append([]model.Item(nil), s.state.Items...)
 	for _, it := range s.state.Items {
 		if it.ID == id {
 			item, found = it, true
@@ -174,10 +175,18 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	// Built while the listing is still held: the full board, not this one
 	// item, is what the gate needs to answer whether it is held.
-	deps := pipeline.NewDeps(s.cfg, s.state.Items)
+	deps := pipeline.NewDeps(s.cfg, items)
+	staleSrc := make(map[string]bool, len(s.listErr))
+	for name := range s.listErr {
+		staleSrc[name] = true
+	}
 	s.mu.RUnlock()
 	if !found {
 		http.Error(w, "no item "+id+" on the board", http.StatusNotFound)
+		return
+	}
+	if dispatchUsesStaleState(item, deps, staleSrc, staleItemIDs(items, staleSrc)) {
+		http.Error(w, id+" cannot start while its source or a dependency source has a stale listing", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -730,13 +739,21 @@ func (s *Server) releaseDependencyMarks(ctx context.Context) int {
 		return 0
 	}
 	s.mu.RLock()
+	items := append([]model.Item(nil), s.state.Items...)
+	deps := pipeline.NewDeps(s.cfg, items)
+	staleSrc := make(map[string]bool, len(s.listErr))
+	for name := range s.listErr {
+		staleSrc[name] = true
+	}
+	staleItems := staleItemIDs(items, staleSrc)
 	var legacy []model.Item
-	for _, it := range s.state.Items {
+	for _, it := range items {
 		block := s.blocks[it.ID]
 		// A failed listing leaves last-good items on the board. Do not mutate
 		// that source from stale evidence; its next successful listing will
 		// make the migration eligible again.
-		if it.Blocked && block.Kind == dependencyKind && !block.Asked && s.listErr[it.Source] == "" {
+		if it.Blocked && block.Kind == dependencyKind && !block.Asked &&
+			!dispatchUsesStaleState(it, deps, staleSrc, staleItems) {
 			legacy = append(legacy, it)
 		}
 	}
@@ -745,7 +762,14 @@ func (s *Server) releaseDependencyMarks(ctx context.Context) int {
 		return 0
 	}
 	fmt.Fprintf(os.Stderr, "conveyor: migrating %d legacy dependency mark(s) to computed holds\n", len(legacy))
-	n := s.unblockAll(ctx, legacy)
+	n := 0
+	for _, it := range legacy {
+		if err := s.unblockKind(ctx, it, dependencyKind); err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: could not migrate dependency mark on %s: %v\n", it.ID, err)
+			continue
+		}
+		n++
+	}
 	if n > 0 {
 		s.wakeUp()
 	}
@@ -756,6 +780,37 @@ func (s *Server) releaseDependencyMarks(ctx context.Context) int {
 // off. The engine's note goes with it — the run that explains it is still
 // filed, but the item is no longer asking anything of anyone.
 func (s *Server) unblock(ctx context.Context, item model.Item) error {
+	return s.unblockKind(ctx, item, "")
+}
+
+// unblockKind is unblock with an optional compare-and-clear guard. Migration
+// passes dependencyKind so a newer decision/error mark wins instead of being
+// erased by an old snapshot. All clearing writes share the per-item claim,
+// which closes the same race against a concurrent answer or doctor pass.
+func (s *Server) unblockKind(ctx context.Context, item model.Item, expectedKind string) error {
+	if _, busy := s.unblocking.LoadOrStore(item.ID, struct{}{}); busy {
+		return fmt.Errorf("a mark-clearing write is already in progress")
+	}
+	defer s.unblocking.Delete(item.ID)
+
+	s.mu.RLock()
+	current, found := model.Item{}, false
+	for _, it := range s.state.Items {
+		if it.ID == item.ID {
+			current, found = it, true
+			break
+		}
+	}
+	block := s.blocks[item.ID]
+	s.mu.RUnlock()
+	if !found || !current.Blocked {
+		return fmt.Errorf("%s is no longer marked", item.ID)
+	}
+	if expectedKind != "" && (block.Kind != expectedKind || block.Asked) {
+		return fmt.Errorf("%s mark changed from %s to %s", item.ID, expectedKind, block.Kind)
+	}
+	item = current
+
 	client, ok := s.eng.Client(item.Source)
 	if !ok {
 		return fmt.Errorf("%s: no provider client", item.Source)

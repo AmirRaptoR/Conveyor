@@ -287,3 +287,29 @@ func (d Deps) Held(it *model.Item, target string) (Hold, bool) {
 	}
 	return Hold{By: bestBy, Stage: best.stage, Target: target, Blocked: best.blocked, Until: until}, true
 }
+
+// DependsOnAny reports whether id's declared dependency graph reaches any id
+// in unavailable. It is used by dispatchers for facts orthogonal to stage
+// ordering — notably a provider whose latest listing failed. A dependency's
+// cached stage may still be useful to draw, but it must not authorize work.
+//
+// Cyclic edges have already been removed and their owners fail closed through
+// invalid, but seen keeps this helper total even for a zero-value or partially
+// constructed Deps.
+func (d Deps) DependsOnAny(id string, unavailable map[string]bool) bool {
+	seen := map[string]bool{}
+	var walk func(string) bool
+	walk = func(from string) bool {
+		if seen[from] {
+			return false
+		}
+		seen[from] = true
+		for _, dep := range d.edges[from] {
+			if unavailable[dep] || walk(dep) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(id)
+}

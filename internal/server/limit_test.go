@@ -122,19 +122,69 @@ func TestDependencyMarkMigrationWaitsForAFreshSourceListing(t *testing.T) {
 		}
 	}
 	s := New(cfg, r)
-	s.state.Items = []model.Item{{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog", Blocked: true}}
+	s.state.Items = []model.Item{
+		{ID: "s2:9", Ref: "9", Source: "s2", Stage: "done"},
+		{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog", Blocked: true, DependsOn: []string{"s2:9"}},
+	}
 	s.blocks = map[string]Block{"s1:1": {Kind: dependencyKind, Reason: "waiting"}}
-	s.listErr["s1"] = "provider unavailable"
+	s.listErr["s2"] = "dependency provider unavailable"
 	if n := s.releaseDependencyMarks(t.Context()); n != 0 {
 		t.Fatalf("released %d stale mark(s)", n)
 	}
-	if !s.state.Items[0].Blocked {
-		t.Fatal("migration mutated a source whose current listing failed")
+	if !s.state.Items[1].Blocked {
+		t.Fatal("migration trusted a stale dependency source")
 	}
-	delete(s.listErr, "s1")
+	delete(s.listErr, "s2")
 	if n := s.releaseDependencyMarks(t.Context()); n != 1 {
 		t.Fatalf("released %d mark(s) after recovery, want 1", n)
 	}
+}
+
+func TestDependencyMarkMigrationDoesNotClearANewerMarkKind(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.state.Items = []model.Item{{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog", Blocked: true}}
+	s.blocks = map[string]Block{"s1:1": {Kind: "decision", Reason: "newer question", Asked: true}}
+
+	err := s.unblockKind(t.Context(), s.state.Items[0], dependencyKind)
+	if err == nil {
+		t.Fatal("dependency migration cleared a newer decision mark")
+	}
+	if !s.state.Items[0].Blocked || s.blocks["s1:1"].Kind != "decision" {
+		t.Fatal("compare-and-clear changed the current mark")
+	}
+}
+
+func TestRefreshRunsDependencyMarkMigration(t *testing.T) {
+	cfg, r := boardFor(t)
+	for i := range cfg.Stages {
+		if cfg.Stages[i].Name == "working" {
+			cfg.Stages[i].DependenciesAt = "done"
+		}
+	}
+	writeScript(t, cfg.Sources[0].List, `#!/bin/sh
+cat >"$CONVEYOR_RESULT" <<'JSON'
+[
+  {"id":"s1:1","ref":"1","source":"s1","stage":"done","title":"foundation"},
+  {"id":"s1:2","ref":"2","source":"s1","stage":"backlog","title":"follower","blocked":true,"blockKind":"dependency","blockReason":"waiting","dependsOn":["s1:1"]}
+]
+JSON
+`)
+	s := New(cfg, r)
+	s.refresh(t.Context())
+
+	for _, it := range s.state.Items {
+		if it.ID == "s1:2" {
+			if it.Blocked {
+				t.Fatal("refresh left the legacy dependency mark in place")
+			}
+			if _, found := s.blocks[it.ID]; found {
+				t.Fatal("refresh left the legacy dependency note cached")
+			}
+			return
+		}
+	}
+	t.Fatal("refresh did not list the follower")
 }
 
 // Answering is one gesture with unblocking, which means the session has to be
