@@ -4,6 +4,9 @@ import { state, load, focusDescriptor, findFocusTarget } from "./shared.js";
 import { blocks, tone, questionsOf, formatDuration, durSpan, bucketByStage } from "./board.js";
 import { stageBy, startable, startItem, saveOrder, handBack } from "./drag.js";
 import { openAsk, openReport } from "./report.js";
+import { renderPanelRelationships } from "./relationships.js";
+
+export { renderPanelRelationships } from "./relationships.js";
 
 export let openItemId = null, openItemTitle = null, followRun = null;
 
@@ -38,6 +41,7 @@ export async function inspect(id, title, stage) {
   lastBlockSig.delete(id);
   refreshOpenStop(id, true);
   renderPanelActions(id);
+  renderPanelRelationships(id);
   // The report is derived from run history, so it exists for every item;
   // on one still moving it is the passage so far.
   const label = stageBy(stage)?.terminal ? "Final report" : "Report so far";

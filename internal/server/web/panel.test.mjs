@@ -113,3 +113,69 @@ test("renderPanelActions: an item absent from state.items entirely clears the ac
   p.mod.renderPanelActions("gone:1");
   assert.equal(p.el("#pactions").innerHTML, "");
 });
+
+// ---- relationship detail ---------------------------------------------------
+
+test("renderPanelRelationships: family and execution dependencies are separate, linked safely, and status-labelled", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [
+      { id: "s1:1", source: "s1", stage: "backlog", title: "Parent <one>", url: "https://example.test/1" },
+      { id: "s1:2", source: "s1", stage: "working", title: "Current", parent: "s1:1",
+        children: ["s1:3", "s1:9"], dependsOn: ["s1:4", "s1:5", "s1:8"] },
+      { id: "s1:3", source: "s1", stage: "done", title: "Done child", url: "javascript:alert(1)" },
+      { id: "s1:4", source: "s1", stage: "done", title: "Done dependency", url: "http://example.test/4" },
+      { id: "s1:5", source: "s1", stage: "working", title: "Live dependency" },
+    ],
+    held: { "s1:2": { by: "s1:5", stage: "working", target: "done", until: "done" } },
+  }));
+  p.mod.renderPanelRelationships("s1:2");
+  const html = p.el("#relationships").innerHTML;
+  assert.match(html, /<h4>Tracking family<\/h4>/);
+  assert.match(html, /<h4>Execution dependencies<\/h4>/);
+  assert.match(html, /href="https:\/\/example\.test\/1"/);
+  assert.match(html, /Parent &lt;one&gt;/);
+  assert.doesNotMatch(html, /href="javascript:/);
+  assert.match(html, /Done child[\s\S]*complete/);
+  assert.match(html, /9[\s\S]*off board/);
+  assert.match(html, /aria-label="dependency 4: complete"/);
+  assert.match(html, /aria-label="dependency 5: in working"/);
+  assert.match(html, /aria-label="dependency 8: missing · error"/);
+  assert.doesNotMatch(html, /missing<\/small>[\s\S]*missing · error/);
+  assert.match(html, /Current hold[\s\S]*s1:5 is in working; must reach done before this item can enter done\./);
+});
+
+test("renderPanelRelationships: invalid dependency reason is verbatim and separate from a blocked mark", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:2", source: "s1", stage: "backlog", title: "Current", blocked: true,
+      parent: "s1:99", dependsOn: ["s1:2"] }],
+    blocks: { "s1:2": { kind: "decision", reason: "the blocked mark reason" } },
+    held: { "s1:2": { by: "s1:2", invalid: true, reason: "dependency cycle: s1:2 -> s1:2" } },
+  }));
+  p.mod.renderPanelRelationships("s1:2");
+  const html = p.el("#relationships").innerHTML;
+  assert.match(html, /role="alert"[\s\S]*dependency cycle: s1:2 -&gt; s1:2/);
+  assert.match(html, /Parent[\s\S]*99[\s\S]*off board/);
+  assert.doesNotMatch(html, /the blocked mark reason/);
+});
+
+test("draw: an open panel refreshes relationships from full state despite source filtering", async () => {
+  const p = await page();
+  const initial = baseState({
+    items: [
+      { id: "s1:2", source: "s1", stage: "backlog", title: "Current", children: ["s2:3"] },
+      { id: "s2:3", source: "s2", stage: "working", title: "Other source child" },
+    ],
+  });
+  await withState(p, initial);
+  p.mod.setSourceFilter("s1");
+  await p.mod.inspect("s1:2", "Current", "backlog");
+  assert.match(p.el("#relationships").innerHTML, /Other source child[\s\S]*working/);
+
+  await withState(p, baseState({ items: [
+    { id: "s1:2", source: "s1", stage: "backlog", title: "Current", children: ["s2:3"] },
+    { id: "s2:3", source: "s2", stage: "done", title: "Other source child" },
+  ] }));
+  assert.match(p.el("#relationships").innerHTML, /Other source child[\s\S]*complete/);
+});

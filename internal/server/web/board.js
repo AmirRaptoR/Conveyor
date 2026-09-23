@@ -6,7 +6,7 @@ import {
 } from "./shared.js";
 import { updateRailCtl } from "./rail.js";
 import { openFromHash } from "./device.js";
-import { openItemId, inspect, renderPanelActions, refreshOpenStop } from "./panel.js";
+import { openItemId, inspect, renderPanelActions, renderPanelRelationships, refreshOpenStop } from "./panel.js";
 import { dragging, justDragged, refusals, stageBy, wireDrag, wireQueue } from "./drag.js";
 import { renderInbox } from "./inbox.js";
 
@@ -292,7 +292,11 @@ export function draw() {
   // The panel's own action controls (move up/down, start) and stop notice
   // read the same rebuilt #rail, so they are kept in step with every draw()
   // rather than only when the panel first opens.
-  if (openItemId) { renderPanelActions(openItemId); refreshOpenStop(openItemId, false); }
+  if (openItemId) {
+    renderPanelActions(openItemId);
+    renderPanelRelationships(openItemId);
+    refreshOpenStop(openItemId, false);
+  }
 }
 
 // draw()'s own deferral flag lives here with it; the drag's dragend (drag.js)
@@ -457,6 +461,7 @@ function card(it, active, place) {
         ? `<span class="dependency-error" title="${esc(hold.reason || "invalid dependency graph")}">dependency error</span>`
         : `<span class="behind">behind ${esc(hold.by.split(":").pop())}${hold.until ? ` · until ${esc(hold.until)}` : ""}</span>`) : ""}
       ${needsChip(it, hold)}
+      ${familyChip(it)}
       ${ranked && !working && !it.blocked ? `<span class="rank">${place + 1}</span>` : ""}
       ${hasPrio ? `<span class="prio">p${it.priority}</span>` : ""}
       ${working ? "" : waitChip(it)}
@@ -469,6 +474,29 @@ function card(it, active, place) {
     </span>
     ${refusals.has(it.id) ? `<span class="refused">${esc(refusals.get(it.id))}</span>` : ""}
   </article>`;
+}
+
+// Tracking structure is not execution order. Keep this neutral and separate
+// from `.needs`: an absent parent may intentionally not be executable work,
+// while child progress is only a summary of listed children.
+function familyChip(it) {
+  const children = Array.isArray(it.children) ? it.children : [];
+  if (!it.parent && !children.length) return "";
+  const parts = [], labels = [];
+  if (it.parent) {
+    const parent = String(it.parent).split(":").pop();
+    parts.push(`parent ${esc(parent)}`);
+    labels.push(`parent ${parent}`);
+  }
+  if (children.length) {
+    const complete = children.filter(id => {
+      const child = byId.get(id);
+      return child && terminal.has(child.stage);
+    }).length;
+    parts.push(`children ${complete}/${children.length}`);
+    labels.push(`${complete} of ${children.length} children complete`);
+  }
+  return `<span class="family" aria-label="tracking family: ${esc(labels.join("; "))}">${parts.join(" · ")}</span>`;
 }
 
 // Every item this one is sequenced behind, by number, whether or not any of

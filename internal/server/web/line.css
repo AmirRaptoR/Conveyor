@@ -205,6 +205,11 @@
 .item .needs .holding { color:var(--stop); font-weight:600; }
 .item .needs .missing { color:var(--stop); text-decoration:underline wavy; }
 
+/* Informational family structure is neither a dependency nor a state signal. */
+.item .family {
+  color:var(--dim); border-left:1px solid var(--rule-soft); padding-left:8px;
+}
+
 /* Terminal stations sit after a gap, joined by a short spur. A terminal
    column takes a pipeline station's own basis and gutter, so its card is
    the same width as any other column's no matter what is in it; the gap

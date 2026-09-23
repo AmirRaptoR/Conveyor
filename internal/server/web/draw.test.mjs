@@ -428,3 +428,30 @@ test("draw: a card declaring nothing has no needs chip", async () => {
   }));
   assert.doesNotMatch(p.el("#rail").innerHTML, /class="needs"/);
 });
+
+// ---- tracking family -------------------------------------------------------
+
+test("draw: family state is a separate accessible chip with child completion", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [
+      { id: "s1:1", source: "s1", stage: "backlog", title: "parent" },
+      { id: "s1:2", source: "s1", stage: "backlog", title: "current", parent: "s1:1", children: ["s1:3", "s1:4"] },
+      { id: "s1:3", source: "s1", stage: "done", title: "finished child" },
+      { id: "s1:4", source: "s1", stage: "working", title: "active child" },
+    ],
+  }));
+  const rendered = p.el("#rail").innerHTML;
+  assert.match(rendered, /class="family" aria-label="tracking family: parent 1; 1 of 2 children complete">parent 1 · children 1\/2</);
+  assert.doesNotMatch(rendered, /class="needs"[^>]*>[^<]*parent/);
+});
+
+test("draw: an off-board parent remains neutral rather than a dependency error", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:2", source: "s1", stage: "backlog", title: "child", parent: "s1:99" }],
+  }));
+  const rendered = p.el("#rail").innerHTML;
+  assert.match(rendered, /class="family"[^>]*>parent 99</);
+  assert.doesNotMatch(rendered, /dependency-error|dependency-invalid|class="missing"/);
+});
