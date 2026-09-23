@@ -400,6 +400,9 @@ test("draw: a card lists what it depends on, by number", async () => {
   assert.match(rendered, /class="met"[^>]*>3</);
   assert.match(rendered, /class="missing"[^>]*>9</);
   assert.match(rendered, /behind 1 · until working/);
+  assert.match(rendered, /aria-label="dependency 1: blocking in backlog until working"/);
+  assert.match(rendered, /aria-label="dependency 3: complete in done"/);
+  assert.match(rendered, /aria-label="dependency 9: missing"/);
   assert.doesNotMatch(rendered, /needs [^<]*s1:/);
 });
 

@@ -26,8 +26,10 @@
 #   DEFAULT_STAGE  where an onboarded issue carrying no mapped label lands
 #                  (default: backlog)
 #   LIMIT          max open issues to fetch per enrolling label (default: 200)
-#   CLOSED_LIMIT   how many of the most recently closed issues to keep, after
-#                  sorting (default: 100)
+#   CLOSED_LIMIT   how many of the most recently closed issues to keep in the
+#                  visible history ledger after sorting (default: 100).
+#                  Completed issues referenced by listed work are resolved
+#                  separately and retained even when older than this window.
 #   CLOSED_FETCH_LIMIT  how many closed issues to fetch before that sort
 #                  (default: 1000) — larger than CLOSED_LIMIT on purpose, so
 #                  the sort has more than an arbitrary CLOSED_LIMIT-sized page
@@ -143,6 +145,32 @@ gh_issues() {
 			return 1
 		fi
 		echo "gh issue list $* failed (attempt $attempt): $(cat "$work/gh.err")" >&2
+		sleep $((attempt * 2))
+		attempt=$((attempt + 1))
+	done
+}
+
+# gh_issue <number> — resolve one dependency that fell outside CLOSED_LIMIT.
+# A genuine missing issue is reported with status 2 so the engine can expose
+# it as invalid state; transient/API failures still fail the whole listing,
+# preserving last-good state rather than briefly inventing a missing node.
+gh_issue() {
+	local ref=$1 attempt=1 out
+	while :; do
+		if out=$(gh issue view "$ref" --repo "$REPO" \
+			--json number,title,body,labels,url,assignees,state,stateReason,closedAt \
+			2>"$work/gh.err"); then
+			printf '%s' "$out"
+			return 0
+		fi
+		if grep -qiE 'not found|could not resolve|HTTP 404' "$work/gh.err"; then
+			return 2
+		fi
+		if ((attempt >= ${GH_ATTEMPTS:-3})); then
+			echo "gh issue view $ref failed after $attempt attempts: $(cat "$work/gh.err")" >&2
+			return 1
+		fi
+		echo "gh issue view $ref failed (attempt $attempt): $(cat "$work/gh.err")" >&2
 		sleep $((attempt * 2))
 		attempt=$((attempt + 1))
 	done
@@ -330,6 +358,42 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 			# reproducible. Only ever set when they do not already say it.
 			+ (if $stage != ($mapped // $default) then {reconcile: $stage} else {} end))
 		)' "$work/items.jsonl" >"$work/listed.json"
+
+# CLOSED_LIMIT bounds the history ledger, not dependency correctness. Resolve
+# any referenced node absent from that bounded slice. A completed issue is
+# added back as a terminal dependency-only record; an open/unresolvable issue
+# remains absent so NewDeps reports the declaration as invalid. The number of
+# extra calls and records is bounded by references on the already-bounded
+# listing, never by repository history.
+mapfile -t missing_refs < <(jq -r '
+	[.[].id] as $ids
+	| [.[].dependsOn[]? | select(. as $d | ($ids | index($d) | not))]
+	| unique[] | split(":")[-1]
+' "$work/listed.json")
+for ref in "${missing_refs[@]}"; do
+	issue=""
+	if issue=$(gh_issue "$ref"); then
+		if [[ -n "$done_stage" ]] && jq -e '
+			((.state // "") | ascii_downcase) == "closed"
+			and ((.stateReason // "completed") | ascii_downcase) == "completed"
+		' <<<"$issue" >/dev/null; then
+			jq -c --arg source "$CONVEYOR_SOURCE" --arg done "$done_stage" '
+				(.labels | map(.name)) as $names
+				| {id: "\($source):\(.number)", ref: (.number | tostring), source: $source,
+				   stage: $done, title: .title, blocked: false,
+				   description: (.body // ""), url: .url, labels: $names,
+				   priority: ([$names[] | capture("^priority:p(?<n>[0-3])$") | .n | tonumber] | .[0]),
+				   assignee: (.assignees | map(.login) | .[0] // ""),
+				   finishedAt: (.closedAt // "")}
+			' <<<"$issue" >"$work/resolved.json"
+			jq -s '.[0] + [.[1]]' "$work/listed.json" "$work/resolved.json" >"$work/listed.next"
+			mv "$work/listed.next" "$work/listed.json"
+		fi
+	else
+		status=$?
+		if ((status != 2)); then exit "$status"; fi
+	fi
+done
 
 # The labels catch up with the status, using the one script that writes labels
 # rather than a second copy of its rules here. Rare — an item needs it once,

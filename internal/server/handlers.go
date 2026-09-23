@@ -411,13 +411,8 @@ func (s *Server) handleUnblockAll(w http.ResponseWriter, r *http.Request) {
 		// refuses a marked item on its own mark before the gate is ever
 		// reached. Decided from DependsOn and the listing alone: nothing
 		// here reads the mark's own kind or the word "dependency" to decide
-		// it — Scripts own that vocabulary, the engine never interprets it.
-		//
-		// The residual: a dependency the listing cannot see (an
-		// un-onboarded issue, another repository) is not a hold the engine
-		// can compute, so the item is still cleared here. agents/_deps
-		// re-marks it at implement time, before the worktree and before any
-		// model run, which is the accepted cost of that gap.
+		// it — Scripts own that vocabulary. A missing dependency is itself an
+		// invalid computed hold, so it remains fail-closed here too.
 		if next, ok := nextStage(s.cfg, it.Stage); ok {
 			if _, held := deps.Held(&it, next); held {
 				heldByDependencies++
@@ -471,8 +466,9 @@ func (s *Server) unblockAll(ctx context.Context, held []model.Item) int {
 // releaseLimited hands back the items an agent's usage limit stopped, once that
 // agent reports itself well again.
 //
-// This is the only mark the engine clears on its own initiative, and it is a
-// narrow exception on purpose. A `decision` mark is a person's answer
+// This and one-time legacy dependency-mark migration are the only marks the
+// engine clears on its own initiative. This is a narrow exception on purpose.
+// A `decision` mark is a person's answer
 // outstanding, and no amount of waiting produces one — clearing it spends an
 // agent run to be told the same thing. A `limit` is the outside world: nothing
 // was ever wrong with the item, the agent said so itself in the mark, and the
@@ -708,6 +704,53 @@ func (s *Server) anyPaused() bool {
 // on. It is still the scripts' word, not the engine's: agents/_blocked defines
 // it, and an agent that never says it simply never gets this behaviour.
 const limitKind = "limit"
+
+// dependencyKind is the legacy script mark superseded by dependenciesAt.
+// Unlike limitKind it is not an ongoing flow-control signal: once a config
+// enables an engine dependency gate, the computed hold owns that state and
+// this old mark must come off or the item can never resume after the hold does.
+const dependencyKind = "dependency"
+
+func hasDependencyGate(cfg *config.Config) bool {
+	for _, st := range cfg.Stages {
+		if st.DependenciesAt != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// releaseDependencyMarks is the automatic migration for boards that used the
+// old agents/_deps mark before dependenciesAt existed. The provider mark is
+// cleared once; an open, missing, self-referential, or cyclic dependency stays
+// stopped by pipeline.Deps, without a model run or capacity claim. A satisfied
+// dependency resumes normally. Other marks and questions remain human-owned.
+func (s *Server) releaseDependencyMarks(ctx context.Context) int {
+	if !hasDependencyGate(s.cfg) {
+		return 0
+	}
+	s.mu.RLock()
+	var legacy []model.Item
+	for _, it := range s.state.Items {
+		block := s.blocks[it.ID]
+		// A failed listing leaves last-good items on the board. Do not mutate
+		// that source from stale evidence; its next successful listing will
+		// make the migration eligible again.
+		if it.Blocked && block.Kind == dependencyKind && !block.Asked && s.listErr[it.Source] == "" {
+			legacy = append(legacy, it)
+		}
+	}
+	s.mu.RUnlock()
+	if len(legacy) == 0 {
+		return 0
+	}
+	fmt.Fprintf(os.Stderr, "conveyor: migrating %d legacy dependency mark(s) to computed holds\n", len(legacy))
+	n := s.unblockAll(ctx, legacy)
+	if n > 0 {
+		s.wakeUp()
+	}
+	return n
+}
 
 // unblock is one provider write: the same move that set the mark, with the mark
 // off. The engine's note goes with it — the run that explains it is still

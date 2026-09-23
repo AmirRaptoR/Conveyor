@@ -142,6 +142,37 @@ func TestDeclineReasonNamesInvalidDependency(t *testing.T) {
 	}
 }
 
+func TestExplicitRunStageCannotBypassDependencyPolicy(t *testing.T) {
+	cfg := explainCfg(t)
+	dependency := model.Item{ID: "s1:1", Stage: "backlog"}
+	follower := model.Item{ID: "s1:2", Stage: "backlog", DependsOn: []string{"s1:1"}}
+	d := pipeline.NewDeps(cfg, []model.Item{dependency, follower})
+	if stage, err := selectRunStage(cfg, &follower, d, "working"); err == nil {
+		t.Fatalf("explicit stage bypassed hold: stage=%q", stage)
+	} else if !strings.Contains(err.Error(), "s1:1") || !strings.Contains(err.Error(), "working") {
+		t.Fatalf("error = %q, want dependency and required stage", err)
+	}
+
+	invalid := model.Item{ID: "s1:3", Stage: "backlog", DependsOn: []string{"s1:999"}}
+	d = pipeline.NewDeps(cfg, []model.Item{invalid})
+	if _, err := selectRunStage(cfg, &invalid, d, "working"); err == nil || !strings.Contains(err.Error(), "missing item s1:999") {
+		t.Fatalf("invalid explicit stage error = %v", err)
+	}
+}
+
+func TestExplicitRunStageStillAllowsAValidOperatorOverride(t *testing.T) {
+	cfg := explainCfg(t)
+	item := model.Item{ID: "s1:1", Stage: "backlog"}
+	d := pipeline.NewDeps(cfg, []model.Item{item})
+	stage, err := selectRunStage(cfg, &item, d, "working")
+	if err != nil || stage != "working" {
+		t.Fatalf("selectRunStage = %q, %v; want working", stage, err)
+	}
+	if _, err := selectRunStage(cfg, &item, d, "missing"); err == nil {
+		t.Fatal("unknown explicit stage was accepted")
+	}
+}
+
 func TestExplainRunPrintsThePlanAndRunsNothing(t *testing.T) {
 	cfg := explainCfg(t)
 	item := &model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog", Title: "do the thing"}

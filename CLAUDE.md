@@ -269,7 +269,10 @@ peer, and the socket is the only door with no password on it (#94).
   which is the shape a refined issue actually writes and which used to
   declare nothing (the keyword line had no number on it, and a line break is
   a sentence break); implement stops before the worktree with a `dependency`
-  mark, a condition the doctor clears once every named issue is closed. The
+  mark on configurations that have not enabled the engine gate. Once any
+  stage declares `dependenciesAt`, a successful listing automatically removes
+  those legacy script marks and the computed hold owns the condition instead;
+  questions and other mark kinds remain untouched. The
   agent is also told not to stop for an open dependency itself — nine of one
   week's seventeen "decisions" were that. The GitHub provider's `list.sh`
   restates the same parse for `dependsOn`, and `agents/_deps-fixtures.jsonl`
@@ -291,10 +294,14 @@ peer, and the socket is the only door with no password on it (#94).
   an unknown id, a self-edge, a stage the config does not declare, a cycle —
   is a visible invalid hold and fails closed before a run slot is claimed.
   Repairing the declaration clears it on the next listing; dropping it would
-  silently authorize the order it was meant to forbid. This is the line's own sequencing and is not
-  `agents/_deps`, which still asks GitHub about issues the board cannot see —
-  narrower (an un-onboarded sibling gates nothing here) and later (it catches
-  what the engine could not see, immediately before the worktree). `Unblock
+  silently authorize the order it was meant to forbid. The GitHub provider
+  resolves completed referenced issues that fell outside `CLOSED_LIMIT`, so
+  old finished predecessors remain distinguishable from typos. This is the
+  line's own sequencing and is not `agents/_deps`, which remains a final
+  script-side check for configurations that have not enabled an engine gate.
+  The supervised `conveyor run -stage` command asks this same rule about its
+  requested destination, so its routing override cannot become a dependency
+  override. `Unblock
   all` asks the same rule directly — would this item be held if it were not
   marked — rather than through `Target`, which would refuse it on its own mark
   first; a marked item still held this way gets no provider write and is
@@ -403,7 +410,11 @@ peer, and the socket is the only door with no password on it (#94).
   call is server-side filtered; there is nothing to push it behind. Closed
   history stays a single listing, but is sorted newest-`closedAt`-first
   *before* `CLOSED_LIMIT` cuts it down, so that is the N most recently closed
-  rather than an arbitrary N `gh` happened to return first.
+  rather than an arbitrary N `gh` happened to return first. A listed item's
+  dependency that falls outside that ledger is resolved directly; a completed
+  predecessor is added back as a terminal dependency-only record, while a
+  missing, open-but-unenrolled, or abandoned reference remains absent and is
+  surfaced by the engine as invalid state.
 - **`list` reads closed issues it labelled, and only those.** A finished item is
   a closed issue — the pull request says `Closes #N` — so listing open ones
   alone left the last stages empty: an item did not arrive in `done`, it

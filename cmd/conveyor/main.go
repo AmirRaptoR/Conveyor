@@ -473,17 +473,14 @@ func cmdRun(args []string) error {
 		return fmt.Errorf("source %q has no item %q", *srcName, *itemID)
 	}
 
-	stage := *stageName
-	if stage == "" {
-		// Built from this source's full listing, the same one item was found
-		// in — the dependency that must hold it is as likely to be sitting
-		// in this list as anywhere.
-		deps := pipeline.NewDeps(cfg, res.Items)
-		target, ok := pipeline.Target(cfg, item, deps)
-		if !ok {
-			return fmt.Errorf("no stage to run: %s", declineReason(cfg, item, deps))
-		}
-		stage = target
+	// Built from this source's full listing, the same one item was found in.
+	// An explicit -stage remains an operator routing override, but never a
+	// dependency override: the graph is checked against the requested stage
+	// before explain can describe it or Advance can claim any capacity.
+	deps := pipeline.NewDeps(cfg, res.Items)
+	stage, err := selectRunStage(cfg, item, deps, *stageName)
+	if err != nil {
+		return err
 	}
 
 	if *explain {

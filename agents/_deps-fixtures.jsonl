@@ -10,3 +10,4 @@
 {"name": "a keyword line that names something itself opens no list", "body": "Depends on: nothing yet.\n- #12 is a related note", "want": []}
 {"name": "a keyword line with a number does not also read the list below it", "body": "Depends on #7\n- #12 is a related note", "want": ["7"]}
 {"name": "a list with no keyword line above it donates nothing", "body": "Related:\n- #12\n- #13", "want": []}
+{"name": "CRLF dependency lists match LF lists", "body": "Depends on:\r\n- #12\r\n- #13\r\n", "want": ["12", "13"]}

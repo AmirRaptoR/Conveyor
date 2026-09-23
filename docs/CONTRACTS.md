@@ -425,9 +425,12 @@ This is a fail-closed reconciliation, not a relabel migration:
    card has either an ordinary `behind N · must reach <stage>` hold or a red
    `dependency error`; the JSON equivalents are `.held[ID].until` and
    `.held[ID].invalid`.
-3. Repair missing/self/cyclic declarations before enabling automatic work.
-   Do not remove a dependency merely to clear the error: either onboard the
-   missing item or correct the reference.
+3. On the first successful listing, Conveyor automatically removes legacy
+   script-written marks whose kind is `dependency`; the computed hold replaces
+   them without launching a stage. Questions and every other mark remain
+   untouched. Repair missing/self/cyclic declarations before enabling
+   automatic work. Do not remove a dependency merely to clear the error:
+   either onboard the missing item or correct the reference.
 4. Items already at or beyond the gated stage are not moved backwards. The
    inherited threshold holds them where they are until their dependencies
    reach the required stage, then they resume through the normal recovery

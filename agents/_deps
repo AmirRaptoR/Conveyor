@@ -85,6 +85,7 @@ dependency_refs() {
 	BEGIN { pending = 0; inlist = 0 }
 	{
 		line = $0
+		sub(/\r$/, "", line) # GitHub bodies may use CRLF; parse both adapters alike.
 		if (line ~ /^[ \t]*$/) { inlist = 0; next }
 		if ((pending || inlist) && line ~ /^[ \t]*([-*+]|[0-9]+[.)])[ \t]+/) {
 			inlist = 1; pending = 0

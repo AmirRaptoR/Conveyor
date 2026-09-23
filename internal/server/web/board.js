@@ -490,7 +490,11 @@ function needsChip(it, hold) {
     const met = dep && terminal.has(dep.stage);
     const cls = hold && hold.by === id ? "holding" : !dep ? "missing" : met ? "met" : "";
     const where = dep ? `${id} is in ${dep.stage}` : `${id} is not on the board`;
-    return `<span class="${cls}" title="${esc(where)}">${esc(id.split(":").pop())}</span>`;
+    const status = !dep ? "missing"
+      : met ? `complete in ${dep.stage}`
+      : hold && hold.by === id ? `blocking in ${dep.stage}${hold.until ? ` until ${hold.until}` : ""}`
+      : `in ${dep.stage}`;
+    return `<span class="${cls}" title="${esc(where)}" aria-label="dependency ${esc(id.split(":").pop())}: ${esc(status)}">${esc(id.split(":").pop())}</span>`;
   });
   return `<span class="needs" title="depends on ${esc(deps.map(id => id.split(":").pop()).join(", "))}">needs ${refs.join(" ")}</span>`;
 }
