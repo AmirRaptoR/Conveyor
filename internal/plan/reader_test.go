@@ -204,6 +204,58 @@ func TestReaderStopsStreamingAtAcceptedRevisionCap(t *testing.T) {
 	}
 }
 
+func TestReaderCapsAt1000RejectedLines(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plan.jsonl")
+	os.WriteFile(path, nil, 0o600)
+	r := NewReader()
+
+	for batch := 0; batch < 2; batch++ {
+		var lines []string
+		for i := 0; i < 600; i++ {
+			lines = append(lines, "not json")
+		}
+		writeLines(t, path, lines...)
+		r.Poll(path)
+	}
+	if r.Rejected() != MaxRejectedLines {
+		t.Fatalf("expected rejected capped at %d, got %d", MaxRejectedLines, r.Rejected())
+	}
+	if !r.capped {
+		t.Fatalf("expected reader capped after %d rejections", MaxRejectedLines)
+	}
+}
+
+func TestReaderStopsStreamingAtRejectedLineCap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plan.jsonl")
+	var content strings.Builder
+	for i := 0; i < MaxRejectedLines; i++ {
+		content.WriteString("not json\n")
+	}
+	content.WriteString(strings.Repeat("x", 8*1024*1024))
+	if err := os.WriteFile(path, []byte(content.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewReader()
+	r.Poll(path)
+	if r.Rejected() != MaxRejectedLines || !r.capped {
+		t.Fatalf("rejected=%d capped=%v, want %d and true", r.Rejected(), r.capped, MaxRejectedLines)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.offset >= info.Size() {
+		t.Fatalf("reader scanned all %d bytes after reaching the rejected cap", info.Size())
+	}
+	before := r.offset
+	if events := r.Poll(path); len(events) != 0 || r.offset != before {
+		t.Fatalf("capped reader kept scanning: events=%+v offset=%d want %d", events, r.offset, before)
+	}
+}
+
 func TestReaderDiagnosticsCappedAtTenWithSuppressedSummary(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "plan.jsonl")

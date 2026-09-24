@@ -58,7 +58,7 @@ func NewReader() *Reader { return &Reader{} }
 // Accepted is the count of revisions accepted so far, capped at MaxRevisions.
 func (r *Reader) Accepted() int { return r.acceptedN }
 
-// Rejected is the count of lines rejected so far, uncapped.
+// Rejected is the count of lines rejected so far, capped at MaxRejectedLines.
 func (r *Reader) Rejected() int { return r.rejectedN }
 
 // Last is the most recently accepted revision, and whether there is one.
@@ -162,6 +162,9 @@ func (r *Reader) consume(data []byte) []Event {
 			}
 			return events
 		}
+		if r.capped {
+			return events
+		}
 		line := data[:nl]
 		data = data[nl+1:]
 
@@ -183,6 +186,9 @@ func (r *Reader) consume(data []byte) []Event {
 
 		if len(full)+1 > MaxLineBytes {
 			events = append(events, r.reject("line too long"))
+			if r.capped {
+				return events
+			}
 			continue
 		}
 
@@ -198,6 +204,9 @@ func (r *Reader) consume(data []byte) []Event {
 			}
 		} else {
 			events = append(events, r.reject(reason))
+			if r.capped {
+				return events
+			}
 		}
 	}
 }
@@ -207,6 +216,9 @@ func (r *Reader) reject(reason string) Event {
 	diagnose := r.diagnosedN < maxDiagnostics
 	if diagnose {
 		r.diagnosedN++
+	}
+	if r.rejectedN == MaxRejectedLines {
+		r.capped = true
 	}
 	return Event{Reason: reason, Line: r.lineNum, Diagnose: diagnose}
 }

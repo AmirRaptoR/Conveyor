@@ -32,6 +32,14 @@ const MaxIDLen = 64
 // hold before a reader stops parsing further lines.
 const MaxRevisions = 1000
 
+// MaxRejectedLines bounds how many rejected lines one run's plan.jsonl may
+// produce before a reader stops parsing further lines. The 10-line
+// diagnostic cap only bounds how many rejections are worth a log line; this
+// bounds the reader's own memory and event traffic, since a writer other
+// than agents/_plan (the only one the protocol's own limits constrain) could
+// otherwise flood plan.jsonl with malformed lines forever.
+const MaxRejectedLines = 1000
+
 // StatusPending, StatusInProgress and StatusCompleted are the closed set a
 // todo's status is validated against. The engine derives no other meaning
 // from it; progress and "current step" are computed by whoever is handed a
