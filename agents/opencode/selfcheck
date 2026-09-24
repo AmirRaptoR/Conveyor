@@ -108,6 +108,15 @@ incremental=$(printf '%s\n' \
 	render_stream)
 chk "a progressively growing text part keeps the new suffix" "$(tr '\n' ' ' <<<"$incremental" | tr -s ' ')" "work complete "
 
+tool_progress=$(printf '%s\n' \
+	'{"type":"step_start","timestamp":1,"sessionID":"ses-tool","part":{"id":"s","type":"step-start"}}' \
+	'{"type":"tool_use","timestamp":2,"sessionID":"ses-tool","part":{"id":"tool","type":"tool","tool":"bash","state":{"status":"running","title":"slow check"}}}' \
+	'{"type":"tool_use","timestamp":3,"sessionID":"ses-tool","part":{"id":"tool","type":"tool","tool":"bash","state":{"status":"completed","title":"slow check","output":"secret"}}}' \
+	'{"type":"step_finish","timestamp":4,"sessionID":"ses-tool","part":{"id":"f","type":"step-finish"}}' |
+	render_stream)
+chk "a tool part may progress through a nonterminal state" "$(grep -c 'bash: slow check' <<<"$tool_progress")" "2"
+chk "the progressive tool still hides its output" "$(grep -c secret <<<"$tool_progress" || true)" "0"
+
 RESUME_SESSION=""
 prompt=$(resume_prompt '{"answer":"continue","session":"opencode:ses-old"}' 'original' 2>/dev/null)
 chk "an answer resumes with only the answer" "$prompt" "continue"

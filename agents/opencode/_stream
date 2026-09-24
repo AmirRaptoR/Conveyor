@@ -131,9 +131,10 @@ last_said() {
 }
 
 render_stream() {
-	local line type session="" current seen=0 finished=0 errors=0 detail id text previous
+	local line type session="" current seen=0 finished=0 errors=0 detail id text previous status key
 	declare -A parts=()
 	declare -A texts=()
+	declare -A tool_states=()
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		[[ -z "$line" ]] && continue
 		if ! jq -e 'type == "object" and (.type | type == "string" and length > 0)
@@ -180,10 +181,15 @@ render_stream() {
 			;;
 		tool_use)
 			jq -e '.part | type == "object" and (.id | type == "string" and length > 0) and .type == "tool"
-				and (.tool | type == "string") and (.state.status == "completed" or .state.status == "error")' \
+				and (.tool | type == "string" and length > 0)
+				and (.state.status | type == "string" and length > 0)' \
 				>/dev/null 2>&1 <<<"$line" || {
 				echo "opencode emitted a malformed tool_use event" >&2; return 2; }
-			id=$(jq -r .part.id <<<"$line"); [[ -n "${parts[$id]+seen}" ]] && continue; parts[$id]=1
+			id=$(jq -r .part.id <<<"$line")
+			status=$(jq -r .part.state.status <<<"$line")
+			key="$id:$status"
+			[[ -n "${tool_states[$key]+seen}" ]] && continue
+			tool_states[$key]=1
 			jq -r '"  · \(.part.tool): \(.part.state.title // .part.state.status) [\(.part.state.status)]"' <<<"$line"
 			seen=1
 			;;

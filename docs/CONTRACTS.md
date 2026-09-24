@@ -296,7 +296,10 @@ OpenCode `1.18.32` is the one supported event contract. The adapter disables
 auto-update, validates the exact version, selected model and primary agent
 before a model call, and consumes `run --format json` NDJSON. It renders text
 and tool names as logs but never tool output or reasoning, requires one stable
-session id and a finishing event, and fails closed on malformed events. The
+session id and a finishing event, and fails closed on malformed known events;
+unknown well-formed event types are named in the log and ignored for forward
+compatibility. A tool part may report multiple statuses, each rendered once,
+so a nonterminal state cannot abort an otherwise valid stream. The
 session id is merged into `$CONVEYOR_RESULT` with an `opencode:` prefix on a
 stop, so an answer resumes with `--session`; it never uses the process-global
 "latest session". Another backend treats that prefix as foreign and falls back
