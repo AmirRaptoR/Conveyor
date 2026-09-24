@@ -2,12 +2,25 @@
 # Mock stage script: emits streaming logs so the UI's live pane has something to
 # show, then writes structured data to the result file. Exit code drives the move.
 set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/../_plan"
+
 payload=$(cat)
 title=$(jq -r '.item.title' <<<"$payload")
 
 echo "refining: $title"
-for step in "reading item" "mapping the codebase" "drafting criteria" "verifying"; do
-  echo "  $step..."; sleep 0.4
+plan_start "mock refine"
+steps=("reading item" "mapping the codebase" "drafting criteria" "verifying")
+for i in "${!steps[@]}"; do
+  todos="[]"
+  for j in "${!steps[@]}"; do
+    status="pending"
+    ((j < i)) && status="completed"
+    ((j == i)) && status="in_progress"
+    todos=$(jq -c --arg text "${steps[$j]}" --arg status "$status" '. + [{text: $text, status: $status}]' <<<"$todos")
+  done
+  plan_publish "$todos"
+  echo "  ${steps[$i]}..."; sleep 0.4
 done
 
 # Empty description is the mock's stand-in for "not enough to work with".

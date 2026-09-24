@@ -7,11 +7,15 @@
 # enough — and sequences the item behind the ref one lower. Always exits 0,
 # the same as the real adapter: this stage never blocks and never waits.
 set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/../_plan"
+
 payload=$(cat)
 ref=$(jq -r '.item.ref' <<<"$payload")
 title=$(jq -r '.item.title' <<<"$payload")
 
 echo "prioritising $ref — $title"
+plan_start "mock prioritise"
 part=$(grep -oiE '(child|part|batch|step)[[:space:]]*([0-9]+)' <<<"$title" | grep -oE '[0-9]+' | head -1 || true)
 if [[ -n "$part" && "$part" -gt 1 ]]; then
 	echo "  part $part; sequenced behind #$((ref - 1))"
