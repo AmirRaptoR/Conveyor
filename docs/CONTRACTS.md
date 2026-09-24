@@ -308,7 +308,9 @@ endpoint. Its status probe therefore makes no model call and labels that quota
 detail as unavailable unless a stage has observed an explicit structured quota
 refusal. Such a refusal is cached briefly for the shared agent pause, cleared by
 a successful run against that provider, and never inferred from a generic HTTP
-429.
+429. The transient loopback readiness server is started in pure mode with a new
+random basic-auth credential on every probe and is terminated before the status
+script returns; loopback is not treated as an authentication boundary.
 
 **`preflight`** (optional, `providers/<name>/preflight`) — a readiness check
 for one source, run only by `conveyor preflight`, and by `conveyor enroll`

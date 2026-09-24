@@ -92,6 +92,22 @@ for arg in '--format' 'json' '--model' 'openai/gpt-test' '--variant' 'high' '--a
 	chk "run receives $arg" "$(grep -Fx -- "$arg" "$OC_ARGS" || true)" "$arg"
 done
 
+set +e
+fixture=$(render_stream <"$here/fixtures/tool-run-1.18.32.jsonl" 2>&1)
+rc=$?
+set -e
+chk "the sanitized live 1.18.32 tool transcript parses" "$rc" "0"
+chk "the live fixture renders its completed tool" "$(grep -c 'bash: pwd \[completed\]' <<<"$fixture")" "1"
+chk "the live fixture renders final text" "$(grep -c '^done$' <<<"$fixture")" "1"
+
+incremental=$(printf '%s\n' \
+	'{"type":"step_start","timestamp":1,"sessionID":"ses-progress","part":{"id":"s","type":"step-start"}}' \
+	'{"type":"text","timestamp":2,"sessionID":"ses-progress","part":{"id":"t","type":"text","text":"work"}}' \
+	'{"type":"text","timestamp":3,"sessionID":"ses-progress","part":{"id":"t","type":"text","text":"work complete"}}' \
+	'{"type":"step_finish","timestamp":4,"sessionID":"ses-progress","part":{"id":"f","type":"step-finish"}}' |
+	render_stream)
+chk "a progressively growing text part keeps the new suffix" "$(tr '\n' ' ' <<<"$incremental" | tr -s ' ')" "work complete "
+
 RESUME_SESSION=""
 prompt=$(resume_prompt '{"answer":"continue","session":"opencode:ses-old"}' 'original' 2>/dev/null)
 chk "an answer resumes with only the answer" "$prompt" "continue"

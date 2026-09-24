@@ -32,7 +32,7 @@ resume_prompt() {
 	fi
 	if [[ "$session" == opencode:* ]]; then
 		RESUME_SESSION=${session#opencode:}
-		echo "resuming the conversation that asked (session ${session:0:8})" >&2
+		echo "resuming the conversation that asked (session ${RESUME_SESSION:0:8})" >&2
 		printf '%s' "$answer"
 		return 0
 	fi
@@ -131,8 +131,9 @@ last_said() {
 }
 
 render_stream() {
-	local line type session="" current seen=0 finished=0 errors=0 detail id
+	local line type session="" current seen=0 finished=0 errors=0 detail id text previous
 	declare -A parts=()
+	declare -A texts=()
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		[[ -z "$line" ]] && continue
 		if ! jq -e 'type == "object" and (.type | type == "string" and length > 0)
@@ -159,8 +160,16 @@ render_stream() {
 		text)
 			jq -e '.part | type == "object" and (.id | type == "string" and length > 0) and .type == "text" and (.text | type == "string")' >/dev/null 2>&1 <<<"$line" || {
 				echo "opencode emitted a malformed text event" >&2; return 2; }
-			id=$(jq -r .part.id <<<"$line"); [[ -n "${parts[$id]+seen}" ]] && continue; parts[$id]=1
-			jq -r '.part.text' <<<"$line"
+			id=$(jq -r .part.id <<<"$line")
+			text=$(jq -r .part.text <<<"$line")
+			previous=${texts[$id]-}
+			[[ "$text" == "$previous" ]] && continue
+			if [[ -n "$previous" && "$text" == "$previous"* ]]; then
+				printf '%s\n' "${text:${#previous}}"
+			else
+				printf '%s\n' "$text"
+			fi
+			texts[$id]=$text
 			seen=1
 			;;
 		reasoning)
