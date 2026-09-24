@@ -92,11 +92,10 @@ peer, and the socket is the only door with no password on it (#94).
   call maps its own backend's todo event into it — `TodoWrite` for Claude,
   `todowrite` for OpenCode. Publishing one is an adapter's promise, never
   required: the engine derives no meaning from a plan's contents and never
-  scores, requires or blocks on one existing. As of #110 landing, the
-  protocol, the runner's tailer and the adapter mappings exist; the board
-  still reads its plan/progress display off `panel.js`'s log-parsing
-  `parseTodos` until a follow-up wires `/api/state`, the SSE `plan` event
-  and the report to this channel and retires that parser.
+  scores, requires or blocks on one existing. `/api/state`'s `plans`, the SSE
+  `plan` event and the final report all read this channel; `panel.js`'s old
+  log-parsing `parseTodos` is gone, and no board code reads plan structure out
+  of a log line.
 - **The engine writes provider state before running a stage**, never after, and
   stage scripts never call `move` themselves. A crash mid-stage then leaves a
   truthful record and the item is not handed out twice.
