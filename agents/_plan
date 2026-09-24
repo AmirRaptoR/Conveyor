@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Sourced by the agent adapters. The one writer of $CONVEYOR_PLAN — plan.jsonl
+# in the run directory — appending one JSON revision per line and owning
+# revision numbering, id derivation and the protocol's own limits (see
+# internal/plan), so no adapter reimplements any of it.
+#
+# A plan is presentation and record-keeping, never something a run can fail
+# over: both functions here are always a no-op exiting 0, whatever goes
+# wrong — no CONVEYOR_PLAN, an unwritable path, an invalid array. The one
+# thing that reaches stderr is a reason, for a human reading the log.
+
+_PLAN_MAX_TODOS=200
+_PLAN_MAX_TEXT=500
+_PLAN_MAX_ID=64
+_PLAN_MAX_REVISIONS=1000
+
+# _plan_ready — is $CONVEYOR_PLAN set and its directory writable.
+_plan_ready() {
+	[[ -n "${CONVEYOR_PLAN:-}" ]] || return 1
+	[[ -w "$(dirname -- "$CONVEYOR_PLAN")" ]] || return 1
+	command -v jq >/dev/null 2>&1 || return 1
+	return 0
+}
+
+# _plan_next_rev — the current line count of $CONVEYOR_PLAN plus one, so a
+# rejected line still consumes a number and the sequence stays strictly
+# increasing with no counter file in the run directory.
+_plan_next_rev() {
+	local n=0
+	[[ -s "$CONVEYOR_PLAN" ]] && n=$(wc -l <"$CONVEYOR_PLAN" | tr -d ' ')
+	echo $((n + 1))
+}
+
+# _plan_derive_ids <todos-json> — fills in a stable id for any todo that did
+# not supply one: sha256 of the trimmed, whitespace-collapsed text, truncated
+# to 12 hex characters. A supplied id is used verbatim, trimmed and capped at
+# 64 characters. Duplicate texts in one revision are disambiguated by
+# appending -2, -3… in document order; the first occurrence carries no
+# suffix. Prints the resulting JSON array on success.
+_plan_derive_ids() {
+	local todos=$1
+	local normalized
+	normalized=$(jq -c '[.[] | .id = (.id // "")]' <<<"$todos" 2>/dev/null) || {
+		printf '%s' "$todos"
+		return
+	}
+	local n
+	n=$(jq 'length' <<<"$normalized")
+	local -A seen=()
+	local out="[]"
+	local i
+	for ((i = 0; i < n; i++)); do
+		local item id text
+		item=$(jq -c ".[$i]" <<<"$normalized")
+		id=$(jq -r '.id' <<<"$item")
+		id=$(_plan_trim "$id")
+		if [[ -z "$id" ]]; then
+			text=$(jq -r '.text // ""' <<<"$item")
+			text=$(_plan_collapse "$text")
+			id=$(printf '%s' "$text" | sha256sum | cut -c1-12)
+		fi
+		id="${id:0:64}"
+		local base=$id n2=1
+		while [[ -n "${seen[$id]:-}" ]]; do
+			n2=$((n2 + 1))
+			id="${base}-${n2}"
+		done
+		seen[$id]=1
+		item=$(jq -c --arg id "$id" '.id = $id' <<<"$item")
+		out=$(jq -c --argjson item "$item" '. + [$item]' <<<"$out")
+	done
+	printf '%s' "$out"
+}
+
+_plan_trim() {
+	local s=$1
+	s="${s#"${s%%[![:space:]]*}"}"
+	s="${s%"${s##*[![:space:]]}"}"
+	printf '%s' "$s"
+}
+
+_plan_collapse() {
+	local s
+	s=$(tr -s '[:space:]' ' ' <<<"$1")
+	_plan_trim "$s"
+}
+
+# _plan_validate <todos-json> — the same rules internal/plan.Validate applies
+# to one revision's todos, checked here so an adapter never appends a line it
+# knows the engine will reject. Prints a one-sentence reason and returns
+# non-zero on the first rule broken.
+_plan_validate() {
+	local todos=$1
+	if ! jq -e . >/dev/null 2>&1 <<<"$todos"; then
+		echo "not valid JSON"
+		return 1
+	fi
+	if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$todos"; then
+		echo "todos is not an array"
+		return 1
+	fi
+	local n
+	n=$(jq 'length' <<<"$todos")
+	if ((n > _PLAN_MAX_TODOS)); then
+		echo "too many todos"
+		return 1
+	fi
+	local seen_ids="" i
+	for ((i = 0; i < n; i++)); do
+		local item id text status
+		item=$(jq -c ".[$i]" <<<"$todos")
+		id=$(jq -r '.id // ""' <<<"$item")
+		id=$(_plan_trim "$id")
+		if [[ -z "$id" ]]; then
+			echo "todo missing id"
+			return 1
+		fi
+		if ((${#id} > _PLAN_MAX_ID)); then
+			echo "todo id too long"
+			return 1
+		fi
+		if [[ " $seen_ids " == *" $id "* ]]; then
+			echo "duplicate todo id"
+			return 1
+		fi
+		seen_ids="$seen_ids $id"
+
+		text=$(jq -r '.text // ""' <<<"$item")
+		text=$(_plan_trim "$text")
+		if [[ -z "$text" ]]; then
+			echo "todo missing text"
+			return 1
+		fi
+		if ((${#text} > _PLAN_MAX_TEXT)); then
+			echo "todo text too long"
+			return 1
+		fi
+
+		status=$(jq -r '.status // ""' <<<"$item")
+		case "$status" in
+		pending | in_progress | completed) ;;
+		*)
+			echo "todo status is not valid"
+			return 1
+			;;
+		esac
+	done
+	return 0
+}
+
+# plan_publish <todos-json> — append one revision. todos-json is a JSON array
+# of todos in protocol shape (id optional — derived when absent, see
+# _plan_derive_ids). Refuses (exit 0, one line to stderr) an array that fails
+# _plan_validate, or once 1000 lines are already in the file.
+plan_publish() {
+	local todos=$1
+	_plan_ready || return 0
+
+	if ! jq -e . >/dev/null 2>&1 <<<"$todos"; then
+		echo "plan_publish: refusing invalid todos: not valid JSON" >&2
+		return 0
+	fi
+
+	local rev
+	rev=$(_plan_next_rev)
+	if ((rev > _PLAN_MAX_REVISIONS)); then
+		echo "plan_publish: refusing to append past $_PLAN_MAX_REVISIONS lines" >&2
+		return 0
+	fi
+
+	local derived reason
+	derived=$(_plan_derive_ids "$todos")
+	if ! reason=$(_plan_validate "$derived"); then
+		echo "plan_publish: refusing invalid todos: $reason" >&2
+		return 0
+	fi
+
+	local at line
+	at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	line=$(jq -nc --argjson rev "$rev" --arg at "$at" --argjson todos "$derived" \
+		'{v: 1, rev: $rev, at: $at, todos: $todos}')
+	printf '%s\n' "$line" >>"$CONVEYOR_PLAN"
+}
+
+# plan_start <text> — publish a single in_progress todo, "<CONVEYOR_STAGE>
+# #<CONVEYOR_ITEM_REF>". Idempotent: a no-op once plan.jsonl already has a
+# line in it, so a second call — from a rerun, or a stage that calls it more
+# than once — never overwrites a real plan with a placeholder.
+plan_start() {
+	_plan_ready || return 0
+	[[ -s "$CONVEYOR_PLAN" ]] && return 0
+	local text="${CONVEYOR_STAGE:-} #${CONVEYOR_ITEM_REF:-}"
+	plan_publish "$(jq -nc --arg text "$text" '[{text: $text, status: "in_progress"}]')"
+}

@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Checks agents/_plan, the shared plan/todo publisher every adapter sources.
+# Touches only a throwaway plan.jsonl; runs no model.
+#
+#   agents/_plan-selfcheck
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/_plan"
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# 1. plan_start publishes a single in_progress todo, revision 1, whose text
+# names the stage and item — and is a silent no-op on a second call.
+export CONVEYOR_PLAN="$tmp/plan.jsonl"
+export CONVEYOR_STAGE="implement"
+export CONVEYOR_ITEM_REF="42"
+: >"$CONVEYOR_PLAN"
+plan_start "starting up"
+chk "plan_start writes one line"       "$(wc -l <"$CONVEYOR_PLAN" | tr -d ' ')" "1"
+rev1=$(jq -c '.rev' "$CONVEYOR_PLAN")
+chk "plan_start's revision is 1"       "$rev1" "1"
+status1=$(jq -r '.todos[0].status' "$CONVEYOR_PLAN")
+chk "plan_start's todo is in_progress" "$status1" "in_progress"
+text1=$(jq -r '.todos[0].text' "$CONVEYOR_PLAN")
+chk "plan_start's text names stage and item" "$text1" "implement #42"
+
+plan_start "starting up again"
+chk "plan_start is idempotent (still one line)" "$(wc -l <"$CONVEYOR_PLAN" | tr -d ' ')" "1"
+
+# 2. plan_publish appends a revision with the given todos, rev derived from
+# the line count.
+export CONVEYOR_PLAN="$tmp/plan2.jsonl"
+: >"$CONVEYOR_PLAN"
+plan_publish '[{"id":"a","text":"first","status":"pending"}]'
+plan_publish '[{"id":"a","text":"first","status":"completed"}]'
+chk "plan_publish appends one line per call" "$(wc -l <"$CONVEYOR_PLAN" | tr -d ' ')" "2"
+rev2=$(tail -1 "$CONVEYOR_PLAN" | jq -c '.rev')
+chk "rev increases across calls"       "$rev2" "2"
+status2=$(tail -1 "$CONVEYOR_PLAN" | jq -r '.todos[0].status')
+chk "second revision reflects the update" "$status2" "completed"
+
+# 3. an id is derived, stably, from the trimmed/collapsed text when the
+# caller supplies none — same text, two revisions, same id.
+export CONVEYOR_PLAN="$tmp/plan3.jsonl"
+: >"$CONVEYOR_PLAN"
+plan_publish '[{"text":"do the thing","status":"pending"}]'
+plan_publish '[{"text":"do   the  thing","status":"in_progress"}]'
+id1=$(sed -n '1p' "$CONVEYOR_PLAN" | jq -r '.todos[0].id')
+id2=$(sed -n '2p' "$CONVEYOR_PLAN" | jq -r '.todos[0].id')
+chk "derived id is stable across revisions of the same text" "$id1" "$id2"
+chk "derived id is non-empty" "$([[ -n "$id1" ]] && echo yes)" "yes"
+
+# 4. duplicate texts in one revision are disambiguated in document order.
+export CONVEYOR_PLAN="$tmp/plan4.jsonl"
+: >"$CONVEYOR_PLAN"
+plan_publish '[{"text":"same","status":"pending"},{"text":"same","status":"pending"}]'
+dupids=$(jq -c '[.todos[].id]' "$CONVEYOR_PLAN")
+first=$(jq -r '.todos[0].id' "$CONVEYOR_PLAN")
+second=$(jq -r '.todos[1].id' "$CONVEYOR_PLAN")
+chk "duplicate texts get distinct ids" "$([[ "$first" != "$second" ]] && echo yes)" "yes"
+chk "the second gets a -2 suffix"      "$second" "${first}-2"
+
+# 5. plan_publish refuses an invalid array without failing the run.
+export CONVEYOR_PLAN="$tmp/plan5.jsonl"
+: >"$CONVEYOR_PLAN"
+out=$(plan_publish '[{"text":"","status":"pending"}]' 2>&1)
+rc=$?
+chk "invalid todos: exit code is 0"       "$rc" "0"
+chk "invalid todos: nothing was appended" "$(wc -l <"$CONVEYOR_PLAN" | tr -d ' ')" "0"
+chk "invalid todos: a reason went to stderr" "$([[ -n "$out" ]] && echo yes)" "yes"
+
+out=$(plan_publish 'not json' 2>&1)
+rc=$?
+chk "malformed json: exit code is 0"      "$rc" "0"
+chk "malformed json: nothing was appended" "$(wc -l <"$CONVEYOR_PLAN" | tr -d ' ')" "0"
+
+# 6. both helpers are silent no-ops with CONVEYOR_PLAN unset.
+unset CONVEYOR_PLAN
+out=$(plan_start "x" 2>&1)
+rc=$?
+chk "plan_start with no CONVEYOR_PLAN: exit 0" "$rc" "0"
+chk "plan_start with no CONVEYOR_PLAN: silent" "$out" ""
+out=$(plan_publish '[{"text":"x","status":"pending"}]' 2>&1)
+rc=$?
+chk "plan_publish with no CONVEYOR_PLAN: exit 0" "$rc" "0"
+chk "plan_publish with no CONVEYOR_PLAN: silent" "$out" ""
+
+exit $fail
