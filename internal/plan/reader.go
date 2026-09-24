@@ -124,19 +124,18 @@ func (r *Reader) Poll(path string) []Event {
 // the writer. It also appends the one suppressed-rejections summary event
 // when more lines were rejected than were individually diagnosed.
 func (r *Reader) Final(path string) []Event {
-	if r.stopped {
-		return nil
-	}
 	var events []Event
-	if !r.capped {
-		events = r.Poll(path)
+	if !r.stopped {
+		if !r.capped {
+			events = r.Poll(path)
+		}
+		if len(r.buf) > 0 && !r.skipping {
+			r.lineNum++
+			events = append(events, r.reject("truncated final line"))
+			r.buf = nil
+		}
+		r.skipping = false
 	}
-	if len(r.buf) > 0 && !r.skipping {
-		r.lineNum++
-		events = append(events, r.reject("truncated final line"))
-		r.buf = nil
-	}
-	r.skipping = false
 	if r.rejectedN > r.diagnosedN {
 		events = append(events, Event{
 			Summary: true,

@@ -294,6 +294,52 @@ func TestReaderDiagnosticsCappedAtTenWithSuppressedSummary(t *testing.T) {
 	}
 }
 
+func TestReaderFinalStillSummarisesAfterEarlierStop(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plan.jsonl")
+	os.WriteFile(path, nil, 0o600)
+	r := NewReader()
+
+	var lines []string
+	for i := 0; i < 15; i++ {
+		lines = append(lines, "not json")
+	}
+	writeLines(t, path, lines...)
+	r.Poll(path)
+	if r.diagnosedN != 10 || r.rejectedN != 15 {
+		t.Fatalf("expected 10 diagnosed of 15 rejected before stopping, got diagnosed=%d rejected=%d", r.diagnosedN, r.rejectedN)
+	}
+
+	// Stop tailing for an unrelated reason (here, removal) while a
+	// suppressed-rejection count is already outstanding — the same state a
+	// truncated or unreadable plan.jsonl leaves mid-run.
+	os.Remove(path)
+	stopEvents := r.Poll(path)
+	stopped := false
+	for _, e := range stopEvents {
+		if e.Stopped {
+			stopped = true
+		}
+	}
+	if !stopped || !r.stopped {
+		t.Fatalf("expected the reader to have stopped before Final is called")
+	}
+
+	final := r.Final(path)
+	found := false
+	for _, e := range final {
+		if e.Summary {
+			found = true
+			if !strings.Contains(e.Reason, "5") {
+				t.Fatalf("expected summary to mention 5 suppressed, got %q", e.Reason)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected Final to still emit the suppressed-rejections summary after an earlier stop, got %+v", final)
+	}
+}
+
 func TestReaderPendingFragmentDiscardedWhenGrowingAcrossPolls(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "plan.jsonl")
