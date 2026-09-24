@@ -34,6 +34,16 @@ case "$out" in
   *) echo "FAIL answer without a session: got [$out]"; fail=1;;
 esac
 
+# 3b. A session from another backend is opaque to Claude and falls back to the
+# answered cold prompt rather than being handed to `claude --resume`.
+RESUME_SESSION=""
+out=$(resume_prompt '{"answer":"continue","session":"opencode:ses-abc"}' "do the work")
+case "$out" in
+  "The question you stopped on has been answered: continue"*"do the work") echo "ok   a foreign session falls back to the answered prompt";;
+  *) echo "FAIL foreign session fallback: got [$out]"; fail=1;;
+esac
+chk "a foreign session is not passed to Claude" "${RESUME_SESSION:-}" ""
+
 # 4. the session id is read out of the raw stream, first one wins.
 printf '%s\n' '{"type":"system","session_id":"sess-xyz"}' '{"type":"assistant"}' '{"type":"result","session_id":"sess-xyz"}' > "$CLAUDE_RAW"
 chk "the session id is read from the stream" "$(claude_session)" "sess-xyz"

@@ -283,6 +283,38 @@ tokens or money is the interesting number — all of that differs per agent and
 belongs to the script, which is why the engine holds no struct for it. An agent
 with no `status` script simply says nothing, which is not an error.
 
+The shipped OpenCode adapter is still only a script implementation of this
+contract. A source selects it with `agent: opencode` and passes `MODEL`
+(`provider/model`), optional `VARIANT`, and optional primary `AGENT` in that
+script entry's `params:`. Those names never enter the engine's schema: they are
+environment for one script, exactly like a Claude model or a deployment host.
+Refine, implement, review and approve share the same deterministic worktree,
+dependency, pull-request and postcondition policy as the Claude adapters; only
+the model runner beneath that policy changes.
+
+OpenCode `1.18.32` is the one supported event contract. The adapter disables
+auto-update, validates the exact version, selected model and primary agent
+before a model call, and consumes `run --format json` NDJSON. It renders text
+and tool names as logs but never tool output or reasoning, requires one stable
+session id and a finishing event, and fails closed on malformed known events;
+unknown well-formed event types are named in the log and ignored for forward
+compatibility. A tool part may report multiple statuses, each rendered once,
+so a nonterminal state cannot abort an otherwise valid stream. The
+session id is merged into `$CONVEYOR_RESULT` with an `opencode:` prefix on a
+stop, so an answer resumes with `--session`; it never uses the process-global
+"latest session". Another backend treats that prefix as foreign and falls back
+to the answered cold prompt. Conveyor's existing process-group TERM/KILL
+timeout owns cancellation and child cleanup.
+
+OpenCode publishes provider connectivity but no authoritative remaining-quota
+endpoint. Its status probe therefore makes no model call and labels that quota
+detail as unavailable unless a stage has observed an explicit structured quota
+refusal. Such a refusal is cached briefly for the shared agent pause, cleared by
+a successful run against that provider, and never inferred from a generic HTTP
+429. The transient loopback readiness server is started in pure mode with a new
+random basic-auth credential on every probe and is terminated before the status
+script returns; loopback is not treated as an authentication boundary.
+
 **`preflight`** (optional, `providers/<name>/preflight`) — a readiness check
 for one source, run only by `conveyor preflight`, and by `conveyor enroll`
 and `conveyor run`'s post-run checklist when they need the same answer. Never
