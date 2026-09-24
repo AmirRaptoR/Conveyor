@@ -27,10 +27,26 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	deps := pipeline.NewDeps(s.cfg, s.state.Items)
 	st.Items = pipeline.Order(s.cfg, s.state.Items, s.state.Order, deps)
 	st.Held = heldOf(s.cfg, s.state.Items, deps)
+	st.Tracking = map[string]pipeline.TrackingResult{}
+	var trackingWarnings []string
+	for i := range s.state.Items {
+		if !s.state.Items[i].Tracking {
+			continue
+		}
+		result := deps.Track(&s.state.Items[i])
+		st.Tracking[s.state.Items[i].ID] = result
+		if result.State == pipeline.TrackingInvalid {
+			trackingWarnings = append(trackingWarnings, result.Reason)
+		}
+	}
+	if len(st.Tracking) == 0 {
+		st.Tracking = nil
+	}
 	relationWarnings := pipeline.RelationshipWarnings(s.state.Items)
-	if len(deps.Errors) > 0 || len(relationWarnings) > 0 {
+	if len(deps.Errors) > 0 || len(relationWarnings) > 0 || len(trackingWarnings) > 0 {
 		st.Warnings = append(append([]string(nil), s.state.Warnings...), deps.Errors...)
 		st.Warnings = append(st.Warnings, relationWarnings...)
+		st.Warnings = append(st.Warnings, trackingWarnings...)
 	}
 	bySrc, byStage, held, max, perSrc, perStage := s.eng.Locks().Snapshot()
 	st.Slots = SlotsView{BySource: bySrc, ByStage: byStage, Global: held, GlobalMax: max,
@@ -851,6 +867,17 @@ func (s *Server) unblockKind(ctx context.Context, item model.Item, expectedKind 
 func (s *Server) whyStuck(it model.Item, deps pipeline.Deps) string {
 	if it.Blocked {
 		return it.ID + " is waiting for a person — clear its mark and the pipeline takes it back"
+	}
+	if it.Tracking {
+		tracked := deps.Track(&it)
+		switch tracked.State {
+		case pipeline.TrackingInvalid:
+			return tracked.Reason
+		case pipeline.TrackingPartial:
+			return it.ID + " is a tracking item waiting for its required children to finish"
+		case pipeline.TrackingSettled:
+			return it.ID + " is a completed tracking item"
+		}
 	}
 	st, ok := s.cfg.Stage(it.Stage)
 	switch {

@@ -209,6 +209,7 @@
 .item .family {
   color:var(--dim); border-left:1px solid var(--rule-soft); padding-left:8px;
 }
+.item .family.invalid { color:var(--stop); border-left-color:var(--stop); font-weight:600; }
 
 /* Terminal stations sit after a gap, joined by a short spur. A terminal
    column takes a pipeline station's own basis and gutter, so its card is

@@ -108,6 +108,37 @@ func TestDoctorSweepWithNoMarkedItemsRunsNothing(t *testing.T) {
 	}
 }
 
+func TestDoctorSweepNeverRunsForATrackingItem(t *testing.T) {
+	dir := t.TempDir()
+	ran := filepath.Join(dir, "doctor-ran")
+	cfg, r, _ := doctorBoard(t, "#!/bin/sh\ntouch \""+ran+"\"\nexit 10\n")
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{{
+		ID: "s1:1", Ref: "1", Source: "s1", Stage: "working", Tracking: true, Blocked: true,
+	}}
+	s.blocks["s1:1"] = Block{Kind: trackingKind, Reason: "invalid child graph", Stage: "working"}
+
+	if w := doctorPost(t, s, `{"apply":true}`); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", w.Code)
+	}
+	sw := waitSweepDone(t, s)
+	if len(sw.Results) != 0 {
+		t.Fatalf("tracking item entered doctor sweep: %+v", sw.Results)
+	}
+	if _, err := os.Stat(ran); !os.IsNotExist(err) {
+		t.Fatalf("tracking item ran doctor script: %v", err)
+	}
+
+	row := s.doctorOne(t.Context(), true, "s1:1")
+	if row.Status != "skipped" || !strings.Contains(row.Why, "tracking lifecycle") {
+		t.Fatalf("doctorOne tracking defense = %+v", row)
+	}
+	if _, err := os.Stat(ran); !os.IsNotExist(err) {
+		t.Fatalf("doctorOne tracking defense ran script: %v", err)
+	}
+}
+
 func TestDoctorSweepReturns202BeforeFinishing(t *testing.T) {
 	dir := t.TempDir()
 	release := filepath.Join(dir, "release")

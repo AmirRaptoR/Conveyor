@@ -160,6 +160,22 @@ test("renderPanelRelationships: invalid dependency reason is verbatim and separa
   assert.doesNotMatch(html, /the blocked mark reason/);
 });
 
+test("renderPanelRelationships: invalid tracking lifecycle is visible and a marked terminal child is unfinished", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [
+      { id: "s1:1", source: "s1", stage: "backlog", title: "Tracker", tracking: true, children: ["s1:2"] },
+      { id: "s1:2", source: "s1", stage: "done", title: "Reopened child", blocked: true },
+    ],
+    tracking: { "s1:1": { state: "invalid", reason: "child status is contradictory" } },
+  }));
+  p.mod.renderPanelRelationships("s1:1");
+  const html = p.el("#relationships").innerHTML;
+  assert.match(html, /role="alert"[\s\S]*child status is contradictory/);
+  assert.match(html, /Reopened child[\s\S]*done/);
+  assert.doesNotMatch(html, /Reopened child[\s\S]*complete/);
+});
+
 test("draw: an open panel refreshes relationships from full state despite source filtering", async () => {
   const p = await page();
   const initial = baseState({

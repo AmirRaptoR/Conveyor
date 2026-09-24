@@ -455,3 +455,17 @@ test("draw: an off-board parent remains neutral rather than a dependency error",
   assert.match(rendered, /class="family"[^>]*>parent 99</);
   assert.doesNotMatch(rendered, /dependency-error|dependency-invalid|class="missing"/);
 });
+
+test("draw: a marked terminal child is not counted complete and invalid tracking is visible", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [
+      { id: "s1:1", source: "s1", stage: "backlog", title: "tracker", tracking: true, children: ["s1:2"] },
+      { id: "s1:2", source: "s1", stage: "done", title: "reopened child", blocked: true },
+    ],
+    tracking: { "s1:1": { state: "invalid", reason: "child s1:2 is marked" } },
+  }));
+  const rendered = p.el("#rail").innerHTML;
+  assert.match(rendered, /tracking error · children 0\/1/);
+  assert.match(rendered, /title="child s1:2 is marked"/);
+});

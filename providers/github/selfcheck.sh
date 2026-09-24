@@ -57,6 +57,9 @@ data='[
  {"state":"OPEN","number":19,"title":"Handed to the pipeline","body":"",
   "labels":[{"name":"conveyor"},{"name":"enhancement"}],
   "url":"https://example.test/19","assignees":[]},
+ {"state":"OPEN","number":23,"title":"Tracks required children","body":"",
+  "labels":[{"name":"conveyor:tracking"}],
+  "url":"https://example.test/23","assignees":[]},
  {"number":15,"title":"Shipped and closed","body":"","state":"CLOSED",
   "labels":[{"name":"status:ready"}],
   "url":"https://example.test/15","assignees":[],"closedAt":"2026-08-30T12:00:00Z"},
@@ -68,7 +71,10 @@ data='[
   "url":"https://example.test/21","assignees":[]},
  {"number":27,"title":"Closed mid-flight","body":"","state":"CLOSED",
   "labels":[{"name":"status:in-progress"}],
-  "url":"https://example.test/27","assignees":[],"closedAt":"2026-08-29T00:00:00Z"}
+  "url":"https://example.test/27","assignees":[],"closedAt":"2026-08-29T00:00:00Z"},
+ {"number":29,"title":"Closed tracker","body":"","state":"CLOSED","stateReason":"COMPLETED",
+  "labels":[{"name":"conveyor:tracking"}],
+  "url":"https://example.test/29","assignees":[],"closedAt":"2026-08-31T00:00:00Z"}
 ]'
 case "$*" in
 	*"--state open"*)   jq '[.[] | select(.state == "OPEN")]' <<<"$data" ;;
@@ -79,10 +85,9 @@ STUB
 chmod +x "$tmp/stub/gh"
 
 echo "list.sh"
-# "ready" is this fixture's one terminal stage — ref 15 (closed, mapped
-# "ready") is the "finished" case; ref 27 (closed, mapped "in-progress", which
-# is not terminal) is the "stopped mid-flight" case below.
-echo '{"terminalStages":["ready"]}' |
+# "ready" is this fixture's one terminal stage. Closed completed status sends
+# both mapped and explicitly tracking issues there, whatever label they wore.
+echo '{"stages":["backlog","refining","in-progress","ready"],"terminalStages":["ready"]}' |
 	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/out.json" \
 		./list.sh 2>/dev/null
 
@@ -97,6 +102,10 @@ check "an untagged issue is not listed at all" \
 # and nothing else, so the issue lands wherever new work lands.
 check "the bare tag onboards into DEFAULT_STAGE" \
 	"backlog" "$(jq -r '.[] | select(.ref == "19") | .stage' "$tmp/out.json")"
+check "the tracking label explicitly opts an issue into tracking" \
+	"true" "$(jq -r '.[] | select(.ref == "23") | .tracking' "$tmp/out.json")"
+check "a closed tracker is retained without a mapped stage label" \
+	"ready:true" "$(jq -r '.[] | select(.ref == "29") | "\(.stage):\(.tracking)"' "$tmp/out.json")"
 check "priority:p0 becomes 0" \
 	"0" "$(jq -r '.[0].priority' "$tmp/out.json")"
 # null, not 0 — the model keeps "unranked" and "most urgent" distinct.
@@ -188,6 +197,39 @@ PATH="$tmp/relationships:$PATH" REPO=owner/repo \
 	./list.sh <<<'{"stages":["backlog","done"],"terminalStages":["done"]}' >/dev/null 2>&1
 check "a permanent sub-issue endpoint failure is a warning, not a failed listing" \
 	"yes" "$(jq -r '[.warnings[] | select(.itemId == "fixture:208" and (.reason | contains("complete native child set")))] | if length == 1 then "yes" else "no" end' "$tmp/relationships-unavailable.json")"
+
+# A tracker's required children remain lifecycle inputs after they age out of
+# CLOSED_LIMIT. Pagination must finish before those absent child records are
+# resolved, or children discovered on later pages would stay falsely missing.
+echo "tracking children outside closed history"
+mkdir -p "$tmp/tracking-history"
+cat >"$tmp/tracking-history/gh" <<'STUB'
+#!/usr/bin/env bash
+parent='[{"number":301,"title":"Tracker","body":"","state":"OPEN","labels":[{"name":"conveyor:tracking"}],"url":"https://github.com/owner/repo/issues/301","assignees":[],"parent":null,"subIssues":{"totalCount":2,"nodes":[{"url":"https://github.com/owner/repo/issues/302"}]}}]'
+case "$*" in
+	*"api --paginate --slurp repos/owner/repo/issues/301/sub_issues"*)
+		echo '[[{"number":302,"html_url":"https://github.com/owner/repo/issues/302"},{"number":303,"html_url":"https://github.com/owner/repo/issues/303"}]]' ;;
+	*"issue view 302 "*) ref=302; echo '{"number":302,"title":"Old child","body":"","state":"CLOSED","stateReason":"COMPLETED","closedAt":"2025-01-01T00:00:00Z","labels":[],"url":"https://github.com/owner/repo/issues/302","assignees":[],"parent":{"url":"https://github.com/owner/repo/issues/301"},"subIssues":{"totalCount":0,"nodes":[]}}' ;;
+	*"issue view 303 "*) ref=303; echo '{"number":303,"title":"Later-page child","body":"","state":"CLOSED","stateReason":"COMPLETED","closedAt":"2025-01-02T00:00:00Z","labels":[],"url":"https://github.com/owner/repo/issues/303","assignees":[],"parent":{"url":"https://github.com/owner/repo/issues/301"},"subIssues":{"totalCount":0,"nodes":[]}}' ;;
+	*"--state open"*) echo "$parent" ;;
+	*"--state closed"*) echo '[]' ;;
+	*) echo "stub gh: unhandled: $*" >&2; exit 97 ;;
+esac
+STUB
+chmod +x "$tmp/tracking-history/gh"
+PATH="$tmp/tracking-history:$PATH" REPO=owner/repo CONVEYOR_SOURCE=fixture \
+	CONVEYOR_RESULT="$tmp/tracking-history.json" ./list.sh \
+	<<<'{"stages":["backlog","ready"],"terminalStages":["ready"]}' >/dev/null 2>&1
+check "closed tracker children beyond history are resolved after pagination" \
+	"fixture:302,fixture:303" "$(jq -r '[.[] | select(.parent == "fixture:301") | .id] | sort | join(",")' "$tmp/tracking-history.json")"
+check "resolved tracking children retain reciprocal parentage" \
+	"2" "$(jq '[.[] | select(.parent == "fixture:301" and .stage == "ready")] | length' "$tmp/tracking-history.json")"
+
+PATH="$tmp/tracking-history:$PATH" REPO=owner/repo CONVEYOR_SOURCE=fixture SUBISSUE_LOOKUP_LIMIT=0 \
+	CONVEYOR_RESULT="$tmp/tracking-incomplete.json" ./list.sh \
+	<<<'{"stages":["backlog","ready"],"terminalStages":["ready"]}' >/dev/null 2>&1
+check "a capped explicit tracker carries a fail-closed lifecycle error" \
+	"yes" "$(jq -r '[.items[] | select(.ref == "301" and (.trackingError | contains("lookup limit")))] | if length == 1 then "yes" else "no" end' "$tmp/tracking-incomplete.json")"
 
 # The body is the only place a sequence is written down, and the provider is
 # the only thing that reads it: the engine never learns what "#31" means.
@@ -281,7 +323,7 @@ check "the old ignore label no longer keeps an issue off the board" \
 
 # The variable is gone, not merely defaulted: a config still setting it must not
 # quietly change what is listed.
-echo '{"terminalStages":["ready"]}' |
+echo '{"stages":["backlog","refining","in-progress","ready"],"terminalStages":["ready"]}' |
 	PATH="$tmp/stub:$PATH" CONVEYOR_SOURCE=midgame CONVEYOR_RESULT="$tmp/named.json" \
 		IGNORE_LABELS="status:ready, hold" ./list.sh 2>/dev/null
 check "IGNORE_LABELS is read by nothing" \
@@ -409,18 +451,14 @@ check "a closed issue's item carries finishedAt from closedAt" \
 	"2026-08-30T12:00:00Z" "$(jq -r '.[] | select(.ref == "15") | .finishedAt' "$tmp/out.json")"
 check "an open issue's item carries an empty finishedAt" \
 	"" "$(jq -r '.[] | select(.ref == "7") | .finishedAt' "$tmp/out.json")"
-# --- F09: closed-issue routing depends on whether the mapped stage is terminal
-# "ready" is terminal here, so ref 15 above is unmarked and simply finished.
+# Closed completed status wins over stale stage labels. "ready" is terminal
+# here, so both completed issues are unmarked and listed at the end of the line.
 check "closed + terminal stage is unmarked"    \
 	"false" "$(jq -r '.[] | select(.ref == "15") | .blocked' "$tmp/out.json")"
-# "in-progress" is not, so ref 27 stopped mid-flight: same stage, marked, with
-# a reason a person can read without opening the logs — not silently finished.
-check "closed + non-terminal stage keeps its stage" \
-	"in-progress" "$(jq -r '.[] | select(.ref == "27") | .stage' "$tmp/out.json")"
-check "     and is marked"                     \
-	"true" "$(jq -r '.[] | select(.ref == "27") | .blocked' "$tmp/out.json")"
-check "     with a human-readable reason"      \
-	"true" "$([[ -n "$(jq -r '.[] | select(.ref == "27") | .blockReason' "$tmp/out.json")" ]] && echo true)"
+check "closed completed overrides a non-terminal stage label" \
+	"ready" "$(jq -r '.[] | select(.ref == "27") | .stage' "$tmp/out.json")"
+check "     and is unmarked"                     \
+	"false" "$(jq -r '.[] | select(.ref == "27") | .blocked' "$tmp/out.json")"
 check "a closed issue it never labelled is left in history" \
 	"" "$(jq -r '.[] | select(.ref == "17") | .ref' "$tmp/out.json")"
 # The onboarding tag opens the door; it does not reopen a closed issue. A stage
@@ -514,8 +552,8 @@ echo "move.sh (dry run)"
 issue_view_stub() {
 	cat >"$tmp/stub/gh" <<'STUB'
 #!/usr/bin/env bash
-jq -n --arg l "${LABELS:-}" --arg b "${BODY:-}" \
-	'{labels: ($l | split("\n") | map(select(. != "")) | map({name: .})), body: $b}'
+jq -n --arg l "${LABELS:-}" --arg b "${BODY:-}" --arg s "${STATE:-OPEN}" \
+	'{labels: ($l | split("\n") | map(select(. != "")) | map({name: .})), body: $b, state: $s}'
 STUB
 	chmod +x "$tmp/stub/gh"
 }
@@ -533,6 +571,10 @@ export LABELS="status:ready"
 check "already-correct label writes nothing" \
 	"" \
 	"$(echo '{"item":{"ref":"7"},"stage":"ready"}' | dry)"
+export LABELS=$'conveyor:tracking\nstatus:refining'
+check "the semantic tracking label survives namespace cleanup" \
+	"gh issue edit 7 --repo owner/repo --remove-label status:refining --add-label status:ready" \
+	"$(echo '{"item":{"ref":"7","tracking":true},"stage":"ready"}' | dry)"
 export LABELS="status:ready"
 check "unmapped stage still clears a stale label" \
 	"gh issue edit 7 --repo owner/repo --remove-label status:ready" \
@@ -573,6 +615,58 @@ export LABELS=$'status:in-progress\nblocked'
 check "entering a stage clears the mark" \
 	"gh issue edit 9 --repo owner/repo --remove-label blocked" \
 	"$(echo '{"item":{"ref":"9"},"stage":"in-progress","blocked":false}' | dry)"
+
+# A tracking completion has no pull request to close its issue. The engine's
+# provider-neutral terminal hint plus the explicit item flag is the complete
+# authority; current state makes retries idempotent.
+echo "move.sh (tracking completion)"
+cat >"$tmp/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+	*"issue view"*)
+		jq -n --arg s "${STATE:-OPEN}" --arg l "${TRACKING_LABELS:-conveyor:tracking
+status:ready}" \
+			'{labels:($l | split("\n") | map({name:.})),body:"",state:$s}' ;;
+	*"issue close"*)
+		[[ -z "${FAIL_CLOSE:-}" ]] || exit 1
+		echo close >>"$CALLS" ;;
+	*"issue edit"*) echo edit >>"$CALLS" ;;
+esac
+STUB
+chmod +x "$tmp/stub/gh"
+export CALLS="$tmp/tracking-calls"
+: >"$CALLS"
+echo '{"item":{"ref":"23","tracking":true},"stage":"ready","terminal":true,"trackingComplete":true}' |
+	PATH="$tmp/stub:$PATH" ./move.sh >/dev/null 2>&1
+check "a completed tracker closes its open issue" "close" "$(cat "$CALLS")"
+: >"$CALLS"
+echo '{"item":{"ref":"23","tracking":true},"stage":"ready","terminal":true,"trackingComplete":true}' |
+	TRACKING_LABELS=$'conveyor:tracking\nstatus:refining' PATH="$tmp/stub:$PATH" ./move.sh >/dev/null 2>&1
+check "tracker close happens before terminal label reconciliation" $'close\nedit' "$(cat "$CALLS")"
+: >"$CALLS"
+echo '{"item":{"ref":"23","tracking":true},"stage":"ready","terminal":true,"trackingComplete":true}' |
+	STATE=CLOSED PATH="$tmp/stub:$PATH" ./move.sh >/dev/null 2>&1
+check "an already closed tracker is an idempotent no-op" "" "$(cat "$CALLS")"
+: >"$CALLS"
+echo '{"item":{"ref":"23"},"stage":"ready","terminal":true}' |
+	PATH="$tmp/stub:$PATH" ./move.sh >/dev/null 2>&1
+check "terminal metadata alone never closes ordinary work" "" "$(cat "$CALLS")"
+: >"$CALLS"
+echo '{"item":{"ref":"23","tracking":true},"stage":"ready","terminal":true}' |
+	PATH="$tmp/stub:$PATH" ./move.sh >/dev/null 2>&1
+check "an explicit tracker still needs lifecycle completion proof" "" "$(cat "$CALLS")"
+: >"$CALLS"
+echo '{"item":{"ref":"23","tracking":true},"stage":"ready","terminal":true,"trackingComplete":true,"blocked":true}' |
+	PATH="$tmp/stub:$PATH" ./move.sh >/dev/null 2>&1
+check "an invalid terminal tracker is marked, not closed" "edit" "$(cat "$CALLS")"
+: >"$CALLS"
+rc=0
+echo '{"item":{"ref":"23","tracking":true},"stage":"ready","terminal":true,"trackingComplete":true}' |
+	FAIL_CLOSE=1 PATH="$tmp/stub:$PATH" ./move.sh >/dev/null 2>&1 || rc=$?
+check "a failed tracker close fails the provider move" "yes" "$([[ $rc -ne 0 ]] && echo yes || echo no)"
+check "a failed tracker close leaves stage labels untouched for retry" "" "$(cat "$CALLS")"
+
+issue_view_stub
 # --- move.sh: the reason is a field on the item -----------------------------
 #
 # It used to be a comment, which is append-only: an hourly stall retry clearing

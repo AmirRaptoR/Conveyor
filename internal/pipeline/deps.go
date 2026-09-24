@@ -64,6 +64,9 @@ type Deps struct {
 	// Cycles names every dependency cycle found and dropped, one line each,
 	// retained separately for callers/tests that specifically count cycles.
 	Cycles []string
+	// tracking is the explicit non-work lifecycle derived from the same full
+	// listing as dependency holds. Children alone never populate it.
+	tracking map[string]TrackingResult
 }
 
 // NewDeps reads the listing into a graph. Invalid declarations fail closed:
@@ -80,6 +83,7 @@ func NewDeps(cfg *config.Config, items []model.Item) Deps {
 		until:    make(map[string]string),
 		invalid:  make(map[string]Hold),
 		errorSet: make(map[string]bool),
+		tracking: evaluateTracking(cfg, items),
 	}
 	if cfg != nil {
 		// A threshold remains true after the item passes the stage that

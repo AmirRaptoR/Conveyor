@@ -40,8 +40,13 @@ arrive in this shape.
                                 // the item is actually in (§6).
   "blockKind": null,            // optional. The same stop in one word.
   "priority": 2,                // 0 = most urgent. null = unranked.
+  "tracking": false,            // explicit non-work item whose state is
+                                 // derived from all declared children. Never
+                                 // inferred merely because children exist.
+  "trackingError": null,        // optional source account that the required
+                                 // child set could not be read completely.
   "parent": "midgame:30",      // optional tracking parent, by globally
-                                // qualified item id. Informational only.
+                                 // qualified item id.
   "children": ["midgame:48"],  // optional tracking children, likewise.
                                 // Sorted and unique when the provider can
                                 // supply a deterministic order.
@@ -80,11 +85,46 @@ Rules the engine enforces:
   that asked for a human stops being re-run: nothing carries the item out of the
   line, so nothing has to decide where to put it back.
 - `parent`, `children` and `dependsOn` are three distinct facts. Parentage is
-  tracking structure and never creates a scheduler edge. Providers emit
-  globally-qualified IDs; missing, cross-source, non-reciprocal, self and
+  tracking structure and never creates a dependency scheduler edge. Providers
+  emit globally-qualified IDs; missing, cross-source, non-reciprocal, self and
   cyclic parent/child declarations are warned when they can be proved from
-  current authoritative data. A valid parent is allowed to be absent from the
-  work-item listing (tracking parents are intentionally not executable work).
+  current authoritative data. A parent named by ordinary hierarchy may be
+  absent from the work-item listing; an explicit tracker is listed and all of
+  its own children are required.
+- `tracking` is explicit. Children on an ordinary work item remain descriptive
+  hierarchy and do not change how that item runs; the engine never infers
+  tracking from a non-empty `children` array.
+
+An explicit tracking item is non-work: no stage or model script may run for it.
+Its lifecycle is evaluated deterministically from the full current listing,
+with every declared child required:
+
+- No children is invalid and says to add one or remove `tracking`.
+- A missing, duplicate, unqualified, self or cross-source child; a child that
+  does not name the tracker back as its `parent`; a parent cycle; a child in an
+  undeclared stage; a marked terminal child; or a source-reported incomplete
+  child set is invalid. The first error by sorted child ID is the stable,
+  actionable reason.
+- A tracker already in a terminal stage while any valid child is unfinished is
+  contradictory and invalid.
+- With some valid children non-terminal, the tracker is partial and does not
+  transition.
+- With every valid child terminal, a non-terminal tracker targets the first
+  terminal stage in configured stage order. A tracker already there is settled
+  and has no target.
+
+Invalid non-terminal tracking state is a provider mark of kind `tracking`,
+written directly by automatic server reconciliation after a successful fresh
+listing rather than by a retrying stage. A contradictory tracker already
+terminal remains diagnosed in `/api/state` but is not repeatedly marked against
+its provider-native finished status. Repair clears a lifecycle-owned mark;
+removing the explicit tracking opt-in clears it too. Existing explicit trackers
+marked `no-output` are cleared by the same reconciliation so they can migrate
+without inventing a pull request. Questions and unrelated marks are left alone;
+stale source state and observe/manual modes never perform this reconciliation,
+while their read-only state still carries the computed lifecycle and reason.
+Tracking items are also excluded from doctor sweeps: their child graph is the
+diagnosis, and no stage or doctor script may turn non-work into agent work.
 
 For GitHub, native sub-issue data is authoritative. A child body may carry the
 strict fallback marker `Parent: #123` as its complete first metadata line;
@@ -186,15 +226,26 @@ What it does not emit does not exist: an item the lister filters out is not on
 the board, not in a count, and nothing will ever be run against it. That is the
 whole of deciding what the pipeline works on, and it belongs to the script: the
 GitHub provider lists only the issues wearing one of its labels — a stage, the
-mark, or the bare onboarding tag — and the engine never learns that the others
-were there to skip.
+mark, the bare onboarding tag, or the explicit tracking label — and the engine
+never learns that the others were there to skip.
 
 **`move`** — write a stage change *and the blocked mark* back to the provider
 (set a label, move a card, update a field). Called by the **engine**, never by a
 stage script: the engine owns provider state so a crashed stage script cannot
 leave it inconsistent. Receives
-`{"item":…, "stage": "<target>", "from": "<current>", "blocked": <bool>,
+`{"item":…, "stage": "<target>", "from": "<current>",
+"terminal": <bool>, "trackingComplete": <bool>, "blocked": <bool>,
 "blockedReason": "…", "blockedKind": "…"}`.
+
+`terminal` is provider-neutral metadata: true exactly when the target stage is
+terminal in this configuration. `trackingComplete` is narrower: true only on
+the provider-only transition authorized by the full-list tracking evaluator.
+Clearing a mark while already in a terminal stage therefore cannot accidentally
+finish a tracker. The GitHub provider combines both flags with an explicit,
+unmarked tracking item to close its issue before changing its stage labels.
+That order is the retry guarantee: a close failure leaves the old stage intact,
+while a close that succeeds before a later label failure is still truthfully
+terminal by native status. An already-closed issue is a no-op.
 
 How a provider records the reason and the kind is its own business, but it must
 be somewhere the *item itself* carries, not somewhere only this process knows:
@@ -393,6 +444,12 @@ Step 2 before step 3 is deliberate: it is the same guarantee as marking an issue
 `in-progress` before implementing it. If the process dies mid-stage, the provider
 already reflects reality and the item is not handed out twice.
 
+Tracking items are the narrow non-work path through this order. `Target` can
+name only the first configured terminal stage and only after every required
+child is terminal; `Advance` performs step 2 and returns without step 3. Any
+attempt to advance a tracker into an ordinary stage is refused before a
+provider write.
+
 ## 4a. Which item is next
 
 The scheduler works the line **from its far end backwards**. Rungs, most
@@ -432,9 +489,12 @@ If either the item source or any source reached through its dependency graph
 has a failed latest listing, the cached graph remains visible but authorizes
 no dispatch and no legacy-mark migration. Work resumes after those sources
 list successfully. The GitHub provider directly resolves at most
-`DEPENDENCY_LOOKUP_LIMIT` completed references outside its normal history
-window per poll (50 by default); excess references remain missing and visibly
-fail closed rather than causing unbounded API traffic.
+`DEPENDENCY_LOOKUP_LIMIT` completed dependency or required tracking-child
+references outside its normal history window per poll (50 by default); excess
+references remain missing and visibly fail closed rather than causing unbounded
+API traffic. Native sub-issue pagination happens first, so later pages are part
+of the same bounded resolution pass; a capped, unavailable, or unrepresentable
+child set carries `trackingError` and cannot authorize completion.
 
 A stage may raise that bar for itself with `dependenciesAt: <stage>`: an item
 enters it only once every dependency has reached the named stage or gone past
@@ -777,9 +837,10 @@ can compute a hold for, so that item is still cleared here — `agents/_deps`
 remains the backstop that re-marks it at `implement` time, before the worktree
 and before any model run.
 
-**Only a person clears a mark**, with three exceptions. The first two are the
-outside world coming back rather than a decision being made; the third is the
-only one that reads the reason first.
+**Only a person clears a mark**, with four narrow exceptions. The first two are
+the outside world coming back rather than a decision being made; the third is
+the only one that reads the reason first; the fourth owns a lifecycle mark the
+engine itself derived rather than a script's decision.
 
 When *every* item is marked and the line cannot move at all, `retryStalled:`
 clears them on an interval and lets it try again. The guard is "everything" on
@@ -805,6 +866,14 @@ run history, before deciding. The one invariant that does not move for it
 either: a `decision` mark is never something a doctor may clear — the adapter
 holds that rule, checked by a selfcheck rather than by trust, because the
 engine itself still never reads the word beside the flag.
+
+The fourth is tracking lifecycle reconciliation described in §1. Only marks of
+kind `tracking`, plus legacy `no-output` marks on an explicitly tracking item,
+are cleared when the full fresh listing says the tracker is repaired. A
+question and every unrelated kind remain untouched. This runs only in automatic
+mode and never acts on a source whose latest listing failed, so cached evidence
+cannot mutate provider state. Clearing a complete tracker's legacy mark wakes
+the scheduler for its direct provider-only move to the terminal stage.
 
 ## 5a. Answering a stop
 

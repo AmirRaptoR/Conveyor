@@ -78,7 +78,10 @@ func (s *Server) handleDoctorStart(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	var marked []string
 	for _, it := range pipeline.Order(s.cfg, s.state.Items, s.state.Order, pipeline.NewDeps(s.cfg, s.state.Items)) {
-		if it.Blocked {
+		// A tracker is non-work. Its mark is a deterministic statement about
+		// the freshly listed child graph; no doctor script can repair it, and a
+		// model-backed doctor would violate the same boundary as scheduling it.
+		if it.Blocked && !it.Tracking {
 			marked = append(marked, it.ID)
 		}
 	}
@@ -179,6 +182,9 @@ func (s *Server) doctorOne(ctx context.Context, apply bool, itemID string) Sweep
 	switch {
 	case !found || !item.Blocked:
 		row.Why = "no longer marked"
+		return row
+	case item.Tracking:
+		row.Why = "tracking lifecycle is reconciled from child state, not diagnosed by a script"
 		return row
 	case block.Asked:
 		row.Why = "waiting on a person to answer, not a retry"

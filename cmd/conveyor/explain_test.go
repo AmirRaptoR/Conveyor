@@ -173,6 +173,27 @@ func TestExplicitRunStageStillAllowsAValidOperatorOverride(t *testing.T) {
 	}
 }
 
+func TestExplicitRunStageCannotBypassTrackingLifecycle(t *testing.T) {
+	cfg := explainCfg(t)
+	partial := model.Item{ID: "s1:10", Source: "s1", Stage: "backlog", Tracking: true, Children: []string{"s1:11"}}
+	unfinished := model.Item{ID: "s1:11", Source: "s1", Stage: "working", Parent: "s1:10"}
+	d := pipeline.NewDeps(cfg, []model.Item{partial, unfinished})
+	if _, err := selectRunStage(cfg, &partial, d, "done"); err == nil || !strings.Contains(err.Error(), "waiting") {
+		t.Fatalf("partial tracker explicit terminal stage error = %v", err)
+	}
+	if _, err := selectRunStage(cfg, &partial, d, "working"); err == nil {
+		t.Fatal("partial tracker was explicitly routed into a work stage")
+	}
+
+	complete := partial
+	finished := unfinished
+	finished.Stage = "done"
+	d = pipeline.NewDeps(cfg, []model.Item{complete, finished})
+	if stage, err := selectRunStage(cfg, &complete, d, "done"); err != nil || stage != "done" {
+		t.Fatalf("complete tracker terminal stage = %q, %v", stage, err)
+	}
+}
+
 func TestExplainRunPrintsThePlanAndRunsNothing(t *testing.T) {
 	cfg := explainCfg(t)
 	item := &model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog", Title: "do the thing"}

@@ -46,6 +46,10 @@ type State struct {
 	// cached: a dependency that moves on, marks, unmarks, or leaves the
 	// listing entirely is reflected in the very next /api/state.
 	Held map[string]pipeline.Hold `json:"held,omitempty"`
+	// Tracking is the lifecycle derived from each explicit tracker's current
+	// children. Unlike a provider mark it remains visible in manual and observe
+	// modes, where discovery must diagnose without writing anything.
+	Tracking map[string]pipeline.TrackingResult `json:"tracking,omitempty"`
 	// Times is how long each item has been in the stage it is in, keyed by
 	// item id — a sibling of Blocks, kept the same way: written the moment a
 	// transition lands an item somewhere new, recovered from run history for
