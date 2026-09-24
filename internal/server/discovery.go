@@ -87,6 +87,12 @@ func (s *Server) stalled(ctx context.Context, every time.Duration) {
 		for _, it := range s.state.Items {
 			switch {
 			case it.Blocked:
+				// A tracking mark is derived from this listing, not a transient
+				// script failure. Only a later fresh listing proving the topology
+				// repaired may clear it; retrying cannot discover anything new.
+				if it.Tracking && s.blocks[it.ID].Kind == trackingKind {
+					continue
+				}
 				// A question is not part of a stall. It is not waiting for the
 				// world to come back, it is waiting for a person, and clearing
 				// it on a timer spends a run to be asked the same thing again.
@@ -402,6 +408,7 @@ func (s *Server) refresh(ctx context.Context) {
 	// after the fresh listing and block recovery, leaving the graph itself to
 	// keep unsafe work stopped.
 	s.releaseDependencyMarks(ctx)
+	s.reconcileTracking(ctx)
 }
 
 // mergeSourceListing reconciles one source's listing (fresh may be nil, for a
@@ -593,7 +600,7 @@ func (s *Server) recallBlocks(items []model.Item) {
 			if _, known := s.blocks[it.ID]; !known {
 				wantBlocks[it.ID] = true
 			}
-			if it.BlockReason != "" {
+			if it.BlockReason != "" || it.BlockKind != "" {
 				listed[it.ID] = Block{Kind: it.BlockKind, Reason: it.BlockReason, Stage: it.Stage}
 			}
 		}
@@ -659,6 +666,19 @@ func (s *Server) recallBlocks(items []model.Item) {
 	})
 
 	s.mu.Lock()
+	// A provider may replace one mark with another without an observable
+	// unmarked poll between them. Refresh the cached ownership whenever the
+	// item's own durable reason/kind changed; run-only fields belong to the old
+	// stop and must not authorize clearing or rewriting the new one.
+	for id, l := range listed {
+		if cur, known := s.blocks[id]; known &&
+			(cur.Reason != l.Reason || (l.Kind != "" && cur.Kind != l.Kind)) {
+			if l.Kind == "" {
+				l.Kind = "by hand"
+			}
+			s.blocks[id] = l
+		}
+	}
 	for id, b := range foundBlocks {
 		if _, known := s.blocks[id]; known {
 			continue

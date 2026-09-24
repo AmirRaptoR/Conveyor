@@ -68,8 +68,8 @@ esac
 EOF
 }
 
-ALL_LABELS='[{"name":"status:refining"},{"name":"status:ready"},{"name":"conveyor:blocked"},{"name":"conveyor"}]'
-MISSING_ONE='[{"name":"status:refining"},{"name":"conveyor:blocked"},{"name":"conveyor"}]'
+ALL_LABELS='[{"name":"status:refining"},{"name":"status:ready"},{"name":"conveyor:blocked"},{"name":"conveyor:tracking"},{"name":"conveyor"}]'
+MISSING_ONE='[{"name":"status:refining"},{"name":"conveyor:blocked"},{"name":"conveyor:tracking"},{"name":"conveyor"}]'
 
 # --- everything present ------------------------------------------------
 repo "$tmp/repo" "https://github.com/owner/repo.git"
@@ -207,7 +207,7 @@ esac
 case "$*" in
 *"auth status"*) exit 0 ;;
 *"repo view "*) echo '{"viewerPermission":"WRITE","nameWithOwner":"owner/repo"}' ;;
-*"label list"*) echo '[{"name":"status:refining"},{"name":"status:ready"},{"name":"conveyor:blocked"},{"name":"conveyor"}]' ;;
+*"label list"*) echo '[{"name":"status:refining"},{"name":"status:ready"},{"name":"conveyor:blocked"},{"name":"conveyor:tracking"},{"name":"conveyor"}]' ;;
 *"label create"*) echo "preflight.sh tried to create a label: $*" >&2; exit 99 ;;
 *"label edit"*) echo "preflight.sh tried to edit a label: $*" >&2; exit 99 ;;
 *) exit 0 ;;

@@ -3,11 +3,11 @@
 # conveyor items.
 #
 # Listing is opt-in. An issue is conveyor's because it wears a label saying so —
-# the onboarding tag, a stage label, or the mark — and an issue nobody labelled
-# is left entirely alone: not on the board, not in a count, and no stage is ever
-# run against it. There is no opt-out label, because saying nothing is the
-# opt-out, and a repository can open an issue and work it by hand while the
-# pipeline runs beside it.
+# the onboarding tag, a stage label, the mark, or the explicit tracking label —
+# and an issue nobody labelled is left entirely alone: not on the board, not in
+# a count, and no stage is ever run against it. There is no opt-out label,
+# because saying nothing is the opt-out, and a repository can open an issue and
+# work it by hand while the pipeline runs beside it.
 #
 # Env (from the source's env: block):
 #   REPO           owner/name — required
@@ -23,6 +23,8 @@
 #                  (default: ${LABEL_PREFIX}blocked). It is a mark, not a stage:
 #                  an issue wearing it keeps whatever stage label it stopped on,
 #                  and the scheduler leaves it alone.
+#   TRACKING_LABEL explicit opt-in to the non-work child-tracking lifecycle
+#                  (default: ${LABEL_PREFIX}tracking).
 #   DEFAULT_STAGE  where an onboarded issue carrying no mapped label lands
 #                  (default: backlog)
 #   LIMIT          max open issues to fetch per enrolling label (default: 200)
@@ -34,9 +36,10 @@
 #                  (default: 1000) — larger than CLOSED_LIMIT on purpose, so
 #                  the sort has more than an arbitrary CLOSED_LIMIT-sized page
 #                  to choose the newest from.
-#   DEPENDENCY_LOOKUP_LIMIT  maximum completed references outside the ordinary
-#                  listing to resolve directly per poll (default: 50). Extra
-#                  references remain missing and therefore fail closed.
+#   DEPENDENCY_LOOKUP_LIMIT  maximum completed dependency or required tracking-
+#                  child references outside the ordinary listing to resolve
+#                  directly per poll (default: 50). Extra references remain
+#                  missing and therefore fail closed.
 #   RELATIONSHIP_LOOKUP_LIMIT maximum marker-only parents outside the ordinary
 #                  listing to confirm per poll (default: 50). Native GitHub
 #                  relationships need no confirmation call.
@@ -69,6 +72,7 @@ done_stage=$(jq -r 'first(.stages[]? | select(. as $s | ($ARGS.named.t | index($
 DEFAULT_STAGE="${DEFAULT_STAGE:-backlog}"
 LABEL_PREFIX="${LABEL_PREFIX:-conveyor:}"
 BLOCKED_LABEL="${BLOCKED_LABEL:-${LABEL_PREFIX}blocked}"
+TRACKING_LABEL="${TRACKING_LABEL:-${LABEL_PREFIX}tracking}"
 
 # The onboarding tag: the namespace word with its separator taken off, so
 # "conveyor:" gives "conveyor". Derived rather than configured, because it is
@@ -101,8 +105,8 @@ echo "listing issues in $REPO" >&2
 # would re-list it as new work on every poll.
 #
 # Open issues are fetched one enrolling label at a time — every mapped stage
-# label, the mark, and the onboarding tag — and unioned, rather than one
-# `--state open` call truncated at LIMIT before the enrolment filter runs:
+# label, the mark, the onboarding tag, and the tracking label — and unioned,
+# rather than one `--state open` call truncated at LIMIT before the enrolment filter runs:
 # a call scoped to a label is server-side filtered, so an enrolled issue
 # cannot be pushed out of the page by newer unrelated issues the way a single
 # unfiltered call could. Results are deduplicated by number, since an issue
@@ -113,7 +117,8 @@ echo "listing issues in $REPO" >&2
 # is the N most recently closed rather than an arbitrary N `gh` happened to
 # return first.
 mapfile -t enroll_labels < <(jq -r --arg onboard "$ONBOARD_LABEL" --arg blocked "$BLOCKED_LABEL" \
-	'(keys) + [$onboard, $blocked] | unique[]' <<<"$label_to_stage")
+	--arg tracking "$TRACKING_LABEL" \
+	'(keys) + [$onboard, $blocked, $tracking] | unique[]' <<<"$label_to_stage")
 
 # dedup_by_number — first occurrence wins, in the order the calls happened,
 # rather than unique_by's ascending sort: this feeds straight into the same
@@ -233,6 +238,7 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 		--arg done "$done_stage" \
 		--arg blocked "$BLOCKED_LABEL" \
 		--arg onboard "$ONBOARD_LABEL" \
+		--arg tracking "$TRACKING_LABEL" \
 		--argjson map "$label_to_stage" \
 		--argjson terminal "$terminal_stages" '
 		# The section move.sh writes into an issue body: why it stopped, in a
@@ -260,6 +266,7 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 			(.labels | map(.name)) as $names
 			| ([$names[] | $map[.] // empty] | .[0]) as $mapped
 			| (((.state // "OPEN") | ascii_downcase) == "closed") as $isClosed
+			| (($names | index($tracking)) != null) as $isTracking
 			| ((.stateReason // "") | ascii_downcase) as $why
 			| (.body // "") as $body
 			| ($body | strip_block) as $specBody
@@ -348,8 +355,9 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 			# it here, a person handed it over, or it stopped.
 			| select($mapped != null
 				or ($names | index($onboard)) != null
-				or ($names | index($blocked)) != null)
-			| select((($isClosed | not)) or $mapped != null)
+				or ($names | index($blocked)) != null
+				or $isTracking)
+			| select((($isClosed | not)) or $mapped != null or $isTracking)
 			# **The issue status is the truth about the item.** Closed as
 			# anything but completed is abandoned: off the board entirely,
 			# not marked, not counted, no stage ever run against it again.
@@ -405,11 +413,16 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 				# vocabulary, only meaningful once an issue is actually closed.
 				finishedAt:  (if $isClosed then (.closedAt // "") else "" end)
 			}
+			+ (if $isTracking then {tracking: true} else {} end)
 			+ (if $parent != "" then {parent: $parent} else {} end)
 			+ (if ($nativeChildren | length) > 0 then {children: $nativeChildren} else {} end)
 			+ (if $markerParent != "" and $nativeParent == "" then {_markerParentRef: $markerParentRef} else {} end)
 			+ (if $nativeChildrenTruncated then {_nativeChildrenTruncated: true} else {} end)
 			+ (if ($relationWarnings | length) > 0 then {_relationshipWarnings: $relationWarnings} else {} end)
+			+ (if $isTracking and any($relationWarnings[]?;
+				contains("native child") and contains("another repository")) then
+				{_trackingError: "one or more required native children are in another repository and cannot be represented by this source"}
+			else {} end)
 			+ (if $reopened then
 				{blockKind: "status",
 				 blockReason: "open on GitHub while labelled \"\($mapped)\", the end of the line: it was reopened, or it was never actually closed. Its status says it is not finished."}
@@ -434,51 +447,6 @@ jq -s --arg source "$CONVEYOR_SOURCE" \
 			+ (if $stage != ($mapped // $default) then {reconcile: $stage} else {} end))
 		)' "$work/items.jsonl" >"$work/listed.json"
 
-# CLOSED_LIMIT bounds the history ledger, not dependency correctness. Resolve
-# any referenced node absent from that bounded slice. A completed issue is
-# added back as a terminal dependency-only record; an open/unresolvable issue
-# remains absent so NewDeps reports the declaration as invalid. The number of
-# extra calls and records is bounded by references on the already-bounded
-# listing, never by repository history.
-mapfile -t missing_refs < <(jq -r '
-	[.[].id] as $ids
-	| [.[].dependsOn[]? | select(. as $d | ($ids | index($d) | not))]
-	| unique[] | split(":")[-1]
-' "$work/listed.json")
-dependency_lookup_limit=${DEPENDENCY_LOOKUP_LIMIT:-50}
-if [[ ! "$dependency_lookup_limit" =~ ^[0-9]+$ ]]; then
-	echo "DEPENDENCY_LOOKUP_LIMIT must be a non-negative integer, got: $dependency_lookup_limit" >&2
-	exit 1
-fi
-if ((${#missing_refs[@]} > dependency_lookup_limit)); then
-	echo "dependency lookup limit $dependency_lookup_limit reached; remaining references stay missing and fail closed" >&2
-fi
-lookup_refs=("${missing_refs[@]:0:dependency_lookup_limit}")
-for ref in "${lookup_refs[@]}"; do
-	issue=""
-	if issue=$(gh_issue "$ref"); then
-		if [[ -n "$done_stage" ]] && jq -e '
-			((.state // "") | ascii_downcase) == "closed"
-			and ((.stateReason // "completed") | ascii_downcase) == "completed"
-		' <<<"$issue" >/dev/null; then
-			jq -c --arg source "$CONVEYOR_SOURCE" --arg done "$done_stage" '
-				(.labels | map(.name)) as $names
-				| {id: "\($source):\(.number)", ref: (.number | tostring), source: $source,
-				   stage: $done, title: .title, blocked: false,
-				   description: (.body // ""), url: .url, labels: $names,
-				   priority: ([$names[] | capture("^priority:p(?<n>[0-3])$") | .n | tonumber] | .[0]),
-				   assignee: (.assignees | map(.login) | .[0] // ""),
-				   finishedAt: (.closedAt // "")}
-			' <<<"$issue" >"$work/resolved.json"
-			jq -s '.[0] + [.[1]]' "$work/listed.json" "$work/resolved.json" >"$work/listed.next"
-			mv "$work/listed.next" "$work/listed.json"
-		fi
-	else
-		status=$?
-		if ((status != 2)); then exit "$status"; fi
-	fi
-done
-
 # `gh issue list --json subIssues` embeds a bounded connection. Complete only
 # the parents whose totalCount proves that connection was truncated.
 mapfile -t truncated_parent_refs < <(jq -r '.[] | select(._nativeChildrenTruncated) | .ref' "$work/listed.json")
@@ -497,6 +465,7 @@ for ref in "${truncated_parent_refs[@]:0:subissue_lookup_limit}"; do
 			map(if .ref == $ref then
 				._relationshipWarnings = ((._relationshipWarnings // []) +
 					["GitHub would not return the complete native child set; the embedded partial set is retained"])
+				| if .tracking then ._trackingError = "GitHub would not return the complete required child set" else . end
 			else . end)
 		' "$work/listed.json" >"$work/listed.next"
 		mv "$work/listed.next" "$work/listed.json"
@@ -522,6 +491,9 @@ for ref in "${truncated_parent_refs[@]:0:subissue_lookup_limit}"; do
 		map(if .ref == $ref then
 			.children = $children
 			| ._relationshipWarnings = ((._relationshipWarnings // []) + $cross)
+			| if .tracking and ($cross | length) > 0 then
+				._trackingError = "one or more required native children are in another repository and cannot be represented by this source"
+			else . end
 		else . end)
 	' "$work/listed.json" >"$work/listed.next"
 	mv "$work/listed.next" "$work/listed.json"
@@ -532,11 +504,60 @@ if ((${#truncated_parent_refs[@]} > subissue_lookup_limit)); then
 			map(if .ref == $ref then
 				._relationshipWarnings = ((._relationshipWarnings // []) +
 					["sub-issue lookup limit " + ($n|tostring) + " reached; the embedded partial child set is retained"])
+				| if .tracking then ._trackingError = "the sub-issue lookup limit was reached before the complete required child set was read" else . end
 			else . end)
 		' "$work/listed.json" >"$work/listed.next"
 		mv "$work/listed.next" "$work/listed.json"
 	done
 fi
+
+# CLOSED_LIMIT bounds the history ledger, not relationship correctness. Resolve
+# completed dependencies and required tracking children absent from that slice.
+# Pagination runs first so a large tracker contributes its complete child set.
+# Open, abandoned or unresolvable references remain absent and fail closed.
+mapfile -t missing_refs < <(jq -r '
+	[.[].id] as $ids
+	| ([.[].dependsOn[]?] + [.[] | select(.tracking == true) | .children[]?])
+	| [.[] | select(. as $d | ($ids | index($d) | not))]
+	| unique[] | split(":")[-1]
+' "$work/listed.json")
+dependency_lookup_limit=${DEPENDENCY_LOOKUP_LIMIT:-50}
+if [[ ! "$dependency_lookup_limit" =~ ^[0-9]+$ ]]; then
+	echo "DEPENDENCY_LOOKUP_LIMIT must be a non-negative integer, got: $dependency_lookup_limit" >&2
+	exit 1
+fi
+if ((${#missing_refs[@]} > dependency_lookup_limit)); then
+	echo "dependency/child lookup limit $dependency_lookup_limit reached; remaining references stay missing and fail closed" >&2
+fi
+lookup_refs=("${missing_refs[@]:0:dependency_lookup_limit}")
+for ref in "${lookup_refs[@]}"; do
+	issue=""
+	if issue=$(gh_issue "$ref"); then
+		if [[ -n "$done_stage" ]] && jq -e '
+			((.state // "") | ascii_downcase) == "closed"
+			and ((.stateReason // "completed") | ascii_downcase) == "completed"
+		' <<<"$issue" >/dev/null; then
+			jq -c --arg source "$CONVEYOR_SOURCE" --arg repo "$REPO" --arg done "$done_stage" '
+				(.labels | map(.name)) as $names
+				| ((.parent.url // "")
+					| [capture("^https://github\\.com/(?<owner>[^/]+)/(?<name>[^/]+)/issues/(?<ref>[0-9]+)$")] | .[0] // null) as $p
+				| {id: "\($source):\(.number)", ref: (.number | tostring), source: $source,
+				   stage: $done, title: .title, blocked: false,
+				   description: (.body // ""), url: .url, labels: $names,
+				   priority: ([$names[] | capture("^priority:p(?<n>[0-3])$") | .n | tonumber] | .[0]),
+				   assignee: (.assignees | map(.login) | .[0] // ""),
+				   finishedAt: (.closedAt // "")}
+				+ (if $p != null and (((($p.owner + "/" + $p.name) | ascii_downcase) == ($repo | ascii_downcase)))
+					then {parent: ($source + ":" + ($p.ref | tonumber | tostring))} else {} end)
+			' <<<"$issue" >"$work/resolved.json"
+			jq -s '.[0] + [.[1]]' "$work/listed.json" "$work/resolved.json" >"$work/listed.next"
+			mv "$work/listed.next" "$work/listed.json"
+		fi
+	else
+		status=$?
+		if ((status != 2)); then exit "$status"; fi
+	fi
+done
 
 # A strict Parent: #N marker is durable fallback metadata, not proof that the
 # target still exists. Confirm marker-only targets that are outside the visible
@@ -612,7 +633,8 @@ fi
 jq '
 	([.[] as $item | $item._relationshipWarnings[]?
 		| {itemId: $item.id, reason: .}]) as $warnings
-	| (map(del(.reconcile, ._relationshipWarnings, ._markerParentRef, ._nativeChildrenTruncated))) as $items
+	| (map((if ._trackingError != null then .trackingError = ._trackingError else . end)
+		| del(.reconcile, ._relationshipWarnings, ._markerParentRef, ._nativeChildrenTruncated, ._trackingError))) as $items
 	| if ($warnings | length) > 0 then {items: $items, warnings: ($warnings | unique | sort_by(.itemId, .reason))}
 		else $items end
 ' "$work/listed.json" >"$CONVEYOR_RESULT"

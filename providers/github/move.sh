@@ -11,12 +11,14 @@
 # no-op, and a no-op must exit 0 — source.Move treats anything else as failure.
 #
 # Env: REPO (required), STAGE_LABELS, BLOCKED_LABEL (default: blocked),
+#      TRACKING_LABEL (default: ${LABEL_PREFIX}tracking),
 #      CONVEYOR_DRY_RUN (log, write nothing).
 set -euo pipefail
 
 : "${REPO:?REPO is required (set it in the source env: block)}"
 LABEL_PREFIX="${LABEL_PREFIX:-conveyor:}"
 BLOCKED_LABEL="${BLOCKED_LABEL:-${LABEL_PREFIX}blocked}"
+TRACKING_LABEL="${TRACKING_LABEL:-${LABEL_PREFIX}tracking}"
 
 payload=$(cat)
 ref=$(jq -r '.item.ref' <<<"$payload")
@@ -24,13 +26,17 @@ to=$(jq -r '.stage' <<<"$payload")
 blocked=$(jq -r '.blocked // false' <<<"$payload")
 reason=$(jq -r '.blockedReason // ""' <<<"$payload")
 kind=$(jq -r '.blockedKind // ""' <<<"$payload")
+tracking=$(jq -r '.item.tracking // false' <<<"$payload")
+terminal=$(jq -r '.terminal // false' <<<"$payload")
+tracking_complete=$(jq -r '.trackingComplete // false' <<<"$payload")
 # Fetched, not taken from the payload. The payload's labels come from the last
 # list, which is already stale by the second move of the same tick: the engine
 # moves an item into a stage and out of it between two polls, so a cached label
 # set makes the second move skip a removal and leave the issue wearing both.
-view=$(gh issue view "$ref" --repo "$REPO" --json labels,body)
+view=$(gh issue view "$ref" --repo "$REPO" --json labels,body,state)
 have=$(jq -r '.labels[].name' <<<"$view")
 body=$(jq -r '.body // ""' <<<"$view")
+state=$(jq -r '(.state // "OPEN") | ascii_downcase' <<<"$view")
 
 trim() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 wearing() { grep -qxF "$1" <<<"$have"; }
@@ -74,20 +80,21 @@ done <<<"$have"
 # label this pipeline wrote is a label this pipeline can take off, whether or
 # not it is still in the config.
 #
-# The mark is excluded: it is handled below, and removing it here would set and
-# clear the same label in one call.
+# The mark and tracking opt-in are excluded: the mark is handled below, and the
+# tracking label is semantic item identity rather than a stage to clean up.
 managed=$(
 	{
 		printf '%s\n' "${mapping_values[@]+"${mapping_values[@]}"}"
 		printf '%s\n' "${owned[@]+"${owned[@]}"}"
-	} | grep -v "^${BLOCKED_LABEL}\(:\| \|$\)" | sort -u || true
+	} | sort -u
 )
 # The one this stage wants.
 want="${stage_label[$to]:-}"
 
 args=()
 while IFS= read -r label; do
-	[[ -z "$label" || "$label" == "$want" ]] && continue
+	[[ -z "$label" || "$label" == "$want" || "$label" == "$TRACKING_LABEL" ]] && continue
+	[[ "$label" == "$BLOCKED_LABEL" || "$label" == "$BLOCKED_LABEL: "* ]] && continue
 	wearing "$label" && args+=(--remove-label "$label")
 done <<<"$managed"
 
@@ -172,56 +179,56 @@ if [[ "$want_body" != "$body" ]]; then
 	args+=(--body-file "$bodyfile")
 fi
 
+# A completed tracking item has no pull request to close its GitHub issue.
+# Close before changing its stage labels: if this call fails, the old stage is
+# still visible and the same transition remains retryable. If close succeeds
+# but a later label edit fails, native closed status is authoritative and the
+# next listing can safely finish label reconciliation.
+if [[ "$tracking" == "true" && "$terminal" == "true" && "$tracking_complete" == "true" && "$blocked" != "true" && "$state" == "open" ]]; then
+	if [[ -n "${CONVEYOR_DRY_RUN:-}" ]]; then
+		echo "DRY RUN: gh issue close $ref --repo $REPO" >&2
+	else
+		echo "closing completed tracking issue #$ref" >&2
+		gh issue close "$ref" --repo "$REPO" >&2
+	fi
+fi
+
 if [[ ${#args[@]} -eq 0 ]]; then
 	# Either the stage maps to no label (backlog, done — nothing to write), or
 	# the issue is already correct. Both are success.
 	echo "issue #$ref already reflects '$to'; nothing to write" >&2
-	exit 0
-fi
+else
+	echo "issue #$ref -> $to${want:+ ($want)}${marking:+ + $BLOCKED_LABEL}${kind:+ [$kind]}" >&2
 
-echo "issue #$ref -> $to${want:+ ($want)}${marking:+ + $BLOCKED_LABEL}${kind:+ [$kind]}" >&2
-
-# The body travels through a temp file, whose name is noise; a log that says
-# `--body-file /tmp/tmp.9fK2` tells nobody anything, and a dry run has to be
-# reproducible from one run to the next to be worth diffing.
-shown=("${args[@]}")
-if [[ -n "${bodyfile:-}" ]]; then
-	shown=("${shown[@]/#"$bodyfile"/<body>}")
-fi
-
-if [[ -n "${CONVEYOR_DRY_RUN:-}" ]]; then
-	echo "DRY RUN: gh issue edit $ref --repo $REPO ${shown[*]}" >&2
-	exit 0
-fi
-
-# A label this pipeline wants may simply not exist yet — a stage added to the
-# config since the repository was onboarded is the ordinary way to get there,
-# and `gh issue edit --add-label` fails outright on a name the repository has
-# never seen. That failure marked the item with an `error` the moment it
-# reached the new stage, which is a confusing way to be told to run
-# providers/github/onboard.sh.
-#
-# Created on failure rather than before every edit: adding a label is the
-# common path and this is the rare one, so the normal move still costs exactly
-# one API call.
-if ! gh issue edit "$ref" --repo "$REPO" "${args[@]}" >&2; then
-	made=0
-	for i in "${!args[@]}"; do
-		[[ "${args[$i]}" == "--add-label" ]] || continue
-		label="${args[$((i + 1))]}"
-		if gh label create "$label" --repo "$REPO" --color 1D76DB \
-			--description "Conveyor: $to" >/dev/null 2>&1; then
-			echo "created missing label $label" >&2
-			made=1
-		fi
-	done
-	# Retried once, and only when creating something actually changed the
-	# world: a second identical call that failed for any other reason would
-	# just fail again, and looping on it is how a provider write turns into a
-	# rate limit.
-	if [[ "$made" -eq 0 ]]; then
-		echo "gh issue edit #$ref failed and no missing label explained it" >&2
-		exit 1
+	# The body travels through a temp file, whose name is noise; a log that says
+	# `--body-file /tmp/tmp.9fK2` tells nobody anything, and a dry run has to be
+	# reproducible from one run to the next to be worth diffing.
+	shown=("${args[@]}")
+	if [[ -n "${bodyfile:-}" ]]; then
+		shown=("${shown[@]/#"$bodyfile"/<body>}")
 	fi
-	gh issue edit "$ref" --repo "$REPO" "${args[@]}" >&2
+
+	if [[ -n "${CONVEYOR_DRY_RUN:-}" ]]; then
+		echo "DRY RUN: gh issue edit $ref --repo $REPO ${shown[*]}" >&2
+	else
+		# A label this pipeline wants may simply not exist yet — a stage added to the
+		# config since the repository was onboarded is the ordinary way to get there.
+		if ! gh issue edit "$ref" --repo "$REPO" "${args[@]}" >&2; then
+			made=0
+			for i in "${!args[@]}"; do
+				[[ "${args[$i]}" == "--add-label" ]] || continue
+				label="${args[$((i + 1))]}"
+				if gh label create "$label" --repo "$REPO" --color 1D76DB \
+					--description "Conveyor: $to" >/dev/null 2>&1; then
+					echo "created missing label $label" >&2
+					made=1
+				fi
+			done
+			if [[ "$made" -eq 0 ]]; then
+				echo "gh issue edit #$ref failed and no missing label explained it" >&2
+				exit 1
+			fi
+			gh issue edit "$ref" --repo "$REPO" "${args[@]}" >&2
+		fi
+	fi
 fi

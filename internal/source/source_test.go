@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -89,6 +90,46 @@ func TestValidateRejectsAnEmptyRef(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("warnings = %v, want one naming items[0] with no ref", warns)
+	}
+}
+
+func TestMoveTellsProviderWhetherTheTargetIsTerminal(t *testing.T) {
+	cfg, src := preflightConfig(t, nil)
+	seen := filepath.Join(t.TempDir(), "move.json")
+	writeExecFile(t, src.Move, "#!/bin/sh\ncat >\""+seen+"\"\n")
+	c := New(cfg, src, runner.New(filepath.Join(t.TempDir(), "runs")))
+	item := &model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"}
+	if _, err := c.Move(context.Background(), item, "done", Mark{}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(seen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got model.StageInput
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Terminal {
+		t.Fatalf("move input = %+v, want terminal true for done", got)
+	}
+	if got.TrackingComplete {
+		t.Fatalf("ordinary move input = %+v, invented tracking completion proof", got)
+	}
+
+	tracker := &model.Item{ID: "s1:2", Ref: "2", Source: "s1", Stage: "backlog", Tracking: true}
+	if _, err := c.CompleteTracking(context.Background(), tracker, "done", Mark{}); err != nil {
+		t.Fatal(err)
+	}
+	b, err = os.ReadFile(seen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Terminal || !got.TrackingComplete {
+		t.Fatalf("tracking completion input = %+v, want terminal and trackingComplete", got)
 	}
 }
 

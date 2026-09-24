@@ -28,14 +28,19 @@ export function renderPanelRelationships(id) {
   const children = Array.isArray(it.children) ? it.children : [];
   const deps = Array.isArray(it.dependsOn) ? it.dependsOn : [];
   const hold = state?.held?.[id];
-  const family = it.parent || children.length;
+  const tracking = state?.tracking?.[id];
+  const family = it.parent || children.length || it.tracking;
+
+  const trackingHTML = tracking ? `<div class="tracking-state ${esc(tracking.state || "unknown")}"${tracking.state === "invalid" ? ' role="alert"' : ""}>
+      <b>Tracking ${esc(tracking.state || "unknown")}</b>${tracking.reason ? `<span>${esc(tracking.reason)}</span>` : ""}
+    </div>` : "";
 
   const familyHTML = family ? `<div class="family-tree" aria-label="Tracking family">
       ${it.parent ? `<div class="relation-row parent"><b>Parent</b>${relatedItem(it.parent, byId, "parent")}</div>` : ""}
       <div class="relation-row current"><b>This item</b><span>${esc(`${refOf(it.id)} · ${it.title || it.id}`)}</span></div>
       ${children.length ? `<div class="relation-row children"><b>Children</b><div role="list">${children.map(childId => {
         const child = byId.get(childId);
-        const done = child && terminal.has(child.stage);
+        const done = child && terminal.has(child.stage) && !child.blocked;
         return `<div role="listitem" class="relation-child${done ? " complete" : ""}">${relatedItem(childId, byId, "child")}${child ? `<small>${done ? "complete" : esc(child.stage)}</small>` : ""}</div>`;
       }).join("")}</div></div>` : ""}
     </div>` : `<p class="none">No tracking family.</p>`;
@@ -60,7 +65,7 @@ export function renderPanelRelationships(id) {
 
   box.innerHTML = `<section aria-labelledby="relationships-title">
     <h3 id="relationships-title">Relationships</h3>
-    <h4>Tracking family</h4>${familyHTML}
+    <h4>Tracking family</h4>${trackingHTML}${familyHTML}
     <h4>Execution dependencies</h4>${holdHTML}${dependenciesHTML}
   </section>`;
   box.hidden = false;

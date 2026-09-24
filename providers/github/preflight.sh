@@ -10,6 +10,7 @@
 #   STAGE_LABELS   "stage=label" per line — required; without it nothing can
 #                  be moved, so its absence is a fail rather than a skip
 #   BLOCKED_LABEL  default "${LABEL_PREFIX}blocked"
+#   TRACKING_LABEL default "${LABEL_PREFIX}tracking"
 #
 # $CONVEYOR_WORKDIR is checked for a remote resolving to $REPO.
 set -uo pipefail
@@ -30,6 +31,7 @@ finish() {
 
 LABEL_PREFIX="${LABEL_PREFIX:-conveyor:}"
 BLOCKED_LABEL="${BLOCKED_LABEL:-${LABEL_PREFIX}blocked}"
+TRACKING_LABEL="${TRACKING_LABEL:-${LABEL_PREFIX}tracking}"
 ONBOARD_LABEL="${LABEL_PREFIX%[^[:alnum:]]}"
 
 if [[ -z "${REPO:-}" ]]; then
@@ -111,7 +113,7 @@ else
 	mapfile -t needed < <(
 		{
 			stage_labels_pairs <<<"${STAGE_LABELS:-}" | cut -f2
-			printf '%s\n' "$BLOCKED_LABEL" "$ONBOARD_LABEL"
+			printf '%s\n' "$BLOCKED_LABEL" "$TRACKING_LABEL" "$ONBOARD_LABEL"
 		} | awk '!seen[$0]++'
 	)
 
@@ -128,6 +130,7 @@ else
 			fix_env="REPO=$REPO STAGE_LABELS=\$'$(stage_labels_pairs <<<"${STAGE_LABELS:-}" | awk -F'\t' '{printf "%s=%s\\n", $1, $2}')'"
 			[[ "$LABEL_PREFIX" != "conveyor:" ]] && fix_env="LABEL_PREFIX=$LABEL_PREFIX $fix_env"
 			[[ "$BLOCKED_LABEL" != "${LABEL_PREFIX}blocked" ]] && fix_env="BLOCKED_LABEL=$BLOCKED_LABEL $fix_env"
+			[[ "$TRACKING_LABEL" != "${LABEL_PREFIX}tracking" ]] && fix_env="TRACKING_LABEL=$TRACKING_LABEL $fix_env"
 			add_check "labels" fail "missing: $(
 				IFS=', '
 				echo "${missing[*]}"

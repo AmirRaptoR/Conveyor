@@ -255,7 +255,23 @@ type Mark struct {
 // second call to clear a mark, and the gap between them is a window in which
 // the item is in one state and marked for another.
 func (c *Client) Move(ctx context.Context, item *model.Item, to string, mark Mark) (*model.Run, error) {
+	return c.move(ctx, item, to, mark, false)
+}
+
+// CompleteTracking performs the same atomic provider move with explicit proof
+// from the full-list lifecycle evaluator that this non-work item is complete.
+func (c *Client) CompleteTracking(ctx context.Context, item *model.Item, to string, mark Mark) (*model.Run, error) {
+	stage, ok := c.cfg.Stage(to)
+	if !item.Tracking || !ok || !stage.Terminal {
+		return nil, fmt.Errorf("source %q: tracking completion requires an explicit tracker and terminal target", c.src.Name)
+	}
+	return c.move(ctx, item, to, mark, true)
+}
+
+func (c *Client) move(ctx context.Context, item *model.Item, to string, mark Mark, trackingComplete bool) (*model.Run, error) {
 	from := item.Stage
+	stage, _ := c.cfg.Stage(to)
+	terminal := stage != nil && stage.Terminal
 	res, err := c.run.Run(ctx, runner.Spec{
 		Script:  c.cfg.ResolveScript(c.src.Move),
 		Kind:    "move",
@@ -267,7 +283,7 @@ func (c *Client) Move(ctx context.Context, item *model.Item, to string, mark Mar
 		To:      to,
 		Timeout: c.cfg.Timeout.D(),
 		Stdin: model.StageInput{
-			Item: item, Stage: to, From: from,
+			Item: item, Stage: to, From: from, Terminal: terminal, TrackingComplete: trackingComplete,
 			Blocked: mark.Blocked, BlockedReason: mark.Reason, BlockedKind: mark.Kind,
 		},
 	})
@@ -280,5 +296,7 @@ func (c *Client) Move(ctx context.Context, item *model.Item, to string, mark Mar
 	}
 	item.Stage = to
 	item.Blocked = mark.Blocked
+	item.BlockReason = mark.Reason
+	item.BlockKind = mark.Kind
 	return &res.Run, nil
 }

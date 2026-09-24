@@ -30,6 +30,15 @@ type Item struct {
 	// with no notion of finishing simply sends nothing.
 	FinishedAt string `json:"finishedAt,omitempty"`
 
+	// Tracking marks an explicit non-work item whose lifecycle is derived from
+	// all of its declared Children. It is never inferred from Children alone:
+	// ordinary work may carry hierarchy without becoming non-executable.
+	Tracking bool `json:"tracking,omitempty"`
+	// TrackingError says the source could not provide a complete, representable
+	// required-child set. The engine fails the tracking lifecycle closed rather
+	// than treating a partial provider response as completion.
+	TrackingError string `json:"trackingError,omitempty"`
+
 	// Parent and Children describe tracking structure, not execution order.
 	// Every value is a globally-qualified item ID (normally
 	// "<source>:<ref>"). Providers must report both directions when they know
@@ -173,6 +182,14 @@ type StageInput struct {
 	Item  *Item  `json:"item"`
 	Stage string `json:"stage"`
 	From  string `json:"from,omitempty"`
+	// Terminal tells a provider move that the target is terminal in the
+	// configured pipeline. It is provider-neutral metadata; providers decide
+	// whether their native item status needs reconciling with that fact.
+	Terminal bool `json:"terminal,omitempty"`
+	// TrackingComplete is the narrow authorization that the full-list tracker
+	// evaluator proved every required child complete. Terminal alone is not
+	// enough: clearing a mark in a terminal stage must never finish an item.
+	TrackingComplete bool `json:"trackingComplete,omitempty"`
 	// Blocked is the mark a move script should leave the item wearing. Always
 	// present, and always the whole truth: a move writes both the stage and the
 	// mark, so there is no second verb to forget to call. Setting and clearing

@@ -195,3 +195,60 @@ sources:
 		t.Fatalf("CONVEYOR_DEPENDENCIES_AT = %q, want done", got)
 	}
 }
+
+func TestAdvanceRefusesToRunATrackingItemInAnOrdinaryStage(t *testing.T) {
+	dir := t.TempDir()
+	moves := filepath.Join(dir, "moves")
+	stages := filepath.Join(dir, "stages")
+	writeExec(t, filepath.Join(dir, "providers", "fake", "list.sh"), "#!/bin/sh\nexit 0\n")
+	writeExec(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\ncat >/dev/null\necho x >> "+moves+"\n")
+	writeExec(t, filepath.Join(dir, "work.sh"), "#!/bin/sh\necho x >> "+stages+"\n")
+	if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "conveyor.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`version: 1
+stages:
+  - name: backlog
+  - name: working
+    script: work
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: fake
+    workdir: ./repo
+    scripts:
+      work:
+        script: ./work.sh
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := New(cfg, runner.New(filepath.Join(dir, "runs")))
+	item := &model.Item{ID: "s1:10", Ref: "10", Source: "s1", Stage: "backlog", Tracking: true}
+
+	if _, err := e.Advance(context.Background(), "s1", item, "working", model.Resume{}); err == nil {
+		t.Fatal("Advance accepted a tracking item into a model-backed stage")
+	}
+	for path, what := range map[string]string{moves: "provider move", stages: "stage run"} {
+		if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
+			t.Errorf("tracking refusal still performed a %s", what)
+		}
+	}
+
+	tr, err := e.Advance(context.Background(), "s1", item, "done", model.Resume{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Stage != "done" || tr.Outcome != model.OutcomeNoop {
+		t.Fatalf("terminal tracking move = item %+v transition %+v", item, tr)
+	}
+	if b, err := os.ReadFile(stages); err == nil && len(b) > 0 {
+		t.Fatal("terminal tracking move ran a stage script")
+	}
+}

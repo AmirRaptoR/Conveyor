@@ -27,6 +27,15 @@ func declineReason(cfg *config.Config, it *model.Item, d pipeline.Deps) string {
 	if it.Blocked {
 		return fmt.Sprintf("item %s is marked; only a person clears that", it.ID)
 	}
+	if it.Tracking {
+		tracked := d.Track(it)
+		if tracked.Reason != "" {
+			return tracked.Reason
+		}
+		if tracked.State == pipeline.TrackingPartial {
+			return fmt.Sprintf("tracking item %s is waiting for its required children", it.ID)
+		}
+	}
 	stage, ok := cfg.Stage(it.Stage)
 	if !ok {
 		return fmt.Sprintf("stage %q is not in this config", it.Stage)
@@ -75,6 +84,12 @@ func selectRunStage(cfg *config.Config, item *model.Item, deps pipeline.Deps, re
 	}
 	if _, ok := cfg.Stage(requested); !ok {
 		return "", fmt.Errorf("no stage named %q", requested)
+	}
+	if item.Tracking {
+		target, ok := pipeline.Target(cfg, item, deps)
+		if !ok || requested != target {
+			return "", fmt.Errorf("no stage to run: %s", declineReason(cfg, item, deps))
+		}
 	}
 	if hold, held := deps.Held(item, requested); held {
 		return "", fmt.Errorf("no stage to run: %s", dependencyDeclineReason(hold, requested))

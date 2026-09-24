@@ -24,6 +24,7 @@ set -euo pipefail
 
 LABEL_PREFIX="${LABEL_PREFIX:-conveyor:}"
 BLOCKED_LABEL="${BLOCKED_LABEL:-${LABEL_PREFIX}blocked}"
+TRACKING_LABEL="${TRACKING_LABEL:-${LABEL_PREFIX}tracking}"
 
 # The onboarding tag, derived exactly as list.sh derives it (list.sh:43): the
 # namespace word with its separator taken off. Same fact, one definition —
@@ -65,5 +66,10 @@ done < <(stage_labels_pairs <<<"$STAGE_LABELS")
 # fact in a third place and made "everything blocked" two queries instead of
 # one; move.sh takes any left over off the next time it writes.
 label "$BLOCKED_LABEL" D93F0B "Conveyor: blocked — read the reason at the top of the issue"
+
+# Explicit opt-in for non-work parent issues whose completion is derived from
+# their required children. Semantic like the blocked label, so move preserves
+# it rather than treating it as a stale stage name inside the namespace.
+label "$TRACKING_LABEL" 8250DF "Conveyor: non-work tracking item completed from its children"
 
 echo "$made created, $kept already there"

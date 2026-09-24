@@ -481,8 +481,13 @@ function card(it, active, place) {
 // while child progress is only a summary of listed children.
 function familyChip(it) {
   const children = Array.isArray(it.children) ? it.children : [];
-  if (!it.parent && !children.length) return "";
+  const lifecycle = state?.tracking?.[it.id];
+  if (!it.parent && !children.length && !it.tracking) return "";
   const parts = [], labels = [];
+  if (lifecycle?.state === "invalid") {
+    parts.push("tracking error");
+    labels.push(`tracking error: ${lifecycle.reason || "invalid child state"}`);
+  }
   if (it.parent) {
     const parent = String(it.parent).split(":").pop();
     parts.push(`parent ${esc(parent)}`);
@@ -491,12 +496,12 @@ function familyChip(it) {
   if (children.length) {
     const complete = children.filter(id => {
       const child = byId.get(id);
-      return child && terminal.has(child.stage);
+      return child && terminal.has(child.stage) && !child.blocked;
     }).length;
     parts.push(`children ${complete}/${children.length}`);
     labels.push(`${complete} of ${children.length} children complete`);
   }
-  return `<span class="family" aria-label="tracking family: ${esc(labels.join("; "))}">${parts.join(" · ")}</span>`;
+  return `<span class="family${lifecycle?.state === "invalid" ? " invalid" : ""}"${lifecycle?.reason ? ` title="${esc(lifecycle.reason)}"` : ""} aria-label="tracking family: ${esc(labels.join("; "))}">${parts.join(" · ")}</span>`;
 }
 
 // Every item this one is sequenced behind, by number, whether or not any of

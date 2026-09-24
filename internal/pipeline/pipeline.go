@@ -329,6 +329,24 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 
 	from := item.Stage
 	tr := &Transition{Item: *item, Stage: to, From: from}
+	if item.Tracking && !stage.Terminal {
+		err := fmt.Errorf("tracking item %s may move only to a terminal stage, not %s", item.ID, to)
+		tr.Err = err
+		return tr, err
+	}
+
+	// A tracker has no stage script. This distinct provider call carries the
+	// proof Target derived from the full listing; a generic move or unblock in
+	// a terminal stage must not be able to close it.
+	if item.Tracking {
+		if _, err := client.CompleteTracking(ctx, item, to, source.Mark{}); err != nil {
+			tr.Err = err
+			return tr, err
+		}
+		tr.Item = *item
+		tr.Outcome = model.OutcomeNoop
+		return tr, nil
+	}
 
 	// Entering a stage writes the mark as well as the stage, and it writes it
 	// off. The scheduler never hands over a marked item, so reaching here means
@@ -339,7 +357,6 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 		return tr, err
 	}
 	tr.Item = *item
-
 	// A stage with no script is a queue, not an error: the item rests here
 	// until something else moves it.
 	if !stage.Runs() {
@@ -659,6 +676,20 @@ func Target(cfg *config.Config, it *model.Item, d Deps) (string, bool) {
 	// carrying the item out of the line.
 	if it.Blocked {
 		return "", false
+	}
+	if it.Tracking {
+		tracked := d.Track(it)
+		if tracked.State != TrackingComplete || tracked.Target == "" {
+			return "", false
+		}
+		stage, ok := cfg.Stage(tracked.Target)
+		if !ok || !stage.Terminal {
+			return "", false
+		}
+		if _, held := d.Held(it, tracked.Target); held {
+			return "", false
+		}
+		return tracked.Target, true
 	}
 	stage, ok := cfg.Stage(it.Stage)
 	if !ok || stage.Terminal {
