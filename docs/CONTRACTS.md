@@ -123,6 +123,8 @@ marked `no-output` are cleared by the same reconciliation so they can migrate
 without inventing a pull request. Questions and unrelated marks are left alone;
 stale source state and observe/manual modes never perform this reconciliation,
 while their read-only state still carries the computed lifecycle and reason.
+Tracking items are also excluded from doctor sweeps: their child graph is the
+diagnosis, and no stage or doctor script may turn non-work into agent work.
 
 For GitHub, native sub-issue data is authoritative. A child body may carry the
 strict fallback marker `Parent: #123` as its complete first metadata line;
