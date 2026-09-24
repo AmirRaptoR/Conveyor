@@ -100,6 +100,16 @@ chk "the sanitized live 1.18.32 tool transcript parses" "$rc" "0"
 chk "the live fixture renders its completed tool" "$(grep -c 'bash: pwd \[completed\]' <<<"$fixture")" "1"
 chk "the live fixture renders final text" "$(grep -c '^done$' <<<"$fixture")" "1"
 
+export CONVEYOR_PLAN="$tmp/plan.jsonl"
+: >"$CONVEYOR_PLAN"
+render_stream <"$here/fixtures/todowrite-synthetic.jsonl" >/dev/null 2>&1 || true
+chk "the todowrite fixture publishes one revision" "$(wc -l <"$CONVEYOR_PLAN" | tr -d ' ')" "1"
+chk "its ids are used verbatim"     "$(jq -r '.todos[0].id' "$CONVEYOR_PLAN")" "step-1"
+chk "content maps to text"          "$(jq -r '.todos[1].text' "$CONVEYOR_PLAN")" "write the fix"
+chk "status passes through"         "$(jq -r '.todos[2].status' "$CONVEYOR_PLAN")" "pending"
+chk "no active equivalent is set"   "$(jq -r '.todos[1].active // "absent"' "$CONVEYOR_PLAN")" "absent"
+unset CONVEYOR_PLAN
+
 incremental=$(printf '%s\n' \
 	'{"type":"step_start","timestamp":1,"sessionID":"ses-progress","part":{"id":"s","type":"step-start"}}' \
 	'{"type":"text","timestamp":2,"sessionID":"ses-progress","part":{"id":"t","type":"text","text":"work"}}' \
