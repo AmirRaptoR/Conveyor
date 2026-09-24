@@ -11,15 +11,23 @@ title=$(jq -r '.item.title' <<<"$payload")
 echo "refining: $title"
 plan_start "mock refine"
 steps=("reading item" "mapping the codebase" "drafting criteria" "verifying")
-for i in "${!steps[@]}"; do
-  todos="[]"
+
+# publish_progress <upto> — one revision naming every step's status, mirroring
+# agents/mock/implement so a mock pipeline demonstrates the same live
+# per-step progress a real adapter's TodoWrite/todowrite mapping produces.
+publish_progress() {
+  local upto=$1 todos="[]" j status
   for j in "${!steps[@]}"; do
     status="pending"
-    ((j < i)) && status="completed"
-    ((j == i)) && status="in_progress"
+    ((j < upto)) && status="completed"
+    ((j == upto)) && status="in_progress"
     todos=$(jq -c --arg text "${steps[$j]}" --arg status "$status" '. + [{text: $text, status: $status}]' <<<"$todos")
   done
   plan_publish "$todos"
+}
+
+for i in "${!steps[@]}"; do
+  publish_progress "$i"
   echo "  ${steps[$i]}..."; sleep 0.4
 done
 
@@ -31,6 +39,8 @@ if [[ -z "$(jq -r '.item.description // ""' <<<"$payload")" ]]; then
   jq -n '{blocked:true,reason:"needs a description before it can be refined"}' >"$CONVEYOR_RESULT"
   exit 20
 fi
+
+publish_progress "${#steps[@]}"
 
 jq -n '{criteria:["AC1 observable behaviour","AC2 error path"],priority:2}' >"$CONVEYOR_RESULT"
 echo "refined ok"
