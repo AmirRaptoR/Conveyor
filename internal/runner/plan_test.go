@@ -134,6 +134,37 @@ sleep 0.15
 	}
 }
 
+// OnPlan carries the run's own Kind and target Stage, so a subscriber keying
+// board state by item can tell a stage run targeting a real stage apart from
+// a list, move, doctor or status run publishing against the same item — the
+// only distinction that decides whether a revision may ever reach a card.
+func TestOnPlanCarriesKindAndStage(t *testing.T) {
+	r := New(t.TempDir())
+	var got runner_PlanUpdateCapture
+	r.OnPlan = func(runID, itemID string, u PlanUpdate) {
+		got = runner_PlanUpdateCapture{kind: u.Kind, stage: u.Stage, has: true}
+	}
+	body := `printf '{"v":1,"rev":1,"at":"2026-09-24T12:00:00Z","todos":[{"id":"a","text":"step","status":"pending"}]}\n' > "$CONVEYOR_PLAN"`
+	_, err := r.Run(context.Background(), Spec{
+		Script: script(t, body), Kind: "stage", To: "implementing",
+		Workdir: t.TempDir(), Source: "test", Item: &model.Item{ID: "i1", Ref: "1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.has {
+		t.Fatal("OnPlan never fired")
+	}
+	if got.kind != "stage" || got.stage != "implementing" {
+		t.Errorf("got Kind=%q Stage=%q, want Kind=%q Stage=%q", got.kind, got.stage, "stage", "implementing")
+	}
+}
+
+type runner_PlanUpdateCapture struct {
+	kind, stage string
+	has         bool
+}
+
 // A rejection is diagnosed into the run's own log, capped at 10, with a
 // suppressed-count summary line after the final read.
 func TestPlanRejectionsAreLoggedAsEngineLines(t *testing.T) {

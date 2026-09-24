@@ -9,6 +9,7 @@ import { openFromHash } from "./device.js";
 import { openItemId, inspect, renderPanelActions, renderPanelRelationships, refreshOpenStop } from "./panel.js";
 import { dragging, justDragged, refusals, stageBy, wireDrag, wireQueue } from "./drag.js";
 import { renderInbox } from "./inbox.js";
+import { cardPlan } from "./plans.js";
 
 // A draw() that lands mid-drag defers instead of touching #rail (see draw()
 // and shouldDeferDraw above); the drag's own dragend runs the one redraw that
@@ -454,6 +455,7 @@ function card(it, active, place) {
       style="--src:${sourceColour(it.source)}"
       data-id="${esc(it.id)}" data-title="${esc(it.title)}" data-stage="${esc(it.stage)}">
     <span class="title">${esc(it.title)}</span>
+    ${cardPlan(it, active)}
     <span class="foot">
       ${working ? `<span class="working-tag">working ${durSpan(new Date(inHand.startedAt).getTime(), false)}</span>` : ""}
       ${it.blocked ? why(it) : ""}

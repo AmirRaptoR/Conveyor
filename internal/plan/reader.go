@@ -3,6 +3,7 @@ package plan
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -48,6 +49,7 @@ type Reader struct {
 	diagnosedN   int
 	lineNum      int
 	stopped      bool
+	capped       bool
 }
 
 // NewReader returns a Reader positioned at the start of a run's plan.jsonl.
@@ -71,7 +73,7 @@ func (r *Reader) Last() (Revision, bool) {
 // events it produced, in file order. Once tailing has stopped (a Stopped
 // event was ever produced), Poll is a no-op returning nil.
 func (r *Reader) Poll(path string) []Event {
-	if r.stopped {
+	if r.stopped || r.capped {
 		return nil
 	}
 	info, err := os.Stat(path)
@@ -96,14 +98,23 @@ func (r *Reader) Poll(path string) []Event {
 		r.stopped = true
 		return []Event{{Stopped: true, Reason: "plan.jsonl unreadable: " + err.Error()}}
 	}
-	buf := make([]byte, info.Size()-r.offset)
-	n, err := f.Read(buf)
-	if err != nil && n == 0 {
-		r.stopped = true
-		return []Event{{Stopped: true, Reason: "plan.jsonl unreadable: " + err.Error()}}
+	var events []Event
+	buf := make([]byte, 32*1024)
+	for !r.capped {
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			r.offset += int64(n)
+			events = append(events, r.consume(buf[:n])...)
+		}
+		if readErr != nil {
+			if readErr != io.EOF {
+				r.stopped = true
+				events = append(events, Event{Stopped: true, Reason: "plan.jsonl unreadable: " + readErr.Error()})
+			}
+			break
+		}
 	}
-	r.offset += int64(n)
-	return r.consume(buf[:n])
+	return events
 }
 
 // Final does one last Poll (to catch anything written between the process's
@@ -116,7 +127,10 @@ func (r *Reader) Final(path string) []Event {
 	if r.stopped {
 		return nil
 	}
-	events := r.Poll(path)
+	var events []Event
+	if !r.capped {
+		events = r.Poll(path)
+	}
 	if len(r.buf) > 0 && !r.skipping {
 		r.lineNum++
 		events = append(events, r.reject("truncated final line"))
@@ -178,6 +192,10 @@ func (r *Reader) consume(data []byte) []Event {
 			r.lastAccepted = &rev
 			r.acceptedN++
 			events = append(events, Event{Accepted: true, Revision: rev, Line: r.lineNum})
+			if r.acceptedN == MaxRevisions {
+				r.capped = true
+				return events
+			}
 		} else {
 			events = append(events, r.reject(reason))
 		}

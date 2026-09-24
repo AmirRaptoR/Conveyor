@@ -424,6 +424,22 @@ func TestOnResultFiresForEveryRun(t *testing.T) {
 	}
 }
 
+func TestOnStartCarriesLiveRunIdentity(t *testing.T) {
+	r := New(t.TempDir())
+	var got model.Run
+	r.OnStart = func(run model.Run) { got = run }
+	res, err := r.Run(context.Background(), Spec{
+		Script: script(t, `exit 0`), Kind: "stage", To: "working",
+		Workdir: t.TempDir(), Source: "test", Item: &model.Item{ID: "test:1", Ref: "1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != res.Run.ID || got.ItemID != "test:1" || got.Kind != "stage" || got.To != "working" {
+		t.Fatalf("OnStart got %+v, final run %+v", got, res.Run)
+	}
+}
+
 // meta.json is written to a temp file and renamed into place, so a run that
 // dies mid-write leaves the previous meta.json intact rather than truncated.
 func TestMetaJSONWriteIsAtomic(t *testing.T) {
@@ -463,8 +479,8 @@ func TestPersistenceFailureIsReportedNotSilentlyDropped(t *testing.T) {
 		// Makes its own run directory read-only before exiting, so the final
 		// meta.json write — which happens after the script's own work is
 		// done — fails exactly like a full disk would.
-		Script:  script(t, `dir=$(dirname "$CONVEYOR_RESULT"); echo working; chmod 500 "$dir"`),
-		Kind:    "stage", Workdir: t.TempDir(), Timeout: time.Minute, Source: "test",
+		Script: script(t, `dir=$(dirname "$CONVEYOR_RESULT"); echo working; chmod 500 "$dir"`),
+		Kind:   "stage", Workdir: t.TempDir(), Timeout: time.Minute, Source: "test",
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)

@@ -174,6 +174,36 @@ func TestReaderCapsAt1000AcceptedRevisions(t *testing.T) {
 	}
 }
 
+func TestReaderStopsStreamingAtAcceptedRevisionCap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plan.jsonl")
+	var content strings.Builder
+	for rev := 1; rev <= MaxRevisions; rev++ {
+		fmt.Fprintf(&content, `{"v":1,"rev":%d,"at":"2026-09-24T12:00:00Z","todos":[]}`+"\n", rev)
+	}
+	content.WriteString(strings.Repeat("x", 8*1024*1024))
+	if err := os.WriteFile(path, []byte(content.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewReader()
+	r.Poll(path)
+	if r.Accepted() != MaxRevisions || !r.capped {
+		t.Fatalf("accepted=%d capped=%v, want %d and true", r.Accepted(), r.capped, MaxRevisions)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.offset >= info.Size() {
+		t.Fatalf("reader scanned all %d bytes after reaching the cap", info.Size())
+	}
+	before := r.offset
+	if events := r.Poll(path); len(events) != 0 || r.offset != before {
+		t.Fatalf("capped reader kept scanning: events=%+v offset=%d want %d", events, r.offset, before)
+	}
+}
+
 func TestReaderDiagnosticsCappedAtTenWithSuppressedSummary(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "plan.jsonl")

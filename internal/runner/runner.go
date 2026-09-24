@@ -92,6 +92,10 @@ const maxLineBytes = 64 * 1024
 // Runner writes run directories under Root.
 type Runner struct {
 	Root string
+	// OnStart, if set, is called after the run's directory and initial metadata
+	// exist, immediately before its process is started. It gives live views the
+	// run id while the run is still active rather than only after it returns.
+	OnStart func(run model.Run)
 	// OnLog, if set, is called for every line as it is produced — this is what
 	// makes logs live in the UI. Called from a single goroutine, in order.
 	OnLog func(runID string, line LogLine)
@@ -116,7 +120,14 @@ type Runner struct {
 type PlanUpdate struct {
 	Revision    plan.Revision
 	HasRevision bool
+	Accepted    int
 	Rejected    int
+	// Kind and Stage are the run's own Spec.Kind and Spec.To, carried so a
+	// caller keying board state by item can tell a stage run targeting a
+	// real stage — the only kind that ever produces a card entry — apart
+	// from a list, move, doctor or status run publishing to the same item.
+	Kind  string
+	Stage string
 }
 
 // gracePeriod is how long a script gets to exit after SIGTERM before SIGKILL.
@@ -288,6 +299,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	}
 	env, envMap := buildEnv(spec, resultPath, planPath, deadline)
 	run.Env = envMap
+	if r.OnStart != nil {
+		r.OnStart(run)
+	}
 
 	cmd := exec.Command(script)
 	cmd.Dir = spec.Workdir
@@ -335,6 +349,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	}
 	var curRev plan.Revision
 	var curOK bool
+	acceptedSoFar := 0
 	rejectedSoFar := 0
 	handlePlanEvents := func(events []plan.Event) {
 		for _, ev := range events {
@@ -343,8 +358,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 				emit("engine", "plan.jsonl: "+ev.Reason)
 			case ev.Accepted:
 				curRev, curOK = ev.Revision, true
+				acceptedSoFar++
 				if r.OnPlan != nil {
-					r.OnPlan(runID, itemID, PlanUpdate{Revision: curRev, HasRevision: curOK, Rejected: rejectedSoFar})
+					r.OnPlan(runID, itemID, PlanUpdate{Revision: curRev, HasRevision: curOK, Accepted: acceptedSoFar, Rejected: rejectedSoFar, Kind: spec.Kind, Stage: spec.To})
 				}
 			default:
 				rejectedSoFar++
@@ -352,7 +368,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 					emit("engine", fmt.Sprintf("plan.jsonl line %d rejected: %s", ev.Line, ev.Reason))
 				}
 				if r.OnPlan != nil {
-					r.OnPlan(runID, itemID, PlanUpdate{Revision: curRev, HasRevision: curOK, Rejected: rejectedSoFar})
+					r.OnPlan(runID, itemID, PlanUpdate{Revision: curRev, HasRevision: curOK, Accepted: acceptedSoFar, Rejected: rejectedSoFar, Kind: spec.Kind, Stage: spec.To})
 				}
 			}
 		}

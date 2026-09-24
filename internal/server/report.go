@@ -6,8 +6,10 @@
 package server
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,15 +21,22 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
+	"github.com/AmirRaptoR/Conveyor/internal/plan"
 )
 
-// runFact is one run in an item's history, paired with what it wrote to
-// $CONVEYOR_RESULT. The loader reads result.json once so the formatter reads
-// no files of its own — CONTRACTS §2's split, carried into this report: logs
-// are never parsed, and everything structured comes back through one file.
+// runFact is one run in an item's history, paired with its two structured
+// outputs. The loader reads result.json and stage plan.jsonl once so the
+// formatter reads no files of its own; logs remain prose and are never parsed.
 type runFact struct {
 	model.Run
 	Result json.RawMessage
+	Plan   *reportPlan
+}
+
+type reportPlan struct {
+	Revision  plan.Revision
+	Accepted  int
+	Truncated bool
 }
 
 // loadReport walks run history for one item id and returns every run found,
@@ -45,11 +54,68 @@ func (s *Server) loadReport(itemID string) []runFact {
 		if b, err := os.ReadFile(filepath.Join(m.Dir, "result.json")); err == nil {
 			rf.Result = b
 		}
+		if m.Kind == "stage" {
+			rf.Plan = loadReportPlan(filepath.Join(m.Dir, "plan.jsonl"))
+		}
 		out = append(out, rf)
 		return true
 	})
 	sort.SliceStable(out, func(i, j int) bool { return out[i].StartedAt.Before(out[j].StartedAt) })
 	return out
+}
+
+// loadReportPlan validates at most the first 1000 physical lines. It keeps the
+// final accepted revision and count, and peeks only one byte beyond the bound
+// to say honestly that a longer file was truncated.
+func loadReportPlan(path string) *reportPlan {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, plan.MaxLineBytes)
+	lastRev, accepted := 0, 0
+	var latest plan.Revision
+	for lineNo := 0; lineNo < plan.MaxRevisions; lineNo++ {
+		line, terminated, present := readReportPlanLine(r)
+		if !present {
+			break
+		}
+		if !terminated {
+			break // the protocol never accepts an unterminated fragment
+		}
+		if rev, reason := plan.Validate(line, lastRev); reason == "" {
+			latest, lastRev = rev, rev.Rev
+			accepted++
+		}
+	}
+	_, err = r.ReadByte()
+	truncated := err == nil
+	if accepted == 0 {
+		return nil
+	}
+	return &reportPlan{Revision: latest, Accepted: accepted, Truncated: truncated}
+}
+
+// readReportPlanLine returns one physical line without its newline. Oversized
+// lines are consumed in bounded fragments and returned as an invalid line,
+// rather than allocating whatever a broken writer put on disk.
+func readReportPlanLine(r *bufio.Reader) (line []byte, terminated, present bool) {
+	line, err := r.ReadSlice('\n')
+	if err == nil {
+		return line[:len(line)-1], true, true
+	}
+	if err == io.EOF {
+		return line, false, len(line) > 0
+	}
+	if err != bufio.ErrBufferFull {
+		return nil, false, false
+	}
+	for err == bufio.ErrBufferFull {
+		_, err = r.ReadSlice('\n')
+	}
+	return make([]byte, plan.MaxLineBytes), err == nil, true
 }
 
 // handleReport answers the final report for one item. Derived on demand, on
@@ -110,6 +176,10 @@ func formatReport(item model.Item, runs []runFact, stages []config.Stage, now ti
 	b.WriteString("## Stages\n\n")
 	b.WriteString(stagesTable(tl))
 	b.WriteString("\n")
+	if plans := plansSection(runs); plans != "" {
+		b.WriteString(plans)
+		b.WriteString("\n")
+	}
 
 	b.WriteString("## Stops and failures\n\n")
 	b.WriteString(stopsSection(tl))
@@ -120,6 +190,44 @@ func formatReport(item model.Item, runs []runFact, stages []config.Stage, now ti
 	}
 
 	return b.String()
+}
+
+func plansSection(runs []runFact) string {
+	var b strings.Builder
+	for _, rf := range runs {
+		if rf.Kind != "stage" || rf.Plan == nil {
+			continue
+		}
+		if b.Len() == 0 {
+			b.WriteString("## Plans\n")
+		}
+		fmt.Fprintf(&b, "\n### %s · run `%s`\n\n", markdownText(rf.To), oneLine(rf.ID))
+		fmt.Fprintf(&b, "%s produced the final revision.\n\n", plural(rf.Plan.Accepted, "accepted revision"))
+		for _, todo := range rf.Plan.Revision.Todos {
+			check := " "
+			suffix := ""
+			if todo.Status == plan.StatusCompleted {
+				check = "x"
+			} else if todo.Status == plan.StatusInProgress {
+				suffix = " — in progress"
+			}
+			fmt.Fprintf(&b, "- [%s] %s%s\n", check, markdownText(todo.Text), suffix)
+		}
+		if rf.Plan.Truncated {
+			b.WriteString("\nPlan file exceeded 1000 lines; later lines were not read.\n")
+		}
+	}
+	return b.String()
+}
+
+// markdownText keeps agent-authored plan text on one literal checklist line.
+// Escaping link delimiters and HTML brackets prevents it becoming a link or
+// raw element; collapsing newlines prevents headings and nested list markers.
+func markdownText(s string) string {
+	s = oneLine(s)
+	return strings.NewReplacer(
+		"\\", "\\\\", "[", "\\[", "]", "\\]", "<", "&lt;", ">", "&gt;",
+	).Replace(s)
 }
 
 // identityLine is the item id, and its url when it has one — linked only when

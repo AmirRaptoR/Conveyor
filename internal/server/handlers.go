@@ -66,6 +66,26 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	for id, t := range s.times {
 		st.Times[id] = t
 	}
+	// A completed stage's plan must never trail an item that has already
+	// moved on: an entry whose Stage no longer matches the item's current
+	// one is dropped here rather than shown against the wrong card. The
+	// underlying cache is left untouched — a later transition into that
+	// same stage again is free to publish a fresh entry.
+	stageOf := make(map[string]string, len(st.Items))
+	for _, it := range st.Items {
+		stageOf[it.ID] = it.Stage
+	}
+	if len(s.plans) > 0 {
+		st.Plans = make(map[string]PlanView, len(s.plans))
+		for id, p := range s.plans {
+			if cur, onBoard := stageOf[id]; onBoard && p.Stage == cur {
+				st.Plans[id] = p
+			}
+		}
+		if len(st.Plans) == 0 {
+			st.Plans = nil
+		}
+	}
 	st.TransitionErrors = make(map[string]TransitionError, len(s.transitionErrs))
 	for id, e := range s.transitionErrs {
 		st.TransitionErrors[id] = e

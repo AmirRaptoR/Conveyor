@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/plan"
 )
 
 // reportStages is the four-stage pipeline docs/CONTRACTS.md's example report
@@ -305,6 +307,106 @@ func TestReport_NoSummariesMeansNoNotesSection(t *testing.T) {
 	md := formatReport(item, runs, reportStages(), t0.Add(time.Hour))
 	if strings.Contains(md, "## Notes") {
 		t.Errorf("report = %s, want no Notes section", md)
+	}
+}
+
+func TestReport_PlansRenderStatusesCountsAndSafeTodoText(t *testing.T) {
+	runs := []runFact{{
+		Run: model.Run{ID: "r-plan", Kind: "stage", To: "in-progress"},
+		Plan: &reportPlan{Accepted: 2, Revision: plan.Revision{Rev: 9, Todos: []plan.Todo{
+			{ID: "a", Text: "done", Status: plan.StatusCompleted},
+			{ID: "b", Text: "pending", Status: plan.StatusPending},
+			{ID: "c", Text: "work\n# heading\n- nested [link](https://bad) <b>tag</b>", Active: "do not render", Status: plan.StatusInProgress},
+		}}},
+	}}
+	md := plansSection(runs)
+	for _, want := range []string{
+		"## Plans", "### in-progress · run `r-plan`", "2 accepted revisions",
+		"- [x] done", "- [ ] pending", "- [ ] work # heading - nested \\[link\\](https://bad) &lt;b&gt;tag&lt;/b&gt; — in progress",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("plans section missing %q:\n%s", want, md)
+		}
+	}
+	if strings.Contains(md, "do not render") || strings.Contains(md, "\n# heading") || strings.Contains(md, "<b>") {
+		t.Errorf("agent plan text restructured markdown or used active text:\n%s", md)
+	}
+}
+
+func TestLoadReportPlanCountsAcceptedLinesNotRevisionNumber(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "plan.jsonl")
+	content := strings.Join([]string{
+		`{"v":1,"rev":1,"at":"2026-09-24T12:00:00Z","todos":[{"id":"a","text":"first","status":"pending"}]}`,
+		`malformed`,
+		`{"v":1,"rev":9,"at":"2026-09-24T12:00:01Z","todos":[{"id":"a","text":"latest","status":"completed"}]}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := loadReportPlan(path)
+	if got == nil || got.Accepted != 2 || got.Revision.Rev != 9 || got.Revision.Todos[0].Text != "latest" {
+		t.Fatalf("plan = %+v, want two accepted revisions and final rev 9", got)
+	}
+}
+
+func TestLoadReportPlanOmitsMissingEmptyAndRejectedOnly(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct{ name, content string }{
+		{name: "missing"},
+		{name: "empty", content: ""},
+		{name: "rejected", content: "not json\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, tc.name)
+			if tc.name != "missing" {
+				if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := loadReportPlan(path); got != nil {
+				t.Fatalf("got %+v, want no report plan", got)
+			}
+		})
+	}
+}
+
+func TestLoadReportReadsPlansForStageRunsOnly(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	for _, tc := range []struct{ id, kind string }{{"120000.000-stage", "stage"}, {"120001.000-move", "move"}} {
+		dir := writeRunMeta(t, r, "2026-09-24", tc.id, "s1:1", tc.kind, "backlog", "working", "success", "2026-09-24T12:00:00Z")
+		writePlanFile(t, dir, `{"v":1,"rev":1,"at":"2026-09-24T12:00:00Z","todos":[{"id":"a","text":"step","status":"pending"}]}`)
+	}
+	runs := s.loadReport("s1:1")
+	if len(runs) != 2 {
+		t.Fatalf("got %d runs", len(runs))
+	}
+	for _, rf := range runs {
+		if rf.Kind == "stage" && rf.Plan == nil {
+			t.Error("stage plan was not loaded")
+		}
+		if rf.Kind != "stage" && rf.Plan != nil {
+			t.Error("non-stage run acquired a report plan")
+		}
+	}
+}
+
+func TestLoadReportPlanTruncatesAfter1000PhysicalLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "plan.jsonl")
+	var content strings.Builder
+	for rev := 1; rev <= 1001; rev++ {
+		fmt.Fprintf(&content, `{"v":1,"rev":%d,"at":"2026-09-24T12:00:00Z","todos":[{"id":"a","text":"step %d","status":"pending"}]}`+"\n", rev, rev)
+	}
+	if err := os.WriteFile(path, []byte(content.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := loadReportPlan(path)
+	if got == nil || got.Accepted != 1000 || got.Revision.Rev != 1000 || !got.Truncated {
+		t.Fatalf("plan = %+v, want 1000 accepted through rev 1000 and truncated", got)
+	}
+	md := plansSection([]runFact{{Run: model.Run{ID: "r1", Kind: "stage", To: "working"}, Plan: got}})
+	if !strings.Contains(md, "Plan file exceeded 1000 lines; later lines were not read.") {
+		t.Errorf("truncation not reported:\n%s", md)
 	}
 }
 

@@ -5,6 +5,7 @@ import { blocks, tone, questionsOf, formatDuration, durSpan, bucketByStage } fro
 import { stageBy, startable, startItem, saveOrder, handBack } from "./drag.js";
 import { openAsk, openReport } from "./report.js";
 import { renderPanelRelationships } from "./relationships.js";
+import { beginPanelPlan, applyPlanSnapshot } from "./plans.js";
 
 export { renderPanelRelationships } from "./relationships.js";
 
@@ -37,7 +38,7 @@ export async function inspect(id, title, stage) {
   // opened rather than leading with the button that closes it again.
   $("#ptitle").focus();
   setLogStatus("loading", "Loading…");
-  $("#todos").innerHTML = ""; $("#todos").hidden = true;
+  beginPanelPlan(null);
   lastBlockSig.delete(id);
   refreshOpenStop(id, true);
   renderPanelActions(id);
@@ -389,6 +390,7 @@ export function trimLog(log) {
 async function showRun(id) {
   followRun = id;
   const gen = ++logGen;
+  const planRequest = beginPanelPlan(id);
   // `followRun === id` alone cannot tell apart the first click on a run from
   // a later re-click on the same run — A, then B, then A again leaves two
   // in-flight fetches that both satisfy that check. `gen` is what actually
@@ -399,7 +401,7 @@ async function showRun(id) {
   logBuffer = [];
   document.querySelectorAll("#history [data-run]").forEach(b => b.classList.toggle("sel", b.dataset.run === id));
   setLogStatus("loading", "Loading…");
-  let lines;
+  let lines, runPlan;
   try {
     const res = await fetch(`/api/runs/${id}`);
     // The reader moved to another run, closed the panel, or re-clicked this
@@ -423,6 +425,7 @@ async function showRun(id) {
     }
     const r = await res.json();
     lines = r.lines || [];
+    runPlan = r.plan || null;
   } catch {
     if (stale()) return;
     setLogStatus("error", "Could not load this run.");
@@ -435,11 +438,7 @@ async function showRun(id) {
   // A newly opened run starts its DOM cap fresh — the marker and count both
   // belonged to whichever run was open before.
   logDiscarded = 0; logMarker = null;
-  // Reset before replaying: a run with no TodoWrite call of its own should
-  // not keep showing whichever run was open before it. renderLine repopulates
-  // this as it walks the lines (and any buffered lines appendBuffered adds
-  // after), so it ends on that run's own latest state.
-  $("#todos").innerHTML = ""; $("#todos").hidden = true;
+  applyPlanSnapshot(planRequest, runPlan);
   for (const line of lines) { log.appendChild(renderLine(line)); trimLog(log); }
   logPending = false;
   appendBuffered(lines);
@@ -485,19 +484,6 @@ export function renderLine(line) {
   const tool = text.match(/^\s*·\s*([A-Za-z_]+):\s?([\s\S]*)$/);
   if (tool) {
     el.classList.add("tool");
-    if (tool[1] === "TodoWrite") {
-      const list = parseTodos(tool[2]);
-      if (list) {
-        updateTodos(list);
-        const done = list.filter(t => t.status === "completed").length;
-        const active = list.find(t => t.status === "in_progress");
-        const gist = `${done}/${list.length} done` + (active ? ` · ${active.activeForm || active.content}` : "");
-        el.innerHTML = `<span class="tname">TodoWrite</span> <span class="targ">${esc(gist)}</span>`;
-        return el;
-      }
-      // Falls through to the generic rendering below on a shape this does
-      // not recognise — the sticky panel just misses this update.
-    }
     el.innerHTML = `<span class="tname">${esc(tool[1])}</span> <span class="targ">${esc(tool[2])}</span>`;
     return el;
   }
@@ -524,38 +510,12 @@ export function inline(s) {
     .replace(/\*\*([^*]+)\*\*/g, (_, b) => `<strong>${b}</strong>`);
 }
 
-// TodoWrite's arg is the plan itself, sent whole (see agents/claude/_stream),
-// not a path or a command truncated to a preview — so it is the one tool line
-// here worth parsing back into structure rather than just displaying. Defensive
-// by construction: any shape this does not recognise returns null and the
-// caller falls back to the plain tool-line rendering every other tool gets.
-function parseTodos(raw) {
-  let list;
-  try { list = JSON.parse(raw); } catch { return null; }
-  if (!Array.isArray(list)) return null;
-  if (!list.every(t => t && typeof t.content === "string" && typeof t.status === "string")) return null;
-  return list;
-}
-
-// The agent's own plan, kept current in the sticky panel above the log.
-// Presentation only, like everything else renderLine does — this reads
-// nothing back into $CONVEYOR_RESULT or the engine.
-function updateTodos(list) {
-  const box = $("#todos");
-  if (!list.length) { box.innerHTML = ""; box.hidden = true; return; }
-  box.innerHTML = list.map(t => {
-    const mark = t.status === "completed" ? "✔" : t.status === "in_progress" ? "▶" : "○";
-    const label = t.status === "in_progress" ? (t.activeForm || t.content) : t.content;
-    return `<div class="todo ${esc(t.status)}"><span class="mark">${mark}</span><span>${esc(label)}</span></div>`;
-  }).join("");
-  box.hidden = false;
-}
-
 export function closePanel() {
   $("#panel").classList.remove("open"); $("#panel").setAttribute("aria-hidden", "true");
   $("#scrim").classList.remove("open");
   if (openItemId) lastBlockSig.delete(openItemId);
   openItemId = null; openItemTitle = null; followRun = null;
+  beginPanelPlan(null);
   logPending = false; logBuffer = [];
   // Back to whichever card or `.need` button opened the panel, by identity —
   // looked up fresh rather than a stored node, since a draw() while the panel

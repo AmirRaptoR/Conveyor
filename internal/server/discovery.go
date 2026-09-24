@@ -387,6 +387,18 @@ func (s *Server) refresh(ctx context.Context) {
 			delete(s.answerInfo, id)
 		}
 	}
+	for id := range s.plans {
+		if !onBoard[id] {
+			delete(s.plans, id)
+			delete(s.planGeneration, id)
+		}
+	}
+	for id := range s.planMisses {
+		if !onBoard[id] {
+			delete(s.planMisses, id)
+			delete(s.planGeneration, id)
+		}
+	}
 	for id := range s.cancels {
 		if !onBoard[id] {
 			delete(s.cancels, id)
@@ -607,21 +619,44 @@ func (s *Server) recallBlocks(items []model.Item) {
 	}
 	stageOf := make(map[string]string, len(items))
 	wantTimes := map[string]bool{}
+	wantPlans := map[string]bool{}
+	planGenerations := map[string]uint64{}
+	runStoreGen := s.runStoreGen
 	for _, it := range items {
 		stageOf[it.ID] = it.Stage
 		t, known := s.times[it.ID]
 		if !known || t.Stage != it.Stage {
 			wantTimes[it.ID] = true
 		}
+		p, hasPlan := s.plans[it.ID]
+		miss, hasMiss := s.planMisses[it.ID]
+		switch {
+		case hasPlan && p.Stage == it.Stage:
+			// The accepted summary is already current.
+		case !hasPlan && hasMiss && miss.Stage == it.Stage:
+			// The newest matching run was already inspected and had no
+			// accepted revision. Do not rescan it every discovery pass.
+		default:
+			wantPlans[it.ID] = true
+			planGenerations[it.ID] = s.planGeneration[it.ID]
+		}
 	}
 	s.mu.RUnlock()
-	if len(wantBlocks) == 0 && len(wantTimes) == 0 {
+	if len(wantBlocks) == 0 && len(wantTimes) == 0 && len(wantPlans) == 0 {
 		return
 	}
 
 	foundBlocks := map[string]Block{}
 	foundTimes := map[string]ItemTime{}
-	s.walkRuns(func(m RunMeta) bool {
+	foundPlans := map[string]PlanView{}
+	foundPlanRuns := map[string]string{}
+	// Keep the scanned directories present until every recovered cache entry
+	// has merged. Retention takes the write side of this lock and then evicts
+	// under s.mu, so no API state can observe a deleted run being reinserted in
+	// the gap between the history walk and its merge.
+	s.runStoreMu.RLock()
+	defer s.runStoreMu.RUnlock()
+	s.walkRunsUnlocked(func(m RunMeta) bool {
 		// Only a run of the stage the item is *in*. The walk is newest-first
 		// over the whole store, and without this the newest failed run in any
 		// stage answered for a mark it had nothing to do with: a card stopped
@@ -662,7 +697,24 @@ func (s *Server) recallBlocks(items []model.Item) {
 			foundTimes[m.ItemID] = ItemTime{Stage: m.To, EnteredStage: m.FinishedAt, RunID: m.ID}
 			delete(wantTimes, m.ItemID)
 		}
-		return len(wantBlocks) > 0 || len(wantTimes) > 0
+		// The newest kind:"stage" run of the item in its current stage,
+		// whatever it holds — found once, never searched past. A run with no
+		// plan.jsonl, an empty one, or only rejected lines means the item has
+		// no plan; that verdict is this run's alone, not a reason to look
+		// further back at an older run in the same stage.
+		if wantPlans[m.ItemID] && m.Kind == "stage" && m.To == stageOf[m.ItemID] {
+			foundPlanRuns[m.ItemID] = m.ID
+			if rev, ok, _, rejected := loadRunPlan(m.Dir, m.Outcome != model.OutcomeRunning); ok {
+				completed, total, inProgress := rev.Progress()
+				foundPlans[m.ItemID] = PlanView{
+					RunID: m.ID, Stage: m.To, Rev: rev.Rev, At: rev.At,
+					Total: total, Completed: completed, InProgress: inProgress,
+					Rejected: rejected,
+				}
+			}
+			delete(wantPlans, m.ItemID)
+		}
+		return len(wantBlocks) > 0 || len(wantTimes) > 0 || len(wantPlans) > 0
 	})
 
 	s.mu.Lock()
@@ -741,4 +793,5 @@ func (s *Server) recallBlocks(items []model.Item) {
 		}
 	}
 	s.mu.Unlock()
+	s.mergeRecoveredPlans(runStoreGen, planGenerations, stageOf, foundPlans, foundPlanRuns)
 }

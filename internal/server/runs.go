@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/plan"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 )
 
@@ -26,6 +27,20 @@ type RunMeta struct {
 	// the rest instead of being handed a log's whole size in one response.
 	Lines      []runner.LogLine `json:"lines,omitempty"`
 	TotalLines int              `json:"totalLines"`
+	// Plan is this run's latest full revision, read straight from its own
+	// plan.jsonl — nil when it published none. RunPlanView carries the
+	// counts too, so the panel needs no second request to render a finished
+	// or historical run's progress and rejection count.
+	Plan *RunPlanView `json:"plan,omitempty"`
+}
+
+// RunPlanView is one run's own plan, in full — the panel's shape, distinct
+// from PlanView (the card's summary, which carries no todo list at all so a
+// large board's /api/state payload does not grow with plan size).
+type RunPlanView struct {
+	Revision *plan.Revision `json:"revision,omitempty"`
+	Accepted int            `json:"accepted"`
+	Rejected int            `json:"rejected"`
 }
 
 // handleRuns lists recent runs, newest first, optionally for one item.
@@ -47,8 +62,10 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid run id", http.StatusBadRequest)
 		return
 	}
+	s.runStoreMu.RLock()
 	run, ok := s.findRun(id)
 	if !ok {
+		s.runStoreMu.RUnlock()
 		s.mu.RLock()
 		swept := s.everSwept
 		horizon := s.sweepHorizon
@@ -73,6 +90,14 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	all := parseLog(string(b))
 	run.TotalLines = len(all)
 	run.Lines = logWindow(all, r.URL.Query().Get("tail"), r.URL.Query().Get("offset"))
+	if rev, hasRev, accepted, rejected := loadRunPlan(run.Dir, run.Outcome != model.OutcomeRunning); hasRev || rejected > 0 {
+		var latest *plan.Revision
+		if hasRev {
+			latest = &rev
+		}
+		run.Plan = &RunPlanView{Revision: latest, Accepted: accepted, Rejected: rejected}
+	}
+	s.runStoreMu.RUnlock()
 	writeJSON(w, run)
 }
 
@@ -177,6 +202,14 @@ func (s *Server) listRuns(itemID string, limit int) ([]RunMeta, error) {
 // One walk, one definition of "newest": the directory names are the clock, day
 // then time-ordered id, so sorting them descending is the whole ordering.
 func (s *Server) walkRuns(visit func(RunMeta) bool) {
+	s.runStoreMu.RLock()
+	defer s.runStoreMu.RUnlock()
+	s.walkRunsUnlocked(visit)
+}
+
+// walkRunsUnlocked is walkRuns with runStoreMu already held by a caller that
+// must keep the same filesystem snapshot through work done after the walk.
+func (s *Server) walkRunsUnlocked(visit func(RunMeta) bool) {
 	root := s.run.Root
 	days, err := os.ReadDir(root)
 	if err != nil {
