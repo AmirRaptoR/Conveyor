@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Exercise status/preflight reporting against a local fake OpenCode server.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/bin" "$tmp/state"
+
+cat >"$tmp/server.py" <<'PY'
+import json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/global/health": body = {"healthy": True, "version": "1.18.32"}
+        elif self.path == "/provider": body = {"connected": json.loads(os.environ.get("OC_PROVIDERS", '["openai"]'))}
+        elif self.path == "/agent": body = [{"name": "build", "mode": "primary"}]
+        else:
+            self.send_response(404); self.end_headers(); return
+        raw = json.dumps(body).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+    def log_message(self, *_): pass
+HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+PY
+
+cat >"$tmp/bin/opencode" <<STUB
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" == "--version" ]]; then echo "\${OC_VERSION:-1.18.32}"; exit 0; fi
+if [[ "\${1:-}" == "--pure" && "\${2:-}" == "debug" && "\${3:-}" == "config" ]]; then echo '{}'; exit 0; fi
+if [[ "\${1:-}" == "--pure" && "\${2:-}" == "serve" ]]; then
+	shift 2
+	while [[ \$# -gt 0 ]]; do
+		if [[ \$1 == --port ]]; then port=\$2; break; fi
+		shift
+	done
+	exec python3 '$tmp/server.py' "\$port"
+fi
+exit 1
+STUB
+chmod +x "$tmp/bin/opencode"
+
+export PATH="$tmp/bin:$PATH" XDG_STATE_HOME="$tmp/state"
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+run_status() {
+	export CONVEYOR_RESULT="$tmp/result"
+	rm -f "$CONVEYOR_RESULT"
+	"$here/status" >/dev/null 2>&1
+}
+
+run_status
+chk "ready tooling reports ok" "$(jq -r .state "$CONVEYOR_RESULT")" "ok"
+chk "the pinned version is reported" "$(jq -r '.detail[] | select(.label=="version") | .value' "$CONVEYOR_RESULT")" "1.18.32"
+chk "connected providers are reported" "$(jq -r '.detail[] | select(.label=="providers") | .value' "$CONVEYOR_RESULT")" "openai"
+chk "quota uncertainty is explicit" "$(jq -r '.detail[] | select(.label=="quota") | .value' "$CONVEYOR_RESULT")" "no live endpoint; explicit refusals are cached"
+
+export OC_PROVIDERS='[]'
+run_status
+chk "missing provider authentication fails readiness" "$(jq -r .state "$CONVEYOR_RESULT")" "unknown"
+chk "missing provider authentication is named" "$(jq -r .summary "$CONVEYOR_RESULT")" "OpenCode is installed but no authenticated provider or primary agent is ready"
+unset OC_PROVIDERS
+
+mkdir -p "$XDG_STATE_HOME/conveyor/opencode"
+printf '{"provider":"openai","limitedAt":"now","expiresAt":%s,"reason":"quota"}\n' "$(( $(date +%s) + 600 ))" >"$XDG_STATE_HOME/conveyor/opencode/openai.json"
+run_status
+chk "a cached refusal reports limited" "$(jq -r .state "$CONVEYOR_RESULT")" "limited"
+chk "the refusal names its provider" "$(jq -r .summary "$CONVEYOR_RESULT")" "OpenCode provider openai is limited: quota"
+chk "the cached refusal reports its retry time" "$(jq -r '.resetsAt | test("Z$")' "$CONVEYOR_RESULT")" "true"
+
+rm -f "$XDG_STATE_HOME/conveyor/opencode/openai.json"
+export OC_VERSION=1.18.31
+run_status
+chk "version drift fails preflight closed" "$(jq -r .state "$CONVEYOR_RESULT")" "unknown"
+chk "version drift names the supported pin" "$(jq -r .summary "$CONVEYOR_RESULT")" "OpenCode 1.18.31 is unsupported; install 1.18.32"
+
+exit "$fail"

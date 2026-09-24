@@ -35,9 +35,65 @@ depends on all of them at once.
 | Prerequisite | Needed for | Prove it |
 | --- | --- | --- |
 | `codex` CLI | `agents/codex/review`, `agents/codex/status` | `codex --version` |
+| OpenCode CLI **1.18.32** | `agents/opencode/{refine,implement,review,approve}` | `opencode --version` |
 | Node.js | the UI test suite (`*.test.mjs`), run by `./check` | `node --version` |
 | systemd | running the engine as a service (`deploy/conveyor.service.example`) | `systemctl --version` |
 | Caddy | TLS in front of the board, required for Web Push (a secure origin) | `caddy version` |
+
+OpenCode is pinned exactly because `opencode run --format json` is a CLI event
+projection rather than a versioned protocol. Disable its auto-update and install
+the supported version before enabling an OpenCode script:
+
+```bash
+OPENCODE_DISABLE_AUTOUPDATE=1 opencode upgrade 1.18.32 --method curl
+opencode --version                         # must print 1.18.32
+opencode auth list                         # the intended provider is connected
+```
+
+### OpenCode canary
+
+Agent selection remains a source-script choice; the engine has no OpenCode
+configuration. Canary one stage in one source by changing only that script
+entry:
+
+```yaml
+scripts:
+  refine:
+    agent: opencode
+    params:
+      MODEL: openai/gpt-5.6-sol
+      VARIANT: high
+      AGENT: build
+      PROMPT: "/refine $REF"
+```
+
+`MODEL` is required and uses `provider/model`; `VARIANT` is optional and names
+that model's reasoning variant; `AGENT` defaults to `build` and must resolve to
+a primary OpenCode agent. `conveyor preflight` runs
+`agents/opencode/status` without a model call: it verifies the exact CLI pin,
+resolved config, local readiness API, connected providers and primary agents.
+OpenCode has no live quota endpoint, so the probe says that explicitly and
+reports `limited` only after an adapter receives a structured, explicit quota
+refusal. The cache expires after 15 minutes by default and a successful run
+clears it immediately.
+
+Run the canary through one complete item before changing refine, implement,
+review or approve for another source. Rollback is one config edit, with no data
+migration and no service downgrade:
+
+```yaml
+scripts:
+  refine:
+    agent: claude
+    params:
+      MODEL: claude-sonnet-5
+      PROMPT: "/refine $REF"
+```
+
+Restart Conveyor after either edit so one process has one resolved adapter
+configuration. Existing OpenCode session ids remain harmless opaque item data;
+the Claude adapter cannot resume them and therefore leads with the recorded
+answer plus the original prompt, which is the normal cross-agent fallback.
 
 ## Development sequence: clone to a running board
 

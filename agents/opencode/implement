@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export CONVEYOR_AGENT_BACKEND=opencode
+exec "$(dirname "$0")/../claude/implement"

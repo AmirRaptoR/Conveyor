@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Exercise the OpenCode event adapter without making a model call.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/bin" "$tmp/state"
+
+cat >"$tmp/bin/opencode" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "--version" ]]; then
+	echo "${OC_VERSION:-1.18.32}"
+	exit 0
+fi
+if [[ "${1:-}" == "--pure" && "${2:-}" == "debug" && "${3:-}" == "config" ]]; then
+	echo '{}'
+	exit 0
+fi
+if [[ "${1:-}" == "--pure" && "${2:-}" == "debug" && "${3:-}" == "agent" ]]; then
+	case "${4:-}" in
+	build) echo '{"name":"build","mode":"primary"}' ;;
+	general) echo '{"name":"general","mode":"subagent"}' ;;
+	*) exit 1 ;;
+	esac
+	exit 0
+fi
+if [[ "${1:-}" == "--pure" && "${2:-}" == "models" ]]; then
+	echo 'openai/gpt-test'
+	exit 0
+fi
+printf '%s\n' "$@" >"$OC_ARGS"
+cat >"$OC_PROMPT"
+case "${OC_SCENE:-success}" in
+success)
+	printf '%s\n' \
+		'{"type":"step_start","timestamp":1,"sessionID":"ses-good","part":{"id":"p1","type":"step-start"}}' \
+		'{"type":"text","timestamp":2,"sessionID":"ses-good","part":{"id":"p2","type":"text","text":"work complete"}}' \
+		'{"type":"text","timestamp":2,"sessionID":"ses-good","part":{"id":"p2","type":"text","text":"work complete"}}' \
+		'{"type":"tool_use","timestamp":3,"sessionID":"ses-good","part":{"id":"p3","type":"tool","tool":"bash","state":{"status":"completed","title":"run tests","output":"SECRET TOOL OUTPUT"}}}' \
+		'{"type":"step_finish","timestamp":4,"sessionID":"ses-good","part":{"id":"p4","type":"step-finish","reason":"stop","tokens":{"input":10,"output":2}}}'
+	;;
+limit)
+	printf '%s\n' '{"type":"error","timestamp":1,"sessionID":"ses-limit","error":{"name":"FreeUsageLimitError","data":{"message":"free usage limit reached","responseBody":"SECRET PROVIDER BODY"}}}'
+	;;
+generic429)
+	printf '%s\n' '{"type":"error","timestamp":1,"sessionID":"ses-rate","error":{"name":"APIError","data":{"message":"too many requests","statusCode":429}}}'
+	;;
+malformed)
+	echo 'not-json'
+	;;
+mismatch)
+	printf '%s\n' \
+		'{"type":"step_start","timestamp":1,"sessionID":"ses-one","part":{"id":"p1","type":"step-start"}}' \
+		'{"type":"step_finish","timestamp":2,"sessionID":"ses-two","part":{"id":"p2","type":"step-finish"}}'
+	;;
+sleep)
+	sleep 300 &
+	echo "$!" >"$OC_CHILD"
+	wait
+	;;
+esac
+STUB
+chmod +x "$tmp/bin/opencode"
+
+export PATH="$tmp/bin:$PATH"
+export XDG_STATE_HOME="$tmp/state"
+export OC_ARGS="$tmp/args" OC_PROMPT="$tmp/prompt"
+export MODEL=openai/gpt-test VARIANT=high AGENT=build
+export CONVEYOR_SOURCE=test CONVEYOR_STAGE=working CONVEYOR_ITEM_REF=7
+
+source "$here/_stream"
+trap 'rm -rf "$tmp"; rm -f "$CLAUDE_SAID" "$CLAUDE_RAW"' EXIT
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+OC_SCENE=success
+export OC_SCENE
+set +e
+out=$(run_claude 'do the work' 2>&1)
+rc=$?
+set -e
+chk "a valid event stream succeeds" "$rc" "0"
+chk "text events become logs" "$(grep -c 'work complete' <<<"$out")" "1"
+chk "tool output is not logged" "$(grep -c 'SECRET TOOL OUTPUT' <<<"$out" || true)" "0"
+chk "the session is captured" "$(claude_session)" "ses-good"
+chk "the selected model is recorded" "$(record_model)" "model: openai/gpt-test variant: high agent: build"
+chk "the prompt is sent on stdin" "$(cat "$OC_PROMPT")" "do the work"
+for arg in '--format' 'json' '--model' 'openai/gpt-test' '--variant' 'high' '--agent' 'build'; do
+	chk "run receives $arg" "$(grep -Fx -- "$arg" "$OC_ARGS" || true)" "$arg"
+done
+
+RESUME_SESSION=""
+prompt=$(resume_prompt '{"answer":"continue","session":"opencode:ses-old"}' 'original' 2>/dev/null)
+chk "an answer resumes with only the answer" "$prompt" "continue"
+resume_prompt '{"answer":"continue","session":"opencode:ses-old"}' 'original' >/dev/null 2>&1
+OC_SCENE=success run_claude "$prompt" >/dev/null
+chk "resume uses the exact session" "$(grep -A1 -Fx -- '--session' "$OC_ARGS" | tail -1)" "ses-old"
+
+export CONVEYOR_RESULT="$tmp/result"
+printf '%s\n' '{"type":"text","timestamp":1,"sessionID":"ses-question","part":{"id":"p","type":"text","text":"x"}}' >"$CLAUDE_RAW"
+echo '{"blocked":true,"kind":"decision","reason":"choose","questions":[{"header":"Mode","question":"Which?","options":[{"label":"Safe","description":"Use safe mode"}]}]}' >"$CONVEYOR_RESULT"
+agent_asked
+chk "questions remain questions" "$(jq -r .asked "$CONVEYOR_RESULT")" "true"
+chk "questions retain their session" "$(jq -r .session "$CONVEYOR_RESULT")" "opencode:ses-question"
+
+OC_SCENE=limit
+export OC_SCENE
+set +e
+run_claude 'hit the quota' >/dev/null 2>&1
+rc=$?
+set -e
+chk "an error event fails the run" "$rc" "1"
+chk "an explicit quota event is recognised" "$(hit_limit && echo yes)" "yes"
+chk "the quota refusal is cached for status" "$([[ -s "$XDG_STATE_HOME/conveyor/opencode/openai.json" ]] && echo yes)" "yes"
+chk "provider response bodies are not cached" "$(grep -c 'SECRET PROVIDER BODY' "$XDG_STATE_HOME/conveyor/opencode/openai.json" || true)" "0"
+
+OC_SCENE=success run_claude 'quota recovered' >/dev/null
+chk "a successful provider run clears its quota cache" "$([[ -e "$XDG_STATE_HOME/conveyor/opencode/openai.json" ]] && echo present || echo absent)" "absent"
+
+export OC_SCENE=generic429
+set +e
+run_claude 'transient rate limit' >/dev/null 2>&1
+set -e
+chk "a generic 429 is not called account quota" "$(hit_limit && echo limited || echo transient)" "transient"
+
+for scene in malformed mismatch; do
+	export OC_SCENE=$scene
+	set +e
+	run_claude 'bad protocol' >/dev/null 2>&1
+	rc=$?
+	set -e
+	chk "$scene events fail closed" "$rc" "2"
+done
+
+export AGENT=general OC_SCENE=success
+set +e
+run_claude 'wrong agent mode' >/dev/null 2>&1
+rc=$?
+set -e
+chk "a subagent cannot silently replace a primary agent" "$rc" "2"
+export AGENT=build
+
+export OC_SCENE=sleep OC_CHILD="$tmp/child"
+cat >"$tmp/cancel-driver" <<DRIVER
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH='$tmp/bin':\"\$PATH\"
+export MODEL=openai/gpt-test AGENT=build OC_SCENE=sleep OC_ARGS='$tmp/args' OC_PROMPT='$tmp/prompt' OC_CHILD='$tmp/child'
+export CONVEYOR_SOURCE=test CONVEYOR_STAGE=working CONVEYOR_ITEM_REF=7
+source '$here/_stream'
+run_claude wait
+DRIVER
+chmod +x "$tmp/cancel-driver"
+setsid "$tmp/cancel-driver" >/dev/null 2>&1 &
+driver=$!
+for _ in {1..100}; do [[ -s "$OC_CHILD" ]] && break; sleep 0.02; done
+child=$(cat "$OC_CHILD")
+kill -TERM -- "-$driver"
+wait "$driver" 2>/dev/null || true
+for _ in {1..100}; do kill -0 "$child" 2>/dev/null || break; sleep 0.02; done
+chk "process-group cancellation removes the CLI child" "$(kill -0 "$child" 2>/dev/null && echo alive || echo gone)" "gone"
+
+export OC_VERSION=1.18.31 OC_SCENE=success
+set +e
+run_claude 'wrong version' >/dev/null 2>&1
+rc=$?
+set -e
+chk "an unpinned OpenCode version is refused" "$rc" "2"
+
+unset OC_VERSION RESUME_SESSION
+export OC_SCENE=success PROMPT='Refine this item.' CONVEYOR_RESULT="$tmp/wrapper-result"
+printf '%s\n' '{"item":{"ref":"7","title":"Wrapper test","description":"Body","url":"https://example.test/7"}}' |
+	"$here/refine" >/dev/null
+chk "agent: opencode selects the native backend" "$(grep -c 'Refine this item.' "$OC_PROMPT")" "1"
+
+exit "$fail"

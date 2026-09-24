@@ -158,3 +158,18 @@ sources:
   # opinion belongs in a working config, where it can differ per repository —
   # see conveyor.example.yaml's commented `midgame` source for what setting it
   # per stage looks like.
+  #
+  # To canary OpenCode for exactly one source and stage, change only that
+  # script's `agent:` to `opencode` and add its required MODEL plus optional
+  # reasoning variant and primary agent:
+  #
+  #   refine:
+  #     agent: opencode
+  #     params:
+  #       MODEL: openai/gpt-5.6-sol
+  #       VARIANT: high
+  #       AGENT: build
+  #       PROMPT: "/refine $REF"
+  #
+  # Reverting `agent:` to `claude` is the complete rollback. See INSTALL.md's
+  # OpenCode canary section for the exact CLI pin and rollout checks.

@@ -89,7 +89,7 @@
 # while review is still happening, the clock should keep giving it room.
 set -euo pipefail
 
-source "$(dirname "$0")/_stream"
+source "$(dirname "$0")/../_backend"
 source "$(dirname "$0")/../_blocked"
 source "$(dirname "$0")/../_worktree"
 source "$(dirname "$0")/../_pr"

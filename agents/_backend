@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Select the model runner beneath the shared stage policy. The stage scripts
+# still own worktrees, GitHub postconditions and blocked semantics; an agent
+# backend owns only prompt execution and its structured event protocol.
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+case "${CONVEYOR_AGENT_BACKEND:-claude}" in
+claude | opencode)
+	source "$root/${CONVEYOR_AGENT_BACKEND:-claude}/_stream"
+	;;
+*)
+	echo "unknown CONVEYOR_AGENT_BACKEND: $CONVEYOR_AGENT_BACKEND" >&2
+	exit 2
+	;;
+esac
