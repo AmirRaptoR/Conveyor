@@ -144,6 +144,24 @@ _plan_validate() {
 			return 1
 			;;
 		esac
+
+		local active_type
+		active_type=$(jq -r '(.active // null) | type' <<<"$item")
+		case "$active_type" in
+		null) ;; # omitted or explicit null: the reader falls back to text
+		string)
+			local active
+			active=$(jq -r '.active' <<<"$item")
+			if ((${#active} > _PLAN_MAX_TEXT)); then
+				echo "todo active too long"
+				return 1
+			fi
+			;;
+		*)
+			echo "todo active is not a string"
+			return 1
+			;;
+		esac
 	done
 	return 0
 }
