@@ -171,6 +171,9 @@ func Validate(line []byte, lastRev int) (Revision, string) {
 	if len(w.Todos) == 0 {
 		return Revision{}, "missing todos"
 	}
+	if bytes.Equal(bytes.TrimSpace(w.Todos), []byte("null")) {
+		return Revision{}, "todos is not an array"
+	}
 	var rawTodos []json.RawMessage
 	if err := json.Unmarshal(w.Todos, &rawTodos); err != nil {
 		return Revision{}, "todos is not an array"

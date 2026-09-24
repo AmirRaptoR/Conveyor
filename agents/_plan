@@ -14,10 +14,15 @@ _PLAN_MAX_TEXT=500
 _PLAN_MAX_ID=64
 _PLAN_MAX_REVISIONS=1000
 
-# _plan_ready — is $CONVEYOR_PLAN set and its directory writable.
+# _plan_ready — is $CONVEYOR_PLAN set and appendable: the file writable if it
+# already exists, its directory writable if it does not yet.
 _plan_ready() {
 	[[ -n "${CONVEYOR_PLAN:-}" ]] || return 1
-	[[ -w "$(dirname -- "$CONVEYOR_PLAN")" ]] || return 1
+	if [[ -e "$CONVEYOR_PLAN" ]]; then
+		[[ -w "$CONVEYOR_PLAN" ]] || return 1
+	else
+		[[ -w "$(dirname -- "$CONVEYOR_PLAN")" ]] || return 1
+	fi
 	command -v jq >/dev/null 2>&1 || return 1
 	return 0
 }
@@ -197,7 +202,16 @@ plan_publish() {
 	at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 	line=$(jq -nc --argjson rev "$rev" --arg at "$at" --argjson todos "$derived" \
 		'{v: 1, rev: $rev, at: $at, todos: $todos}')
-	printf '%s\n' "$line" >>"$CONVEYOR_PLAN"
+	# The same 64 KiB bound the reader enforces, checked here so a
+	# shape-valid array is never appended only to be rejected on read.
+	if ((${#line} + 1 > 65536)); then
+		echo "plan_publish: refusing invalid todos: line too long" >&2
+		return 0
+	fi
+	printf '%s\n' "$line" >>"$CONVEYOR_PLAN" 2>/dev/null || {
+		echo "plan_publish: CONVEYOR_PLAN not writable" >&2
+		return 0
+	}
 }
 
 # plan_start <text> — publish a single in_progress todo, "<CONVEYOR_STAGE>

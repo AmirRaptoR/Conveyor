@@ -71,9 +71,22 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	// one is dropped here rather than shown against the wrong card. The
 	// underlying cache is left untouched — a later transition into that
 	// same stage again is free to publish a fresh entry.
+	//
+	// The engine writes provider state before running a stage, but the
+	// in-memory item list here only catches up on the next successful
+	// listing poll — so for the whole span of an ordinary transition into a
+	// new stage, st.Items still names the *old* stage while the run (and
+	// the plan it publishes) is already in the target one. An active
+	// transition's own target stage — s.state.Active, set the instant the
+	// run starts — is what the live plan is actually keyed against, and
+	// takes precedence here so a fresh run's plan is not dropped from every
+	// poll until discovery happens to relist it.
 	stageOf := make(map[string]string, len(st.Items))
 	for _, it := range st.Items {
 		stageOf[it.ID] = it.Stage
+	}
+	for _, a := range st.Active {
+		stageOf[a.ItemID] = a.Stage
 	}
 	if len(s.plans) > 0 {
 		st.Plans = make(map[string]PlanView, len(s.plans))
