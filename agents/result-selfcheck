@@ -43,6 +43,10 @@ export API_SECRET='quoted"secret\value'
 escaped=$(jq -nc --arg value "saw $API_SECRET" '{v:1,outcome:"success",summary:$value}')
 result_accept "$escaped"
 chk "JSON-escaped secret values are redacted" "$(jq -r .summary "$CONVEYOR_RESULT")" "saw [REDACTED]"
+export SHORT_KEY='abc'
+result_accept '{"v":1,"outcome":"success","summary":"saw abc"}'
+chk "short non-empty secrets are redacted" "$(jq -r .summary "$CONVEYOR_RESULT")" "saw [REDACTED]"
+chk "JSON-escaped log text is redacted" "$(redact_text "$escaped" | grep -c 'quoted\\\"secret\\\\value' || true)" "0"
 result_quarantine 'malformed output contained secret-value-112' sess-bad
 chk "quarantine is precise and redacted" "$(jq -c '[.kind,.asked,.session,.reason]' "$CONVEYOR_RESULT")" '["invalid-result",false,"sess-bad","malformed output contained [REDACTED]"]'
 

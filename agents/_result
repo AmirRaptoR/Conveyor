@@ -47,14 +47,17 @@ result_json_schema() {
 }
 
 # Exact-value redaction for values carried by conventionally sensitive
-# environment names. Empty and very short values are skipped to avoid erasing
-# ordinary punctuation or single letters from logs and reasons.
+# environment names. Empty values carry no secret; every non-empty value is
+# replaced even when short because this boundary promises exact-value redaction.
 redact_text() {
-	local text=$1 name value
+	local text=$1 name value escaped
 	for name in $(compgen -e); do
 		[[ "$name" =~ ([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Kk][Ee][Yy]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]) ]] || continue
 		value=${!name-}
-		[[ ${#value} -ge 4 ]] || continue
+		[[ -n "$value" ]] || continue
+		escaped=$(jq -nr --arg value "$value" '$value | @json') || return 1
+		escaped=${escaped:1:${#escaped}-2}
+		[[ "$escaped" == "$value" ]] || text=${text//"$escaped"/[REDACTED]}
 		text=${text//"$value"/[REDACTED]}
 	done
 	printf '%s' "$text"
@@ -65,7 +68,7 @@ secret_values_json() {
 	for name in $(compgen -e); do
 		[[ "$name" =~ ([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Kk][Ee][Yy]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]) ]] || continue
 		value=${!name-}
-		[[ ${#value} -ge 4 ]] || continue
+		[[ -n "$value" ]] || continue
 		values=$(jq -c --arg value "$value" '. + [$value]' <<<"$values") || return 1
 	done
 	printf '%s' "$values"

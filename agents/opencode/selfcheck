@@ -56,6 +56,12 @@ success)
 		'{"type":"tool_use","timestamp":3,"sessionID":"ses-good","part":{"id":"p3","type":"tool","tool":"bash","state":{"status":"completed","title":"run tests","output":"SECRET TOOL OUTPUT"}}}' \
 		'{"type":"step_finish","timestamp":4,"sessionID":"ses-good","part":{"id":"p4","type":"step-finish","reason":"stop","tokens":{"input":10,"output":2}}}'
 	;;
+secrets)
+	text=$(jq -nc --arg summary "saw $SHORT_KEY and $API_SECRET" '{v:1,outcome:"success",summary:$summary}')
+	jq -nc '{type:"step_start",timestamp:1,sessionID:"ses-secrets",part:{id:"start",type:"step-start"}}'
+	jq -nc --arg text "$text" '{type:"text",timestamp:2,sessionID:"ses-secrets",part:{id:"text",type:"text",text:$text}}'
+	jq -nc '{type:"step_finish",timestamp:3,sessionID:"ses-secrets",part:{id:"finish",type:"step-finish",reason:"stop"}}'
+	;;
 invalid-once|invalid-always)
 	text='not json'
 	if [[ "$OC_SCENE" == invalid-once && "$run_no" -gt 1 ]]; then
@@ -64,6 +70,20 @@ invalid-once|invalid-always)
 	jq -nc --arg text "$text" '{type:"step_start",timestamp:1,sessionID:"ses-invalid",part:{id:"start",type:"step-start"}}'
 	jq -nc --arg text "$text" '{type:"text",timestamp:2,sessionID:"ses-invalid",part:{id:"text",type:"text",text:$text}}'
 	jq -nc '{type:"step_finish",timestamp:3,sessionID:"ses-invalid",part:{id:"finish",type:"step-finish",reason:"stop"}}'
+	;;
+duplicate-once|duplicate-always)
+	if [[ "$OC_SCENE" == duplicate-once && "$run_no" -gt 1 ]]; then
+		printf '%s\n' \
+			'{"type":"step_start","timestamp":1,"sessionID":"ses-duplicate","part":{"id":"correct-start","type":"step-start"}}' \
+			'{"type":"text","timestamp":2,"sessionID":"ses-duplicate","part":{"id":"correct-text","type":"text","text":"{\"v\":1,\"outcome\":\"success\",\"summary\":\"corrected duplicate\"}"}}' \
+			'{"type":"step_finish","timestamp":3,"sessionID":"ses-duplicate","part":{"id":"correct-finish","type":"step-finish","reason":"stop"}}'
+	else
+		printf '%s\n' \
+			'{"type":"step_start","timestamp":1,"sessionID":"ses-duplicate","part":{"id":"duplicate-start","type":"step-start"}}' \
+			'{"type":"text","timestamp":2,"sessionID":"ses-duplicate","part":{"id":"duplicate-text","type":"text","text":"{\"v\":1,\"outcome\":\"success\",\"summary\":\"ambiguous\"}"}}' \
+			'{"type":"step_finish","timestamp":3,"sessionID":"ses-duplicate","part":{"id":"finish-one","type":"step-finish","reason":"stop"}}' \
+			'{"type":"step_finish","timestamp":4,"sessionID":"ses-duplicate","part":{"id":"finish-two","type":"step-finish","reason":"stop"}}'
+	fi
 	;;
 limit)
 	printf '%s\n' '{"type":"error","timestamp":1,"sessionID":"ses-limit","error":{"name":"FreeUsageLimitError","data":{"message":"free usage limit reached","responseBody":"SECRET PROVIDER BODY"}}}'
@@ -189,6 +209,21 @@ for arg in '--format' 'json' '--model' 'openai/gpt-test' '--variant' 'high' '--a
 done
 
 reset_invocations
+export OC_SCENE=secrets SHORT_KEY=abc API_SECRET='quoted"secret\value'
+set +e
+out=$(run_claude 'return secrets for the fixture' 2>&1)
+rc=$?
+set -e
+escaped_secret=$(jq -nr --arg value "$API_SECRET" '$value | @json')
+escaped_secret=${escaped_secret:1:${#escaped_secret}-2}
+chk "a secret-bearing result succeeds after redaction" "$rc" "0"
+chk "a short secret is absent from backend logs" "$(grep -Fc -- "$SHORT_KEY" <<<"$out" || true)" "0"
+chk "a literal complex secret is absent from backend logs" "$(grep -Fc -- "$API_SECRET" <<<"$out" || true)" "0"
+chk "a JSON-escaped secret is absent from backend logs" "$(grep -Fc -- "$escaped_secret" <<<"$out" || true)" "0"
+chk "secret values are absent from the persisted result" "$(jq -r .summary "$CONVEYOR_RESULT")" "saw [REDACTED] and [REDACTED]"
+unset SHORT_KEY API_SECRET
+
+reset_invocations
 export OC_SCENE=invalid-once
 set +e
 run_claude 'return a result' >/dev/null 2>&1
@@ -209,6 +244,27 @@ set -e
 chk "an invalid correction is quarantined after two calls" "$rc:$(cat "$OC_CALLS")" "20:2"
 chk "the quarantine names invalid-result" "$(jq -r .kind "$CONVEYOR_RESULT")" "invalid-result"
 chk "the quarantine is a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
+
+reset_invocations
+export OC_SCENE=duplicate-once
+set +e
+run_claude 'return one result' >/dev/null 2>&1
+rc=$?
+set -e
+chk "duplicate terminal results get one correction" "$rc:$(cat "$OC_CALLS")" "0:2"
+chk "the duplicate correction is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "corrected duplicate"
+chk "the duplicate correction reuses the session" "$(grep -A1 -Fx -- '--session' "$OC_ARGS.2" | tail -1)" "ses-duplicate"
+chk "the duplicate correction denies every tool" "$(jq -r '.agent["conveyor-result"].permission["*"]' "$OC_CONFIG.2")" "deny"
+
+reset_invocations
+export OC_SCENE=duplicate-always
+set +e
+run_claude 'return one result' >/dev/null 2>&1
+rc=$?
+set -e
+chk "a second ambiguous correction is quarantined" "$rc:$(cat "$OC_CALLS")" "20:2"
+chk "the ambiguous quarantine names invalid-result" "$(jq -r .kind "$CONVEYOR_RESULT")" "invalid-result"
+chk "the ambiguous quarantine is a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
 
 set +e
 fixture=$(render_stream <"$here/fixtures/tool-run-1.18.32.jsonl" 2>&1)

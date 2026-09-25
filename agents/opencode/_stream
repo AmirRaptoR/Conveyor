@@ -219,6 +219,7 @@ _opencode_pause() {
 render_stream() {
 	local line type session="" event_session="" final_text="" seen=0 finished=0 errors=0 detail id text previous status key command kind rendered reason tid
 	_OPENCODE_STREAM_ABORTED=0
+	_OPENCODE_RESULT_AMBIGUOUS=0
 	declare -A parts=()
 	declare -A texts=()
 	declare -A tool_states=()
@@ -314,9 +315,10 @@ render_stream() {
 			reason=$(jq -r '.part.reason // ""' <<<"$line")
 			if [[ "$reason" != tool-calls ]] && _opencode_tools_terminal "${tool_status[@]}"; then
 				if [[ $finished -eq 1 ]]; then
-					echo "opencode emitted duplicate terminal step_finish events" >&2
-					_OPENCODE_STREAM_ABORTED=1
-					return 2
+					echo "opencode emitted duplicate terminal step_finish events; requesting one result correction" >&2
+					_OPENCODE_RESULT_AMBIGUOUS=1
+					: >"$CLAUDE_FINAL"
+					continue
 				fi
 				finished=1
 				printf '%s' "$final_text" >"$CLAUDE_FINAL"
@@ -393,6 +395,7 @@ _opencode_invoke_child() {
 	_OPENCODE_STREAM_SESSION=""
 	_OPENCODE_CHILD_WAITED=0
 	_OPENCODE_STREAM_ABORTED=0
+	_OPENCODE_RESULT_AMBIGUOUS=0
 	_OPENCODE_STREAM_INCOMPLETE=0
 	_OPENCODE_STREAM_FORCED_STOP=0
 	_OPENCODE_CAPTURE_STREAM=1
@@ -509,7 +512,11 @@ $(result_brief)"
 		if result_accept "$final" "${session:+opencode:$session}"; then
 			return 0
 		fi
-		failure="the agent completed without one valid version-1 final result"
+		if [[ "$_OPENCODE_RESULT_AMBIGUOUS" == 1 ]]; then
+			failure="the agent completed with multiple terminal result candidates"
+		else
+			failure="the agent completed without one valid version-1 final result"
+		fi
 		flags=(--pure run --format json --model "$MODEL" --agent conveyor-result --dir "$PWD"
 			--title "conveyor:${CONVEYOR_SOURCE:-unknown}:${CONVEYOR_ITEM_REF:-unknown}:${CONVEYOR_STAGE:-unknown}:result-correction")
 		[[ -n "${VARIANT:-}" ]] && flags+=(--variant "$VARIANT")
