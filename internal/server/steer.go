@@ -1,11 +1,12 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -14,30 +15,6 @@ import (
 
 // steerBodyLimit bounds POST /api/items/{id}/steer.
 const steerBodyLimit = 8 << 10
-
-// steerAppendMu serialises appends to one run's control.jsonl across
-// concurrent requests: AppendCommand itself derives seq from the file's
-// current line count and is not safe for concurrent callers on its own
-// (see its own doc comment). One mutex per run id, not a global one, so
-// steering two different runs at once never waits on each other.
-var (
-	steerAppendMu   sync.Map // runID -> *sync.Mutex
-	steerAppendMuMu sync.Mutex
-)
-
-func steerLockFor(runID string) *sync.Mutex {
-	if v, ok := steerAppendMu.Load(runID); ok {
-		return v.(*sync.Mutex)
-	}
-	steerAppendMuMu.Lock()
-	defer steerAppendMuMu.Unlock()
-	if v, ok := steerAppendMu.Load(runID); ok {
-		return v.(*sync.Mutex)
-	}
-	m := &sync.Mutex{}
-	steerAppendMu.Store(runID, m)
-	return m
-}
 
 // handleSteer enqueues one command — an instruction or a pause — against a
 // live stage run, binding it to an exact item, run id and, when supplied,
@@ -83,7 +60,7 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if body.RunID == "" {
-		http.Error(w, "runId is required", http.StatusBadRequest)
+		http.Error(w, "runId is required: a command must name the live run it is for", http.StatusConflict)
 		return
 	}
 
@@ -111,9 +88,13 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lock := steerLockFor(entry.RunID)
-	lock.Lock()
-	defer lock.Unlock()
+	lease, ok := s.liveRuns.Acquire(id, body.RunID)
+	if !ok {
+		http.Error(w, "that run has already finished", http.StatusConflict)
+		return
+	}
+	defer lease.Release()
+	entry = lease.Entry()
 
 	res := steering.Load(entry.Dir, false)
 	if len(res.Accepts) == 0 {
@@ -135,27 +116,46 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "that is not this run's current session", http.StatusConflict)
 		return
 	}
+	lease.SetSession(res.Session)
 	if len(res.Commands) >= steering.MaxCommands {
 		http.Error(w, "this run has already reached its command limit", http.StatusConflict)
 		return
 	}
 
+	commandID, err := steerID()
+	if err != nil {
+		http.Error(w, "could not mint command id: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	cmd := steering.Command{
-		ID: steerID(), At: time.Now(), Kind: body.Kind, Text: text,
-		ItemID: id, RunID: body.RunID, Session: body.Session, By: requestedBy(r),
+		ID: commandID, At: time.Now(), Kind: body.Kind, Text: text,
+		ItemID: id, RunID: body.RunID, Session: res.Session, By: requestedBy(r),
 	}
 	ctlPath := filepath.Join(entry.Dir, "control.jsonl")
-	if _, err := steering.AppendCommand(ctlPath, cmd); err != nil {
+	seq, err := steering.AppendCommand(ctlPath, cmd)
+	if err != nil {
 		http.Error(w, "could not record the command: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.hub.publish(event{Kind: "state"})
+	cmd.Seq = seq
+	res = steering.Load(entry.Dir, false)
+	view := steeringView(body.RunID, entry.Stage, res, true)
+	s.mu.Lock()
+	s.steeringGen[id]++
+	s.steering[id] = view.SteeringSummary
+	delete(s.steeringMisses, id)
+	s.mu.Unlock()
+	s.hub.publish(event{Kind: "steering", RunID: body.RunID, ItemID: id, Steering: &view})
 	w.WriteHeader(http.StatusAccepted)
 }
 
 // steerID mints a command id: short enough for the 32-character shape the
 // issue's own protocol sketch names, unique enough for one run's lifetime
 // (at most 50 commands ever).
-func steerID() string {
-	return "cmd-" + time.Now().UTC().Format("150405.000000000")
+func steerID() (string, error) {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "cmd-" + hex.EncodeToString(b), nil
 }

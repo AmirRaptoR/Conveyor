@@ -51,6 +51,12 @@ func TestLiveRunsRegistryOpensWhileStageRunsAndClosesAfter(t *testing.T) {
 		_, ok := s.liveRuns.Lookup("s1:1")
 		return !ok
 	})
+	// Registry closure deliberately precedes the provider move that finishes
+	// the transition. Wait for that separate lifetime before TempDir cleanup.
+	waitFor(t, "the transition to finish", func() bool {
+		_, working := s.working.Load("s1:1")
+		return !working
+	})
 }
 
 // A list, move, doctor or status run is never steerable and must never

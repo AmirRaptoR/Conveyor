@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
@@ -9,7 +11,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/registry"
 	"github.com/AmirRaptoR/Conveyor/internal/steering"
@@ -36,7 +40,7 @@ func steerBoard(t *testing.T, accepts ...string) (*Server, string) {
 		}
 		acceptsJSON += `"` + a + `"`
 	}
-	ack := fmt.Sprintf(`{"v":1,"type":"hello","seq":1,"at":"2026-09-24T12:00:00Z","accepts":[%s]}`+"\n", acceptsJSON)
+	ack := fmt.Sprintf(`{"v":1,"type":"hello","seq":1,"at":"2026-09-24T12:00:00Z","accepts":[%s],"session":""}`+"\n", acceptsJSON)
 	if err := os.WriteFile(filepath.Join(runDir, "control-ack.jsonl"), []byte(ack), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -97,11 +101,11 @@ func TestSteerNoLiveRunIs409(t *testing.T) {
 	}
 }
 
-func TestSteerMissingRunIDIs400(t *testing.T) {
+func TestSteerMissingRunIDIs409(t *testing.T) {
 	s, _ := steerBoard(t, "instruction")
 	w := postSteer(s, "s1:1", `{"kind":"instruction","text":"x"}`)
-	if w.Code != 400 {
-		t.Fatalf("status = %d, want 400", w.Code)
+	if w.Code != 409 {
+		t.Fatalf("status = %d, want 409", w.Code)
 	}
 }
 
@@ -237,6 +241,123 @@ func TestSteerConcurrentPostsBothLand(t *testing.T) {
 	}
 }
 
+func TestSteerConcurrentPostsToTwoItemsStayIndependent(t *testing.T) {
+	s, firstDir := steerBoard(t, "instruction")
+	secondDir := t.TempDir()
+	os.WriteFile(filepath.Join(secondDir, "control.jsonl"), nil, 0o600)
+	os.WriteFile(filepath.Join(secondDir, "control-ack.jsonl"), []byte(hello("")+"\n"), 0o600)
+	s.state.Items = append(s.state.Items, model.Item{ID: "s1:2", Ref: "2", Source: "s1", Stage: "working"})
+	s.liveRuns.Open("s1:2", registry.Entry{RunID: "run2", Dir: secondDir, Stage: "working"})
+
+	var wg sync.WaitGroup
+	for _, tc := range []struct{ id, run string }{{"s1:1", "run1"}, {"s1:2", "run2"}} {
+		tc := tc
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			body := fmt.Sprintf(`{"kind":"instruction","text":"%s","runId":"%s"}`, tc.id, tc.run)
+			if w := postSteer(s, tc.id, body); w.Code != 202 {
+				t.Errorf("%s: %d %s", tc.id, w.Code, w.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+	if got := steering.Load(firstDir, false); len(got.Commands) != 1 || got.Commands[0].Command.ItemID != "s1:1" {
+		t.Fatalf("first run = %+v", got.Commands)
+	}
+	if got := steering.Load(secondDir, false); len(got.Commands) != 1 || got.Commands[0].Command.ItemID != "s1:2" {
+		t.Fatalf("second run = %+v", got.Commands)
+	}
+}
+
+func TestSteerRacingCloseNeverAppendsAfterClose(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		s, dir := steerBoard(t, "instruction")
+		start := make(chan struct{})
+		var w *httptest.ResponseRecorder
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			w = postSteer(s, "s1:1", `{"kind":"instruction","text":"x","runId":"run1"}`)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			s.liveRuns.Close("s1:1", "run1")
+		}()
+		close(start)
+		wg.Wait()
+		before := len(steering.Load(dir, false).Commands)
+		if w.Code != 202 && w.Code != 409 {
+			t.Fatalf("race status = %d: %s", w.Code, w.Body.String())
+		}
+		if (w.Code == 202 && before != 1) || (w.Code == 409 && before != 0) {
+			t.Fatalf("status=%d commands=%d", w.Code, before)
+		}
+		after := postSteer(s, "s1:1", `{"kind":"instruction","text":"late","runId":"run1"}`)
+		if after.Code != 409 || len(steering.Load(dir, false).Commands) != before {
+			t.Fatalf("post-close status=%d commands before=%d after=%d", after.Code, before, len(steering.Load(dir, false).Commands))
+		}
+	}
+}
+
+func TestSteerPublishesFullSSEEvent(t *testing.T) {
+	s, _ := steerBoard(t, "instruction")
+	ch := s.hub.subscribe()
+	defer s.hub.unsubscribe(ch)
+	w := postSteer(s, "s1:1", `{"kind":"instruction","text":"x","runId":"run1"}`)
+	if w.Code != 202 {
+		t.Fatal(w.Body.String())
+	}
+	select {
+	case e := <-ch:
+		if e.Kind != "steering" || e.Steering == nil || len(e.Steering.Commands) != 1 || e.Steering.Commands[0].Text != "x" {
+			t.Fatalf("event = %+v", e)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no steering event")
+	}
+}
+
+func TestSteerRequestedByThroughAuthenticatedAndSocketHandlers(t *testing.T) {
+	s, dir := steerBoard(t, "instruction")
+	s.cfg.Auth = config.Auth{Users: map[string]string{"amir": hashed(t, "secret")}}
+	s.verify = newAuthVerifier(s.cfg.Auth.Check)
+	tcp, socket, err := s.handler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/api/items/s1:1/steer", bytes.NewBufferString(`{"kind":"instruction","text":"tcp","runId":"run1"}`))
+	req.Host = "localhost"
+	req.SetBasicAuth("amir", "secret")
+	w := httptest.NewRecorder()
+	tcp.ServeHTTP(w, req)
+	if w.Code != 202 {
+		t.Fatalf("authenticated request = %d: %s", w.Code, w.Body.String())
+	}
+	res := steering.Load(dir, false)
+	if res.Commands[0].Command.By != "amir" {
+		t.Fatalf("authenticated by = %q", res.Commands[0].Command.By)
+	}
+
+	// The socket intentionally has no auth wall. A Basic header there is only
+	// caller-supplied audit text, exactly as requestedBy already documents.
+	req = httptest.NewRequest("POST", "/api/items/s1:1/steer", bytes.NewBufferString(`{"kind":"instruction","text":"socket","runId":"run1"}`))
+	req.Host = "localhost"
+	req.SetBasicAuth("claimed", "anything")
+	w = httptest.NewRecorder()
+	socket.ServeHTTP(w, req)
+	if w.Code != 202 {
+		t.Fatalf("socket-chain request = %d: %s", w.Code, w.Body.String())
+	}
+	res = steering.Load(dir, false)
+	if res.Commands[1].Command.By != "claimed" {
+		t.Fatalf("socket by = %q", res.Commands[1].Command.By)
+	}
+}
+
 func TestSteerByIsRequestedByUnauthenticated(t *testing.T) {
 	s, dir := steerBoard(t, "instruction")
 	w := postSteer(s, "s1:1", `{"kind":"instruction","text":"x","runId":"run1"}`)
@@ -246,5 +367,38 @@ func TestSteerByIsRequestedByUnauthenticated(t *testing.T) {
 	res := steering.Load(dir, false)
 	if res.Commands[0].Command.By != "" {
 		t.Errorf("expected empty By with no Basic Auth on the request, got %q", res.Commands[0].Command.By)
+	}
+}
+
+func TestCancelRunIDCannotCancelReplacement(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	called := make(chan struct{}, 1)
+	s.cancelFns.Store("s1:1", context.CancelFunc(func() { called <- struct{}{} }))
+	s.liveRuns.Open("s1:1", registry.Entry{RunID: "new-run"})
+
+	request := func(runID string) *httptest.ResponseRecorder {
+		body := fmt.Sprintf(`{"reason":"stop","runId":%q}`, runID)
+		req := httptest.NewRequest("POST", "/api/items/s1:1/cancel", strings.NewReader(body))
+		req.SetPathValue("id", "s1:1")
+		w := httptest.NewRecorder()
+		s.handleCancel(w, req)
+		return w
+	}
+	if w := request("old-run"); w.Code != 409 {
+		t.Fatalf("stale run = %d", w.Code)
+	}
+	select {
+	case <-called:
+		t.Fatal("stale run id cancelled the replacement")
+	default:
+	}
+	if w := request("new-run"); w.Code != 202 {
+		t.Fatalf("live run = %d: %s", w.Code, w.Body.String())
+	}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("matching run id did not cancel")
 	}
 }

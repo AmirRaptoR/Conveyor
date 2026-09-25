@@ -26,6 +26,7 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var body struct {
 		Reason string `json:"reason"`
+		RunID  string `json:"runId"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, cancelBodyLimit)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -33,7 +34,7 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
-		http.Error(w, `expected {"reason": "..."}`, http.StatusBadRequest)
+		http.Error(w, `expected {"reason": "...", "runId": "..."}`, http.StatusBadRequest)
 		return
 	}
 	reason := strings.TrimSpace(body.Reason)
@@ -41,6 +42,17 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "reason is required: a cancellation with no reason is a mystery for whoever looks at this item next",
 			http.StatusBadRequest)
 		return
+	}
+
+	var release func()
+	if body.RunID != "" {
+		lease, ok := s.liveRuns.Acquire(id, body.RunID)
+		if !ok {
+			http.Error(w, "that run has already finished", http.StatusConflict)
+			return
+		}
+		release = lease.Release
+		defer release()
 	}
 
 	v, ok := s.cancelFns.Load(id)
