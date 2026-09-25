@@ -12,6 +12,16 @@ function steering(overrides = {}) {
   }, overrides);
 }
 
+// The compact per-item summary /api/state actually sends has no "commands"
+// key at all (SteeringSummary carries no such field; only the full
+// run-detail/SSE view embeds it) — unlike steering() above, which always
+// sets one so full-payload tests need not repeat it.
+function compact(overrides = {}) {
+  const s = steering(overrides);
+  delete s.commands;
+  return s;
+}
+
 function run(overrides = {}) {
   return Object.assign({
     id: "run-a", itemId, kind: "stage", to: "working", outcome: "running",
@@ -22,6 +32,8 @@ function select(p, value = run(), mode = "auto") {
   p.mod.selectPanelRun(value.id, itemId, "Build it", mode);
   p.mod.applySteeringSnapshot(value, mode);
 }
+
+const flush = () => new Promise(resolve => setImmediate(resolve));
 
 test("live selected run offers cancel and only the advertised steering kinds", async () => {
   const p = await page();
@@ -166,6 +178,86 @@ test("a final SSE payload with omitted live clears controls from the formerly li
   delete ended.live; // Go's json omitempty representation of live:false.
   p.mod.applySteeringEvent({ kind: "steering", runId: "run-a", itemId, steering: ended });
   assert.doesNotMatch(p.el("#steering").innerHTML, /data-steer=|data-cancel/);
+});
+
+test("state removes controls for an ended non-advertising run while tolerating active entries without run ids", async () => {
+  const p = await page();
+  select(p, run());
+  assert.match(p.el("#steering").innerHTML, /data-cancel/);
+
+  p.mod.applySteeringState({ mode: "auto", active: [{ itemId, stage: "working" }] });
+  assert.match(p.el("#steering").innerHTML, /data-cancel/, "an old or not-yet-bound active entry is still compatible");
+
+  p.mod.applySteeringState({ mode: "auto", active: [] });
+  assert.doesNotMatch(p.el("#steering").innerHTML, /data-steer=|data-cancel/);
+});
+
+test("a compact state advance reloads command detail after missed enqueue and acknowledgement events", async () => {
+  const p = await page({ fetch: async url => {
+    assert.equal(url, "/api/runs/run-a");
+    return { ok: true, status: 200, json: async () => run({ steering: steering({
+      maxSeq: 2, version: 3, queued: 1, consumed: 1,
+      commands: [
+        { id: "c1", seq: 1, kind: "instruction", text: "first", state: "consumed" },
+        { id: "c2", seq: 2, kind: "instruction", text: "second", state: "queued" },
+      ],
+    }) }) };
+  } });
+  select(p, run({ steering: steering({ maxSeq: 1, version: 1, queued: 1,
+    commands: [{ id: "c1", seq: 1, kind: "instruction", text: "stale command", state: "queued" }] }) }));
+
+  p.mod.applySteeringState({ mode: "auto", active: [{ itemId, runId: "run-a" }], steering: {
+    [itemId]: compact({ maxSeq: 2, version: 3, queued: 1, consumed: 1 }),
+  } });
+  assert.doesNotMatch(p.el("#steering").innerHTML, /stale command/, "contradictory rows disappear while detail reloads");
+  await flush();
+  const html = p.el("#steering").innerHTML;
+  assert.match(html, /consumed[\s\S]*first/);
+  assert.match(html, /queued[\s\S]*second/);
+  assert.equal(p.calls.fetch.length, 1);
+});
+
+test("a stale detail reload cannot replace a newer acknowledgement-aware SSE record", async () => {
+  let resolveDetail;
+  const p = await page({ fetch: async () => new Promise(resolve => { resolveDetail = resolve; }) });
+  select(p, run({ steering: steering({ maxSeq: 1, version: 1, queued: 1,
+    commands: [{ id: "c1", seq: 1, kind: "instruction", text: "initial", state: "queued" }] }) }));
+  p.mod.applySteeringState({ mode: "auto", active: [{ itemId, runId: "run-a" }], steering: {
+    [itemId]: compact({ maxSeq: 1, version: 2, consumed: 1 }),
+  } });
+  p.mod.applySteeringEvent({ kind: "steering", runId: "run-a", itemId,
+    steering: steering({ maxSeq: 1, version: 3, consumed: 1,
+      commands: [{ id: "c1", seq: 1, kind: "instruction", text: "newest audit", state: "consumed" }] }) });
+
+  resolveDetail({ ok: true, status: 200, json: async () => run({ steering: steering({ maxSeq: 1, version: 2, rejected: 1,
+    commands: [{ id: "c1", seq: 1, kind: "instruction", text: "stale detail", state: "rejected" }] }) }) });
+  await flush();
+  assert.match(p.el("#steering").innerHTML, /newest audit/);
+  assert.doesNotMatch(p.el("#steering").innerHTML, /stale detail/);
+  assert.equal(p.calls.fetch.length, 1);
+});
+
+test("repeated compact summaries do not duplicate an in-flight or completed detail reload", async () => {
+  let resolveDetail;
+  const p = await page({ fetch: async () => new Promise(resolve => { resolveDetail = resolve; }) });
+  select(p, run({ steering: steering({ maxSeq: 1, version: 1, queued: 1,
+    commands: [{ id: "c1", seq: 1, kind: "instruction", text: "one", state: "queued" }] }) }));
+  const snapshot = { mode: "auto", active: [{ itemId, runId: "run-a" }], steering: {
+    [itemId]: compact({ maxSeq: 2, version: 2, queued: 2 }),
+  } };
+  p.mod.applySteeringState(snapshot);
+  p.mod.applySteeringState(snapshot);
+  assert.equal(p.calls.fetch.length, 1);
+
+  resolveDetail({ ok: true, status: 200, json: async () => run({ steering: steering({ maxSeq: 2, version: 2, queued: 2,
+    commands: [
+      { id: "c1", seq: 1, kind: "instruction", text: "one", state: "queued" },
+      { id: "c2", seq: 2, kind: "instruction", text: "two", state: "queued" },
+    ] }) }) });
+  await flush();
+  p.mod.applySteeringState(snapshot);
+  await flush();
+  assert.equal(p.calls.fetch.length, 1);
 });
 
 test("steering and cancel refusals surface the server reason as text", async () => {

@@ -6,6 +6,9 @@ import { $, esc } from "./dom.js";
 const runs = new Map();
 const highestSeq = new Map();
 const highestVersion = new Map();
+const fullCursors = new Map();
+const detailReloads = new Map();
+const reloadedThrough = new Map();
 let selected = null;
 let selectedMeta = null;
 let selectedReady = false;
@@ -13,11 +16,72 @@ let mode = "auto";
 
 function hasOwn(o, key) { return Object.prototype.hasOwnProperty.call(o || {}, key); }
 
-function accept(value, itemId) {
+function cursorOf(value) {
+  const maxSeq = Number(value?.maxSeq) || 0;
+  return { maxSeq, version: Number(value?.version) || maxSeq };
+}
+
+function compareCursor(a, b) {
+  if (a.maxSeq !== b.maxSeq) return a.maxSeq - b.maxSeq;
+  return a.version - b.version;
+}
+
+function noteFullCursor(runId, cursor) {
+  const previous = fullCursors.get(runId);
+  if (!previous || compareCursor(cursor, previous) >= 0) fullCursors.set(runId, cursor);
+}
+
+function needsDetailReload(runId) {
+  const full = fullCursors.get(runId);
+  const current = runs.get(runId);
+  return full && current && compareCursor(cursorOf(current), full) > 0;
+}
+
+function reloadDetail(runId) {
+  if (!needsDetailReload(runId) || detailReloads.has(runId)) return;
+  const target = cursorOf(runs.get(runId));
+  const previousTarget = reloadedThrough.get(runId);
+  if (previousTarget && compareCursor(target, previousTarget) <= 0) return;
+  reloadedThrough.set(runId, target);
+
+  const request = (async () => {
+    let res;
+    try { res = await fetch(`/api/runs/${encodeURIComponent(runId)}`); }
+    catch {
+      if (reloadedThrough.get(runId) === target) reloadedThrough.delete(runId);
+      return;
+    }
+    if (!res.ok) {
+      if (reloadedThrough.get(runId) === target) reloadedThrough.delete(runId);
+      return;
+    }
+    let run;
+    try { run = await res.json(); } catch { return; }
+    if (run?.id !== runId || !run.steering) return;
+    const detail = { ...run.steering, runId };
+    // A compact summary may have advanced again while this GET was in flight.
+    // Only a detail record at least as current as the cache can restore rows.
+    if (compareCursor(cursorOf(detail), cursorOf(runs.get(runId))) < 0) {
+      noteFullCursor(runId, cursorOf(detail));
+      return;
+    }
+    if (accept(detail, run.itemId, true) && selected?.runId === runId) render();
+  })().finally(() => {
+    detailReloads.delete(runId);
+    // One later summary may have arrived during this request. It gets one
+    // follow-up for its newer cursor; repeated copies of the same summary do
+    // not turn into a fetch loop.
+    reloadDetail(runId);
+  });
+  detailReloads.set(runId, request);
+}
+
+function accept(value, itemId, full = hasOwn(value, "commands")) {
   const runId = String(value?.runId || "");
   if (!runId) return false;
-  const maxSeq = Number(value?.maxSeq) || 0;
-  const version = Number(value?.version) || maxSeq;
+  const { maxSeq, version } = cursorOf(value);
+  const incoming = { maxSeq, version };
+  if (full) noteFullCursor(runId, incoming);
   const highest = highestSeq.get(runId);
   if (highest !== undefined && maxSeq < highest) return false;
   if (highest !== undefined && maxSeq === highest && version < (highestVersion.get(runId) || highest)) return false;
@@ -27,12 +91,23 @@ function accept(value, itemId) {
   // Live is omitempty in the Go view: only true is sent, and absence on a
   // complete steering payload therefore means false rather than "unchanged".
   next.live = previous.live === false ? false : value.live === true;
-  if (!hasOwn(value, "commands") && hasOwn(previous, "commands")) next.commands = previous.commands;
+  if (!full && hasOwn(previous, "commands")) {
+    if (compareCursor(incoming, fullCursors.get(runId) || incoming) <= 0) next.commands = previous.commands;
+    else delete next.commands;
+  }
   if (itemId) next.itemId = itemId;
   runs.set(runId, next);
   highestSeq.set(runId, maxSeq);
   highestVersion.set(runId, version);
+  if (!full) reloadDetail(runId);
   return true;
+}
+
+function endSelectedRun() {
+  if (!selected) return;
+  const previous = runs.get(selected.runId) || { runId: selected.runId, itemId: selected.itemId };
+  runs.set(selected.runId, { ...previous, live: false });
+  if (selectedMeta) selectedMeta = { ...selectedMeta, outcome: "" };
 }
 
 function say(text) { $("#announcer").textContent = text; }
@@ -234,7 +309,11 @@ export function applySteeringSnapshot(run, boardMode = "auto") {
   mode = boardMode || "auto";
   selectedMeta = { kind: run.kind, itemId: run.itemId, outcome: run.outcome };
   selectedReady = true;
-  if (run.steering) accept({ ...run.steering, runId: run.id }, run.itemId);
+  if (run.steering) accept({ ...run.steering, runId: run.id }, run.itemId, true);
+  else {
+    noteFullCursor(run.id, { maxSeq: 0, version: 0 });
+    reloadDetail(run.id);
+  }
   render();
   return true;
 }
@@ -252,12 +331,26 @@ export function applySteeringEvent(event) {
 
 export function applySteeringState(snapshot) {
   mode = snapshot?.mode || "auto";
+  let exactSelectedSummary = false;
   for (const [itemId, value] of Object.entries(snapshot?.steering || {})) {
     const applied = accept(value, itemId);
     if (applied && selected?.runId === value?.runId && selected.itemId === itemId) {
+      exactSelectedSummary = true;
       selectedMeta = { kind: "stage", itemId, outcome: value.live ? "running" : "" };
       selectedReady = true;
     }
+  }
+  if (selected && !exactSelectedSummary && Array.isArray(snapshot?.active)) {
+    const active = snapshot.active.filter(a => a?.itemId === selected.itemId);
+    const exact = active.some(a => a.runId === selected.runId);
+    // A run id is briefly absent before the stage runner opens its directory,
+    // and older servers did not expose one. In that ambiguous case preserve
+    // the selected detail's verdict; no active entry at all is an exact end.
+    // A snapshot with no active array at all (never sent by /api/state, whose
+    // "active" field has no omitempty) is the same ambiguous case, not a
+    // signal of anything.
+    const legacy = active.some(a => !a.runId);
+    if (!exact && !legacy) endSelectedRun();
   }
   if (selected) render();
 }

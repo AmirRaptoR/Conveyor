@@ -252,7 +252,7 @@ type SteeringSummary struct {
 	MaxSeq    int      `json:"maxSeq"`
 	AckSeq    int      `json:"ackSeq"`
 	Version   int      `json:"version"`
-	Live      bool     `json:"live,omitempty"`
+	Live      bool     `json:"live"`
 }
 
 // TransitionError is an infrastructure failure a transition hit for an item —
@@ -561,10 +561,11 @@ type Server struct {
 	active    sync.Map // itemID -> Active, one entry per transition in flight
 	// liveRuns is the live-run registry (#111): the one place that knows a
 	// stage process is actually running right now and where its run
-	// directory is. Opened in Runner.OnStart and closed in Runner.OnResult,
-	// so an entry exists exactly while the process is live — active cannot
-	// serve this, since it is set before Engine.Advance and survives the
-	// post-stage provider move.
+	// directory is. Opened in Runner.OnStart and closed in
+	// Runner.OnProcessExit, before the runner's final control-channel read, so
+	// an entry exists exactly while the process is live — active cannot serve
+	// this, since it is set before Engine.Advance and survives the post-stage
+	// provider move.
 	liveRuns *registry.Registry
 	// working is which items have a transition in flight, recorded before the
 	// goroutine starts rather than from inside it.
@@ -760,11 +761,27 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 		if prevStart != nil {
 			prevStart(run)
 		}
-		s.noteRunStarted(run)
 		// Only a stage run naming a real item and target stage is ever
 		// steerable — a list, move, doctor or status run never is.
 		if run.Kind == "stage" && run.ItemID != "" && run.To != "" {
 			s.liveRuns.Open(run.ItemID, registry.Entry{RunID: run.ID, Dir: run.Dir, Stage: run.To})
+			s.mu.Lock()
+			s.steeringGen[run.ItemID]++
+			s.steering[run.ItemID] = SteeringSummary{RunID: run.ID, Stage: run.To, Live: true}
+			delete(s.steeringMisses, run.ItemID)
+			s.mu.Unlock()
+		}
+		// noteRunStarted publishes state. The live steering summary above must
+		// already exist when a client reacts to that publication.
+		s.noteRunStarted(run)
+	}
+	prevProcessExit := r.OnProcessExit
+	r.OnProcessExit = func(run model.Run) {
+		if run.Kind == "stage" && run.ItemID != "" {
+			s.liveRuns.Close(run.ItemID, run.ID)
+		}
+		if prevProcessExit != nil {
+			prevProcessExit(run)
 		}
 	}
 	// Every run this Runner executes — list, move, stage, doctor, status —
@@ -772,6 +789,9 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 	// without a check threaded through every call site that starts a run.
 	prevResult := r.OnResult
 	r.OnResult = func(res *runner.Result) {
+		// Defensive and harmless if OnProcessExit already closed it. This also
+		// keeps synthetic results and future early-return paths from leaking an
+		// entry if they ever acquire one.
 		if res != nil && res.Run.Kind == "stage" && res.Run.ItemID != "" {
 			s.liveRuns.Close(res.Run.ItemID, res.Run.ID)
 		}

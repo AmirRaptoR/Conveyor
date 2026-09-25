@@ -73,7 +73,11 @@ func (s *Server) handleSteeringUpdate(runID, itemID string, u runner.SteeringUpd
 	if u.Kind == "stage" && u.Stage != "" && itemID != "" {
 		s.mu.Lock()
 		s.steeringGen[itemID]++
-		if hasSteering(u.Resolution) {
+		// OnStart installs an empty live summary before the first state
+		// publication. Keep that exact process state through malformed-only
+		// updates, and retain the final empty summary as a live:false tombstone
+		// even when the adapter never advertised the protocol.
+		if u.Final || live || hasSteering(u.Resolution) {
 			s.steering[itemID] = v.SteeringSummary
 			delete(s.steeringMisses, itemID)
 		} else {
@@ -82,7 +86,7 @@ func (s *Server) handleSteeringUpdate(runID, itemID string, u runner.SteeringUpd
 		}
 		s.mu.Unlock()
 	}
-	if u.Resolution.AckVersion > 0 || hasSteering(u.Resolution) || u.Resolution.Malformed > 0 {
+	if u.Final || u.Resolution.AckVersion > 0 || hasSteering(u.Resolution) || u.Resolution.Malformed > 0 {
 		s.hub.publish(event{Kind: "steering", RunID: runID, ItemID: itemID, Steering: &v})
 	}
 }

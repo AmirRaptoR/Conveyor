@@ -5,17 +5,34 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/AmirRaptoR/Conveyor/internal/model"
 )
 
 // The live-run registry (#111) is opened on Runner.OnStart and closed on
-// Runner.OnResult: an entry exists exactly while the stage process itself
-// is running, unlike active (schedule.go), which is set before
-// Engine.Advance and survives the post-stage provider move.
-func TestLiveRunsRegistryOpensWhileStageRunsAndClosesAfter(t *testing.T) {
+// Runner.OnProcessExit: an entry exists exactly while the stage process itself
+// is running, unlike active (schedule.go), which is set before Engine.Advance
+// and survives the post-stage provider move.
+func TestLiveRunsRegistryClosesBeforeProviderMove(t *testing.T) {
 	cfg, r, dir := pipelineFor(t)
+	moves := filepath.Join(dir, "moves")
+	writeScript(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\necho x >> "+moves+"\nexit 0\n")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := New(cfg, r)
+	processExited := make(chan struct{})
+	releaseExitCallback := make(chan struct{})
+	previous := r.OnProcessExit
+	r.OnProcessExit = func(run model.Run) {
+		if previous != nil {
+			previous(run)
+		}
+		if run.Kind == "stage" {
+			close(processExited)
+			<-releaseExitCallback
+		}
+	}
 	s.ctx = ctx
 	go s.poll(ctx)
 	go s.schedule(ctx)
@@ -46,17 +63,25 @@ func TestLiveRunsRegistryOpensWhileStageRunsAndClosesAfter(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "release"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-
-	waitFor(t, "the live-run entry to close once the stage process exits", func() bool {
-		_, ok := s.liveRuns.Lookup("s1:1")
-		return !ok
-	})
-	// Registry closure deliberately precedes the provider move that finishes
-	// the transition. Wait for that separate lifetime before TempDir cleanup.
+	select {
+	case <-processExited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for process-exit callback")
+	}
+	if _, ok := s.liveRuns.Lookup("s1:1"); ok {
+		t.Fatal("live-run registry remained open in the process-exit callback")
+	}
+	if got := countLines(moves); got != 1 {
+		t.Fatalf("provider moves before process-exit callback returned = %d, want only the initial move", got)
+	}
+	close(releaseExitCallback)
 	waitFor(t, "the transition to finish", func() bool {
 		_, working := s.working.Load("s1:1")
 		return !working
 	})
+	if got := countLines(moves); got != 2 {
+		t.Fatalf("provider moves after transition = %d, want initial and outgoing moves", got)
+	}
 }
 
 // A list, move, doctor or status run is never steerable and must never

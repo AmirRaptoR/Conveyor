@@ -97,6 +97,11 @@ type Runner struct {
 	// exist, immediately before its process is started. It gives live views the
 	// run id while the run is still active rather than only after it returns.
 	OnStart func(run model.Run)
+	// OnProcessExit, if set, is called immediately after cmd.Wait returns and
+	// before the final plan and control-ack reads begin. A caller closing an
+	// operation registry here can therefore wait for an in-flight write and
+	// know the final read includes it, while refusing every later write.
+	OnProcessExit func(run model.Run)
 	// OnLog, if set, is called for every line as it is produced — this is what
 	// makes logs live in the UI. Called from a single goroutine, in order.
 	OnLog func(runID string, line LogLine)
@@ -506,6 +511,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 
 	wg.Wait()
 	waitErr := cmd.Wait()
+	if r.OnProcessExit != nil {
+		r.OnProcessExit(run)
+	}
 	close(tailStop)
 	tailWG.Wait()
 
