@@ -120,6 +120,9 @@ type State struct {
 	// has actually published a plan; the engine derives no meaning from its
 	// contents beyond the counts and the current step already computed here.
 	Plans map[string]PlanView `json:"plans,omitempty"`
+	// Steering is each item's compact control-channel state. Full commands
+	// stay on GET /api/runs/{id} and steering SSE events.
+	Steering map[string]SteeringSummary `json:"steering,omitempty"`
 	// Active is every transition running right now. The board lights those
 	// stations; without it the page cannot tell work from stillness.
 	Active []Active `json:"active"`
@@ -230,6 +233,26 @@ type PlanView struct {
 type planCursor struct {
 	Stage string
 	RunID string
+}
+
+// SteeringSummary is the bounded card/state representation of one run's
+// control channel. AckSeq and Version disambiguate updates whose command
+// MaxSeq is equal but whose ack state or malformed count changed.
+type SteeringSummary struct {
+	RunID     string   `json:"runId"`
+	Stage     string   `json:"stage"`
+	Session   string   `json:"session"`
+	Accepts   []string `json:"accepts"`
+	Queued    int      `json:"queued"`
+	Consumed  int      `json:"consumed"`
+	Rejected  int      `json:"rejected"`
+	Carried   int      `json:"carried"`
+	Dropped   int      `json:"dropped"`
+	Malformed int      `json:"malformed"`
+	MaxSeq    int      `json:"maxSeq"`
+	AckSeq    int      `json:"ackSeq"`
+	Version   int      `json:"version"`
+	Live      bool     `json:"live,omitempty"`
 }
 
 // TransitionError is an infrastructure failure a transition hit for an item —
@@ -453,6 +476,9 @@ type Server struct {
 	// rejects one that began before retention deleted what it read.
 	planMisses     map[string]planCursor
 	planGeneration map[string]uint64
+	steering       map[string]SteeringSummary
+	steeringMisses map[string]planCursor
+	steeringGen    map[string]uint64
 	runStoreGen    uint64
 	// transitionErrs is the last infrastructure error a transition hit for an
 	// item — an initial provider move that failed, an unknown source or
@@ -691,6 +717,9 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 	s.plans = map[string]PlanView{}
 	s.planMisses = map[string]planCursor{}
 	s.planGeneration = map[string]uint64{}
+	s.steering = map[string]SteeringSummary{}
+	s.steeringMisses = map[string]planCursor{}
+	s.steeringGen = map[string]uint64{}
 	s.transitionErrs = map[string]TransitionError{}
 	s.paused = map[string]PauseView{}
 	s.cancels = map[string]CancelView{}
@@ -743,14 +772,14 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 	// without a check threaded through every call site that starts a run.
 	prevResult := r.OnResult
 	r.OnResult = func(res *runner.Result) {
+		if res != nil && res.Run.Kind == "stage" && res.Run.ItemID != "" {
+			s.liveRuns.Close(res.Run.ItemID, res.Run.ID)
+		}
 		if prevResult != nil {
 			prevResult(res)
 		}
 		s.notePersistFault(res)
 		s.finishPlanRun(res)
-		if res != nil && res.Run.Kind == "stage" && res.Run.ItemID != "" {
-			s.liveRuns.Close(res.Run.ItemID, res.Run.ID)
-		}
 	}
 	// Every accepted plan revision and every rejection reaches here live,
 	// the same way OnLog makes logs live — see handlePlanUpdate.
@@ -760,6 +789,13 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 			prevPlan(runID, itemID, u)
 		}
 		s.handlePlanUpdate(runID, itemID, u)
+	}
+	prevSteering := r.OnSteering
+	r.OnSteering = func(runID, itemID string, u runner.SteeringUpdate) {
+		if prevSteering != nil {
+			prevSteering(runID, itemID, u)
+		}
+		s.handleSteeringUpdate(runID, itemID, u)
 	}
 	return s
 }

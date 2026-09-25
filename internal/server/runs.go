@@ -13,6 +13,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/plan"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
+	steeringprotocol "github.com/AmirRaptoR/Conveyor/internal/steering"
 )
 
 // RunMeta is one run directory, as the board needs it.
@@ -31,7 +32,8 @@ type RunMeta struct {
 	// plan.jsonl — nil when it published none. RunPlanView carries the
 	// counts too, so the panel needs no second request to render a finished
 	// or historical run's progress and rejection count.
-	Plan *RunPlanView `json:"plan,omitempty"`
+	Plan     *RunPlanView     `json:"plan,omitempty"`
+	Steering *RunSteeringView `json:"steering,omitempty"`
 }
 
 // RunPlanView is one run's own plan, in full — the panel's shape, distinct
@@ -96,6 +98,15 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			latest = &rev
 		}
 		run.Plan = &RunPlanView{Revision: latest, Accepted: accepted, Rejected: rejected}
+	}
+	steeringResult := steeringprotocol.Load(run.Dir, run.Outcome != model.OutcomeRunning)
+	if hasSteering(steeringResult) || steeringResult.Malformed > 0 {
+		live := false
+		if entry, ok := s.liveRuns.Lookup(run.ItemID); ok && entry.RunID == run.ID {
+			live = true
+		}
+		view := steeringView(run.ID, run.To, steeringResult, live)
+		run.Steering = &view
 	}
 	s.runStoreMu.RUnlock()
 	writeJSON(w, run)

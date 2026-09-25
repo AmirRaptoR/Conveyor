@@ -15,6 +15,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/preflight"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 	"github.com/AmirRaptoR/Conveyor/internal/source"
+	"github.com/AmirRaptoR/Conveyor/internal/steering"
 )
 
 // discoveryWorkers bounds how many sources are listed at once. Listing is I/O
@@ -399,6 +400,18 @@ func (s *Server) refresh(ctx context.Context) {
 			delete(s.planGeneration, id)
 		}
 	}
+	for id := range s.steering {
+		if !onBoard[id] {
+			delete(s.steering, id)
+			delete(s.steeringGen, id)
+		}
+	}
+	for id := range s.steeringMisses {
+		if !onBoard[id] {
+			delete(s.steeringMisses, id)
+			delete(s.steeringGen, id)
+		}
+	}
 	for id := range s.cancels {
 		if !onBoard[id] {
 			delete(s.cancels, id)
@@ -618,9 +631,12 @@ func (s *Server) recallBlocks(items []model.Item) {
 		}
 	}
 	stageOf := make(map[string]string, len(items))
+	channelStages := effectiveStages(items, s.state.Active)
 	wantTimes := map[string]bool{}
 	wantPlans := map[string]bool{}
 	planGenerations := map[string]uint64{}
+	wantSteering := map[string]bool{}
+	steeringGenerations := map[string]uint64{}
 	runStoreGen := s.runStoreGen
 	for _, it := range items {
 		stageOf[it.ID] = it.Stage
@@ -628,21 +644,31 @@ func (s *Server) recallBlocks(items []model.Item) {
 		if !known || t.Stage != it.Stage {
 			wantTimes[it.ID] = true
 		}
+		channelStage := channelStages[it.ID]
 		p, hasPlan := s.plans[it.ID]
 		miss, hasMiss := s.planMisses[it.ID]
 		switch {
-		case hasPlan && p.Stage == it.Stage:
+		case hasPlan && p.Stage == channelStage:
 			// The accepted summary is already current.
-		case !hasPlan && hasMiss && miss.Stage == it.Stage:
+		case !hasPlan && hasMiss && miss.Stage == channelStage:
 			// The newest matching run was already inspected and had no
 			// accepted revision. Do not rescan it every discovery pass.
 		default:
 			wantPlans[it.ID] = true
 			planGenerations[it.ID] = s.planGeneration[it.ID]
 		}
+		v, hasSteering := s.steering[it.ID]
+		steeringMiss, hasSteeringMiss := s.steeringMisses[it.ID]
+		switch {
+		case hasSteering && v.Stage == channelStage:
+		case !hasSteering && hasSteeringMiss && steeringMiss.Stage == channelStage:
+		default:
+			wantSteering[it.ID] = true
+			steeringGenerations[it.ID] = s.steeringGen[it.ID]
+		}
 	}
 	s.mu.RUnlock()
-	if len(wantBlocks) == 0 && len(wantTimes) == 0 && len(wantPlans) == 0 {
+	if len(wantBlocks) == 0 && len(wantTimes) == 0 && len(wantPlans) == 0 && len(wantSteering) == 0 {
 		return
 	}
 
@@ -650,6 +676,8 @@ func (s *Server) recallBlocks(items []model.Item) {
 	foundTimes := map[string]ItemTime{}
 	foundPlans := map[string]PlanView{}
 	foundPlanRuns := map[string]string{}
+	foundSteering := map[string]SteeringSummary{}
+	foundSteeringRuns := map[string]string{}
 	// Keep the scanned directories present until every recovered cache entry
 	// has merged. Retention takes the write side of this lock and then evicts
 	// under s.mu, so no API state can observe a deleted run being reinserted in
@@ -702,7 +730,7 @@ func (s *Server) recallBlocks(items []model.Item) {
 		// plan.jsonl, an empty one, or only rejected lines means the item has
 		// no plan; that verdict is this run's alone, not a reason to look
 		// further back at an older run in the same stage.
-		if wantPlans[m.ItemID] && m.Kind == "stage" && m.To == stageOf[m.ItemID] {
+		if wantPlans[m.ItemID] && m.Kind == "stage" && m.To == channelStages[m.ItemID] {
 			foundPlanRuns[m.ItemID] = m.ID
 			if rev, ok, _, rejected := loadRunPlan(m.Dir, m.Outcome != model.OutcomeRunning); ok {
 				completed, total, inProgress := rev.Progress()
@@ -714,7 +742,15 @@ func (s *Server) recallBlocks(items []model.Item) {
 			}
 			delete(wantPlans, m.ItemID)
 		}
-		return len(wantBlocks) > 0 || len(wantTimes) > 0 || len(wantPlans) > 0
+		if wantSteering[m.ItemID] && m.Kind == "stage" && m.To == channelStages[m.ItemID] {
+			foundSteeringRuns[m.ItemID] = m.ID
+			res := steering.Load(m.Dir, m.Outcome != model.OutcomeRunning)
+			if hasSteering(res) {
+				foundSteering[m.ItemID] = steeringView(m.ID, m.To, res, false).SteeringSummary
+			}
+			delete(wantSteering, m.ItemID)
+		}
+		return len(wantBlocks) > 0 || len(wantTimes) > 0 || len(wantPlans) > 0 || len(wantSteering) > 0
 	})
 
 	s.mu.Lock()
@@ -793,5 +829,6 @@ func (s *Server) recallBlocks(items []model.Item) {
 		}
 	}
 	s.mu.Unlock()
-	s.mergeRecoveredPlans(runStoreGen, planGenerations, stageOf, foundPlans, foundPlanRuns)
+	s.mergeRecoveredPlans(runStoreGen, planGenerations, channelStages, foundPlans, foundPlanRuns)
+	s.mergeRecoveredSteering(runStoreGen, steeringGenerations, channelStages, foundSteering, foundSteeringRuns)
 }
