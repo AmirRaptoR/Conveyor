@@ -114,7 +114,8 @@ ${default}"
 }
 
 # hit_limit reports whether the account was out of quota. Claude Code says so in
-# the transcript and exits cleanly, so nothing else can tell you.
+# the transcript and exits cleanly, so nothing else can tell you. Classification
+# reads the private raw stream; CLAUDE_SAID is redacted for human-visible logs.
 #
 # Anchored to the start of a line, because the transcript is not only the CLI
 # talking — it is also the model talking, and the model quotes. Searching the
@@ -135,15 +136,13 @@ ${default}"
 # apostrophe without depending on the locale to make a bracket expression
 # match a multibyte character.
 hit_limit() {
-	[[ -s "$CLAUDE_SAID" ]] &&
-		grep -qiE "^[[:space:]]*You.{0,2}ve hit your (session|usage|weekly) limit" "$CLAUDE_SAID"
+	[[ -s "$CLAUDE_RAW" ]] && render_stream <"$CLAUDE_RAW" |
+		grep -qiE "^[[:space:]]*You.{0,2}ve hit your (session|usage|weekly) limit"
 }
 
 # hit_max_turns reports whether the run stopped because it exhausted its
 # --max-turns budget rather than finishing or being denied for quota. Reads
-# the line render_stream just put in $CLAUDE_SAID for exactly this — a result
-# event with is_error and subtype "error_max_turns" — instead of re-parsing
-# the raw stream a second time.
+# its private result event with is_error and subtype "error_max_turns".
 #
 # This is a condition, not a decision: the work done before the wall is real
 # (commits pushed, comments posted, tests run), and what stopped it was a
@@ -151,7 +150,8 @@ hit_limit() {
 # record_session first if the caller wants the conversation resumable —
 # hit_max_turns only answers "was this the reason", it writes nothing.
 hit_max_turns() {
-	[[ -s "$CLAUDE_SAID" ]] && grep -q '\[claude stopped: error_max_turns' "$CLAUDE_SAID"
+	[[ -s "$CLAUDE_RAW" ]] &&
+		jq -e 'select(.type == "result" and (.is_error // false) and .subtype == "error_max_turns")' "$CLAUDE_RAW" >/dev/null 2>&1
 }
 
 # record_session merges {"session": "..."} into $CONVEYOR_RESULT, creating it

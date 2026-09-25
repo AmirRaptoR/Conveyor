@@ -222,6 +222,11 @@ chk "a valid event stream succeeds" "$rc" "0"
 chk "text events become logs" "$(grep -c 'work complete' <<<"$out")" "1"
 chk "tool output is not logged" "$(grep -c 'SECRET TOOL OUTPUT' <<<"$out" || true)" "0"
 chk "the session is captured" "$(claude_session)" "ses-good"
+reset_invocations
+export API_KEY=good OC_SCENE=success
+run_claude 'do the work' >/dev/null 2>&1
+chk "a secret-colliding OpenCode session is omitted" "$(jq -r 'has("session")' "$CONVEYOR_RESULT")" "false"
+unset API_KEY
 chk "the selected model is recorded" "$(record_model)" "model: openai/gpt-test variant: high agent: build"
 export API_SECRET=gpt-test
 chk "OpenCode model metadata is redacted" "$(record_model)" "model: openai/[REDACTED] variant: high agent: build"
