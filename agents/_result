@@ -30,6 +30,18 @@ version-1 result contract from the prior request. Do not wrap it in explanation.
 BRIEF
 }
 
+# Stops that may clear without a person's answer. This is the one script-owned
+# list used by result normalization, backend adapters, and the board parity test.
+CONDITION_KINDS=(limit turns unfinished dependency worktree invalid-result)
+
+is_condition_kind() {
+	local word=$1 k
+	for k in "${CONDITION_KINDS[@]}"; do
+		[[ "$word" == "$k" ]] && return 0
+	done
+	return 1
+}
+
 # Broad enough for each shipped stage's task-specific payload while still
 # forcing the transport discriminator and rejecting model-owned trusted fields.
 result_json_schema() {
@@ -151,11 +163,12 @@ result_validate_model() {
 }
 
 result_normalize() {
-	local json=$1 session=${2:-}
-	jq -c --arg session "$session" '
+	local json=$1 session=${2:-} conditions
+	conditions=$(printf '%s\n' "${CONDITION_KINDS[@]}" | jq -Rsc 'split("\n")[:-1]') || return 1
+	jq -c --arg session "$session" --argjson conditions "$conditions" '
 		if .outcome == "blocked" then
 			.kind as $kind |
-			. + {blocked:true, asked: (((.questions // []) | length) > 0 or (["limit","turns","unfinished","dependency","worktree"] | index($kind)) == null)}
+			. + {blocked:true, asked: (((.questions // []) | length) > 0 or ($conditions | index($kind)) == null)}
 		elif .outcome == "noop" then . + {noop:true}
 		else . end |
 		if $session == "" then . else . + {session:$session} end

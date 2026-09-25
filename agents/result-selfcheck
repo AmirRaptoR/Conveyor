@@ -2,6 +2,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/_result"
+source "$here/_blocked"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 export CONVEYOR_RESULT="$tmp/result.json"
@@ -36,10 +37,15 @@ for bad in \
 	chk "a rejection preserves the complete old result" "$(cat "$CONVEYOR_RESULT")" "$before"
 done
 
-result_accept '{"v":1,"outcome":"blocked","kind":"decision","reason":"choose","questions":[{"header":"API","question":"Which API?","options":[{"label":"A","description":"first"},{"label":"B","description":"second"}],"multiSelect":false}]}' sess-q
+advertised='{"v":1,"outcome":"blocked","kind":"decision","reason":"<the decision needed, in one sentence>","questions":[{"header":"<label, under 12 chars>","question":"<the full question, self-contained>","options":[{"label":"<recommended choice>","description":"<what choosing it means>"},{"label":"<alternative choice>","description":"<what choosing it means>"}],"multiSelect":false}]}'
+chk "the advertised decision envelope is exact" "$(decision_brief | grep -Fc "$advertised")" "1"
+if result_accept "$advertised" sess-q; then got=accepted; else got=rejected; fi
+chk "the advertised decision envelope is accepted" "$got" "accepted"
 chk "a question gets trusted compatibility fields" "$(jq -c '[.blocked,.asked,.session]' "$CONVEYOR_RESULT")" '[true,true,"sess-q"]'
 result_accept '{"v":1,"outcome":"blocked","kind":"dependency","reason":"wait"}'
 chk "a condition is not promoted to a question" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
+result_accept '{"v":1,"outcome":"blocked","kind":"invalid-result","reason":"malformed"}'
+chk "invalid-result is normalized as a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
 result_accept '{"v":1,"outcome":"waiting","waiting":{"why":"later","until":"2026-09-25T18:00:00Z"}}'
 chk "a real UTC waiting timestamp is accepted" "$(jq -r .waiting.until "$CONVEYOR_RESULT")" "2026-09-25T18:00:00Z"
 

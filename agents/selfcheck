@@ -542,15 +542,15 @@ chk "a grace wider than the stage still reads" \
 
 # 13. is_condition_kind (#68): the predicate agent_asked derives `asked`
 # from, checked directly rather than through a model-written result.
-for k in limit turns unfinished dependency worktree; do
+for k in limit turns unfinished dependency worktree invalid-result; do
 	chk "is_condition_kind recognises $k" "$(is_condition_kind "$k" && echo yes)" "yes"
 done
 for k in decision no-output input draft error flabbergasted; do
 	chk "is_condition_kind rejects $k" "$(is_condition_kind "$k" && echo yes)" ""
 done
 
-# 14. board.js's WAITING set and agents/_blocked's CONDITION_KINDS are one
-# list, not two that can drift apart. agents/_blocked is authoritative, so
+# 14. board.js's WAITING set and agents/_result's CONDITION_KINDS are one
+# list, not two that can drift apart. agents/_result is authoritative, so
 # this fails on a word added to or removed from either side — verified by
 # making each of those four edits and watching this line fail.
 board_waiting=$(grep -o 'WAITING = new Set(\[[^]]*\])' "$here/../internal/server/web/board.js" |

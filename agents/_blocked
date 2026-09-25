@@ -70,27 +70,6 @@ blocked() {
 	exit 20
 }
 
-# CONDITION_KINDS — the self-clearing subset of the vocabulary above: a stop
-# that may have passed by the time anyone looks, so bulk-clearing it costs at
-# most one run wrongly retried, never a question answered twice. Not the
-# whole vocabulary — decision, no-output, input, draft and error are
-# deliberately not on it. The six words are already written down in
-# CLAUDE.md's three-tone bullet and in board.js's WAITING set; this is what
-# gives them one place a script can read instead of a third copy of the list
-# (a check in ./check keeps this and board.js's WAITING in agreement).
-CONDITION_KINDS=(limit turns unfinished dependency worktree invalid-result)
-
-# is_condition_kind <word> — true when word names a condition rather than a
-# question. Used by agent_asked (agents/claude/_stream) to derive `asked`
-# from the kind the model actually wrote, instead of a call site guessing.
-is_condition_kind() {
-	local word=$1 k
-	for k in "${CONDITION_KINDS[@]}"; do
-		[[ "$word" == "$k" ]] && return 0
-	done
-	return 1
-}
-
 # asks <kind> "<question>" — stop because a person has to answer something.
 #
 # The same mark, with one bit more: `asked`. A stop is one of two things and
@@ -118,12 +97,7 @@ decision_brief() {
 	If this cannot be done because it needs a decision only a human can make,
 	change nothing and return this as your final structured response:
 
-	  {"v": 1, "outcome": "blocked", "kind": "decision",
-	   "reason": "<the decision needed, in one sentence>",
-	   "questions": [{"header": "<label, under 12 chars>",
-	                  "question": "<the full question, self-contained>",
-	                  "options": [{"label": "<1-5 words>", "description": "<what choosing it means>"}],
-	                  "multiSelect": false}]}
+	  {"v":1,"outcome":"blocked","kind":"decision","reason":"<the decision needed, in one sentence>","questions":[{"header":"<label, under 12 chars>","question":"<the full question, self-contained>","options":[{"label":"<recommended choice>","description":"<what choosing it means>"},{"label":"<alternative choice>","description":"<what choosing it means>"}],"multiSelect":false}]}
 
 	One entry per question, two to four options each, the one you would pick
 	listed first. This is the AskUserQuestion shape; that tool is not available
