@@ -351,7 +351,9 @@ calls=1
 printf '%s' "$calls" >"$RESULT_CALLS"
 printf '%s\n' "$*" >"$RESULT_ARGS.$calls"
 printf '%s\n' "${CONVEYOR_RESULT+exposed}" >>"$RESULT_ENV"
-jq -nc '{type:"system",subtype:"init",session_id:"result-session",model:"stub"}'
+if [[ "$RESULT_SCENE" != invalid-no-session ]]; then
+	jq -nc '{type:"system",subtype:"init",session_id:"result-session",model:"stub"}'
+fi
 case "$RESULT_SCENE" in
 fenced)
 	jq -nc --arg result $'```json\n{"v":1,"outcome":"success","summary":"fenced"}\n```' \
@@ -372,7 +374,7 @@ secret)
 	jq -nc --arg text "$RESULT_SECRET" '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"success",summary:$text}}'
 	;;
 stderr-secret)
-	printf 'provider stderr: %s / %s\n' "$RESULT_SECRET" "$RESULT_ESCAPED" >&2
+	printf 'provider stderr: %s / %s / %s\n' "$RESULT_SECRET" "$RESULT_ESCAPED" "${RESULT_ALTERNATE:-}" >&2
 	jq -nc '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"success"}}'
 	;;
 waiting)
@@ -380,6 +382,9 @@ waiting)
 	;;
 invalid)
 	jq -nc --arg result 'still not json' '{type:"result",subtype:"success",is_error:false,session_id:"result-session",result:$result}'
+	;;
+invalid-no-session)
+	jq -nc --arg result 'still not json' '{type:"result",subtype:"success",is_error:false,result:$result}'
 	;;
 incomplete)
 	jq -nc '{type:"assistant",session_id:"result-session",message:{content:[{type:"text",text:"partial"}]}}'
@@ -423,6 +428,8 @@ chk "the duplicate correction wins" "$(jq -r .summary "$CONVEYOR_RESULT")" "corr
 chk "a second invalid result quarantines" "$(run_result_scene invalid):$(cat "$RESULT_CALLS")" "20:2"
 chk "the invalid result has a precise kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "invalid-result"
 chk "the invalid result is not a question" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
+chk "an invalid result without a session is not retried" "$(run_result_scene invalid-no-session):$(cat "$RESULT_CALLS")" "20:1"
+chk "a sessionless invalid result is quarantined" "$(jq -r .kind "$CONVEYOR_RESULT")" "invalid-result"
 
 chk "a waiting final returns the deferral exit" "$(run_result_scene waiting)" "10"
 chk "the waiting reason is persisted" "$(jq -r .waiting.why "$CONVEYOR_RESULT")" "checks are running"
@@ -447,6 +454,11 @@ secret_log=$(run_claude 'do the task' 2>&1)
 chk "literal secrets are absent from Claude stderr" "$(grep -Fc -- "$API_SECRET" <<<"$secret_log" || true)" "0"
 chk "JSON-escaped secrets are absent from Claude stderr" "$(grep -Fc -- "$RESULT_ESCAPED" <<<"$secret_log" || true)" "0"
 unset API_SECRET RESULT_SECRET RESULT_ESCAPED
+
+export API_SECRET='abc/é😀' RESULT_SECRET=safe RESULT_ESCAPED=safe RESULT_ALTERNATE='abc\/\u00E9\uD83D\uDE00' RESULT_SCENE=stderr-secret
+secret_log=$(run_claude 'do the task' 2>&1)
+chk "alternate JSON escapes are absent from Claude stderr" "$(grep -Fic 'abc\/\u00E9\uD83D\uDE00' <<<"$secret_log" || true)" "0"
+unset API_SECRET RESULT_SECRET RESULT_ESCAPED RESULT_ALTERNATE
 
 export PRIVATE_KEY=$'multi-secret-top\nmulti-secret-bottom'
 export RESULT_SECRET="$PRIVATE_KEY" RESULT_SCENE=secret

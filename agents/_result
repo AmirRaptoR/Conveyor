@@ -58,24 +58,43 @@ result_json_schema() {
 	}'
 }
 
+_secret_pattern() {
+	jq -nr --arg value "$1" '
+		def re: gsub("\\\\";"\\\\") | gsub("\\.";"\\.") | gsub("\\^";"\\^") |
+			gsub("\\$";"\\$") | gsub("\\|";"\\|") | gsub("\\?";"\\?") |
+			gsub("\\*";"\\*") | gsub("\\+";"\\+") | gsub("\\(";"\\(") |
+			gsub("\\)";"\\)") | gsub("\\[";"\\[") | gsub("\\]";"\\]") |
+			gsub("\\{";"\\{") | gsub("\\}";"\\}");
+		def hd: if . < 10 then tostring else
+			(["a","b","c","d","e","f"][.-10] as $x | "["+$x+($x|ascii_upcase)+"]") end;
+		def u4($n): "\\\\u" + (($n/4096|floor)%16|hd) + (($n/256|floor)%16|hd) +
+			(($n/16|floor)%16|hd) + ($n%16|hd);
+		def unicode($cp): if $cp <= 65535 then u4($cp) else
+			(($cp-65536) as $n | u4(55296+($n/1024|floor)) + u4(56320+($n%1024))) end;
+		[$value | explode[] | . as $cp |
+			([([.]|implode), (([.]|implode)|tojson|.[1:-1])] +
+			 (if $cp == 47 then ["\\/"] else [] end) | unique | map(re) | join("|")) as $ordinary |
+			"(?:"+$ordinary+"|"+unicode($cp)+")"] | join("")'
+}
+
 # Exact-value redaction for values carried by conventionally sensitive
-# environment names. Empty values carry no secret; every non-empty value is
-# replaced even when short because this boundary promises exact-value redaction.
+# environment names. The pattern accepts literal text and any equivalent JSON
+# string escaping, including escaped solidus, Unicode, and surrogate pairs.
 redact_text() {
-	local text=$1 name value escaped fragment
+	local text=$1 name value fragment pattern
 	for name in $(compgen -e); do
 		[[ "$name" =~ ([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Kk][Ee][Yy]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]) ]] || continue
 		value=${!name-}
 		[[ -n "$value" ]] || continue
-		escaped=$(jq -nr --arg value "$value" '$value | @json') || return 1
-		escaped=${escaped:1:${#escaped}-2}
-		[[ "$escaped" == "$value" ]] || text=${text//"$escaped"/[REDACTED]}
-		text=${text//"$value"/[REDACTED]}
+		pattern=$(_secret_pattern "$value") || return 1
+		text=$(jq -nr --arg text "$text" --arg pattern "$pattern" '$text | gsub($pattern;"[REDACTED]")') || return 1
 		# redact_stream receives one line at a time. Redact every non-empty
 		# component of a multiline secret so joining those lines cannot recover it.
 		if [[ "$value" == *$'\n'* ]]; then
 			while IFS= read -r fragment || [[ -n "$fragment" ]]; do
-				[[ -n "$fragment" ]] && text=${text//"$fragment"/[REDACTED]}
+				[[ -n "$fragment" ]] || continue
+				pattern=$(_secret_pattern "$fragment") || return 1
+				text=$(jq -nr --arg text "$text" --arg pattern "$pattern" '$text | gsub($pattern;"[REDACTED]")') || return 1
 			done <<<"$value"
 		fi
 	done

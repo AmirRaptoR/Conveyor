@@ -381,6 +381,10 @@ $(result_brief)"
 		return 0
 	fi
 	failure="the agent completed without one valid version-1 final result"
+	if [[ -z "$session" ]]; then
+		result_quarantine "$failure; no session was available for a same-session correction"
+		return 20
+	fi
 	RESUME_SESSION=$session
 	if _claude_invoke "$(result_correction_brief)" 1; then rc=0; else rc=$?; fi
 	if [[ $rc -eq 0 ]]; then

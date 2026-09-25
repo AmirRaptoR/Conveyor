@@ -58,7 +58,7 @@ success)
 	;;
 secrets)
 	text=$(jq -nc --arg summary "saw $SHORT_KEY and $API_SECRET" '{v:1,outcome:"success",summary:$summary}')
-	printf 'provider stderr: %s / %s\n' "$API_SECRET" "$ESCAPED_SECRET" >&2
+	printf 'provider stderr: %s / %s / %s\n' "$API_SECRET" "$ESCAPED_SECRET" "${ALT_ESCAPED_SECRET:-}" >&2
 	jq -nc '{type:"step_start",timestamp:1,sessionID:"ses-secrets",part:{id:"start",type:"step-start"}}'
 	jq -nc --arg text "$text" '{type:"text",timestamp:2,sessionID:"ses-secrets",part:{id:"text",type:"text",text:$text}}'
 	jq -nc '{type:"step_finish",timestamp:3,sessionID:"ses-secrets",part:{id:"finish",type:"step-finish",reason:"stop"}}'
@@ -255,6 +255,12 @@ chk "a literal complex secret is absent from backend logs" "$(grep -Fc -- "$API_
 chk "a JSON-escaped secret is absent from backend logs" "$(grep -Fc -- "$escaped_secret" <<<"$out" || true)" "0"
 chk "secret values are absent from the persisted result" "$(jq -r .summary "$CONVEYOR_RESULT")" "saw [REDACTED] and [REDACTED]"
 unset SHORT_KEY API_SECRET ESCAPED_SECRET
+
+reset_invocations
+export OC_SCENE=secrets SHORT_KEY=safe API_SECRET='abc/é😀' ESCAPED_SECRET=safe ALT_ESCAPED_SECRET='abc\/\u00E9\uD83D\uDE00'
+out=$(run_claude 'return escaped secrets for the fixture' 2>&1)
+chk "alternate JSON escapes are absent from OpenCode logs" "$(grep -Fic 'abc\/\u00E9\uD83D\uDE00' <<<"$out" || true)" "0"
+unset SHORT_KEY API_SECRET ESCAPED_SECRET ALT_ESCAPED_SECRET
 
 reset_invocations
 export OC_SCENE=waiting
