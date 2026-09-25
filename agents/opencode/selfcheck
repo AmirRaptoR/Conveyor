@@ -107,7 +107,8 @@ duplicate-once|duplicate-always)
 	fi
 	;;
 limit)
-	printf '%s\n' '{"type":"error","timestamp":1,"sessionID":"ses-limit","error":{"name":"FreeUsageLimitError","data":{"message":"free usage limit reached","responseBody":"SECRET PROVIDER BODY"}}}'
+	jq -nc --arg message "${LIMIT_MESSAGE:-free usage limit reached}" \
+		'{type:"error",timestamp:1,sessionID:"ses-limit",error:{name:"FreeUsageLimitError",data:{message:$message,responseBody:"SECRET PROVIDER BODY"}}}'
 	;;
 generic429)
 	printf '%s\n' '{"type":"error","timestamp":1,"sessionID":"ses-rate","error":{"name":"APIError","data":{"message":"too many requests","statusCode":429}}}'
@@ -522,8 +523,12 @@ agent_asked
 chk "questions remain questions" "$(jq -r .asked "$CONVEYOR_RESULT")" "true"
 chk "questions retain their session" "$(jq -r .session "$CONVEYOR_RESULT")" "opencode:ses-question"
 
+export API_TOKEN='quota-secret-112' API_SECRET='quoted"quota\value'
+escaped_quota=$(jq -nr --arg value "$API_SECRET" '$value | @json')
+escaped_quota=${escaped_quota:1:${#escaped_quota}-2}
+LIMIT_MESSAGE="quota exceeded for $API_TOKEN and $escaped_quota"
 OC_SCENE=limit
-export OC_SCENE
+export OC_SCENE LIMIT_MESSAGE
 set +e
 run_claude 'hit the quota' >/dev/null 2>&1
 rc=$?
@@ -532,6 +537,12 @@ chk "an error event fails the run" "$rc" "1"
 chk "an explicit quota event is recognised" "$(hit_limit && echo yes)" "yes"
 chk "the quota refusal is cached for status" "$([[ -s "$XDG_STATE_HOME/conveyor/opencode/openai.json" ]] && echo yes)" "yes"
 chk "provider response bodies are not cached" "$(grep -c 'SECRET PROVIDER BODY' "$XDG_STATE_HOME/conveyor/opencode/openai.json" || true)" "0"
+chk "literal secrets are absent from the quota cache" "$(grep -Fc -- "$API_TOKEN" "$XDG_STATE_HOME/conveyor/opencode/openai.json" || true)" "0"
+chk "JSON-escaped secrets are absent from the quota cache" "$(grep -Fc -- "$escaped_quota" "$XDG_STATE_HOME/conveyor/opencode/openai.json" || true)" "0"
+status_out=$("$here/status" 2>&1)
+chk "literal quota secrets are absent from status output" "$(grep -Fc -- "$API_TOKEN" <<<"$status_out" || true)" "0"
+chk "JSON-escaped quota secrets are absent from status output" "$(grep -Fc -- "$escaped_quota" <<<"$status_out" || true)" "0"
+unset API_TOKEN API_SECRET LIMIT_MESSAGE
 
 OC_SCENE=success run_claude 'quota recovered' >/dev/null
 chk "a successful provider run clears its quota cache" "$([[ -e "$XDG_STATE_HOME/conveyor/opencode/openai.json" ]] && echo present || echo absent)" "absent"

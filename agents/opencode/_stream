@@ -94,6 +94,7 @@ hit_limit() {
 	reason=$(jq -rs '[.[] | select(.type == "error") |
 		(.error.data.message // .error.message // .error.name // "explicit quota refusal") |
 		tostring | gsub("[[:space:]]+"; " ") | .[0:300]][0]' "$CLAUDE_RAW")
+	reason=$(redact_text "$reason") || reason="[REDACTED] quota refusal"
 	file=$(limit_file)
 	mkdir -p "$(dirname "$file")" || return 0
 	expires=$(($(date +%s) + ${OPENCODE_LIMIT_TTL:-900}))
