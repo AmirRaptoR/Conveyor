@@ -358,9 +358,10 @@ provider and board readers keep consuming the same top-level fields:
 
 `outcome` is exactly `success`, `blocked`, `noop` or `waiting`. `blocked`
 requires `kind` and `reason`; `noop` requires `reason`; `waiting` requires
-`waiting.why` and permits a UTC `waiting.until`, and the adapter returns exit
-10 so every stage takes the ordinary deferral path before its postconditions.
-A block may carry
+`waiting.why` and permits a UTC `waiting.until`. The adapter returns exit 10 so
+a stage that permits waiting takes the ordinary deferral path before its
+postconditions. `prioritise` is deliberately best-effort and treats that exit
+like any other missing decision: it writes its default and advances. A block may carry
 `questions` in the AskUserQuestion shape. A successful task may carry the
 task-specific fields the adapter requested: `dispositions`, `priority`,
 `after`, `part`, `of`, `verdict` or `summary`. Unknown fields, unknown

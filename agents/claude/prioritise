@@ -95,10 +95,6 @@ rc=$?
 
 record_model
 
-if [[ $rc -eq 10 ]] && result_is_waiting; then
-	exit 10
-fi
-
 if hit_limit; then
 	echo "out of quota before deciding the sequence for #$ref; leaving it unsequenced this poll" >&2
 elif hit_max_turns; then

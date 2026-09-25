@@ -49,6 +49,10 @@ chk "short non-empty secrets are redacted" "$(jq -r .summary "$CONVEYOR_RESULT")
 chk "JSON-escaped log text is redacted" "$(redact_text "$escaped" | grep -c 'quoted\\\"secret\\\\value' || true)" "0"
 result_accept '{"v":1,"outcome":"success","dispositions":{"abc":"one","[REDACTED]":"two"}}'
 chk "secret-bearing object keys are redacted without collision loss" "$(jq -c '.dispositions | to_entries' "$CONVEYOR_RESULT")" '[{"key":"[REDACTED]","value":"one"},{"key":"[REDACTED]-2","value":"two"}]'
+export PRIVATE_KEY=$'multi-secret-top\nmulti-secret-bottom'
+multiline_log=$(printf '%s\n' "$PRIVATE_KEY" | redact_stream)
+chk "multiline secrets cannot be reconstructed from log lines" "$(grep -Ec 'multi-secret-(top|bottom)' <<<"$multiline_log" || true)" "0"
+unset PRIVATE_KEY
 result_quarantine 'malformed output contained secret-value-112' sess-bad
 chk "quarantine is precise and redacted" "$(jq -c '[.kind,.asked,.session,.reason]' "$CONVEYOR_RESULT")" '["invalid-result",false,"sess-bad","malformed output contained [REDACTED]"]'
 

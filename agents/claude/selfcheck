@@ -441,6 +441,20 @@ chk "literal secrets are absent from Claude stderr" "$(grep -Fc -- "$API_SECRET"
 chk "JSON-escaped secrets are absent from Claude stderr" "$(grep -Fc -- "$RESULT_ESCAPED" <<<"$secret_log" || true)" "0"
 unset API_SECRET RESULT_SECRET RESULT_ESCAPED
 
+export PRIVATE_KEY=$'multi-secret-top\nmulti-secret-bottom'
+export RESULT_SECRET="$PRIVATE_KEY" RESULT_SCENE=secret
+rm -f "$RESULT_CALLS" "$RESULT_ENV" "$RESULT_ARGS".*
+: >"$CONVEYOR_RESULT"
+secret_log=$(run_claude 'do the task' 2>&1)
+chk "multiline secret lines are absent from assistant output" "$(grep -Ec 'multi-secret-(top|bottom)' <<<"$secret_log" || true)" "0"
+chk "multiline secrets are redacted in persisted results" "$(jq -r .summary "$CONVEYOR_RESULT")" "[REDACTED]"
+export RESULT_ESCAPED='multi-secret-top\nmulti-secret-bottom' RESULT_SCENE=stderr-secret
+rm -f "$RESULT_CALLS" "$RESULT_ENV" "$RESULT_ARGS".*
+: >"$CONVEYOR_RESULT"
+secret_log=$(run_claude 'do the task' 2>&1)
+chk "multiline secret lines are absent from Claude stderr" "$(grep -Ec 'multi-secret-(top|bottom)' <<<"$secret_log" || true)" "0"
+unset PRIVATE_KEY RESULT_SECRET RESULT_ESCAPED
+
 chk "an incomplete stream fails without correction" "$(run_result_scene incomplete):$(cat "$RESULT_CALLS")" "2:1"
 chk "an incomplete stream persists nothing" "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
 

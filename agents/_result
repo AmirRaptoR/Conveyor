@@ -50,7 +50,7 @@ result_json_schema() {
 # environment names. Empty values carry no secret; every non-empty value is
 # replaced even when short because this boundary promises exact-value redaction.
 redact_text() {
-	local text=$1 name value escaped
+	local text=$1 name value escaped fragment
 	for name in $(compgen -e); do
 		[[ "$name" =~ ([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Kk][Ee][Yy]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]) ]] || continue
 		value=${!name-}
@@ -59,6 +59,13 @@ redact_text() {
 		escaped=${escaped:1:${#escaped}-2}
 		[[ "$escaped" == "$value" ]] || text=${text//"$escaped"/[REDACTED]}
 		text=${text//"$value"/[REDACTED]}
+		# redact_stream receives one line at a time. Redact every non-empty
+		# component of a multiline secret so joining those lines cannot recover it.
+		if [[ "$value" == *$'\n'* ]]; then
+			while IFS= read -r fragment || [[ -n "$fragment" ]]; do
+				[[ -n "$fragment" ]] && text=${text//"$fragment"/[REDACTED]}
+			done <<<"$value"
+		fi
 	done
 	printf '%s' "$text"
 }

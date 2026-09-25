@@ -36,7 +36,7 @@ cat >"$tmp/stub/claude" <<'STUB'
 cat >/dev/null
 result='{"v":1,"outcome":"success"}'
 if [[ -n "${CLAUDE_RESPONSE:-}" ]]; then
-	result=$(jq -c '. + {v:1,outcome:"success"}' <<<"$CLAUDE_RESPONSE")
+	result=$(jq -c 'if .outcome == "waiting" then . else . + {v:1,outcome:"success"} end' <<<"$CLAUDE_RESPONSE")
 fi
 jq -nc '{type:"system",subtype:"init",session_id:"prioritise-session",model:"stub"}'
 jq -nc --argjson result "$result" '{type:"result",subtype:"success",is_error:false,session_id:"prioritise-session",structured_output:$result}'
@@ -143,6 +143,14 @@ check "an existing priority is kept, not overwritten" \
 run 38 "no marker, no decision this time"
 check "no decision reached still exits 0" "0" "$?"
 check "no decision reached still writes the standalone marker" \
+	"1" "$(grep -c -- '<!-- conveyor:sequence standalone -->' "$BODY_LOG")"
+
+# A model-authored wait is also no decision here. Prioritise is deliberately
+# best-effort and always advances rather than spending another model run.
+CLAUDE_RESPONSE='{"v":1,"outcome":"waiting","waiting":{"why":"more context may arrive"}}' \
+	run 42 "no marker, model asked to wait"
+check "a model-authored wait still exits 0" "0" "$?"
+check "a model-authored wait still writes the standalone marker" \
 	"1" "$(grep -c -- '<!-- conveyor:sequence standalone -->' "$BODY_LOG")"
 
 # A person can write (or correct) the marker themselves in the minutes the
