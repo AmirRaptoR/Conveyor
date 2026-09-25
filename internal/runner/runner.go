@@ -297,7 +297,19 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	if err := os.WriteFile(planPath, nil, 0o600); err != nil {
 		return nil, err
 	}
-	env, envMap := buildEnv(spec, resultPath, planPath, deadline)
+	// controlPath/controlAckPath are pre-created the same way and for the
+	// same reason as planPath: a script's own append must open a file
+	// already at 0600, and a source's env: must not be able to redirect
+	// either channel elsewhere (see buildEnv).
+	controlPath := filepath.Join(dir, "control.jsonl")
+	if err := os.WriteFile(controlPath, nil, 0o600); err != nil {
+		return nil, err
+	}
+	controlAckPath := filepath.Join(dir, "control-ack.jsonl")
+	if err := os.WriteFile(controlAckPath, nil, 0o600); err != nil {
+		return nil, err
+	}
+	env, envMap := buildEnv(spec, resultPath, planPath, controlPath, controlAckPath, deadline)
 	run.Env = envMap
 	if r.OnStart != nil {
 		r.OnStart(run)
@@ -611,7 +623,7 @@ func trimNewline(s string) string {
 	return s
 }
 
-func buildEnv(spec Spec, resultPath, planPath string, deadline time.Time) ([]string, map[string]string) {
+func buildEnv(spec Spec, resultPath, planPath, controlPath, controlAckPath string, deadline time.Time) ([]string, map[string]string) {
 	own := map[string]string{
 		"CONVEYOR_RESULT":  resultPath,
 		"CONVEYOR_WORKDIR": spec.Workdir,
@@ -640,10 +652,12 @@ func buildEnv(spec Spec, resultPath, planPath string, deadline time.Time) ([]str
 		own[k] = v
 	}
 	// Applied last, and so unconditionally winning over spec.Env: a source's
-	// env: or a script's params: must not be able to redirect the plan
-	// channel elsewhere. CONVEYOR_RESULT above does not get the same
-	// treatment yet — a pre-existing gap, not one this protocol closes.
+	// env: or a script's params: must not be able to redirect the plan or
+	// control channels elsewhere. CONVEYOR_RESULT above does not get the
+	// same treatment yet — a pre-existing gap, not one this protocol closes.
 	own["CONVEYOR_PLAN"] = planPath
+	own["CONVEYOR_CONTROL"] = controlPath
+	own["CONVEYOR_CONTROL_ACK"] = controlAckPath
 	env := os.Environ()
 	for k, v := range own {
 		env = append(env, k+"="+v)
