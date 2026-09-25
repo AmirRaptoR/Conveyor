@@ -80,7 +80,11 @@ peer, and the socket is the only door with no password on it (#94).
 - **stdout/stderr are logs and are never parsed.** Structured data comes back
   via `$CONVEYOR_RESULT`, the live `$CONVEYOR_PLAN`, or the control
   acknowledgement channel; commands go in through their own control channel.
-  An AI stage script emits megabytes of prose.
+  An AI stage script emits megabytes of prose. A shipped model child never sees
+  `$CONVEYOR_RESULT`: it returns one v1 object in its backend's final event, and
+  `agents/_result` validates, redacts and atomically persists it. One malformed
+  completed response gets one formatting-only correction; a second becomes an
+  `invalid-result` condition. Partial event streams fail without correction.
 - **A plan is a third channel, not a parsed log line.** `$CONVEYOR_PLAN`
   (`plan.jsonl` in the run directory, pre-created 0600, engine-owned so a
   source's `env:` cannot redirect it) is where a run appends one JSON todo
@@ -286,8 +290,8 @@ peer, and the socket is the only door with no password on it (#94).
   `questions` through on the block unread; the board draws a modal that walks
   them one at a time and posts the choices as the `answer`. The board shows a
   stop in one of three tones — a question (violet, "needs you"), a condition
-  that passes on its own (grey: `limit`, `turns`, `unfinished`, `dependency`,
-  `worktree`), or a fault (red) — and lists every question in a strip under
+  that can pass on retry (grey: `limit`, `turns`, `unfinished`, `dependency`,
+  `worktree`, `invalid-result`), or a fault (red) — and lists every question in a strip under
   the masthead. The tone is presentation: the engine still reads only `asked`.
 - **An item's pull request is found by closing reference, never by search.**
   `agents/_pr` is the one lookup — "Closes #N" in the body, or the
@@ -527,10 +531,11 @@ needed; this is the one-shot so that is not a discovery spread over a week.
 `agents/<name>/<script>` holds reusable adapters, resolved by `agent:` exactly
 as `provider:` resolves under `providers/`. The prompt, tools, model and turn
 limit are that script's `params:`. The adapter prepends the item to the prompt
-and appends the blocked convention, so prompts stay portable and every agent
-signals "needs a human" identically: exit 20, with `{"blocked": true, "reason":
-"…"}` in `$CONVEYOR_RESULT`. The engine hands that reason to `move`, and the
-GitHub provider comments it on the issue beside the label.
+and appends the blocked convention, so prompts stay portable and every model
+returns a v1 `blocked` outcome identically. The adapter adds the trusted
+compatibility fields and session, persists them to `$CONVEYOR_RESULT`, and exits
+20. The engine hands that reason to `move`, and the GitHub provider comments it
+on the issue beside the label.
 
 ## Agent status
 

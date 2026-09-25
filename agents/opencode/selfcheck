@@ -37,8 +37,10 @@ if [[ -s "$OC_CALLS" ]]; then run_no=$(($(cat "$OC_CALLS") + 1)); fi
 printf '%s\n' "$run_no" >"$OC_CALLS"
 cp "$OC_ARGS" "$OC_ARGS.$run_no"
 cp "$OC_PROMPT" "$OC_PROMPT.$run_no"
+printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" >"$OC_CONFIG.$run_no"
 printf '%s\n' "$run_no" >>"$OC_STARTS"
 printf '%s\n' "$$" >>"$OC_PIDS"
+printf '%s\n' "${CONVEYOR_RESULT+exposed}" >>"$OC_RESULT_ENV"
 if [[ -n "${CONVEYOR_CONTROL_ACK:-}" && -s "${CONVEYOR_CONTROL_ACK:-}" ]] &&
 	jq -e 'select(.type == "hello")' "$CONVEYOR_CONTROL_ACK" >/dev/null 2>&1; then
 	printf 'yes\n' >>"$OC_HELLO_BEFORE_RUN"
@@ -49,10 +51,19 @@ case "${OC_SCENE:-success}" in
 success)
 	printf '%s\n' \
 		'{"type":"step_start","timestamp":1,"sessionID":"ses-good","part":{"id":"p1","type":"step-start"}}' \
-		'{"type":"text","timestamp":2,"sessionID":"ses-good","part":{"id":"p2","type":"text","text":"work complete"}}' \
-		'{"type":"text","timestamp":2,"sessionID":"ses-good","part":{"id":"p2","type":"text","text":"work complete"}}' \
+		'{"type":"text","timestamp":2,"sessionID":"ses-good","part":{"id":"p2","type":"text","text":"{\"v\":1,\"outcome\":\"success\",\"summary\":\"work complete\"}"}}' \
+		'{"type":"text","timestamp":2,"sessionID":"ses-good","part":{"id":"p2","type":"text","text":"{\"v\":1,\"outcome\":\"success\",\"summary\":\"work complete\"}"}}' \
 		'{"type":"tool_use","timestamp":3,"sessionID":"ses-good","part":{"id":"p3","type":"tool","tool":"bash","state":{"status":"completed","title":"run tests","output":"SECRET TOOL OUTPUT"}}}' \
 		'{"type":"step_finish","timestamp":4,"sessionID":"ses-good","part":{"id":"p4","type":"step-finish","reason":"stop","tokens":{"input":10,"output":2}}}'
+	;;
+invalid-once|invalid-always)
+	text='not json'
+	if [[ "$OC_SCENE" == invalid-once && "$run_no" -gt 1 ]]; then
+		text='{"v":1,"outcome":"success","summary":"corrected"}'
+	fi
+	jq -nc --arg text "$text" '{type:"step_start",timestamp:1,sessionID:"ses-invalid",part:{id:"start",type:"step-start"}}'
+	jq -nc --arg text "$text" '{type:"text",timestamp:2,sessionID:"ses-invalid",part:{id:"text",type:"text",text:$text}}'
+	jq -nc '{type:"step_finish",timestamp:3,sessionID:"ses-invalid",part:{id:"finish",type:"step-finish",reason:"stop"}}'
 	;;
 limit)
 	printf '%s\n' '{"type":"error","timestamp":1,"sessionID":"ses-limit","error":{"name":"FreeUsageLimitError","data":{"message":"free usage limit reached","responseBody":"SECRET PROVIDER BODY"}}}'
@@ -92,7 +103,7 @@ steering|delivery-fail|pause)
 		if [[ "$OC_SCENE" == delivery-fail ]]; then exit 73; fi
 		printf '%s\n' \
 			'{"type":"step_start","timestamp":6,"sessionID":"ses-steer","part":{"id":"continued-start","type":"step-start"}}' \
-			'{"type":"text","timestamp":7,"sessionID":"ses-steer","part":{"id":"continued-text","type":"text","text":"continued"}}' \
+			'{"type":"text","timestamp":7,"sessionID":"ses-steer","part":{"id":"continued-text","type":"text","text":"{\"v\":1,\"outcome\":\"success\",\"summary\":\"continued\"}"}}' \
 			'{"type":"step_finish","timestamp":8,"sessionID":"ses-steer","part":{"id":"continued-finish","type":"step-finish"}}'
 		exit 0
 	fi
@@ -124,9 +135,12 @@ export OC_ARGS="$tmp/args" OC_PROMPT="$tmp/prompt" OC_CALLS="$tmp/calls" OC_STAR
 export OC_HELLO_BEFORE_RUN="$tmp/hello-before-run" OC_SIGNALS="$tmp/signals"
 export OC_EARLY_ACK="$tmp/early-ack" OC_UNSAFE_ACK="$tmp/unsafe-ack"
 export OC_ABORTED="$tmp/aborted"
+export OC_RESULT_ENV="$tmp/result-env"
+export OC_CONFIG="$tmp/config"
 export OC_BOUNDARY_FIXTURE="$here/fixtures/steering-boundaries-synthetic.jsonl"
 export MODEL=openai/gpt-test VARIANT=high AGENT=build
 export CONVEYOR_SOURCE=test CONVEYOR_STAGE=working CONVEYOR_ITEM_REF=7
+export CONVEYOR_RESULT="$tmp/result.json"
 
 source "$here/_stream"
 trap 'rm -rf "$tmp" "$_OPENCODE_TMP"' EXIT
@@ -136,7 +150,7 @@ chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2]
 
 reset_invocations() {
 	rm -f "$OC_CALLS" "$OC_STARTS" "$OC_PIDS" "$OC_HELLO_BEFORE_RUN" "$OC_SIGNALS" \
-		"$OC_EARLY_ACK" "$OC_UNSAFE_ACK" "$OC_ABORTED" "$OC_ARGS".* "$OC_PROMPT".*
+		"$OC_EARLY_ACK" "$OC_UNSAFE_ACK" "$OC_ABORTED" "$OC_RESULT_ENV" "$OC_ARGS".* "$OC_PROMPT".* "$OC_CONFIG".*
 }
 
 reset_control() {
@@ -167,10 +181,34 @@ chk "text events become logs" "$(grep -c 'work complete' <<<"$out")" "1"
 chk "tool output is not logged" "$(grep -c 'SECRET TOOL OUTPUT' <<<"$out" || true)" "0"
 chk "the session is captured" "$(claude_session)" "ses-good"
 chk "the selected model is recorded" "$(record_model)" "model: openai/gpt-test variant: high agent: build"
-chk "the prompt is sent on stdin" "$(cat "$OC_PROMPT")" "do the work"
+chk "the task leads the prompt" "$(sed -n '1p' "$OC_PROMPT")" "do the work"
+chk "the result contract is appended" "$(grep -c 'versioned result contract' "$OC_PROMPT")" "1"
+chk "the model child cannot see CONVEYOR_RESULT" "$(grep -c exposed "$OC_RESULT_ENV" || true)" "0"
 for arg in '--format' 'json' '--model' 'openai/gpt-test' '--variant' 'high' '--agent' 'build'; do
 	chk "run receives $arg" "$(grep -Fx -- "$arg" "$OC_ARGS" || true)" "$arg"
 done
+
+reset_invocations
+export OC_SCENE=invalid-once
+set +e
+run_claude 'return a result' >/dev/null 2>&1
+rc=$?
+set -e
+chk "one malformed final gets one correction" "$rc:$(cat "$OC_CALLS")" "0:2"
+chk "the valid correction is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "corrected"
+chk "the correction reuses the session" "$(grep -A1 -Fx -- '--session' "$OC_ARGS.2" | tail -1)" "ses-invalid"
+chk "the correction uses the no-tool agent" "$(grep -A1 -Fx -- '--agent' "$OC_ARGS.2" | tail -1)" "conveyor-result"
+chk "the correction denies every tool" "$(jq -r '.agent["conveyor-result"].permission["*"]' "$OC_CONFIG.2")" "deny"
+
+reset_invocations
+export OC_SCENE=invalid-always
+set +e
+run_claude 'return a result' >/dev/null 2>&1
+rc=$?
+set -e
+chk "an invalid correction is quarantined after two calls" "$rc:$(cat "$OC_CALLS")" "20:2"
+chk "the quarantine names invalid-result" "$(jq -r .kind "$CONVEYOR_RESULT")" "invalid-result"
+chk "the quarantine is a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
 
 set +e
 fixture=$(render_stream <"$here/fixtures/tool-run-1.18.32.jsonl" 2>&1)
@@ -315,6 +353,15 @@ incremental=$(printf '%s\n' \
 	'{"type":"step_finish","timestamp":4,"sessionID":"ses-progress","part":{"id":"f","type":"step-finish"}}' |
 	render_stream)
 chk "a progressively growing text part keeps the new suffix" "$(tr '\n' ' ' <<<"$incremental" | tr -s ' ')" "work complete "
+
+printf '%s\n' \
+	'{"type":"step_start","timestamp":1,"sessionID":"ses-split","part":{"id":"s","type":"step-start"}}' \
+	'{"type":"text","timestamp":2,"sessionID":"ses-split","part":{"id":"a","type":"text","text":"{\"v\":1,\"outcome\":"}}' \
+	'{"type":"text","timestamp":3,"sessionID":"ses-split","part":{"id":"b","type":"text","text":"\"success\",\"summary\":\"split\"}"}}' \
+	'{"type":"step_finish","timestamp":4,"sessionID":"ses-split","part":{"id":"f","type":"step-finish","reason":"stop"}}' |
+	render_stream >/dev/null
+result_accept "$(<"$CLAUDE_FINAL")" "opencode:ses-split"
+chk "separate final text parts are joined deterministically" "$(jq -r .summary "$CONVEYOR_RESULT")" "split"
 
 tool_progress=$(printf '%s\n' \
 	'{"type":"step_start","timestamp":1,"sessionID":"ses-tool","part":{"id":"s","type":"step-start"}}' \

@@ -182,7 +182,7 @@ func TestActionsAreHandedToTheBoard(t *testing.T) {
 func TestWaitingIsReadOffTheRunsResult(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "result.json"),
-		[]byte(`{"waiting":{"until":"2026-09-08T12:00:00Z","why":"the PR must stay quiet"}}`), 0o644); err != nil {
+		[]byte(`{"v":1,"outcome":"waiting","waiting":{"until":"2026-09-08T12:00:00Z","why":"the PR must stay quiet"}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	got, ok := waitingAt(dir)

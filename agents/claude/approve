@@ -354,7 +354,7 @@ run_tests() {
 # success; it never merges in the run that pushed a fix.
 #
 # A changed commit is not proof every thread was addressed — only a
-# disposition the model itself reported, per thread id, in $CONVEYOR_RESULT
+# disposition the adapter persisted from the model's final response, per thread
 # is. A thread it does not report on is left unresolved and unreplied here;
 # gate 12 picks it up as a question once the model has already had a poll to
 # answer it. Only threads named in this run's own unanswered set count — a
@@ -387,10 +387,11 @@ For each, make the necessary change, or explain in your own commit message why
 none is needed. Commit and push your changes to the branch you are already on
 (${head_ref}) — do not open a new pull request, and do not change branch.
 
-For every thread you actually addressed, report a one-sentence disposition in
-\$CONVEYOR_RESULT under a \"dispositions\" object keyed by that thread's id,
-e.g. {\"dispositions\": {\"<thread id>\": \"renamed the variable and added a
-test\"}}. Only the thread ids listed below are yours to report on; a thread
+	For every thread you actually addressed, include a one-sentence disposition in
+	your final structured response under a \"dispositions\" object keyed by that
+	thread's id, e.g. {\"v\":1,\"outcome\":\"success\",\"dispositions\":
+	{\"<thread id>\": \"renamed the variable and added a test\"}}. Only the thread
+	ids listed below are yours to report on; a thread
 you do not report a disposition for is left open for a person to look at,
 even if you touched code near it.
 

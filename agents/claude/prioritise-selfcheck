@@ -34,10 +34,12 @@ mkdir -p "$tmp/stub"
 cat >"$tmp/stub/claude" <<'STUB'
 #!/usr/bin/env bash
 cat >/dev/null
-echo "decided"
+result='{"v":1,"outcome":"success"}'
 if [[ -n "${CLAUDE_RESPONSE:-}" ]]; then
-	printf '%s' "$CLAUDE_RESPONSE" >"$CONVEYOR_RESULT"
+	result=$(jq -c '. + {v:1,outcome:"success"}' <<<"$CLAUDE_RESPONSE")
 fi
+jq -nc '{type:"system",subtype:"init",session_id:"prioritise-session",model:"stub"}'
+jq -nc --argjson result "$result" '{type:"result",subtype:"success",is_error:false,session_id:"prioritise-session",structured_output:$result}'
 STUB
 chmod +x "$tmp/stub/claude"
 

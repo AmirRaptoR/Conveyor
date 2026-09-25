@@ -178,8 +178,8 @@ test("attentionCategory: dependency and limit are their own categories, not fold
   assert.equal(attentionCategory({ blocked: true }, { kind: "limit" }, null), "limit");
 });
 
-test("attentionCategory: turns/unfinished/worktree are the generic waiting category", () => {
-  for (const kind of ["turns", "unfinished", "worktree"]) {
+test("attentionCategory: retryable conditions are the generic waiting category", () => {
+  for (const kind of ["turns", "unfinished", "worktree", "invalid-result"]) {
     assert.equal(attentionCategory({ blocked: true }, { kind }, null), "waiting");
   }
 });

@@ -21,7 +21,10 @@ CLAUDE_SAID=$(mktemp)
 # back into the conversation that asked, instead of starting a new one that has
 # to rediscover the repository first.
 CLAUDE_RAW=$(mktemp)
-trap 'rm -f "$CLAUDE_SAID" "$CLAUDE_RAW"' EXIT
+CLAUDE_FINAL=$(mktemp)
+trap 'rm -f "$CLAUDE_SAID" "$CLAUDE_RAW" "$CLAUDE_FINAL"' EXIT
+
+declare -f result_accept >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_result"
 
 # claude_session prints the conversation's own id, or nothing. Nothing is a
 # normal answer: STREAM=0 produces no events, and an adapter that gets no
@@ -162,18 +165,14 @@ hit_max_turns() {
 # before the first event) — same reasoning as claude_session itself: nothing
 # is a normal answer, not a blank line worth writing down.
 record_session() {
-	local sess tmp base
+	local sess base merged
 	[[ -z "${CONVEYOR_RESULT:-}" ]] && return 0
 	sess=$(claude_session)
 	[[ -z "$sess" ]] && return 0
-	tmp=$(mktemp)
 	base='{}'
 	[[ -s "$CONVEYOR_RESULT" ]] && jq -e . "$CONVEYOR_RESULT" >/dev/null 2>&1 && base=$(cat "$CONVEYOR_RESULT")
-	if jq --arg s "$sess" '. + {session: $s}' <<<"$base" >"$tmp" 2>/dev/null; then
-		mv "$tmp" "$CONVEYOR_RESULT"
-	else
-		rm -f "$tmp"
-	fi
+	merged=$(jq -c --arg s "$sess" '. + {v:1,outcome:(.outcome // "success"),session:$s}' <<<"$base" 2>/dev/null) || return 0
+	result_write_json "$merged" || true
 }
 
 # agent_asked needs _blocked's is_condition_kind, but every adapter sources
@@ -214,7 +213,7 @@ declare -f plan_publish >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}"
 # `reason` and `questions` are left exactly as written, and a file jq cannot
 # read as an object is left untouched, same as always.
 agent_asked() {
-	local sess kind asked tmp
+	local sess kind asked merged
 	[[ -z "${CONVEYOR_RESULT:-}" || ! -s "$CONVEYOR_RESULT" ]] && return 0
 	jq -e 'type == "object"' "$CONVEYOR_RESULT" >/dev/null 2>&1 || return 0
 	kind=$(jq -r '.kind // "decision"' "$CONVEYOR_RESULT" 2>/dev/null) || return 0
@@ -225,14 +224,10 @@ agent_asked() {
 		"$CONVEYOR_RESULT" >/dev/null 2>&1; then
 		asked=true
 	fi
-	tmp=$(mktemp)
-	if jq --arg s "$sess" --arg kind "$kind" --argjson asked "$asked" \
-		'. + {kind: $kind, asked: $asked} + (if $s == "" then {} else {session: $s} end)' \
-		"$CONVEYOR_RESULT" >"$tmp" 2>/dev/null; then
-		mv "$tmp" "$CONVEYOR_RESULT"
-	else
-		rm -f "$tmp"
-	fi
+	merged=$(jq -c --arg s "$sess" --arg kind "$kind" --argjson asked "$asked" \
+		'. + {v:1,outcome:"blocked",blocked:true,kind:$kind,asked:$asked} + (if $s == "" then {} else {session:$s} end)' \
+		"$CONVEYOR_RESULT" 2>/dev/null) || return 0
+	result_write_json "$merged" || true
 }
 
 # last_said — the tail of what the model said, one line, for a reason that
@@ -310,24 +305,95 @@ _plan_route_claude_stream() {
 	done
 }
 
-# run_claude "<prompt>" — honours STREAM=0 for the terse, final-message-only log.
-# Returns claude's exit status, not jq's.
-run_claude() {
-	local prompt=$1
+# _claude_final extracts exactly one successful terminal result. Duplicate
+# result events are ambiguous, even when their contents happen to match.
+_claude_final() {
+	jq -c -s '
+		[.[] | select(.type == "result")] as $results |
+		select(($results | length) == 1 and (($results[0].is_error // false) == false)) |
+		$results[0] | (.structured_output // .result // empty) |
+		if type == "string" then . else tojson end
+	' "$CLAUDE_RAW" 2>/dev/null | jq -r . 2>/dev/null
+}
+
+_claude_invoke() {
+	local prompt=$1 correction=${2:-0} result_count
+	local -a statuses
 	local -a flags=(
 		--max-turns "${MAX_TURNS:-40}"
 		--permission-mode "${PERMISSION_MODE:-acceptEdits}"
 		--allowedTools "${ALLOWED_TOOLS:-Bash,Read,Glob,Grep}"
+		--json-schema "$(result_json_schema)"
 	)
 	[[ -n "${MODEL:-}" ]] && flags+=(--model "$MODEL")
 	# Set by resume_prompt when a person answered and the conversation survives.
 	[[ -n "${RESUME_SESSION:-}" ]] && flags+=(--resume "$RESUME_SESSION")
-
-	if [[ "${STREAM:-1}" == "0" ]]; then
-		claude -p "$prompt" "${flags[@]}" | tee "$CLAUDE_SAID"
-		return "${PIPESTATUS[0]}"
+	if [[ "$correction" == 1 ]]; then
+		flags=(--max-turns 1 --permission-mode dontAsk --allowedTools "" --json-schema "$(result_json_schema)")
+		[[ -n "${MODEL:-}" ]] && flags+=(--model "$MODEL")
+		[[ -n "${RESUME_SESSION:-}" ]] && flags+=(--resume "$RESUME_SESSION")
 	fi
-	claude -p "$prompt" --output-format stream-json --verbose "${flags[@]}" |
-		tee "$CLAUDE_RAW" | render_stream | _plan_route_claude_stream | tee "$CLAUDE_SAID"
-	return "${PIPESTATUS[0]}"
+
+	: >"$CLAUDE_RAW"
+	: >"$CLAUDE_SAID"
+	# CONVEYOR_RESULT belongs to this parent adapter and is deliberately absent
+	# from the model process's environment.
+	if [[ "${STREAM:-1}" == 0 ]]; then
+		env -u CONVEYOR_RESULT claude -p "$prompt" --output-format stream-json --verbose "${flags[@]}" |
+			tee "$CLAUDE_RAW" | render_stream | _plan_route_claude_stream | redact_stream | tee "$CLAUDE_SAID" >/dev/null
+	else
+		env -u CONVEYOR_RESULT claude -p "$prompt" --output-format stream-json --verbose "${flags[@]}" |
+			tee "$CLAUDE_RAW" | render_stream | _plan_route_claude_stream | redact_stream | tee "$CLAUDE_SAID"
+	fi
+	statuses=("${PIPESTATUS[@]}")
+	[[ ${statuses[0]} -eq 0 ]] || return "${statuses[0]}"
+	[[ ${statuses[2]} -eq 0 ]] || return 2
+	result_count=$(jq -s '[.[] | select(.type == "result")] | length' "$CLAUDE_RAW" 2>/dev/null) || return 2
+	[[ "$result_count" -gt 0 ]] || {
+		echo "claude stream ended without a result event" >&2
+		return 2
+	}
+	if jq -s -e 'any(.[]; .type == "result" and (.is_error // false))' "$CLAUDE_RAW" >/dev/null 2>&1; then
+		return 1
+	fi
+	if [[ "${STREAM:-1}" == 0 ]]; then
+		redact_text "$(_claude_final)"
+		printf '\n'
+	fi
+	return 0
+}
+
+# run_claude owns the complete model-to-result transaction. A clean backend
+# completion must yield one valid result; one formatting-only correction is the
+# sole retry, after which the item is quarantined precisely.
+run_claude() {
+	local prompt=$1 rc final session failure
+	prompt="${prompt}
+
+$(result_brief)"
+	if _claude_invoke "$prompt"; then rc=0; else rc=$?; fi
+	[[ $rc -eq 0 ]] || return "$rc"
+	session=$(claude_session)
+	final=$(_claude_final)
+	if [[ -n "$final" ]] && result_accept "$final" "$session"; then
+		return 0
+	fi
+	failure="the agent completed without one valid version-1 final result"
+	RESUME_SESSION=$session
+	if _claude_invoke "$(result_correction_brief)" 1; then rc=0; else rc=$?; fi
+	if [[ $rc -eq 0 ]]; then
+		final=$(_claude_final)
+		if [[ -n "$final" ]] && result_accept "$final" "$session"; then
+			return 0
+		fi
+		failure="the agent's single result correction was still missing, ambiguous, or invalid"
+	else
+		failure="the agent's single result correction failed (exit $rc)"
+	fi
+	result_quarantine "$failure" "$session" || {
+		echo "could not persist the invalid-result quarantine" >&2
+		return 1
+	}
+	echo "blocked (invalid-result): $failure" >&2
+	return 20
 }

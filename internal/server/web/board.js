@@ -550,7 +550,7 @@ function why(it) {
 // and these kinds are conditions that pass on their own (agents/_blocked's
 // vocabulary — presentation only, the engine never reads the word). Anything
 // else stopped because something went wrong.
-const WAITING = new Set(["limit", "turns", "unfinished", "dependency", "worktree"]);
+const WAITING = new Set(["limit", "turns", "unfinished", "dependency", "worktree", "invalid-result"]);
 export function tone(b) {
   b = b || {};
   return b.asked ? "asks" : WAITING.has(b.kind) ? "waiting" : "fault";

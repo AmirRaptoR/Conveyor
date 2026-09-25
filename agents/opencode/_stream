@@ -6,7 +6,9 @@ OPENCODE_SUPPORTED_VERSION=1.18.32
 _OPENCODE_TMP=$(mktemp -d)
 CLAUDE_SAID="$_OPENCODE_TMP/said"
 CLAUDE_RAW="$_OPENCODE_TMP/raw"
+CLAUDE_FINAL="$_OPENCODE_TMP/final"
 trap 'rm -rf "$_OPENCODE_TMP"' EXIT
+declare -f result_accept >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_result"
 # The outer run's process group can receive TERM (a cancellation, a timeout)
 # while the CLI child backgrounded in _opencode_invoke_child is still running.
 # Left untrapped, bash terminates this shell on that signal immediately,
@@ -108,18 +110,14 @@ hit_limit() {
 hit_max_turns() { return 1; }
 
 record_session() {
-	local sess tmp base
+	local sess base merged
 	[[ -z "${CONVEYOR_RESULT:-}" ]] && return 0
 	sess=$(claude_session)
 	[[ -z "$sess" ]] && return 0
-	tmp=$(mktemp)
 	base='{}'
 	[[ -s "$CONVEYOR_RESULT" ]] && jq -e . "$CONVEYOR_RESULT" >/dev/null 2>&1 && base=$(<"$CONVEYOR_RESULT")
-	if jq --arg s "opencode:$sess" '. + {session: $s}' <<<"$base" >"$tmp" 2>/dev/null; then
-		mv "$tmp" "$CONVEYOR_RESULT"
-	else
-		rm -f "$tmp"
-	fi
+	merged=$(jq -c --arg s "opencode:$sess" '. + {v:1,outcome:(.outcome // "success"),session:$s}' <<<"$base" 2>/dev/null) || return 0
+	result_write_json "$merged" || true
 }
 
 declare -f is_condition_kind >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_blocked"
@@ -139,7 +137,7 @@ _plan_publish_opencode_todos() {
 }
 
 agent_asked() {
-	local sess kind asked tmp
+	local sess kind asked merged
 	[[ -z "${CONVEYOR_RESULT:-}" || ! -s "$CONVEYOR_RESULT" ]] && return 0
 	jq -e 'type == "object"' "$CONVEYOR_RESULT" >/dev/null 2>&1 || return 0
 	kind=$(jq -r '.kind // "decision"' "$CONVEYOR_RESULT" 2>/dev/null) || return 0
@@ -150,15 +148,11 @@ agent_asked() {
 		"$CONVEYOR_RESULT" >/dev/null 2>&1; then
 		asked=true
 	fi
-	tmp=$(mktemp)
 	[[ -n "$sess" ]] && sess="opencode:$sess"
-	if jq --arg s "$sess" --arg kind "$kind" --argjson asked "$asked" \
-		'. + {kind: $kind, asked: $asked} + (if $s == "" then {} else {session: $s} end)' \
-		"$CONVEYOR_RESULT" >"$tmp" 2>/dev/null; then
-		mv "$tmp" "$CONVEYOR_RESULT"
-	else
-		rm -f "$tmp"
-	fi
+	merged=$(jq -c --arg s "$sess" --arg kind "$kind" --argjson asked "$asked" \
+		'. + {v:1,outcome:"blocked",blocked:true,kind:$kind,asked:$asked} + (if $s == "" then {} else {session:$s} end)' \
+		"$CONVEYOR_RESULT" 2>/dev/null) || return 0
+	result_write_json "$merged" || true
 }
 
 last_said() {
@@ -167,9 +161,11 @@ last_said() {
 }
 
 _opencode_emit() {
-	printf '%s\n' "$1"
+	local safe
+	safe=$(redact_text "$1")
+	printf '%s\n' "$safe"
 	if [[ "${_OPENCODE_CAPTURE_STREAM:-0}" == 1 ]]; then
-		printf '%s\n' "$1" >>"$CLAUDE_SAID" || true
+		printf '%s\n' "$safe" >>"$CLAUDE_SAID" || true
 	fi
 }
 
@@ -211,9 +207,8 @@ _opencode_pause() {
 	at=$(jq -r '.at // ""' <<<"$command")
 	reason="paused by $by at $at"
 	if [[ -z "${CONVEYOR_RESULT:-}" ]] ||
-		! jq -n --arg session "opencode:$session" --arg reason "$reason" \
-			'{blocked:true, kind:"paused", asked:true, session:$session, reason:$reason}' \
-			>"$CONVEYOR_RESULT"; then
+		! result_write_json "$(jq -nc --arg session "opencode:$session" --arg reason "$reason" \
+			'{v:1,outcome:"blocked",blocked:true,kind:"paused",asked:true,session:$session,reason:$reason}')"; then
 		control_ack "$id" rejected "delivery failed"
 		return 1
 	fi
@@ -222,12 +217,13 @@ _opencode_pause() {
 }
 
 render_stream() {
-	local line type session="" current seen=0 finished=0 errors=0 detail id text previous status key command kind rendered
+	local line type session="" event_session="" final_text="" seen=0 finished=0 errors=0 detail id text previous status key command kind rendered reason tid
 	_OPENCODE_STREAM_ABORTED=0
 	declare -A parts=()
 	declare -A texts=()
 	declare -A tool_states=()
 	declare -A tool_status=()
+	local -a text_ids=()
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		[[ -z "$line" ]] && continue
 		if [[ "${_OPENCODE_CAPTURE_STREAM:-0}" == 1 ]]; then
@@ -248,13 +244,13 @@ render_stream() {
 			_OPENCODE_STREAM_ABORTED=1
 			return 2
 		fi
-		current=$(jq -r .sessionID <<<"$line")
-		if [[ -n "$session" && "$current" != "$session" ]]; then
+		event_session=$(jq -r .sessionID <<<"$line")
+		if [[ -n "$session" && "$event_session" != "$session" ]]; then
 			echo "opencode changed session id inside one event stream" >&2
 			_OPENCODE_STREAM_ABORTED=1
 			return 2
 		fi
-		session=$current
+		session=$event_session
 		_OPENCODE_STREAM_SESSION=$session
 		control_session "opencode:$session"
 		type=$(jq -r .type <<<"$line")
@@ -263,6 +259,8 @@ render_stream() {
 			jq -e '.part | type == "object" and (.id | type == "string" and length > 0) and .type == "step-start"' >/dev/null 2>&1 <<<"$line" || {
 				echo "opencode emitted a malformed step_start event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line"); [[ -n "${parts[$id]+seen}" ]] && continue; parts[$id]=1
+			final_text=""
+			text_ids=()
 			seen=1
 			;;
 		text)
@@ -270,6 +268,8 @@ render_stream() {
 				echo "opencode emitted a malformed text event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line")
 			text=$(jq -r .part.text <<<"$line")
+			text=$(redact_text "$text")
+			[[ -n "${texts[$id]+seen}" ]] || text_ids+=("$id")
 			previous=${texts[$id]-}
 			[[ "$text" == "$previous" ]] && continue
 			if [[ -n "$previous" && "$text" == "$previous"* ]]; then
@@ -278,6 +278,8 @@ render_stream() {
 				_opencode_emit "$text"
 			fi
 			texts[$id]=$text
+			final_text=""
+			for tid in "${text_ids[@]}"; do final_text+="${texts[$tid]}"; done
 			seen=1
 			;;
 		reasoning)
@@ -309,7 +311,16 @@ render_stream() {
 			jq -e '.part | type == "object" and (.id | type == "string" and length > 0) and .type == "step-finish"' >/dev/null 2>&1 <<<"$line" || {
 				echo "opencode emitted a malformed step_finish event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line"); [[ -n "${parts[$id]+seen}" ]] && continue; parts[$id]=1
-			finished=1
+			reason=$(jq -r '.part.reason // ""' <<<"$line")
+			if [[ "$reason" != tool-calls ]] && _opencode_tools_terminal "${tool_status[@]}"; then
+				if [[ $finished -eq 1 ]]; then
+					echo "opencode emitted duplicate terminal step_finish events" >&2
+					_OPENCODE_STREAM_ABORTED=1
+					return 2
+				fi
+				finished=1
+				printf '%s' "$final_text" >"$CLAUDE_FINAL"
+			fi
 			seen=1
 			if [[ -n "${_OPENCODE_CHILD_PID:-}" ]] &&
 				_opencode_tools_terminal "${tool_status[@]}"; then
@@ -377,6 +388,7 @@ _opencode_invoke_child() {
 	mkfifo "$fifo" || return 1
 	: >"$CLAUDE_RAW"
 	: >"$CLAUDE_SAID"
+	: >"$CLAUDE_FINAL"
 	_OPENCODE_CONTROL_COMMAND=""
 	_OPENCODE_STREAM_SESSION=""
 	_OPENCODE_CHILD_WAITED=0
@@ -384,7 +396,7 @@ _opencode_invoke_child() {
 	_OPENCODE_STREAM_INCOMPLETE=0
 	_OPENCODE_STREAM_FORCED_STOP=0
 	_OPENCODE_CAPTURE_STREAM=1
-	OPENCODE_DISABLE_AUTOUPDATE=1 "$bin" "$@" <<<"$prompt" >"$fifo" &
+	OPENCODE_DISABLE_AUTOUPDATE=1 env -u CONVEYOR_RESULT "$bin" "$@" <<<"$prompt" >"$fifo" &
 	_OPENCODE_CHILD_PID=$!
 	if render_stream <"$fifo"; then render_status=0; else render_status=$?; fi
 	# Validation can reject one event while the producer remains alive with the
@@ -454,7 +466,7 @@ validate_opencode() {
 
 # Compatibility name used by the shared stage policy.
 run_claude() {
-	local prompt=$1 bin result command id text session pending_id="" next_prompt
+	local prompt=$1 bin result command id text session pending_id="" next_prompt final failure correction_result
 	local -a flags
 	validate_opencode || return $?
 	bin=$(opencode_bin)
@@ -463,7 +475,9 @@ run_claude() {
 		_OPENCODE_CONTROL_HELLO_SENT=1
 	fi
 
-	next_prompt=$prompt
+	next_prompt="${prompt}
+
+$(result_brief)"
 	session=${RESUME_SESSION:-}
 	while true; do
 		flags=(--pure run --format json --model "$MODEL" --agent "${AGENT:-build}" --dir "$PWD"
@@ -472,6 +486,7 @@ run_claude() {
 		[[ -n "$session" ]] && flags+=(--session "$session")
 		_OPENCODE_PENDING_ID=$pending_id
 		if _opencode_invoke_child "$next_prompt" "$bin" "${flags[@]}"; then result=0; else result=$?; fi
+		[[ -n "${_OPENCODE_STREAM_SESSION:-}" ]] && session=$_OPENCODE_STREAM_SESSION
 
 		if [[ -n "$pending_id" && -n "${_OPENCODE_PENDING_ID:-}" ]]; then
 			control_ack "$pending_id" rejected "delivery failed"
@@ -490,6 +505,32 @@ run_claude() {
 	done
 	if [[ $result -eq 0 ]]; then
 		rm -f "$(limit_file)" 2>/dev/null || true
+		final=$(<"$CLAUDE_FINAL")
+		if result_accept "$final" "${session:+opencode:$session}"; then
+			return 0
+		fi
+		failure="the agent completed without one valid version-1 final result"
+		flags=(--pure run --format json --model "$MODEL" --agent conveyor-result --dir "$PWD"
+			--title "conveyor:${CONVEYOR_SOURCE:-unknown}:${CONVEYOR_ITEM_REF:-unknown}:${CONVEYOR_STAGE:-unknown}:result-correction")
+		[[ -n "${VARIANT:-}" ]] && flags+=(--variant "$VARIANT")
+		[[ -n "$session" ]] && flags+=(--session "$session")
+		if OPENCODE_CONFIG_CONTENT='{"agent":{"conveyor-result":{"mode":"primary","permission":{"*":"deny"}}}}' \
+			_opencode_invoke_child "$(result_correction_brief)" "$bin" "${flags[@]}"; then correction_result=0; else correction_result=$?; fi
+		if [[ $correction_result -eq 0 ]]; then
+			final=$(<"$CLAUDE_FINAL")
+			if result_accept "$final" "${session:+opencode:$session}"; then
+				return 0
+			fi
+			failure="the agent's single result correction was still missing, ambiguous, or invalid"
+		else
+			failure="the agent's single result correction failed (exit $correction_result)"
+		fi
+		result_quarantine "$failure" "${session:+opencode:$session}" || {
+			echo "could not persist the invalid-result quarantine" >&2
+			return 1
+		}
+		echo "blocked (invalid-result): $failure" >&2
+		return 20
 	fi
 	return "$result"
 }

@@ -74,11 +74,11 @@ test("inbox: dependency and limit are their own labels, not folded into a generi
   assert.match(html, /Out of quota/);
 });
 
-test("inbox: a generic wait (turns/unfinished/worktree) reads 'Waiting', distinct from a failure and from a question", async () => {
+test("inbox: an invalid model result reads 'Waiting', distinct from a failure and from a question", async () => {
   const p = await page();
   await withState(p, baseState({
-    items: [{ id: "s1:4b", source: "s1", title: "Ran out of turns", stage: "working", blocked: true }],
-    blocks: { "s1:4b": { kind: "turns", reason: "hit the turn budget mid-review" } },
+    items: [{ id: "s1:4b", source: "s1", title: "Bad model result", stage: "working", blocked: true }],
+    blocks: { "s1:4b": { kind: "invalid-result", reason: "the correction was malformed" } },
   }));
   const html = p.el("#inbox-list").innerHTML;
   assert.match(html, /Waiting/);

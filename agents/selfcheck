@@ -526,7 +526,7 @@ want_hard=$(date -u -d "@$at" +'%H:%M UTC')
 chk "the brief names the engine's kill time" "$(grep -c "killed at" <<<"$brief")" "1"
 chk "and the hard deadline itself"           "$(grep -c "$want_hard" <<<"$brief")" "1"
 chk "and a wrap-up one grace earlier"        "$(grep -c "$want_soft" <<<"$brief")" "1"
-chk "and where to write an unfinished stop"  "$(grep -c "$CONVEYOR_RESULT" <<<"$brief")" "1"
+chk "and how to return an unfinished stop"   "$(grep -c 'final structured response' <<<"$brief")" "1"
 
 # No timeout is a real configuration. An adapter must be able to tell it apart
 # from a deadline in the past — a stage with no limit that told its agent it was

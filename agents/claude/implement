@@ -27,12 +27,12 @@ source "$(dirname "$0")/../_deps"
 noop_brief() {
 	cat <<-BRIEF
 	If you finish without committing anything on purpose — you looked and there
-	was nothing needed doing — say so by writing this to the file at ${CONVEYOR_RESULT}:
+	was nothing needed doing — return this as your final structured response:
 
-	  {"noop": true, "reason": "<why nothing needed doing>"}
+	  {"v": 1, "outcome": "noop", "reason": "<why nothing needed doing>"}
 
 	This is not the decision above: nobody has to choose anything. A run that
-	ends with no commit and no result file at all will be marked for a person
+	ends with no commit and no structured result will be marked for a person
 	to look at, on the assumption that a question was asked in prose and never
 	written down.
 	BRIEF
@@ -233,7 +233,7 @@ fi
 # failure with its own log, so turning that into an unclearable question would
 # be the wrong trade for a transient tool failure. What is left is dominated by
 # the observed case: a model that asked its question in prose, believing it
-# was talking to someone, and stopped — leaving $CONVEYOR_RESULT empty and
+# was talking to someone, and stopped — leaving no valid structured result and
 # neither ref moved. Re-running that blind reproduces the hold, so this is
 # `asks`, not `blocked`: a question, never bulk-cleared by `Unblock all` or
 # `retryStalled`. `record_session` first, since `asks` writes to the same file.
@@ -243,7 +243,10 @@ fi
 # test driving this script into the postcondition therefore has to move one of
 # the two refs captured above first — a stubbed `claude` that commits nothing
 # stops here instead, whatever fixture the postcondition itself is given.
-if [[ $rc -eq 0 ]] && [[ ! -s "${CONVEYOR_RESULT:-}" ]]; then
+if [[ $rc -eq 0 ]] && {
+	[[ ! -s "${CONVEYOR_RESULT:-}" ]] ||
+		jq -e '.outcome == "success"' "$CONVEYOR_RESULT" >/dev/null 2>&1
+}; then
 	guard_head_after=$(git rev-parse -q --verify "refs/heads/$guard_branch" 2>/dev/null || true)
 	guard_origin_after=$(git rev-parse -q --verify "refs/remotes/origin/$guard_branch" 2>/dev/null || true)
 	if [[ "$guard_head_after" == "$guard_head_before" && "$guard_origin_after" == "$guard_origin_before" ]]; then

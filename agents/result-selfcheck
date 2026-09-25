@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/_result"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export CONVEYOR_RESULT="$tmp/result.json"
+: >"$CONVEYOR_RESULT"
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+plain='{"v":1,"outcome":"success","summary":"done"}'
+result_accept "$plain" sess-1
+chk "plain JSON is persisted" "$(jq -c '[.v,.outcome,.summary,.session]' "$CONVEYOR_RESULT")" '[1,"success","done","sess-1"]'
+chk "the result stays private" "$(stat -c %a "$CONVEYOR_RESULT")" "600"
+
+result_accept $'```json\n{"v":1,"outcome":"noop","reason":"already done"}\n```'
+chk "one fenced object is accepted" "$(jq -c '[.outcome,.noop,.reason]' "$CONVEYOR_RESULT")" '["noop",true,"already done"]'
+
+before=$(cat "$CONVEYOR_RESULT")
+for bad in \
+	'{"outcome":"success"}' \
+	'{"v":2,"outcome":"success"}' \
+	'{"v":1,"outcome":"success","unknown":true}' \
+	'{"v":1,"outcome":"blocked","kind":"decision"}' \
+	'{"v":1,"outcome":"success"} {"v":1,"outcome":"success"}' \
+	$'prose\n```json\n{"v":1,"outcome":"success"}\n```' \
+	'{"v":1,"outcome":"success"'; do
+	if result_accept "$bad"; then got=accepted; else got=rejected; fi
+	chk "invalid model result is rejected" "$got" "rejected"
+	chk "a rejection preserves the complete old result" "$(cat "$CONVEYOR_RESULT")" "$before"
+done
+
+result_accept '{"v":1,"outcome":"blocked","kind":"decision","reason":"choose","questions":[{"header":"API","question":"Which API?","options":[{"label":"A","description":"first"},{"label":"B","description":"second"}],"multiSelect":false}]}' sess-q
+chk "a question gets trusted compatibility fields" "$(jq -c '[.blocked,.asked,.session]' "$CONVEYOR_RESULT")" '[true,true,"sess-q"]'
+result_accept '{"v":1,"outcome":"blocked","kind":"dependency","reason":"wait"}'
+chk "a condition is not promoted to a question" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
+
+export API_TOKEN='secret-value-112'
+result_accept '{"v":1,"outcome":"success","summary":"saw secret-value-112"}'
+chk "sensitive environment values are redacted" "$(jq -r .summary "$CONVEYOR_RESULT")" "saw [REDACTED]"
+export API_SECRET='quoted"secret\value'
+escaped=$(jq -nc --arg value "saw $API_SECRET" '{v:1,outcome:"success",summary:$value}')
+result_accept "$escaped"
+chk "JSON-escaped secret values are redacted" "$(jq -r .summary "$CONVEYOR_RESULT")" "saw [REDACTED]"
+result_quarantine 'malformed output contained secret-value-112' sess-bad
+chk "quarantine is precise and redacted" "$(jq -c '[.kind,.asked,.session,.reason]' "$CONVEYOR_RESULT")" '["invalid-result",false,"sess-bad","malformed output contained [REDACTED]"]'
+
+exit "$fail"

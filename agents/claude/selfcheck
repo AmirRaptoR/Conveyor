@@ -68,7 +68,7 @@ chk "and it is still a question"       "$(jq -r .asked "$CONVEYOR_RESULT")" "tru
 # condition — the bug this issue fixes — and still gets a session, since
 # `turns` and `unfinished` are the resumable kinds.
 printf '%s\n' '{"type":"system","session_id":"sess-cond"}' '{"type":"result","session_id":"sess-cond"}' > "$CLAUDE_RAW"
-for k in limit turns unfinished dependency worktree; do
+for k in limit turns unfinished dependency worktree invalid-result; do
 	echo "{\"blocked\":true,\"kind\":\"$k\",\"reason\":\"r\"}" > "$CONVEYOR_RESULT"
 	agent_asked
 	chk "a model-written kind $k stays a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
@@ -336,5 +336,93 @@ chk "the sentinel never reaches the human log" "$(grep -c CONVEYOR_PLAN_TODOS <<
 chk "a human summary is printed instead" "$(grep -c 'plan updated (1/2 done)' <<<"$out")" "1"
 rm -rf "$tmp_plan"
 unset CONVEYOR_PLAN
+
+# 15. The backend owns final-result extraction and one bounded correction.
+tmp_result=$(mktemp -d)
+old_path=$PATH
+mkdir -p "$tmp_result/bin"
+cat >"$tmp_result/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+calls=1
+[[ -s "$RESULT_CALLS" ]] && calls=$(($(<"$RESULT_CALLS") + 1))
+printf '%s' "$calls" >"$RESULT_CALLS"
+printf '%s\n' "$*" >"$RESULT_ARGS.$calls"
+printf '%s\n' "${CONVEYOR_RESULT+exposed}" >>"$RESULT_ENV"
+jq -nc '{type:"system",subtype:"init",session_id:"result-session",model:"stub"}'
+case "$RESULT_SCENE" in
+fenced)
+	jq -nc --arg result $'```json\n{"v":1,"outcome":"success","summary":"fenced"}\n```' \
+		'{type:"result",subtype:"success",is_error:false,session_id:"result-session",result:$result}'
+	;;
+corrected)
+	if ((calls == 1)); then result='not json'; else result='{"v":1,"outcome":"success","summary":"corrected"}'; fi
+	jq -nc --arg result "$result" '{type:"result",subtype:"success",is_error:false,session_id:"result-session",result:$result}'
+	;;
+duplicate)
+	if ((calls == 1)); then
+		jq -nc '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"success"}}'
+	fi
+	jq -nc '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"success",summary:"corrected duplicate"}}'
+	;;
+secret)
+	jq -nc --arg text "$RESULT_SECRET" '{type:"assistant",session_id:"result-session",message:{content:[{type:"text",text:$text}]}}'
+	jq -nc --arg text "$RESULT_SECRET" '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"success",summary:$text}}'
+	;;
+invalid)
+	jq -nc --arg result 'still not json' '{type:"result",subtype:"success",is_error:false,session_id:"result-session",result:$result}'
+	;;
+incomplete)
+	jq -nc '{type:"assistant",session_id:"result-session",message:{content:[{type:"text",text:"partial"}]}}'
+	;;
+esac
+STUB
+chmod +x "$tmp_result/bin/claude"
+PATH="$tmp_result/bin:$PATH"
+export RESULT_CALLS="$tmp_result/calls" RESULT_ARGS="$tmp_result/args" RESULT_ENV="$tmp_result/env"
+export CONVEYOR_RESULT="$tmp_result/result.json"
+
+run_result_scene() {
+	export RESULT_SCENE=$1
+	rm -f "$RESULT_CALLS" "$RESULT_ENV" "$RESULT_ARGS".*
+	: >"$CONVEYOR_RESULT"
+	set +e
+	run_claude 'do the task' >/dev/null 2>&1
+	local rc=$?
+	set -e
+	printf '%s' "$rc"
+}
+
+chk "a fenced final is accepted" "$(run_result_scene fenced)" "0"
+chk "the fenced payload is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "fenced"
+chk "the model child cannot see CONVEYOR_RESULT" "$(grep -c exposed "$RESULT_ENV" || true)" "0"
+chk "the result schema is passed to Claude" "$(grep -c -- '--json-schema' "$RESULT_ARGS.1")" "1"
+
+chk "a malformed final receives one correction" "$(run_result_scene corrected):$(cat "$RESULT_CALLS")" "0:2"
+chk "the correction is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "corrected"
+chk "the correction resumes the same session" "$(grep -c -- '--resume result-session' "$RESULT_ARGS.2")" "1"
+chk "the correction exposes no tools" "$(grep -c -- '--allowedTools  ' "$RESULT_ARGS.2")" "1"
+
+chk "duplicate finals receive one correction" "$(run_result_scene duplicate):$(cat "$RESULT_CALLS")" "0:2"
+chk "the duplicate correction wins" "$(jq -r .summary "$CONVEYOR_RESULT")" "corrected duplicate"
+
+chk "a second invalid result quarantines" "$(run_result_scene invalid):$(cat "$RESULT_CALLS")" "20:2"
+chk "the invalid result has a precise kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "invalid-result"
+chk "the invalid result is not a question" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
+
+export API_TOKEN='result-secret-112' RESULT_SECRET='result-secret-112'
+export RESULT_SCENE=secret
+rm -f "$RESULT_CALLS" "$RESULT_ENV" "$RESULT_ARGS".*
+: >"$CONVEYOR_RESULT"
+secret_log=$(run_claude 'do the task' 2>&1)
+chk "secret values are absent from rendered logs" "$(grep -c 'result-secret-112' <<<"$secret_log" || true)" "0"
+chk "secret values are redacted in persisted results" "$(jq -r .summary "$CONVEYOR_RESULT")" "[REDACTED]"
+unset API_TOKEN RESULT_SECRET
+
+chk "an incomplete stream fails without correction" "$(run_result_scene incomplete):$(cat "$RESULT_CALLS")" "2:1"
+chk "an incomplete stream persists nothing" "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+
+PATH=$old_path
+rm -rf "$tmp_result"
 
 exit $fail
