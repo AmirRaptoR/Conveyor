@@ -552,6 +552,18 @@ RESUME_SESSION=""
 resume_prompt '{"answer":"continue","session":"foreign-session","controlCarryover":false}' 'original' >/dev/null 2>&1
 chk "an ordinary unprefixed session remains foreign" "${RESUME_SESSION:-}" ""
 
+RESUME_SESSION=""
+export API_SECRET=ses-good
+resume_log=$(resume_prompt '{"answer":"continue","session":"opencode:ses-good"}' 'original' 2>&1)
+chk "a secret-colliding resume session is ignored" "${RESUME_SESSION:-}" ""
+chk "a secret-colliding resume session is not logged" "$(grep -Fc ses-good <<<"$resume_log" || true)" "0"
+reset_invocations
+reset_control
+export OC_SCENE=success
+run_claude 'do not persist the colliding session' >/dev/null
+chk "a secret-colliding session is absent from control ack" "$(jq -rs '[.[] | select(.type=="session")] | length' "$CONVEYOR_CONTROL_ACK")" "0"
+unset API_SECRET
+
 export CONVEYOR_RESULT="$tmp/result"
 printf '%s\n' '{"type":"text","timestamp":1,"sessionID":"ses-question","part":{"id":"p","type":"text","text":"x"}}' >"$CLAUDE_RAW"
 echo '{"blocked":true,"kind":"decision","reason":"choose","questions":[{"header":"Mode","question":"Which?","options":[{"label":"Safe","description":"Use safe mode"}]}]}' >"$CONVEYOR_RESULT"
@@ -582,6 +594,18 @@ unset API_TOKEN API_SECRET LIMIT_MESSAGE
 
 OC_SCENE=success run_claude 'quota recovered' >/dev/null
 chk "a successful provider run clears its quota cache" "$([[ -e "$XDG_STATE_HOME/conveyor/opencode/openai.json" ]] && echo present || echo absent)" "absent"
+
+export TEST_SECRET=openai LIMIT_MESSAGE='quota exceeded'
+OC_SCENE=limit
+run_claude 'hit provider quota' >/dev/null 2>&1 || true
+hit_limit
+chk "a secret-colliding provider is redacted in quota cache" "$(jq -r .provider "$XDG_STATE_HOME/conveyor/opencode/redacted.json")" "redacted"
+status_out=$("$here/status" 2>&1)
+chk "a secret-colliding provider is absent from status output" "$(grep -Fc openai <<<"$status_out" || true)" "0"
+
+OC_SCENE=success run_claude 'quota recovered' >/dev/null
+chk "a successful provider run clears a redacted quota cache" "$([[ -e "$XDG_STATE_HOME/conveyor/opencode/redacted.json" ]] && echo present || echo absent)" "absent"
+unset TEST_SECRET LIMIT_MESSAGE
 
 export OC_SCENE=generic429
 set +e

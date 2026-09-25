@@ -112,6 +112,12 @@ secret_values_json() {
 	printf '%s' "$values"
 }
 
+contains_sensitive_value() {
+	local text=$1 secrets
+	secrets=$(secret_values_json) || return 1
+	jq -e --arg text "$text" 'any(.[]; . as $secret | $text | contains($secret))' <<<"$secrets" >/dev/null 2>&1
+}
+
 redact_stream() {
 	local line
 	while IFS= read -r line || [[ -n "$line" ]]; do

@@ -43,6 +43,7 @@ resume_prompt() {
 	answer=$(jq -r '.answer // ""' <<<"$payload")
 	session=$(jq -r '.session // ""' <<<"$payload")
 	control_carryover=$(jq -r '.controlCarryover // false' <<<"$payload")
+	contains_sensitive_value "$session" && session=""
 	if [[ -z "$answer" ]]; then
 		printf '%s' "$default"
 		return 0
@@ -72,13 +73,18 @@ ${default}"
 
 limit_dir() { printf '%s/conveyor/opencode' "${XDG_STATE_HOME:-$HOME/.local/state}"; }
 limit_file() {
-	local provider=${MODEL%%/*}
-	[[ "$provider" =~ ^[A-Za-z0-9._-]+$ ]] || provider=unknown
+	local provider=${1:-${MODEL%%/*}}
+	provider=$(redact_text "$provider") || provider=redacted
+	if [[ "$provider" == *'[REDACTED]'* ]]; then
+		provider=redacted
+	elif [[ ! "$provider" =~ ^[A-Za-z0-9._-]+$ ]]; then
+		provider=unknown
+	fi
 	printf '%s/%s.json' "$(limit_dir)" "$provider"
 }
 
 hit_limit() {
-	local reason expires file tmp
+	local reason expires file tmp provider
 	[[ -s "$CLAUDE_RAW" ]] || return 1
 	if ! jq -s -e 'any(.[]; select(.type == "error") |
 		[(.error.name // ""), (.error.data.message // ""),
@@ -95,11 +101,13 @@ hit_limit() {
 		(.error.data.message // .error.message // .error.name // "explicit quota refusal") |
 		tostring | gsub("[[:space:]]+"; " ") | .[0:300]][0]' "$CLAUDE_RAW")
 	reason=$(redact_text "$reason") || reason="[REDACTED] quota refusal"
-	file=$(limit_file)
+	provider=$(redact_text "${MODEL%%/*}") || provider="[REDACTED]"
+	[[ "$provider" =~ ^[A-Za-z0-9._-]+$ ]] || provider=redacted
+	file=$(limit_file "$provider")
 	mkdir -p "$(dirname "$file")" || return 0
 	expires=$(($(date +%s) + ${OPENCODE_LIMIT_TTL:-900}))
 	tmp=$(mktemp "${file}.XXXXXX") || return 0
-	if jq -n --arg provider "${MODEL%%/*}" --arg reason "$reason" \
+	if jq -n --arg provider "$provider" --arg reason "$reason" \
 		--argjson expires "$expires" '{provider:$provider, limitedAt:(now|todate), expiresAt:$expires, reason:$reason}' >"$tmp"; then
 		mv "$tmp" "$file"
 	else
@@ -257,7 +265,7 @@ render_stream() {
 		fi
 		session=$event_session
 		_OPENCODE_STREAM_SESSION=$session
-		control_session "opencode:$session"
+		contains_sensitive_value "$session" || control_session "opencode:$session"
 		type=$(jq -r .type <<<"$line")
 		case "$type" in
 		step_start)
