@@ -213,6 +213,7 @@ _opencode_pause() {
 
 render_stream() {
 	local line type session="" current seen=0 finished=0 errors=0 detail id text previous status key command kind rendered
+	_OPENCODE_STREAM_ABORTED=0
 	declare -A parts=()
 	declare -A texts=()
 	declare -A tool_states=()
@@ -234,27 +235,29 @@ render_stream() {
 			and (.sessionID | type == "string" and length > 0)' \
 			>/dev/null 2>&1 <<<"$line"; then
 			echo "opencode emitted a malformed JSON event" >&2
+			_OPENCODE_STREAM_ABORTED=1
 			return 2
 		fi
 		current=$(jq -r .sessionID <<<"$line")
 		if [[ -n "$session" && "$current" != "$session" ]]; then
 			echo "opencode changed session id inside one event stream" >&2
+			_OPENCODE_STREAM_ABORTED=1
 			return 2
 		fi
 		session=$current
 		_OPENCODE_STREAM_SESSION=$session
-		control_session "$session"
+		control_session "opencode:$session"
 		type=$(jq -r .type <<<"$line")
 		case "$type" in
 		step_start)
 			jq -e '.part | type == "object" and (.id | type == "string" and length > 0) and .type == "step-start"' >/dev/null 2>&1 <<<"$line" || {
-				echo "opencode emitted a malformed step_start event" >&2; return 2; }
+				echo "opencode emitted a malformed step_start event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line"); [[ -n "${parts[$id]+seen}" ]] && continue; parts[$id]=1
 			seen=1
 			;;
 		text)
 			jq -e '.part | type == "object" and (.id | type == "string" and length > 0) and .type == "text" and (.text | type == "string")' >/dev/null 2>&1 <<<"$line" || {
-				echo "opencode emitted a malformed text event" >&2; return 2; }
+				echo "opencode emitted a malformed text event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line")
 			text=$(jq -r .part.text <<<"$line")
 			previous=${texts[$id]-}
@@ -269,7 +272,7 @@ render_stream() {
 			;;
 		reasoning)
 			jq -e '.part | type == "object" and (.id | type == "string" and length > 0) and .type == "reasoning"' >/dev/null 2>&1 <<<"$line" || {
-				echo "opencode emitted a malformed reasoning event" >&2; return 2; }
+				echo "opencode emitted a malformed reasoning event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line"); [[ -n "${parts[$id]+seen}" ]] && continue; parts[$id]=1
 			seen=1 # deliberately not logged
 			;;
@@ -278,7 +281,7 @@ render_stream() {
 				and (.tool | type == "string" and length > 0)
 				and (.state.status | type == "string" and length > 0)' \
 				>/dev/null 2>&1 <<<"$line" || {
-				echo "opencode emitted a malformed tool_use event" >&2; return 2; }
+				echo "opencode emitted a malformed tool_use event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line")
 			status=$(jq -r .part.state.status <<<"$line")
 			tool_status[$id]=$status
@@ -294,7 +297,7 @@ render_stream() {
 			;;
 		step_finish)
 			jq -e '.part | type == "object" and (.id | type == "string" and length > 0) and .type == "step-finish"' >/dev/null 2>&1 <<<"$line" || {
-				echo "opencode emitted a malformed step_finish event" >&2; return 2; }
+				echo "opencode emitted a malformed step_finish event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line"); [[ -n "${parts[$id]+seen}" ]] && continue; parts[$id]=1
 			finished=1
 			seen=1
@@ -315,7 +318,7 @@ render_stream() {
 			;;
 		error)
 			jq -e '.error | type == "object"' >/dev/null 2>&1 <<<"$line" || {
-				echo "opencode emitted a malformed error event" >&2; return 2; }
+				echo "opencode emitted a malformed error event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			detail=$(jq -r '.error.data.message // .error.message // .error.name // "unknown error"' <<<"$line")
 			_opencode_emit "[opencode stopped: $(jq -r '.error.name // "error"' <<<"$line")] $detail"
 			errors=1
@@ -342,10 +345,16 @@ _opencode_invoke_child() {
 	_OPENCODE_CONTROL_COMMAND=""
 	_OPENCODE_STREAM_SESSION=""
 	_OPENCODE_CHILD_WAITED=0
+	_OPENCODE_STREAM_ABORTED=0
 	_OPENCODE_CAPTURE_STREAM=1
 	OPENCODE_DISABLE_AUTOUPDATE=1 "$bin" "$@" <<<"$prompt" >"$fifo" &
 	_OPENCODE_CHILD_PID=$!
 	if render_stream <"$fifo"; then render_status=0; else render_status=$?; fi
+	# Validation can reject one event while the producer remains alive with the
+	# FIFO open. Stop and reap it before waiting, just as cancellation does.
+	if [[ "$_OPENCODE_STREAM_ABORTED" == 1 && "$_OPENCODE_CHILD_WAITED" != 1 ]]; then
+		_opencode_stop_child
+	fi
 	if [[ "$_OPENCODE_CHILD_WAITED" == 1 ]]; then
 		child_status=$_OPENCODE_CHILD_STATUS
 	elif wait "$_OPENCODE_CHILD_PID"; then
@@ -362,6 +371,7 @@ _opencode_invoke_child() {
 	if [[ $render_status -eq 20 || $render_status -eq 30 ]]; then
 		return "$render_status"
 	fi
+	[[ "$_OPENCODE_STREAM_ABORTED" == 1 ]] && return "$render_status"
 	[[ $child_status -eq 0 ]] || return "$child_status"
 	return "$render_status"
 }

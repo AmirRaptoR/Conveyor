@@ -386,7 +386,11 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	// answer someone typed and an action they then pressed are two things a
 	// person said about the same stop, and the next run should get both.
 	armed := s.answers.Get(item.ID)
+	if armed.Stage != "" && armed.Stage != item.Stage {
+		armed = model.Resume{}
+	}
 	armed.Manual = said.Action
+	armed.Stage = item.Stage
 	if err := s.answers.Set(item.ID, armed); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -421,7 +425,11 @@ func (s *Server) answerThenUnblock(ctx context.Context, item model.Item, answer 
 		// person pressed and a reply they then typed are two things said
 		// about the same stop, and the next run should be handed both.
 		resume = s.answers.Get(item.ID)
+		if resume.Stage != "" && resume.Stage != item.Stage {
+			resume = model.Resume{}
+		}
 		resume.Answer, resume.Session = answer, sess
+		resume.Stage = item.Stage
 		if err := s.answers.Set(item.ID, resume); err != nil {
 			return err
 		}

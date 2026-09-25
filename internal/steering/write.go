@@ -3,6 +3,7 @@ package steering
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -167,7 +168,6 @@ func appendLine(path string, line []byte) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = f.Write(append(line, '\n'))
-	return err
+	_, writeErr := f.Write(append(line, '\n'))
+	return errors.Join(writeErr, f.Close())
 }

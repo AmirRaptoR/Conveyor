@@ -61,7 +61,10 @@ generic429)
 	printf '%s\n' '{"type":"error","timestamp":1,"sessionID":"ses-rate","error":{"name":"APIError","data":{"message":"too many requests","statusCode":429}}}'
 	;;
 malformed)
+	trap 'echo TERM >"$OC_ABORTED"; exit 0' TERM
 	echo 'not-json'
+	deadline=$((SECONDS + 3))
+	while ((SECONDS < deadline)); do :; done
 	;;
 mismatch)
 	printf '%s\n' \
@@ -113,6 +116,7 @@ export XDG_STATE_HOME="$tmp/state"
 export OC_ARGS="$tmp/args" OC_PROMPT="$tmp/prompt" OC_CALLS="$tmp/calls" OC_STARTS="$tmp/starts" OC_PIDS="$tmp/pids"
 export OC_HELLO_BEFORE_RUN="$tmp/hello-before-run" OC_SIGNALS="$tmp/signals"
 export OC_EARLY_ACK="$tmp/early-ack" OC_UNSAFE_ACK="$tmp/unsafe-ack"
+export OC_ABORTED="$tmp/aborted"
 export OC_BOUNDARY_FIXTURE="$here/fixtures/steering-boundaries-synthetic.jsonl"
 export MODEL=openai/gpt-test VARIANT=high AGENT=build
 export CONVEYOR_SOURCE=test CONVEYOR_STAGE=working CONVEYOR_ITEM_REF=7
@@ -125,7 +129,7 @@ chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2]
 
 reset_invocations() {
 	rm -f "$OC_CALLS" "$OC_STARTS" "$OC_PIDS" "$OC_HELLO_BEFORE_RUN" "$OC_SIGNALS" \
-		"$OC_EARLY_ACK" "$OC_UNSAFE_ACK" "$OC_ARGS".* "$OC_PROMPT".*
+		"$OC_EARLY_ACK" "$OC_UNSAFE_ACK" "$OC_ABORTED" "$OC_ARGS".* "$OC_PROMPT".*
 }
 
 reset_control() {
@@ -184,7 +188,7 @@ set -e
 chk "a delivered instruction keeps the run successful" "$rc" "0"
 chk "hello is present before the first model child starts" "$(sed -n '1p' "$OC_HELLO_BEFORE_RUN")" "yes"
 chk "hello is the first ack record" "$(jq -rs '.[0].type' "$CONVEYOR_CONTROL_ACK")" "hello"
-chk "the first event records its raw session" "$(jq -rs '.[1] | [.type,.session] | join(":")' "$CONVEYOR_CONTROL_ACK")" "session:ses-steer"
+chk "the first event records its opaque adapter session" "$(jq -rs '.[1] | [.type,.session] | join(":")' "$CONVEYOR_CONTROL_ACK")" "session:opencode:ses-steer"
 chk "the unsafe step boundary was not polled" "$([[ -e "$OC_UNSAFE_ACK" ]] && echo polled || echo skipped)" "skipped"
 chk "the first child receives TERM at the safe boundary" "$(grep -c '^TERM$' "$OC_SIGNALS" || true)" "1"
 chk "an instruction starts a second child" "$(cat "$OC_CALLS")" "2"
@@ -245,7 +249,7 @@ chk "the handed-back pause resumes instead of starting cold" "$(grep -A1 -Fx -- 
 # not only in agents/_control-selfcheck.
 reset_invocations
 reset_control
-append_command 1 stale-1 instruction "old" "ses-other"
+append_command 1 stale-1 instruction "old" "opencode:ses-other"
 export OC_COMMAND_ID=stale-1 OC_SCENE=boundary-exit
 run_claude 'reject stale' >/dev/null
 chk "a stale session is rejected at the boundary" "$(jq -r 'select(.type=="ack" and .id=="stale-1") | .reason' "$CONVEYOR_CONTROL_ACK")" "stale session"
@@ -349,12 +353,18 @@ set -e
 chk "a generic 429 is not called account quota" "$(hit_limit && echo limited || echo transient)" "transient"
 
 for scene in malformed mismatch; do
+	reset_invocations
 	export OC_SCENE=$scene
+	started=$SECONDS
 	set +e
 	run_claude 'bad protocol' >/dev/null 2>&1
 	rc=$?
 	set -e
 	chk "$scene events fail closed" "$rc" "2"
+	if [[ "$scene" == malformed ]]; then
+		chk "malformed output stops the still-running producer" "$([[ -e "$OC_ABORTED" ]] && echo stopped || echo alive)" "stopped"
+		chk "malformed output does not wait for producer EOF" "$((SECONDS - started < 2 && 1 || 0))" "1"
+	fi
 done
 
 export AGENT=general OC_SCENE=success

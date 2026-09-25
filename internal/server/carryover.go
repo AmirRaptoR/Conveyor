@@ -11,8 +11,6 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/steering"
 )
 
-const carriedSessionPrefix = "opencode:"
-
 // CarryOverInterrupted arms instructions that the newest stage run for each
 // item did not consume before serve stopped. It is called once by cmdServe,
 // after New has opened Answers and before Run starts any work.
@@ -65,16 +63,19 @@ func (s *Server) carryOverRun(run RunMeta) error {
 		block := "\n\n--- carried from the interrupted run " + run.ID + " ---\n" + strings.Join(instructions, "\n\n")
 		armed := s.answers.Get(run.ItemID)
 		reason := "carried into the next run's armed answer"
-		if strings.Contains(armed.Answer, block) {
+		stageConflict := armed.Stage != "" && armed.Stage != run.To
+		if stageConflict {
+			reason = fmt.Sprintf("dropped because the armed answer belongs to stage %s, not %s", armed.Stage, run.To)
+		} else if strings.Contains(armed.Answer, block) {
 			reason = "already present in the next run's armed answer"
 		} else {
 			armed.Answer += block
+			armed.Stage = run.To
 			if res.Session != "" {
-				carriedSession := carriedSessionPrefix + res.Session
 				switch {
 				case armed.Session == "":
-					armed.Session = carriedSession
-				case armed.Session != carriedSession:
+					armed.Session = res.Session
+				case armed.Session != res.Session:
 					reason += "; session conflict: kept the existing armed-answer session"
 				}
 			}
@@ -84,6 +85,9 @@ func (s *Server) carryOverRun(run RunMeta) error {
 		}
 		for i := range entries {
 			if entries[i].State == steering.StateCarried {
+				if stageConflict {
+					entries[i].State = steering.StateDropped
+				}
 				entries[i].Reason = reason
 			}
 		}
