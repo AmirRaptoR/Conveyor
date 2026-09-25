@@ -74,6 +74,48 @@ aside.open { transform:none; }
   .dependency-hold { grid-template-columns:1fr; gap:2px; }
 }
 
+/* Selected-run steering sits directly beside the stopped-run Answer group.
+   Historical rows keep the audit but never the mutation controls. */
+.run-steering { margin:12px 18px 0; padding:12px; border:1px solid var(--rule); border-radius:8px; }
+.steer-head { display:flex; align-items:baseline; justify-content:space-between; gap:10px; }
+.steer-head h3 { margin:0; font-size:13px; font-weight:600; }
+.steer-head span, .steer-capabilities, .steer-summary {
+  color:var(--faint); font-family:var(--mono); font-size:10.5px; overflow-wrap:anywhere;
+}
+.steer-capabilities, .steer-summary { margin-top:5px; }
+.steer-controls { display:flex; align-items:flex-end; gap:10px; margin-top:10px; }
+.steer-instruction { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:6px; flex:1; }
+.steer-instruction label { grid-column:1 / -1; color:var(--dim); font-size:11.5px; }
+.steer-text, .cancel-reason {
+  width:100%; min-width:0; resize:vertical; font:inherit; font-size:13px; line-height:1.45;
+  color:var(--ink); background:var(--ground); border:1px solid var(--rule); border-radius:6px; padding:8px 10px;
+}
+.steer-text:focus, .cancel-reason:focus { outline:none; border-color:var(--run); }
+.steer-buttons { display:flex; gap:6px; flex-wrap:wrap; }
+.steer-controls .ctl { min-height:44px; }
+.ctl.danger { color:var(--stop); border-color:color-mix(in srgb, var(--stop) 45%, var(--rule)); }
+.steer-fault, .cancel-fault { margin-top:8px; color:var(--stop); white-space:pre-wrap; }
+.command-audit { margin-top:12px; }
+.steer-label { color:var(--dim); font-size:11.5px; font-weight:600; }
+.command-audit ol { list-style:none; margin:6px 0 0; padding:0; }
+.command { padding:8px 0; border-top:1px solid var(--rule-soft); }
+.command-head { display:flex; justify-content:space-between; gap:8px; }
+.command-kind { color:var(--ink); font-weight:600; }
+.command-state { color:var(--faint); text-transform:capitalize; }
+.command.consumed .command-state, .command.carried .command-state { color:var(--ok); }
+.command.rejected .command-state, .command.dropped .command-state { color:var(--stop); }
+.command-text, .command-reason { display:block; margin-top:4px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.command-reason { color:var(--stop); }
+.command-meta { margin-top:4px; color:var(--faint); font-family:var(--mono); font-size:10px; overflow-wrap:anywhere; }
+
+@media (max-width: 540px) {
+  .run-steering { margin:10px 14px 0; }
+  .steer-controls { align-items:stretch; flex-direction:column; }
+  .steer-instruction { grid-template-columns:1fr; }
+  .steer-instruction label { grid-column:auto; }
+  .steer-buttons, .steer-buttons .ctl, .steer-instruction .ctl { width:100%; }
+}
+
 /* A run history is genuinely a sequence, so it is drawn as one. */
 .history { padding:12px 18px; border-bottom:1px solid var(--rule); }
 .tr {
