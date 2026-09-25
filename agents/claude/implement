@@ -255,7 +255,7 @@ if [[ $rc -eq 0 ]] && {
 	guard_origin_after=$(git rev-parse -q --verify "refs/remotes/origin/$guard_branch" 2>/dev/null || true)
 	if [[ "$guard_head_after" == "$guard_head_before" && "$guard_origin_after" == "$guard_origin_before" ]]; then
 		record_session
-		asks no-output "the run finished without committing, pushing or writing a result. \
+		asks no-output "the run finished without committing, pushing, or declaring a noop, wait, or block. \
 Read this run's log for what it actually did — a model that asked a question in prose and \
 stopped, believing it was talking to someone, is the usual cause. Answering this mark \
 resumes the same conversation rather than starting cold."

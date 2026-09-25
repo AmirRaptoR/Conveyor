@@ -11,18 +11,28 @@
 
 declare -f result_write_json >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/_result"
 
-# _write_stop <jq args...> <filter> — the merge blocked and asks share: apply
-# filter to whatever is already in $CONVEYOR_RESULT (an empty object if there
-# is nothing, or nothing readable), so a field a caller wrote before stopping
-# survives being blocked.
+# _write_stop <jq args...> <filter> — apply an adapter-authored outcome, retain
+# transport state such as the session, and discard fields owned by the previous
+# outcome so the persisted v1 envelope cannot contradict itself.
 _write_stop() {
 	[[ -z "${CONVEYOR_RESULT:-}" ]] && return 0
 	local base merged outcome
 	base='{}'
 	[[ -s "$CONVEYOR_RESULT" ]] && jq -e . "$CONVEYOR_RESULT" >/dev/null 2>&1 && base=$(cat "$CONVEYOR_RESULT")
 	merged=$(jq -c "$@" <<<"$base" 2>/dev/null) || return 0
-	outcome=$(jq -r 'if .blocked == true then "blocked" elif .noop == true then "noop" elif .waiting != null then "waiting" else (.outcome // "success") end' <<<"$merged")
-	merged=$(jq -c --arg outcome "$outcome" '. + {v:1,outcome:$outcome}' <<<"$merged") || return 0
+	outcome=$(jq -r '.outcome // "success"' <<<"$merged")
+	merged=$(jq -c --arg outcome "$outcome" '
+		def session: if has("session") then {session:.session} else {} end;
+		if $outcome == "blocked" then
+			{v:1,outcome:"blocked",blocked:true,kind:.kind,reason:.reason} +
+			(if has("questions") then {questions:.questions} else {} end) +
+			(if has("asked") then {asked:.asked} else {} end) + session
+		elif $outcome == "noop" then
+			{v:1,outcome:"noop",noop:true,reason:.reason} + session
+		elif $outcome == "waiting" then
+			{v:1,outcome:"waiting",waiting:.waiting} + session
+		else {v:1,outcome:"success"} + session
+		end' <<<"$merged") || return 0
 	result_write_json "$merged" || return 0
 }
 
@@ -65,7 +75,7 @@ _write_stop() {
 # except that one caller, so this changes no existing behaviour.
 blocked() {
 	local kind=$1 reason=$2
-	_write_stop --arg kind "$kind" --arg reason "$reason" '. + {blocked: true, kind: $kind, reason: $reason}'
+	_write_stop --arg kind "$kind" --arg reason "$reason" '. + {outcome:"blocked", blocked:true, kind:$kind, reason:$reason}'
 	echo "blocked ($kind): $reason" >&2
 	exit 20
 }
@@ -114,7 +124,7 @@ decision_brief() {
 asks() {
 	local kind=$1 question=$2
 	_write_stop --arg kind "$kind" --arg reason "$question" \
-		'. + {blocked: true, kind: $kind, reason: $reason, asked: true}'
+		'. + {outcome:"blocked", blocked:true, kind:$kind, reason:$reason, asked:true}'
 	echo "asks ($kind): $question" >&2
 	exit 20
 }
@@ -138,7 +148,7 @@ waits() {
 	local until=""
 	[[ -n "$until_epoch" ]] && until=$(date -u -d "@$until_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
 	_write_stop --arg why "$why" --arg until "$until" \
-		'. + {waiting: ({why: $why} + (if $until == "" then {} else {until: $until} end))}'
+		'. + {outcome:"waiting", waiting:({why:$why} + (if $until == "" then {} else {until:$until} end))}'
 	echo "waiting: $why" >&2
 	exit 10
 }
