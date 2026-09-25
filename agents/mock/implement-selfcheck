@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Checks agents/mock/implement's steering support: it advertises instruction
+# and pause between its simulated steps, honours a queued instruction by
+# acking it and continuing, and honours a queued pause by acking it, writing
+# a paused $CONVEYOR_RESULT, and exiting 20. Runs no model.
+#
+#   agents/mock/implement-selfcheck
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+script="$here/implement"
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# append_command <seq> <id> <kind> <text>
+append_command() {
+	jq -nc --argjson seq "$1" --arg id "$2" --arg kind "$3" --arg text "$4" \
+		'{v:1, type:"command", seq:$seq, id:$id, at:"2026-09-24T12:00:00Z", kind:$kind, text:$text, itemId:"42", runId:"r1", session:"", by:"amir"}' \
+		>>"$tmp/control.jsonl"
+}
+
+run_mock() {
+	# run_mock <label> — sets this test's control channel and a fresh
+	# result/plan path in the *caller's* shell (not a subshell, so the
+	# exported paths are still visible to the assertions after), runs
+	# agents/mock/implement, and leaves its exit code in $mock_rc.
+	export CONVEYOR_RESULT="$tmp/result-$1.json"
+	export CONVEYOR_PLAN="$tmp/plan-$1.jsonl"
+	export CONVEYOR_CONTROL="$tmp/control.jsonl"
+	export CONVEYOR_CONTROL_ACK="$tmp/control-ack-$1.jsonl"
+	: >"$CONVEYOR_PLAN"
+	: >"$CONVEYOR_CONTROL_ACK"
+	echo '{"item":{"id":"42"}}' | "$script" >"$tmp/stdout-$1.log" 2>&1
+	mock_rc=$?
+}
+
+# 1. no command queued: the run advertises instruction and pause, and
+# completes normally.
+: >"$tmp/control.jsonl"
+run_mock plain
+chk "plain run exits 0" "$mock_rc" "0"
+chk "plain run's hello type"    "$(jq -rs '.[0].type' "$CONVEYOR_CONTROL_ACK")" "hello"
+chk "plain run's hello accepts" "$(jq -cs '.[0].accepts' "$CONVEYOR_CONTROL_ACK")" '["instruction","pause"]'
+chk "plain run's session type"  "$(jq -rs '.[1].type' "$CONVEYOR_CONTROL_ACK")" "session"
+chk "plain run wrote a merged result" "$(jq -r '.merged' "$CONVEYOR_RESULT")" "true"
+
+# 2. an instruction queued before the run starts is delivered, acked
+# consumed, and the run still runs to completion.
+: >"$tmp/control.jsonl"
+append_command 1 instr1 instruction "build it differently"
+run_mock instruction
+chk "instruction run exits 0" "$mock_rc" "0"
+chk "instruction acked consumed" "$(jq -r 'select(.type=="ack" and .id=="instr1") | .state' "$CONVEYOR_CONTROL_ACK")" "consumed"
+chk "instruction run still merged" "$(jq -r '.merged' "$CONVEYOR_RESULT")" "true"
+chk "instruction text echoed to the log" "$(grep -c "build it differently" "$tmp/stdout-instruction.log")" "1"
+
+# 3. a pause queued before the run starts is delivered, acked consumed, and
+# the run exits 20 with a paused result instead of completing.
+: >"$tmp/control.jsonl"
+append_command 1 pause1 pause ""
+run_mock pause
+chk "pause run exits 20" "$mock_rc" "20"
+chk "pause acked consumed" "$(jq -r 'select(.type=="ack" and .id=="pause1") | .state' "$CONVEYOR_CONTROL_ACK")" "consumed"
+chk "pause result is blocked"    "$(jq -r '.blocked' "$CONVEYOR_RESULT")" "true"
+chk "pause result kind"          "$(jq -r '.kind' "$CONVEYOR_RESULT")" "paused"
+chk "pause result asked"         "$(jq -r '.asked' "$CONVEYOR_RESULT")" "true"
+chk "pause result names the requester" "$(jq -r '.reason' "$CONVEYOR_RESULT" | grep -c "paused by amir at")" "1"
+chk "pause run did not reach merged completion" "$(jq -r 'has("merged")' "$CONVEYOR_RESULT")" "false"
+
+exit $fail
