@@ -19,6 +19,7 @@ type Resolution struct {
 	// Accepts and Session come from the run's hello/session ack records.
 	Accepts []string
 	Session string
+	Hello   bool
 	// Commands is every command from control.jsonl, in seq order, each with
 	// its derived State.
 	Commands []CommandState
@@ -29,6 +30,14 @@ type Resolution struct {
 	DuplicateAcks int
 	// IgnoredHellos counts a second (or later) hello record.
 	IgnoredHellos int
+	// Malformed is the number of rejected physical lines across both files.
+	Malformed int
+	// MaxSeq and AckSeq are the highest consumed sequence numbers in the
+	// engine-written and script-written files. AckVersion advances for every
+	// physical ack line, including one too malformed to carry a seq.
+	MaxSeq     int
+	AckSeq     int
+	AckVersion int
 }
 
 // Resolve derives every command's state from the accepted ack records
@@ -63,6 +72,7 @@ func Resolve(commands []Command, carriedRecords []Carried, acks []AckRecord, run
 				continue
 			}
 			helloSeen = true
+			res.Hello = true
 			res.Accepts = a.Hello.Accepts
 			if a.Hello.Session != "" {
 				res.Session = a.Hello.Session
@@ -71,7 +81,17 @@ func Resolve(commands []Command, carriedRecords []Carried, acks []AckRecord, run
 			if a.Session.Session == "" {
 				continue
 			}
+			previous := res.Session
 			res.Session = a.Session.Session
+			if previous != "" && previous != res.Session {
+				for _, id := range order {
+					cs := states[id]
+					if cs.State == StateQueued && cs.Command.Session == previous {
+						cs.State = StateRejected
+						cs.Reason = "stale session"
+					}
+				}
+			}
 		case a.Ack != nil:
 			cs, ok := states[a.Ack.ID]
 			if !ok {

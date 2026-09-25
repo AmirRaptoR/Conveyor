@@ -53,6 +53,21 @@ func TestResolveSessionEmptyIgnoredNonEmptyReplaces(t *testing.T) {
 	}
 }
 
+func TestResolveSessionChangeRejectsPreviousSessionQueue(t *testing.T) {
+	commands := []Command{{ID: "c1", Session: "s1"}, {ID: "c2", Session: ""}}
+	acks := []AckRecord{
+		{Hello: &AckHello{Session: "s1"}},
+		{Session: &AckSession{Session: "s2"}},
+	}
+	res := Resolve(commands, nil, acks, false)
+	if res.Commands[0].State != StateRejected || res.Commands[0].Reason != "stale session" {
+		t.Fatalf("previous-session command = %+v", res.Commands[0])
+	}
+	if res.Commands[1].State != StateQueued {
+		t.Fatalf("empty-session command = %+v", res.Commands[1])
+	}
+}
+
 func TestResolveRunEndedRejectsUnresolved(t *testing.T) {
 	commands := []Command{cmd("c1"), cmd("c2")}
 	acks := []AckRecord{{Ack: &AckAck{ID: "c1", State: StateConsumed}}}

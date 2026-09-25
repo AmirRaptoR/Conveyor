@@ -174,16 +174,6 @@ func decodeRaw(line []byte) (rawFields, string) {
 	if err := dec.Decode(&w); err != nil {
 		return w, "not a JSON object"
 	}
-	if len(w.V) == 0 {
-		return w, "missing v"
-	}
-	var v int
-	if err := json.Unmarshal(w.V, &v); err != nil {
-		return w, "v is not a number"
-	}
-	if v != currentVersion {
-		return w, "unknown v"
-	}
 	return w, ""
 }
 
@@ -206,10 +196,27 @@ func decodeSeq(raw json.RawMessage, lastSeq int) (int, string) {
 	if seq < 1 {
 		return 0, "seq must be at least 1"
 	}
-	if seq <= lastSeq {
+	if lastSeq == 0 && seq != 1 {
+		return seq, "seq must start at 1"
+	}
+	if lastSeq > 0 && seq <= lastSeq {
 		return 0, "seq is not increasing"
 	}
 	return seq, ""
+}
+
+func decodeVersion(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return "missing v"
+	}
+	var v int
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "v is not a number"
+	}
+	if v != currentVersion {
+		return "unknown v"
+	}
+	return ""
 }
 
 func decodeString(raw json.RawMessage, field string) (string, string) {
@@ -252,6 +259,45 @@ func boundedField(raw json.RawMessage, field string, max int, required bool) (st
 	return s, ""
 }
 
+func requiredArray(raw json.RawMessage, field string) ([]json.RawMessage, string) {
+	if len(raw) == 0 {
+		return nil, "missing " + field
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, field + " is not an array"
+	}
+	var values []json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, field + " is not an array"
+	}
+	return values, ""
+}
+
+// envelope validates the fields shared by every record. seq is deliberately
+// decoded before every other semantic field: once a positive, forward-moving
+// sequence number appears on a complete JSON object, that number is consumed
+// even if the rest of the line is rejected.
+func envelope(line []byte, lastSeq int) (rawFields, int, string) {
+	w, reason := decodeRaw(line)
+	if reason != "" {
+		return w, 0, reason
+	}
+	seq, reason := decodeSeq(w.Seq, lastSeq)
+	if reason != "" {
+		return w, seq, reason
+	}
+	if reason = decodeVersion(w.V); reason != "" {
+		return w, seq, reason
+	}
+	if _, reason = decodeString(w.Type, "type"); reason != "" {
+		return w, seq, reason
+	}
+	if _, reason = decodeTime(w.At, "at"); reason != "" {
+		return w, seq, reason
+	}
+	return w, seq, ""
+}
+
 // ValidateCommandLine checks one line of control.jsonl (without its
 // trailing newline) against the protocol, given the last accepted seq in
 // this run's control.jsonl (0 before any record has been accepted). A
@@ -259,70 +305,76 @@ func boundedField(raw json.RawMessage, field string, max int, required bool) (st
 // nil and an empty reason, so an older reader tolerates a later issue's new
 // record type rather than rejecting the whole line.
 func ValidateCommandLine(line []byte, lastSeq int) (ControlRecord, int, string) {
-	w, reason := decodeRaw(line)
+	w, seq, reason := envelope(line, lastSeq)
 	if reason != "" {
-		return ControlRecord{}, 0, reason
+		return ControlRecord{}, seq, reason
 	}
 	typ, reason := decodeString(w.Type, "type")
 	if reason != "" {
-		return ControlRecord{}, 0, reason
-	}
-	seq, reason := decodeSeq(w.Seq, lastSeq)
-	if reason != "" {
-		return ControlRecord{}, 0, reason
+		return ControlRecord{}, seq, reason
 	}
 	at, reason := decodeTime(w.At, "at")
 	if reason != "" {
-		return ControlRecord{}, 0, reason
+		return ControlRecord{}, seq, reason
 	}
 
 	switch typ {
 	case "command":
 		id, reason := boundedField(w.ID, "id", MaxFieldLen, true)
 		if reason != "" {
-			return ControlRecord{}, 0, reason
+			return ControlRecord{}, seq, reason
 		}
 		if strings.TrimSpace(id) == "" {
-			return ControlRecord{}, 0, "id is empty"
+			return ControlRecord{}, seq, "id is empty"
 		}
 		kind, reason := decodeString(w.Kind, "kind")
 		if reason != "" {
-			return ControlRecord{}, 0, reason
+			return ControlRecord{}, seq, reason
 		}
 		if !validKind(kind) {
-			return ControlRecord{}, 0, "kind is not valid"
+			return ControlRecord{}, seq, "kind is not valid"
 		}
-		text, reason := boundedField(w.Text, "text", MaxTextLen, false)
+		text, reason := boundedField(w.Text, "text", MaxTextLen, true)
 		if reason != "" {
-			return ControlRecord{}, 0, reason
+			return ControlRecord{}, seq, reason
+		}
+		if kind == KindPause && text != "" {
+			return ControlRecord{}, seq, "pause text must be empty"
+		}
+		if kind == KindInstruction && (strings.TrimSpace(text) == "" || strings.TrimSpace(text) != text) {
+			return ControlRecord{}, seq, "instruction text must be non-empty and trimmed"
 		}
 		itemID, reason := boundedField(w.ItemID, "itemId", MaxFieldLen, true)
 		if reason != "" {
-			return ControlRecord{}, 0, reason
+			return ControlRecord{}, seq, reason
+		}
+		if strings.TrimSpace(itemID) == "" {
+			return ControlRecord{}, seq, "itemId is empty"
 		}
 		runID, reason := boundedField(w.RunID, "runId", MaxFieldLen, true)
 		if reason != "" {
-			return ControlRecord{}, 0, reason
+			return ControlRecord{}, seq, reason
 		}
-		session, reason := boundedField(w.Session, "session", MaxFieldLen, false)
-		if reason != "" {
-			return ControlRecord{}, 0, reason
+		if strings.TrimSpace(runID) == "" {
+			return ControlRecord{}, seq, "runId is empty"
 		}
-		by, reason := boundedField(w.By, "by", MaxFieldLen, false)
+		session, reason := boundedField(w.Session, "session", MaxFieldLen, true)
 		if reason != "" {
-			return ControlRecord{}, 0, reason
+			return ControlRecord{}, seq, reason
+		}
+		by, reason := boundedField(w.By, "by", MaxFieldLen, true)
+		if reason != "" {
+			return ControlRecord{}, seq, reason
 		}
 		cmd := &Command{Seq: seq, ID: id, At: at, Kind: kind, Text: text, ItemID: itemID, RunID: runID, Session: session, By: by}
 		return ControlRecord{Command: cmd}, seq, ""
 	case "carried":
-		if len(w.Entries) == 0 {
-			return ControlRecord{}, 0, "missing entries"
-		}
-		var rawEntries []json.RawMessage
-		if err := json.Unmarshal(w.Entries, &rawEntries); err != nil {
-			return ControlRecord{}, 0, "entries is not an array"
+		rawEntries, reason := requiredArray(w.Entries, "entries")
+		if reason != "" {
+			return ControlRecord{}, seq, reason
 		}
 		entries := make([]CarriedEntry, 0, len(rawEntries))
+		seen := make(map[string]bool, len(rawEntries))
 		for _, raw := range rawEntries {
 			var ef struct {
 				ID     json.RawMessage `json:"id"`
@@ -330,22 +382,29 @@ func ValidateCommandLine(line []byte, lastSeq int) (ControlRecord, int, string) 
 				Reason json.RawMessage `json:"reason"`
 			}
 			if err := json.Unmarshal(raw, &ef); err != nil {
-				return ControlRecord{}, 0, "entry is not an object"
+				return ControlRecord{}, seq, "entry is not an object"
 			}
 			id, reason := boundedField(ef.ID, "entry id", MaxFieldLen, true)
 			if reason != "" {
-				return ControlRecord{}, 0, reason
+				return ControlRecord{}, seq, reason
 			}
+			if strings.TrimSpace(id) == "" {
+				return ControlRecord{}, seq, "entry id is empty"
+			}
+			if seen[id] {
+				return ControlRecord{}, seq, "entries is not a set"
+			}
+			seen[id] = true
 			state, reason := decodeString(ef.State, "entry state")
 			if reason != "" {
-				return ControlRecord{}, 0, reason
+				return ControlRecord{}, seq, reason
 			}
 			if !validCarriedState(state) {
-				return ControlRecord{}, 0, "entry state is not valid"
+				return ControlRecord{}, seq, "entry state is not valid"
 			}
-			reasonText, reason := boundedField(ef.Reason, "entry reason", MaxReasonLen, false)
+			reasonText, reason := boundedField(ef.Reason, "entry reason", MaxReasonLen, true)
 			if reason != "" {
-				return ControlRecord{}, 0, reason
+				return ControlRecord{}, seq, reason
 			}
 			entries = append(entries, CarriedEntry{ID: id, State: state, Reason: reasonText})
 		}
@@ -362,72 +421,70 @@ func ValidateCommandLine(line []byte, lastSeq int) (ControlRecord, int, string) 
 // this run's control-ack.jsonl. As with ValidateCommandLine, an unknown
 // "type" is accepted with every field of AckRecord nil.
 func ValidateAckLine(line []byte, lastSeq int) (AckRecord, int, string) {
-	w, reason := decodeRaw(line)
+	w, seq, reason := envelope(line, lastSeq)
 	if reason != "" {
-		return AckRecord{}, 0, reason
+		return AckRecord{}, seq, reason
 	}
 	typ, reason := decodeString(w.Type, "type")
 	if reason != "" {
-		return AckRecord{}, 0, reason
-	}
-	seq, reason := decodeSeq(w.Seq, lastSeq)
-	if reason != "" {
-		return AckRecord{}, 0, reason
+		return AckRecord{}, seq, reason
 	}
 	at, reason := decodeTime(w.At, "at")
 	if reason != "" {
-		return AckRecord{}, 0, reason
+		return AckRecord{}, seq, reason
 	}
 
 	switch typ {
 	case "hello":
-		if len(w.Accepts) == 0 {
-			return AckRecord{}, 0, "missing accepts"
-		}
-		var rawAccepts []json.RawMessage
-		if err := json.Unmarshal(w.Accepts, &rawAccepts); err != nil {
-			return AckRecord{}, 0, "accepts is not an array"
+		rawAccepts, reason := requiredArray(w.Accepts, "accepts")
+		if reason != "" {
+			return AckRecord{}, seq, reason
 		}
 		var accepts []string
+		seen := map[string]bool{}
 		for _, raw := range rawAccepts {
 			var s string
 			if err := json.Unmarshal(raw, &s); err != nil {
-				return AckRecord{}, 0, "accepts entry is not a string"
+				return AckRecord{}, seq, "accepts entry is not a string"
 			}
 			if validKind(s) {
+				if seen[s] {
+					return AckRecord{}, seq, "accepts is not a set"
+				}
+				seen[s] = true
 				accepts = append(accepts, s)
 			}
 			// An unknown kind in accepts is ignored, not rejected.
 		}
-		session, reason := boundedField(w.Session, "session", MaxFieldLen, false)
+		session, reason := boundedField(w.Session, "session", MaxFieldLen, true)
 		if reason != "" {
-			return AckRecord{}, 0, reason
+			return AckRecord{}, seq, reason
 		}
 		return AckRecord{Hello: &AckHello{Seq: seq, At: at, Accepts: accepts, Session: session}}, seq, ""
 	case "session":
-		session, reason := boundedField(w.Session, "session", MaxFieldLen, false)
+		session, reason := boundedField(w.Session, "session", MaxFieldLen, true)
 		if reason != "" {
-			return AckRecord{}, 0, reason
+			return AckRecord{}, seq, reason
 		}
 		return AckRecord{Session: &AckSession{Seq: seq, At: at, Session: session}}, seq, ""
 	case "ack":
 		id, reason := boundedField(w.ID, "id", MaxFieldLen, true)
 		if reason != "" {
-			return AckRecord{}, 0, reason
+			return AckRecord{}, seq, reason
 		}
 		if strings.TrimSpace(id) == "" {
-			return AckRecord{}, 0, "id is empty"
+			return AckRecord{}, seq, "id is empty"
 		}
 		state, reason := decodeString(w.State, "state")
 		if reason != "" {
-			return AckRecord{}, 0, reason
+			return AckRecord{}, seq, reason
 		}
 		if !validState(state) {
-			return AckRecord{}, 0, "state is not valid"
+			return AckRecord{}, seq, "state is not valid"
 		}
-		reasonText, reason := boundedField(w.Reason, "reason", MaxReasonLen, false)
+		reasonText, reason := boundedField(w.Reason, "reason", MaxReasonLen, true)
 		if reason != "" {
-			return AckRecord{}, 0, reason
+			return AckRecord{}, seq, reason
 		}
 		return AckRecord{Ack: &AckAck{Seq: seq, At: at, ID: id, State: state, Reason: reasonText}}, seq, ""
 	default:

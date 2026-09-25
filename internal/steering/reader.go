@@ -47,12 +47,15 @@ type CommandReader struct {
 	lineNum    int
 	stopped    bool
 	capped     bool
+	commandIDs map[string]bool
 }
 
-func NewCommandReader() *CommandReader { return &CommandReader{} }
+func NewCommandReader() *CommandReader { return &CommandReader{commandIDs: map[string]bool{}} }
 
 func (r *CommandReader) Accepted() int { return r.acceptedN }
 func (r *CommandReader) Rejected() int { return r.rejectedN }
+func (r *CommandReader) MaxSeq() int   { return r.lastSeq }
+func (r *CommandReader) Lines() int    { return r.lineNum }
 
 func (r *CommandReader) Poll(path string) []CommandEvent {
 	if r.stopped || r.capped {
@@ -64,24 +67,26 @@ func (r *CommandReader) Poll(path string) []CommandEvent {
 		r.lineNum++
 		if oversize {
 			events = append(events, r.reject("line too long"))
-			return r.capped
+			return r.capReached()
 		}
-		if r.acceptedN >= MaxCommands {
-			return true
+		rec, seq, reason := ValidateCommandLine(data, r.lastSeq)
+		if seq > r.lastSeq {
+			r.lastSeq = seq
 		}
-		rec, _, reason := ValidateCommandLine(data, r.lastSeq)
 		if reason != "" {
 			events = append(events, r.reject(reason))
-			return r.capped
+			return r.capReached()
 		}
-		r.lastSeq = seqOf(rec, r.lastSeq)
+		if rec.Command != nil && r.commandIDs[rec.Command.ID] {
+			events = append(events, r.reject("command id is not unique"))
+			return r.capReached()
+		}
+		if rec.Command != nil {
+			r.commandIDs[rec.Command.ID] = true
+		}
 		r.acceptedN++
 		events = append(events, CommandEvent{Accepted: true, Record: rec, Line: r.lineNum})
-		if r.acceptedN == MaxCommands {
-			r.capped = true
-			return true
-		}
-		return false
+		return r.capReached()
 	})
 	r.offset, r.buf, r.skipping = cur.Offset, cur.Buf, cur.Skipping
 	if stopped {
@@ -89,6 +94,13 @@ func (r *CommandReader) Poll(path string) []CommandEvent {
 		events = append(events, CommandEvent{Stopped: true, Reason: "control.jsonl " + reason})
 	}
 	return events
+}
+
+func (r *CommandReader) capReached() bool {
+	if r.lineNum >= MaxCommands {
+		r.capped = true
+	}
+	return r.capped
 }
 
 func (r *CommandReader) Final(path string) []CommandEvent {
@@ -119,17 +131,6 @@ func (r *CommandReader) reject(reason string) CommandEvent {
 	return CommandEvent{Reason: reason, Line: r.lineNum, Diagnose: diagnose}
 }
 
-func seqOf(rec ControlRecord, fallback int) int {
-	switch {
-	case rec.Command != nil:
-		return rec.Command.Seq
-	case rec.Carried != nil:
-		return rec.Carried.Seq
-	default:
-		return fallback
-	}
-}
-
 // AckReader tails one run's control-ack.jsonl.
 type AckReader struct {
 	offset   int64
@@ -149,6 +150,8 @@ func NewAckReader() *AckReader { return &AckReader{} }
 
 func (r *AckReader) Accepted() int { return r.acceptedN }
 func (r *AckReader) Rejected() int { return r.rejectedN }
+func (r *AckReader) MaxSeq() int   { return r.lastSeq }
+func (r *AckReader) Lines() int    { return r.lineNum }
 
 func (r *AckReader) Poll(path string) []AckEvent {
 	if r.stopped || r.capped {
@@ -160,24 +163,19 @@ func (r *AckReader) Poll(path string) []AckEvent {
 		r.lineNum++
 		if oversize {
 			events = append(events, r.reject("line too long"))
-			return r.capped
-		}
-		if r.acceptedN >= MaxAckLines {
-			return true
+			return r.capReached()
 		}
 		rec, seq, reason := ValidateAckLine(data, r.lastSeq)
+		if seq > r.lastSeq {
+			r.lastSeq = seq
+		}
 		if reason != "" {
 			events = append(events, r.reject(reason))
-			return r.capped
+			return r.capReached()
 		}
-		r.lastSeq = seq
 		r.acceptedN++
 		events = append(events, AckEvent{Accepted: true, Record: rec, Line: r.lineNum})
-		if r.acceptedN == MaxAckLines {
-			r.capped = true
-			return true
-		}
-		return false
+		return r.capReached()
 	})
 	r.offset, r.buf, r.skipping = cur.Offset, cur.Buf, cur.Skipping
 	if stopped {
@@ -185,6 +183,13 @@ func (r *AckReader) Poll(path string) []AckEvent {
 		events = append(events, AckEvent{Stopped: true, Reason: "control-ack.jsonl " + reason})
 	}
 	return events
+}
+
+func (r *AckReader) capReached() bool {
+	if r.lineNum >= MaxAckLines {
+		r.capped = true
+	}
+	return r.capped
 }
 
 func (r *AckReader) Final(path string) []AckEvent {
@@ -211,9 +216,6 @@ func (r *AckReader) reject(reason string) AckEvent {
 	diagnose := r.diagnosedN < maxDiagnostics
 	if diagnose {
 		r.diagnosedN++
-	}
-	if r.rejectedN == MaxAckLines {
-		r.capped = true
 	}
 	return AckEvent{Reason: reason, Line: r.lineNum, Diagnose: diagnose}
 }

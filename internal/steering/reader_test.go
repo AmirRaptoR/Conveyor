@@ -23,7 +23,7 @@ func writeLines(t *testing.T, path string, lines ...string) {
 }
 
 func cmdLine(seq int, id string) string {
-	return fmt.Sprintf(`{"v":1,"type":"command","seq":%d,"id":%q,"at":"2026-09-24T12:00:00Z","kind":"instruction","text":"hi","itemId":"i1","runId":"r1"}`, seq, id)
+	return fmt.Sprintf(`{"v":1,"type":"command","seq":%d,"id":%q,"at":"2026-09-24T12:00:00Z","kind":"instruction","text":"hi","itemId":"i1","runId":"r1","session":"","by":""}`, seq, id)
 }
 
 func TestCommandReaderAcceptsAppended(t *testing.T) {
@@ -143,12 +143,50 @@ func helloLine(seq int, accepts ...string) string {
 		}
 		fmt.Fprintf(&b, "%q", a)
 	}
-	b.WriteString(`]}`)
+	b.WriteString(`],"session":""}`)
 	return b.String()
 }
 
 func ackLine(seq int, id, state string) string {
-	return fmt.Sprintf(`{"v":1,"type":"ack","seq":%d,"at":"2026-09-24T12:00:00Z","id":%q,"state":%q}`, seq, id, state)
+	return fmt.Sprintf(`{"v":1,"type":"ack","seq":%d,"at":"2026-09-24T12:00:00Z","id":%q,"state":%q,"reason":""}`, seq, id, state)
+}
+
+func TestCommandReaderRejectedSeqIsConsumed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.jsonl")
+	os.WriteFile(path, nil, 0o600)
+	r := NewCommandReader()
+	bad := strings.Replace(cmdLine(1, "bad"), `"kind":"instruction"`, `"kind":"invalid"`, 1)
+	writeLines(t, path, bad, cmdLine(1, "duplicate-seq"), cmdLine(2, "good"))
+	events := r.Poll(path)
+	if len(events) != 3 || events[0].Accepted || events[1].Accepted || !events[2].Accepted {
+		t.Fatalf("rejected seq was not consumed: %+v", events)
+	}
+}
+
+func TestCommandReaderRejectsDuplicateCommandID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.jsonl")
+	os.WriteFile(path, nil, 0o600)
+	r := NewCommandReader()
+	writeLines(t, path, cmdLine(1, "same"), cmdLine(2, "same"))
+	events := r.Poll(path)
+	if len(events) != 2 || !events[0].Accepted || events[1].Accepted || events[1].Reason != "command id is not unique" {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestAckReaderPhysicalLineCapIncludesRejections(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control-ack.jsonl")
+	os.WriteFile(path, nil, 0o600)
+	r := NewAckReader()
+	lines := make([]string, MaxAckLines+10)
+	for i := range lines {
+		lines[i] = "not json"
+	}
+	writeLines(t, path, lines...)
+	r.Poll(path)
+	if r.Lines() != MaxAckLines || r.Rejected() != MaxAckLines || !r.capped {
+		t.Fatalf("lines=%d rejected=%d capped=%v", r.Lines(), r.Rejected(), r.capped)
+	}
 }
 
 func TestAckReaderAcceptsHelloSessionAck(t *testing.T) {

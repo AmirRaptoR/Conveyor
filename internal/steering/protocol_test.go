@@ -45,7 +45,7 @@ func TestValidateCommandLineUnknownTypeAcceptedButEmpty(t *testing.T) {
 }
 
 func TestValidateCommandLineUnknownVRejected(t *testing.T) {
-	line := []byte(`{"v":2,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"instruction","itemId":"i","runId":"r"}`)
+	line := []byte(`{"v":2,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"instruction","text":"x","itemId":"i","runId":"r","session":"","by":""}`)
 	_, _, reason := ValidateCommandLine(line, 0)
 	if reason != "unknown v" {
 		t.Fatalf("expected unknown v rejection, got %q", reason)
@@ -53,7 +53,7 @@ func TestValidateCommandLineUnknownVRejected(t *testing.T) {
 }
 
 func TestValidateCommandLineSeqNotIncreasing(t *testing.T) {
-	line := []byte(`{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"instruction","itemId":"i","runId":"r"}`)
+	line := []byte(`{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"instruction","text":"x","itemId":"i","runId":"r","session":"","by":""}`)
 	_, _, reason := ValidateCommandLine(line, 1)
 	if reason != "seq is not increasing" {
 		t.Fatalf("expected seq rejection, got %q", reason)
@@ -61,7 +61,7 @@ func TestValidateCommandLineSeqNotIncreasing(t *testing.T) {
 }
 
 func TestValidateCommandLineBadKind(t *testing.T) {
-	line := []byte(`{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"nonsense","itemId":"i","runId":"r"}`)
+	line := []byte(`{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"nonsense","text":"x","itemId":"i","runId":"r","session":"","by":""}`)
 	_, _, reason := ValidateCommandLine(line, 0)
 	if reason != "kind is not valid" {
 		t.Fatalf("expected kind rejection, got %q", reason)
@@ -73,9 +73,9 @@ func TestValidateCommandLineMissingRequiredFields(t *testing.T) {
 		name string
 		line string
 	}{
-		{"missing id", `{"v":1,"type":"command","seq":1,"at":"2026-09-24T12:00:00Z","kind":"instruction","itemId":"i","runId":"r"}`},
-		{"missing itemId", `{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"instruction","runId":"r"}`},
-		{"missing runId", `{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"instruction","itemId":"i"}`},
+		{"missing id", `{"v":1,"type":"command","seq":1,"at":"2026-09-24T12:00:00Z","kind":"instruction","text":"x","itemId":"i","runId":"r","session":"","by":""}`},
+		{"missing itemId", `{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"instruction","text":"x","runId":"r","session":"","by":""}`},
+		{"missing runId", `{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"instruction","text":"x","itemId":"i","session":"","by":""}`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -89,7 +89,7 @@ func TestValidateCommandLineMissingRequiredFields(t *testing.T) {
 
 func TestValidateCommandLineTextTooLong(t *testing.T) {
 	long := strings.Repeat("a", MaxTextLen+1)
-	line := []byte(`{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"instruction","text":"` + long + `","itemId":"i","runId":"r"}`)
+	line := []byte(`{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"instruction","text":"` + long + `","itemId":"i","runId":"r","session":"","by":""}`)
 	_, _, reason := ValidateCommandLine(line, 0)
 	if reason != "text too long" {
 		t.Fatalf("expected text too long, got %q", reason)
@@ -98,7 +98,7 @@ func TestValidateCommandLineTextTooLong(t *testing.T) {
 
 func TestValidateCommandLineFieldTooLong(t *testing.T) {
 	long := strings.Repeat("a", MaxFieldLen+1)
-	line := []byte(`{"v":1,"type":"command","seq":1,"id":"` + long + `","at":"2026-09-24T12:00:00Z","kind":"instruction","itemId":"i","runId":"r"}`)
+	line := []byte(`{"v":1,"type":"command","seq":1,"id":"` + long + `","at":"2026-09-24T12:00:00Z","kind":"instruction","text":"x","itemId":"i","runId":"r","session":"","by":""}`)
 	_, _, reason := ValidateCommandLine(line, 0)
 	if reason != "id too long" {
 		t.Fatalf("expected id too long, got %q", reason)
@@ -137,7 +137,7 @@ func TestValidateAckLineHello(t *testing.T) {
 }
 
 func TestValidateAckLineHelloIgnoresUnknownAcceptsMember(t *testing.T) {
-	line := []byte(`{"v":1,"type":"hello","seq":1,"at":"2026-09-24T12:00:00Z","accepts":["instruction","teleport"]}`)
+	line := []byte(`{"v":1,"type":"hello","seq":1,"at":"2026-09-24T12:00:00Z","accepts":["instruction","teleport"],"session":""}`)
 	rec, _, reason := ValidateAckLine(line, 0)
 	if reason != "" {
 		t.Fatalf("expected accept, got %q", reason)
@@ -170,7 +170,7 @@ func TestValidateAckLineAck(t *testing.T) {
 }
 
 func TestValidateAckLineBadState(t *testing.T) {
-	line := []byte(`{"v":1,"type":"ack","seq":1,"at":"2026-09-24T12:00:00Z","id":"c1","state":"maybe"}`)
+	line := []byte(`{"v":1,"type":"ack","seq":1,"at":"2026-09-24T12:00:00Z","id":"c1","state":"maybe","reason":""}`)
 	_, _, reason := ValidateAckLine(line, 0)
 	if reason != "state is not valid" {
 		t.Fatalf("expected state rejection, got %q", reason)
@@ -202,5 +202,59 @@ func TestValidateAckLineSeqNotIncreasing(t *testing.T) {
 	_, _, reason := ValidateAckLine(line, 5)
 	if reason != "seq is not increasing" {
 		t.Fatalf("expected seq rejection, got %q", reason)
+	}
+}
+
+func TestSeqMustStartExactlyAtOne(t *testing.T) {
+	line := []byte(`{"v":1,"type":"future","seq":2,"at":"2026-09-24T12:00:00Z"}`)
+	_, seq, reason := ValidateAckLine(line, 0)
+	if seq != 2 || reason != "seq must start at 1" {
+		t.Fatalf("seq=%d reason=%q", seq, reason)
+	}
+}
+
+func TestStrictArraysAndSets(t *testing.T) {
+	for _, line := range []string{
+		`{"v":1,"type":"hello","seq":1,"at":"2026-09-24T12:00:00Z","accepts":null,"session":""}`,
+		`{"v":1,"type":"hello","seq":1,"at":"2026-09-24T12:00:00Z","accepts":["pause","pause"],"session":""}`,
+	} {
+		if _, _, reason := ValidateAckLine([]byte(line), 0); reason == "" {
+			t.Fatalf("accepted %s", line)
+		}
+	}
+	for _, line := range []string{
+		`{"v":1,"type":"carried","seq":1,"at":"2026-09-24T12:00:00Z","entries":null}`,
+		`{"v":1,"type":"carried","seq":1,"at":"2026-09-24T12:00:00Z","entries":[{"id":"c","state":"carried","reason":""},{"id":"c","state":"dropped","reason":""}]}`,
+	} {
+		if _, _, reason := ValidateCommandLine([]byte(line), 0); reason == "" {
+			t.Fatalf("accepted %s", line)
+		}
+	}
+}
+
+func TestPauseTextMustBeEmpty(t *testing.T) {
+	line := []byte(`{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"pause","text":"no","itemId":"i","runId":"r","session":"","by":""}`)
+	if _, _, reason := ValidateCommandLine(line, 0); reason != "pause text must be empty" {
+		t.Fatalf("reason=%q", reason)
+	}
+}
+
+func TestProtocolRequiresPresentNullableLookingFields(t *testing.T) {
+	for _, line := range []string{
+		`{"v":1,"type":"command","seq":1,"id":"c","at":"2026-09-24T12:00:00Z","kind":"pause","itemId":"i","runId":"r","session":"","by":""}`,
+		`{"v":1,"type":"command","seq":1,"id":"c","at":"2026-09-24T12:00:00Z","kind":"pause","text":"","itemId":"i","runId":"r","by":""}`,
+		`{"v":1,"type":"command","seq":1,"id":"c","at":"2026-09-24T12:00:00Z","kind":"pause","text":"","itemId":"i","runId":"r","session":""}`,
+	} {
+		if _, _, reason := ValidateCommandLine([]byte(line), 0); reason == "" {
+			t.Fatalf("accepted command with a missing required field: %s", line)
+		}
+	}
+	for _, line := range []string{
+		`{"v":1,"type":"hello","seq":1,"at":"2026-09-24T12:00:00Z","accepts":[]}`,
+		`{"v":1,"type":"ack","seq":1,"at":"2026-09-24T12:00:00Z","id":"c","state":"consumed"}`,
+	} {
+		if _, _, reason := ValidateAckLine([]byte(line), 0); reason == "" {
+			t.Fatalf("accepted ack with a missing required field: %s", line)
+		}
 	}
 }

@@ -15,9 +15,25 @@ import "path/filepath"
 // GET /api/runs/{id} and by restart recovery, neither of which is wired to
 // call it yet.
 func Load(dir string, runEnded bool) Resolution {
-	ctlPath := filepath.Join(dir, "control.jsonl")
 	ackPath := filepath.Join(dir, "control-ack.jsonl")
 
+	var acks []AckRecord
+	ar := NewAckReader()
+	for _, ev := range ar.Final(ackPath) {
+		if ev.Accepted {
+			acks = append(acks, ev.Record)
+		}
+	}
+
+	return LoadWithAcks(dir, acks, ar.Rejected(), ar.MaxSeq(), ar.Lines(), runEnded)
+}
+
+// LoadWithAcks resolves control.jsonl against ack records an already-live
+// reader retained. It is what the runner uses after control-ack.jsonl is
+// removed, truncated or unreadable: tailing stops, but accepted records from
+// before that fault remain true and must not disappear from the final state.
+func LoadWithAcks(dir string, acks []AckRecord, ackRejected, ackMaxSeq, ackVersion int, runEnded bool) Resolution {
+	ctlPath := filepath.Join(dir, "control.jsonl")
 	var commands []Command
 	var carried []Carried
 	cr := NewCommandReader()
@@ -32,14 +48,10 @@ func Load(dir string, runEnded bool) Resolution {
 			carried = append(carried, *ev.Record.Carried)
 		}
 	}
-
-	var acks []AckRecord
-	ar := NewAckReader()
-	for _, ev := range ar.Final(ackPath) {
-		if ev.Accepted {
-			acks = append(acks, ev.Record)
-		}
-	}
-
-	return Resolve(commands, carried, acks, runEnded)
+	res := Resolve(commands, carried, acks, runEnded)
+	res.Malformed = cr.Rejected() + ackRejected
+	res.MaxSeq = cr.MaxSeq()
+	res.AckSeq = ackMaxSeq
+	res.AckVersion = ackVersion
+	return res
 }
