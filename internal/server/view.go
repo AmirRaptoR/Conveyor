@@ -15,6 +15,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/push"
+	"github.com/AmirRaptoR/Conveyor/internal/registry"
 	"github.com/AmirRaptoR/Conveyor/internal/release"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 	"github.com/AmirRaptoR/Conveyor/internal/store"
@@ -532,6 +533,13 @@ type Server struct {
 	// without touching any other run's context.
 	cancelFns sync.Map
 	active    sync.Map // itemID -> Active, one entry per transition in flight
+	// liveRuns is the live-run registry (#111): the one place that knows a
+	// stage process is actually running right now and where its run
+	// directory is. Opened in Runner.OnStart and closed in Runner.OnResult,
+	// so an entry exists exactly while the process is live — active cannot
+	// serve this, since it is set before Engine.Advance and survives the
+	// post-stage provider move.
+	liveRuns *registry.Registry
 	// working is which items have a transition in flight, recorded before the
 	// goroutine starts rather than from inside it.
 	//
@@ -670,6 +678,7 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 		wake:         make(chan struct{}, 1),
 		ctx:          context.Background(),
 		drainGrace:   drainGrace,
+		liveRuns:     registry.New(),
 	}
 	s.pushSubs = push.OpenStore(filepath.Join(cfg.DataDir(), "push.json"))
 	if keys, err := push.LoadKeys(filepath.Join(cfg.DataDir(), "vapid.json")); err != nil {
@@ -723,6 +732,11 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 			prevStart(run)
 		}
 		s.noteRunStarted(run)
+		// Only a stage run naming a real item and target stage is ever
+		// steerable — a list, move, doctor or status run never is.
+		if run.Kind == "stage" && run.ItemID != "" && run.To != "" {
+			s.liveRuns.Open(run.ItemID, registry.Entry{RunID: run.ID, Dir: run.Dir, Stage: run.To})
+		}
 	}
 	// Every run this Runner executes — list, move, stage, doctor, status —
 	// reaches here, which is what lets one place notice a persistence fault
@@ -734,6 +748,9 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 		}
 		s.notePersistFault(res)
 		s.finishPlanRun(res)
+		if res != nil && res.Run.Kind == "stage" && res.Run.ItemID != "" {
+			s.liveRuns.Close(res.Run.ItemID, res.Run.ID)
+		}
 	}
 	// Every accepted plan revision and every rejection reaches here live,
 	// the same way OnLog makes logs live — see handlePlanUpdate.
