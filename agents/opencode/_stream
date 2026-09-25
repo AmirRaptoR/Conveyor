@@ -7,6 +7,17 @@ _OPENCODE_TMP=$(mktemp -d)
 CLAUDE_SAID="$_OPENCODE_TMP/said"
 CLAUDE_RAW="$_OPENCODE_TMP/raw"
 trap 'rm -rf "$_OPENCODE_TMP"' EXIT
+# The outer run's process group can receive TERM (a cancellation, a timeout)
+# while the CLI child backgrounded in _opencode_invoke_child is still running.
+# Left untrapped, bash terminates this shell on that signal immediately,
+# without ever reaching the wait _opencode_invoke_child's own normal path
+# does — so nothing in this tree reaps the child, and once it too dies from
+# the same broadcast signal it is left for whatever the OS reparents it to,
+# which is exactly what can keep the process group looking alive to the
+# runner's own cleanup poll. _opencode_stop_child is a no-op when no child is
+# currently in flight, so this is safe to fire on every TERM this process
+# ever sees, not only mid-invocation.
+trap '_opencode_stop_child; exit 143' TERM
 
 opencode_bin() { printf '%s' "${OPENCODE_BIN:-opencode}"; }
 
