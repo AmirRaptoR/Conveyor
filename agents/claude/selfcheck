@@ -336,6 +336,14 @@ chk "status passes through"           "$(jq -r '.todos[0].status' "$CONVEYOR_PLA
 chk "activeForm maps to active"       "$(jq -r '.todos[1].active' "$CONVEYOR_PLAN")" "Writing the fix"
 chk "the sentinel never reaches the human log" "$(grep -c CONVEYOR_PLAN_TODOS <<<"$out")" "0"
 chk "a human summary is printed instead" "$(grep -c 'plan updated (1/2 done)' <<<"$out")" "1"
+export API_TOKEN='plan/é😀' PRIVATE_KEY=$'multi-plan-top\nmulti-plan-bottom'
+secret_event=$(jq -nc --arg literal "$API_TOKEN" --arg escaped 'plan\/\u00E9\uD83D\uDE00' --arg multiline "$PRIVATE_KEY" \
+	'{type:"assistant",message:{content:[{type:"tool_use",name:"TodoWrite",input:{todos:[{content:$literal,status:"pending",activeForm:$escaped},{content:$multiline,status:"pending"}]}}]}}')
+printf '%s\n' "$secret_event" | render_stream | _plan_route_claude_stream >/dev/null
+chk "Claude plan text redacts literal secrets" "$(jq -r '.todos[0].text' "$CONVEYOR_PLAN" | tail -1)" "[REDACTED]"
+chk "Claude plan active text is redacted too" "$(jq -r '.todos[0].active' "$CONVEYOR_PLAN" | tail -1)" "[REDACTED]"
+chk "Claude plan text redacts multiline secrets" "$(jq -r '.todos[1].text' "$CONVEYOR_PLAN" | tail -1)" "[REDACTED]"
+unset API_TOKEN PRIVATE_KEY
 rm -rf "$tmp_plan"
 unset CONVEYOR_PLAN
 

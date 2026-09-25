@@ -14,6 +14,8 @@ _PLAN_MAX_TEXT=500
 _PLAN_MAX_ID=64
 _PLAN_MAX_REVISIONS=1000
 
+declare -f redact_text >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/_result"
+
 # _plan_ready — is $CONVEYOR_PLAN set and appendable: the file writable if it
 # already exists, its directory writable if it does not yet.
 _plan_ready() {
@@ -88,6 +90,24 @@ _plan_collapse() {
 	local s
 	s=$(tr -s '[:space:]' ' ' <<<"$1")
 	_plan_trim "$s"
+}
+
+_plan_redact() {
+	local todos=$1 n i field value safe
+	if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$todos"; then
+		printf '%s' "$todos"
+		return 0
+	fi
+	n=$(jq 'length' <<<"$todos") || return 1
+	for ((i = 0; i < n; i++)); do
+		for field in id text active; do
+			value=$(jq -r --argjson i "$i" --arg field "$field" '.[$i][$field] // empty' <<<"$todos") || return 1
+			[[ -n "$value" ]] || continue
+			safe=$(redact_text "$value") || return 1
+			todos=$(jq -c --argjson i "$i" --arg field "$field" --arg safe "$safe" '.[$i][$field] = $safe' <<<"$todos") || return 1
+		done
+	done
+	printf '%s' "$todos"
 }
 
 # _plan_validate <todos-json> — the same rules internal/plan.Validate applies
@@ -183,6 +203,10 @@ plan_publish() {
 		echo "plan_publish: refusing invalid todos: not valid JSON" >&2
 		return 0
 	fi
+	todos=$(_plan_redact "$todos") || {
+		echo "plan_publish: refusing todos that could not be redacted" >&2
+		return 0
+	}
 
 	local rev
 	rev=$(_plan_next_rev)

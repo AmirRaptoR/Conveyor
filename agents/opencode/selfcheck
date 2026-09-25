@@ -83,6 +83,13 @@ terminal-truncated)
 		'{"type":"step_start","timestamp":4,"sessionID":"ses-truncated","part":{"id":"start-two","type":"step-start"}}' \
 		'{"type":"text","timestamp":5,"sessionID":"ses-truncated","part":{"id":"text-two","type":"text","text":"partial"}}'
 	;;
+terminal-running-tool)
+	printf '%s\n' \
+		'{"type":"step_start","timestamp":1,"sessionID":"ses-tool-after","part":{"id":"start","type":"step-start"}}' \
+		'{"type":"text","timestamp":2,"sessionID":"ses-tool-after","part":{"id":"text","type":"text","text":"{\"v\":1,\"outcome\":\"success\"}"}}' \
+		'{"type":"step_finish","timestamp":3,"sessionID":"ses-tool-after","part":{"id":"finish","type":"step-finish","reason":"stop"}}' \
+		'{"type":"tool_use","timestamp":4,"sessionID":"ses-tool-after","part":{"id":"late-tool","type":"tool","tool":"bash","state":{"status":"running","title":"still running"}}}'
+	;;
 invalid-once|invalid-always)
 	text='not json'
 	if [[ "$OC_SCENE" == invalid-once && "$run_no" -gt 1 ]]; then
@@ -304,6 +311,16 @@ chk "a step truncated after an earlier terminal fails closed" "$rc:$(cat "$OC_CA
 chk "the truncated later step preserves the prior complete result" "$(cat "$CONVEYOR_RESULT")" "$before"
 
 reset_invocations
+export OC_SCENE=terminal-running-tool
+before=$(cat "$CONVEYOR_RESULT")
+set +e
+run_claude 'do not accept post-terminal tools' >/dev/null 2>&1
+rc=$?
+set -e
+chk "a running tool after a terminal result fails closed" "$rc:$(cat "$OC_CALLS")" "2:1"
+chk "the post-terminal tool preserves the prior result" "$(cat "$CONVEYOR_RESULT")" "$before"
+
+reset_invocations
 export OC_SCENE=invalid-once
 set +e
 run_claude 'return a result' >/dev/null 2>&1
@@ -480,6 +497,14 @@ chk "its ids are used verbatim"     "$(jq -r '.todos[0].id' "$CONVEYOR_PLAN")" "
 chk "content maps to text"          "$(jq -r '.todos[1].text' "$CONVEYOR_PLAN")" "write the fix"
 chk "status passes through"         "$(jq -r '.todos[2].status' "$CONVEYOR_PLAN")" "pending"
 chk "no active equivalent is set"   "$(jq -r '.todos[1].active // "absent"' "$CONVEYOR_PLAN")" "absent"
+export API_TOKEN='plan/é😀' PRIVATE_KEY=$'multi-plan-top\nmulti-plan-bottom'
+secret_plan=$(jq -nc --arg literal "$API_TOKEN" --arg escaped 'plan\/\u00E9\uD83D\uDE00' --arg multiline "$PRIVATE_KEY" \
+	'{type:"tool_use",part:{type:"tool",tool:"todowrite",state:{status:"completed",input:{todos:[{id:"secret-id",content:$literal,status:"pending"},{id:"escaped-id",content:$escaped,status:"pending"},{id:"multiline-id",content:$multiline,status:"pending"}]}}}}')
+_plan_publish_opencode_todos "$secret_plan"
+chk "OpenCode plan text redacts literal secrets" "$(jq -r '.todos[0].text' "$CONVEYOR_PLAN" | tail -1)" "[REDACTED]"
+chk "OpenCode plan text redacts alternate JSON escapes" "$(jq -r '.todos[1].text' "$CONVEYOR_PLAN" | tail -1)" "[REDACTED]"
+chk "OpenCode plan text redacts multiline secrets" "$(jq -r '.todos[2].text' "$CONVEYOR_PLAN" | tail -1)" "[REDACTED]"
+unset API_TOKEN PRIVATE_KEY
 unset CONVEYOR_PLAN
 
 incremental=$(printf '%s\n' \

@@ -296,6 +296,7 @@ render_stream() {
 			jq -e '.part | type == "object" and (.id | type == "string" and length > 0) and .type == "reasoning"' >/dev/null 2>&1 <<<"$line" || {
 				echo "opencode emitted a malformed reasoning event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line"); [[ -n "${parts[$id]+seen}" ]] && continue; parts[$id]=1
+			[[ $finished -eq 1 ]] && post_terminal_active=1
 			seen=1 # deliberately not logged
 			;;
 		tool_use)
@@ -306,6 +307,7 @@ render_stream() {
 				echo "opencode emitted a malformed tool_use event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line")
 			status=$(jq -r .part.state.status <<<"$line")
+			[[ $finished -eq 1 ]] && post_terminal_active=1
 			tool_status[$id]=$status
 			key="$id:$status"
 			[[ -n "${tool_states[$key]+seen}" ]] && continue
@@ -368,6 +370,11 @@ render_stream() {
 		return 2
 	}
 	[[ $errors -eq 0 ]] || return 1
+	_opencode_tools_terminal "${tool_status[@]}" || {
+		echo "opencode stream ended with a nonterminal tool" >&2
+		_OPENCODE_STREAM_INCOMPLETE=1
+		return 2
+	}
 	[[ $post_terminal_active -eq 0 ]] || {
 		echo "opencode stream ended during a step after a terminal result" >&2
 		_OPENCODE_STREAM_INCOMPLETE=1
