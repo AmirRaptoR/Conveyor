@@ -65,8 +65,9 @@ func Poll(c *Cursor, path string, maxLine int, fn OnLine) (stopped bool, reason 
 	for {
 		n, readErr := f.Read(buf)
 		if n > 0 {
-			c.Offset += int64(n)
-			if consume(c, buf[:n], maxLine, fn) {
+			consumed, halted := consume(c, buf[:n], maxLine, fn)
+			c.Offset += int64(consumed)
+			if halted {
 				return false, ""
 			}
 		}
@@ -79,24 +80,30 @@ func Poll(c *Cursor, path string, maxLine int, fn OnLine) (stopped bool, reason 
 	}
 }
 
-// consume splits data into complete lines against c, calling fn for each and
-// returning true the moment fn asks to halt.
-func consume(c *Cursor, data []byte, maxLine int, fn OnLine) (halted bool) {
+// consume splits data into complete lines against c, calling fn for each. It
+// returns how many bytes may be committed to the file offset as well as
+// whether fn asked to halt. Bytes after a halting line are deliberately left
+// unconsumed so the next Poll reads them rather than silently skipping every
+// line that happened to share the same read buffer.
+func consume(c *Cursor, data []byte, maxLine int, fn OnLine) (consumed int, halted bool) {
 	for {
 		nl := bytes.IndexByte(data, '\n')
 		if nl == -1 {
 			if !c.Skipping {
 				c.Buf = append(c.Buf, data...)
-				if len(c.Buf) > maxLine {
+				// maxLine includes the newline. A fragment already maxLine
+				// bytes long cannot become a legal line when its newline arrives.
+				if len(c.Buf) >= maxLine {
 					c.Buf = nil
 					c.Skipping = true
-					return fn(nil, true)
+					return consumed + len(data), fn(nil, true)
 				}
 			}
-			return false
+			return consumed + len(data), false
 		}
 		line := data[:nl]
 		data = data[nl+1:]
+		consumed += nl + 1
 
 		if c.Skipping {
 			c.Skipping = false
@@ -111,13 +118,13 @@ func consume(c *Cursor, data []byte, maxLine int, fn OnLine) (halted bool) {
 
 		if len(full)+1 > maxLine {
 			if fn(nil, true) {
-				return true
+				return consumed, true
 			}
 			continue
 		}
 
 		if fn(full, false) {
-			return true
+			return consumed, true
 		}
 	}
 }

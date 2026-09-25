@@ -141,6 +141,65 @@ func TestPollHaltStopsFurtherReadsThisCall(t *testing.T) {
 	if len(got) != 1 || got[0] != "one" {
 		t.Fatalf("expected halt after first line, got %v", got)
 	}
+	Poll(&c, path, 1024, func(data []byte, oversize bool) bool {
+		got = append(got, string(data))
+		return false
+	})
+	if strings.Join(got, ",") != "one,two,three" {
+		t.Fatalf("halt skipped buffered lines: got %v", got)
+	}
+}
+
+func TestPollMaxLineIncludesNewline(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.jsonl")
+	os.WriteFile(path, nil, 0o600)
+	write(t, path, "123456789\n1234567890\nnext\n")
+
+	var got []string
+	var oversized int
+	var c Cursor
+	Poll(&c, path, 10, func(data []byte, oversize bool) bool {
+		if oversize {
+			oversized++
+		} else {
+			got = append(got, string(data))
+		}
+		return false
+	})
+	if oversized != 1 || strings.Join(got, ",") != "123456789,next" {
+		t.Fatalf("oversized=%d lines=%v", oversized, got)
+	}
+}
+
+func TestPollExactCapFragmentWaitsForNewlineThenRejects(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.jsonl")
+	os.WriteFile(path, nil, 0o600)
+	write(t, path, "1234567890")
+
+	var oversized int
+	var c Cursor
+	Poll(&c, path, 10, func(data []byte, oversize bool) bool {
+		if oversize {
+			oversized++
+		}
+		return false
+	})
+	if oversized != 1 || !c.Skipping {
+		t.Fatalf("oversized=%d skipping=%v", oversized, c.Skipping)
+	}
+	write(t, path, "\nnext\n")
+	var got []string
+	Poll(&c, path, 10, func(data []byte, oversize bool) bool {
+		if !oversize {
+			got = append(got, string(data))
+		}
+		return false
+	})
+	if strings.Join(got, ",") != "next" {
+		t.Fatalf("got %v", got)
+	}
 }
 
 func TestPollStopsOnTruncation(t *testing.T) {
