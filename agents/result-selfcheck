@@ -22,6 +22,10 @@ for bad in \
 	'{"outcome":"success"}' \
 	'{"v":2,"outcome":"success"}' \
 	'{"v":1,"outcome":"success","unknown":true}' \
+	'{"v":1,"outcome":"success","summary":null}' \
+	'{"v":1,"outcome":"blocked","kind":"decision","reason":"choose","questions":null}' \
+	'{"v":1,"outcome":"waiting","waiting":{"why":"later","until":null}}' \
+	'{"v":1,"outcome":"blocked","kind":"decision","reason":"choose","questions":[{"header":"H","question":"Q","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}],"multiSelect":null}]}' \
 	'{"v":1,"outcome":"blocked","kind":"decision"}' \
 	'{"v":1,"outcome":"waiting","waiting":{"why":"later","until":"2026-99-99T99:99:99Z"}}' \
 	'{"v":1,"outcome":"success"} {"v":1,"outcome":"success"}' \

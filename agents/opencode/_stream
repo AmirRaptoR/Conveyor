@@ -217,7 +217,7 @@ _opencode_pause() {
 }
 
 render_stream() {
-	local line type session="" event_session="" final_text="" seen=0 finished=0 errors=0 detail id text previous previous_rendered status key command kind rendered reason tid
+	local line type session="" event_session="" final_text="" seen=0 finished=0 post_terminal_active=0 errors=0 detail id text previous previous_rendered status key command kind rendered reason tid
 	_OPENCODE_STREAM_ABORTED=0
 	_OPENCODE_RESULT_AMBIGUOUS=0
 	declare -A parts=()
@@ -261,6 +261,7 @@ render_stream() {
 			jq -e '.part | type == "object" and (.id | type == "string" and length > 0) and .type == "step-start"' >/dev/null 2>&1 <<<"$line" || {
 				echo "opencode emitted a malformed step_start event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line"); [[ -n "${parts[$id]+seen}" ]] && continue; parts[$id]=1
+			[[ $finished -eq 1 ]] && post_terminal_active=1
 			final_text=""
 			text_ids=()
 			seen=1
@@ -269,6 +270,7 @@ render_stream() {
 			jq -e '.part | type == "object" and (.id | type == "string" and length > 0) and .type == "text" and (.text | type == "string")' >/dev/null 2>&1 <<<"$line" || {
 				echo "opencode emitted a malformed text event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line")
+			[[ $finished -eq 1 ]] && post_terminal_active=1
 			# NUL-delimited reads preserve trailing newlines in each text fragment.
 			IFS= read -r -d '' text < <(jq -jr '.part.text, "\u0000"' <<<"$line")
 			IFS= read -r -d '' rendered < <(redact_text "$text"; printf '\0')
@@ -322,6 +324,7 @@ render_stream() {
 					echo "opencode emitted duplicate terminal step_finish events; requesting one result correction" >&2
 					_OPENCODE_RESULT_AMBIGUOUS=1
 					: >"$CLAUDE_FINAL"
+					post_terminal_active=0
 					continue
 				fi
 				finished=1
@@ -362,6 +365,11 @@ render_stream() {
 		return 2
 	}
 	[[ $errors -eq 0 ]] || return 1
+	[[ $post_terminal_active -eq 0 ]] || {
+		echo "opencode stream ended during a step after a terminal result" >&2
+		_OPENCODE_STREAM_INCOMPLETE=1
+		return 2
+	}
 	[[ $finished -eq 1 ]] || {
 		echo "opencode stream ended without step_finish" >&2
 		_OPENCODE_STREAM_INCOMPLETE=1

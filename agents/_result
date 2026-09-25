@@ -113,29 +113,29 @@ result_validate_model() {
 		          "dispositions","priority","after","part","of","verdict","summary"]) | length == 0) and
 		.v == 1 and
 		(.outcome == "success" or .outcome == "blocked" or .outcome == "noop" or .outcome == "waiting") and
-		(.kind == null or (.kind | type == "string" and test("^[a-z0-9][a-z0-9 -]{0,23}$"))) and
-		(.reason == null or (.reason | type == "string" and length > 0)) and
-		(.summary == null or (.summary | type == "string")) and
-		(.verdict == null or (.verdict | type == "string")) and
-		(.priority == null or (.priority | type == "number" and floor == . and . >= 0 and . <= 3)) and
-		(.after == null or (.after | type == "number" and floor == . and . > 0)) and
-		(.part == null or (.part | type == "number" and floor == . and . > 0)) and
-		(.of == null or (.of | type == "number" and floor == . and . > 0)) and
-		(.dispositions == null or (.dispositions | type == "object" and all(to_entries[]; (.key | length > 0) and (.value | type == "string" and length > 0)))) and
-		(.questions == null or (.questions | type == "array" and length > 0 and all(.[];
+		((has("kind") | not) or (.kind | type == "string" and test("^[a-z0-9][a-z0-9 -]{0,23}$"))) and
+		((has("reason") | not) or (.reason | type == "string" and length > 0)) and
+		((has("summary") | not) or (.summary | type == "string")) and
+		((has("verdict") | not) or (.verdict | type == "string")) and
+		((has("priority") | not) or (.priority | type == "number" and floor == . and . >= 0 and . <= 3)) and
+		((has("after") | not) or (.after | type == "number" and floor == . and . > 0)) and
+		((has("part") | not) or (.part | type == "number" and floor == . and . > 0)) and
+		((has("of") | not) or (.of | type == "number" and floor == . and . > 0)) and
+		((has("dispositions") | not) or (.dispositions | type == "object" and all(to_entries[]; (.key | length > 0) and (.value | type == "string" and length > 0)))) and
+		((has("questions") | not) or (.questions | type == "array" and length > 0 and all(.[];
 			type == "object" and
 			((keys - ["header","question","options","multiSelect"]) | length == 0) and
 			(.header | type == "string" and length > 0) and
 			(.question | type == "string" and length > 0) and
-			(.multiSelect == null or (.multiSelect | type == "boolean")) and
+			((has("multiSelect") | not) or (.multiSelect | type == "boolean")) and
 			(.options | type == "array" and length >= 2 and length <= 4 and all(.[];
 				type == "object" and ((keys - ["label","description"]) | length == 0) and
 				(.label | type == "string" and length > 0) and
 				(.description | type == "string" and length > 0)))))) and
-		(.waiting == null or (.waiting | type == "object" and
+		((has("waiting") | not) or (.waiting | type == "object" and
 			((keys - ["why","until"]) | length == 0) and
 			(.why | type == "string" and length > 0) and
-			(.until == null or (.until | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))))) and
+			((has("until") | not) or (.until | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))))) and
 		(if .outcome == "blocked" then (.kind | type == "string") and (.reason | type == "string") and
 			.waiting == null and .dispositions == null and .priority == null and .after == null and .part == null and .of == null and .verdict == null and .summary == null
 		 elif .outcome == "noop" then (.reason | type == "string") and .kind == null and .questions == null and .waiting == null and

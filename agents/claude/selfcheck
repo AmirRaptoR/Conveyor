@@ -409,6 +409,7 @@ chk "a malformed final receives one correction" "$(run_result_scene corrected):$
 chk "the correction is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "corrected"
 chk "the correction resumes the same session" "$(grep -c -- '--resume result-session' "$RESULT_ARGS.2")" "1"
 chk "the correction exposes no tools" "$(grep -c -- '--allowedTools  ' "$RESULT_ARGS.2")" "1"
+chk "the correction removes tools from availability" "$(grep -c -- '--tools  ' "$RESULT_ARGS.2")" "1"
 
 chk "duplicate finals receive one correction" "$(run_result_scene duplicate):$(cat "$RESULT_CALLS")" "0:2"
 chk "the duplicate correction wins" "$(jq -r .summary "$CONVEYOR_RESULT")" "corrected duplicate"

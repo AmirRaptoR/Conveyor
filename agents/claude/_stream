@@ -329,7 +329,7 @@ _claude_invoke() {
 	# Set by resume_prompt when a person answered and the conversation survives.
 	[[ -n "${RESUME_SESSION:-}" ]] && flags+=(--resume "$RESUME_SESSION")
 	if [[ "$correction" == 1 ]]; then
-		flags=(--max-turns 1 --permission-mode dontAsk --allowedTools "" --json-schema "$(result_json_schema)")
+		flags=(--max-turns 1 --permission-mode dontAsk --tools "" --allowedTools "" --json-schema "$(result_json_schema)")
 		[[ -n "${MODEL:-}" ]] && flags+=(--model "$MODEL")
 		[[ -n "${RESUME_SESSION:-}" ]] && flags+=(--resume "$RESUME_SESSION")
 	fi

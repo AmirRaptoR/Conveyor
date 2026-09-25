@@ -75,6 +75,14 @@ split-fenced)
 	jq -nc --arg text '```' '{type:"text",timestamp:4,sessionID:"ses-fenced",part:{id:"three",type:"text",text:$text}}'
 	jq -nc '{type:"step_finish",timestamp:5,sessionID:"ses-fenced",part:{id:"finish",type:"step-finish",reason:"stop"}}'
 	;;
+terminal-truncated)
+	printf '%s\n' \
+		'{"type":"step_start","timestamp":1,"sessionID":"ses-truncated","part":{"id":"start-one","type":"step-start"}}' \
+		'{"type":"text","timestamp":2,"sessionID":"ses-truncated","part":{"id":"text-one","type":"text","text":"{\"v\":1,\"outcome\":\"success\"}"}}' \
+		'{"type":"step_finish","timestamp":3,"sessionID":"ses-truncated","part":{"id":"finish-one","type":"step-finish","reason":"stop"}}' \
+		'{"type":"step_start","timestamp":4,"sessionID":"ses-truncated","part":{"id":"start-two","type":"step-start"}}' \
+		'{"type":"text","timestamp":5,"sessionID":"ses-truncated","part":{"id":"text-two","type":"text","text":"partial"}}'
+	;;
 invalid-once|invalid-always)
 	text='not json'
 	if [[ "$OC_SCENE" == invalid-once && "$run_no" -gt 1 ]]; then
@@ -269,6 +277,16 @@ rc=$?
 set -e
 chk "split fenced text preserves boundary newlines" "$rc:$(cat "$OC_CALLS")" "0:1"
 chk "the split fenced payload is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "split fenced"
+
+reset_invocations
+export OC_SCENE=terminal-truncated
+before=$(cat "$CONVEYOR_RESULT")
+set +e
+run_claude 'do not accept an earlier terminal' >/dev/null 2>&1
+rc=$?
+set -e
+chk "a step truncated after an earlier terminal fails closed" "$rc:$(cat "$OC_CALLS")" "2:1"
+chk "the truncated later step preserves the prior complete result" "$(cat "$CONVEYOR_RESULT")" "$before"
 
 reset_invocations
 export OC_SCENE=invalid-once
