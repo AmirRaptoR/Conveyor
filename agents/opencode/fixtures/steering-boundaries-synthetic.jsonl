@@ -1,0 +1,5 @@
+{"type":"step_start","timestamp":1,"sessionID":"ses-steer","part":{"id":"step-1","type":"step-start"}}
+{"type":"tool_use","timestamp":2,"sessionID":"ses-steer","part":{"id":"tool-1","type":"tool","tool":"bash","state":{"status":"running","title":"edit files"}}}
+{"type":"step_finish","timestamp":3,"sessionID":"ses-steer","part":{"id":"finish-1","type":"step-finish"}}
+{"type":"tool_use","timestamp":4,"sessionID":"ses-steer","part":{"id":"tool-1","type":"tool","tool":"bash","state":{"status":"completed","title":"edit files","output":"synthetic hidden output"}}}
+{"type":"step_finish","timestamp":5,"sessionID":"ses-steer","part":{"id":"finish-2","type":"step-finish"}}
