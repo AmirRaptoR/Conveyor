@@ -278,8 +278,8 @@ stage run and only when that run was settled as interrupted. Queued
 instructions are appended, in order, to the existing one-shot armed answer
 (§5a), carrying the adapter's opaque session when one is available and binding
 the armed value to the interrupted run's target stage. A provider-side stage
-change therefore drops that stale input instead of handing it to another
-script. Carry-over is at-least-once with content deduplication because the
+or script change therefore drops that stale input instead of handing it to
+another script. Carry-over is at-least-once with content deduplication because the
 answer file and run file cannot be updated atomically. A queued pause is dropped
 because the process it would have stopped is already gone. The outcome is
 appended as a `carried` record to the old run's control file. Nothing is replayed

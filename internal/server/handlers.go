@@ -391,6 +391,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	}
 	armed.Manual = said.Action
 	armed.Stage = item.Stage
+	armed.Script = s.targetScriptBinding(item.Source, item.Stage)
 	if err := s.answers.Set(item.ID, armed); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -430,6 +431,7 @@ func (s *Server) answerThenUnblock(ctx context.Context, item model.Item, answer 
 		}
 		resume.Answer, resume.Session = answer, sess
 		resume.Stage = item.Stage
+		resume.Script = s.targetScriptBinding(item.Source, item.Stage)
 		if err := s.answers.Set(item.ID, resume); err != nil {
 			return err
 		}

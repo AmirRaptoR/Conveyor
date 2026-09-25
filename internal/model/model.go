@@ -237,6 +237,10 @@ type Resume struct {
 	// set it so a provider-side stage change cannot deliver stale input to a
 	// different script.
 	Stage string `json:"stage,omitempty"`
+	// Script binds Stage to the executable that was waiting. The value is an
+	// engine-only stable identity; adapters still receive only Answer and
+	// Session, both opaque.
+	Script string `json:"script,omitempty"`
 	// Manual is an action a person pressed, armed for the next run of that
 	// item's stage and spent by it. Kept here rather than in a store of its
 	// own because it is the same fact in the same shape — something a person

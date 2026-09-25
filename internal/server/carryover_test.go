@@ -47,7 +47,25 @@ func ackLines(t *testing.T, dir string, lines ...string) {
 
 func interruptedRun(t *testing.T, s *Server, runID string) string {
 	t.Helper()
-	return writeRunMeta(t, s.run, "2026-09-24", runID, "s1:1", "stage", "backlog", "working", "interrupted", "2026-09-24T12:00:00Z")
+	dir := writeRunMeta(t, s.run, "2026-09-24", runID, "s1:1", "stage", "backlog", "working", "interrupted", "2026-09-24T12:00:00Z")
+	b, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var run model.Run
+	if err := json.Unmarshal(b, &run); err != nil {
+		t.Fatal(err)
+	}
+	source, _ := s.cfg.Source("s1")
+	run.Script = source.Paths["work"]
+	b, err = json.Marshal(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 
 func TestCarryOverOneAndSeveralQueuedInstructions(t *testing.T) {
@@ -72,8 +90,9 @@ func TestCarryOverOneAndSeveralQueuedInstructions(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := "\n\n--- carried from the interrupted run " + runID + " ---\n" + strings.Join(tc.texts, "\n\n")
-			if got := s.answers.Get("s1:1"); got.Answer != want || got.Session != "adapter:session-1" || got.Stage != "working" {
-				t.Fatalf("answer = %+v, want text %q, opaque session, and working stage", got, want)
+			if got := s.answers.Get("s1:1"); got.Answer != want || got.Session != "adapter:session-1" ||
+				got.Stage != "working" || got.Script == "" {
+				t.Fatalf("answer = %+v, want text %q, opaque session, stage, and script binding", got, want)
 			}
 			res := steering.Load(dir, false)
 			if len(res.Commands) != len(tc.texts) {
@@ -130,8 +149,9 @@ func TestCarryOverDeduplicatesCrashAfterAnswerWrite(t *testing.T) {
 	if err := s.CarryOverInterrupted(); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.answers.Get("s1:1"); got != before {
-		t.Fatalf("dedup changed armed answer: got %+v want %+v", got, before)
+	if got := s.answers.Get("s1:1"); got.Answer != before.Answer || got.Session != before.Session ||
+		got.Stage != before.Stage || got.Manual != before.Manual || got.Script == "" {
+		t.Fatalf("dedup did not preserve and bind the armed answer: got %+v before %+v", got, before)
 	}
 	res := steering.Load(dir, false)
 	if got := res.Commands[0]; got.State != steering.StateCarried || !strings.Contains(got.Reason, "already present") {
@@ -204,15 +224,15 @@ func TestCarryOverDoesNotCrossAnArmedStage(t *testing.T) {
 		t.Fatalf("stage-conflicting carry-over changed answer: got %+v want %+v", got, before)
 	}
 	got := steering.Load(dir, false).Commands[0]
-	if got.State != steering.StateDropped || !strings.Contains(got.Reason, "stage done, not working") {
+	if got.State != steering.StateDropped || !strings.Contains(got.Reason, "different stage or script") {
 		t.Fatalf("stage-conflicting command = %+v, want dropped with stage reason", got)
 	}
 }
 
-func TestRunDoesNotDeliverInputArmedForAnotherStage(t *testing.T) {
+func TestRunDoesNotDeliverInputArmedForAnotherScript(t *testing.T) {
 	cfg, r := boardFor(t)
 	s := New(cfg, r)
-	armed := model.Resume{Answer: "do not deliver", Session: "adapter:old", Stage: "backlog"}
+	armed := model.Resume{Answer: "do not deliver", Session: "adapter:old", Stage: "working", Script: "path:another-script"}
 	if err := s.answers.Set("s1:1", armed); err != nil {
 		t.Fatal(err)
 	}
@@ -254,6 +274,32 @@ func TestRunDoesNotDeliverInputArmedForAnotherStage(t *testing.T) {
 	}
 	if input.Answer != "" || input.Session != "" {
 		t.Fatalf("stale input reached another stage: %+v", input)
+	}
+}
+
+func TestCarryOverBindsAnAlreadyCarriedLegacyAnswer(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	runID := "120000.000-legacy"
+	dir := interruptedRun(t, s, runID)
+	queuedCommand(t, dir, "c1", runID, steering.KindInstruction, "legacy instruction")
+	ackLines(t, dir, `{"v":1,"type":"hello","seq":1,"at":"2026-09-24T12:00:00Z","accepts":["instruction"],"session":"raw-legacy-session"}`)
+	if _, err := steering.AppendCarried(filepath.Join(dir, "control.jsonl"), time.Now(), []steering.CarriedEntry{{
+		ID: "c1", State: steering.StateCarried,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	block := "\n\n--- carried from the interrupted run " + runID + " ---\nlegacy instruction"
+	if err := s.answers.Set("s1:1", model.Resume{Answer: block, Session: "raw-legacy-session"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.CarryOverInterrupted(); err != nil {
+		t.Fatal(err)
+	}
+	got := s.answers.Get("s1:1")
+	if got.Stage != "working" || got.Script == "" || got.Session != "raw-legacy-session" {
+		t.Fatalf("legacy carry-over was not safely bound without rewriting its session: %+v", got)
 	}
 }
 

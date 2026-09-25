@@ -66,6 +66,13 @@ malformed)
 	deadline=$((SECONDS + 3))
 	while ((SECONDS < deadline)); do :; done
 	;;
+incomplete)
+	trap 'echo TERM >"$OC_ABORTED"; exit 0' TERM
+	printf '%s\n' '{"type":"text","timestamp":1,"sessionID":"ses-incomplete","part":{"id":"p","type":"text","text":"partial"}}'
+	exec 1>&-
+	deadline=$((SECONDS + 3))
+	while ((SECONDS < deadline)); do :; done
+	;;
 mismatch)
 	printf '%s\n' \
 		'{"type":"step_start","timestamp":1,"sessionID":"ses-one","part":{"id":"p1","type":"step-start"}}' \
@@ -325,6 +332,18 @@ resume_prompt '{"answer":"continue","session":"opencode:ses-old"}' 'original' >/
 OC_SCENE=success run_claude "$prompt" >/dev/null
 chk "resume uses the exact session" "$(grep -A1 -Fx -- '--session' "$OC_ARGS" | tail -1)" "ses-old"
 
+RESUME_SESSION=""
+legacy_answer=$'\n\n--- carried from the interrupted run 120000.000-old ---\ncontinue safely'
+legacy_payload=$(jq -nc --arg answer "$legacy_answer" --arg session "ses-legacy" '{answer:$answer,session:$session}')
+prompt=$(resume_prompt "$legacy_payload" 'original' 2>/dev/null)
+resume_prompt "$legacy_payload" 'original' >/dev/null 2>&1
+chk "a legacy carried control session keeps its opaque handle" "$RESUME_SESSION" "ses-legacy"
+chk "legacy carry-over resumes with the carried instruction" "$prompt" "$legacy_answer"
+
+RESUME_SESSION=""
+resume_prompt '{"answer":"continue","session":"foreign-session"}' 'original' >/dev/null 2>&1
+chk "an ordinary unprefixed session remains foreign" "${RESUME_SESSION:-}" ""
+
 export CONVEYOR_RESULT="$tmp/result"
 printf '%s\n' '{"type":"text","timestamp":1,"sessionID":"ses-question","part":{"id":"p","type":"text","text":"x"}}' >"$CLAUDE_RAW"
 echo '{"blocked":true,"kind":"decision","reason":"choose","questions":[{"header":"Mode","question":"Which?","options":[{"label":"Safe","description":"Use safe mode"}]}]}' >"$CONVEYOR_RESULT"
@@ -352,7 +371,7 @@ run_claude 'transient rate limit' >/dev/null 2>&1
 set -e
 chk "a generic 429 is not called account quota" "$(hit_limit && echo limited || echo transient)" "transient"
 
-for scene in malformed mismatch; do
+for scene in malformed incomplete mismatch; do
 	reset_invocations
 	export OC_SCENE=$scene
 	started=$SECONDS
@@ -361,9 +380,9 @@ for scene in malformed mismatch; do
 	rc=$?
 	set -e
 	chk "$scene events fail closed" "$rc" "2"
-	if [[ "$scene" == malformed ]]; then
-		chk "malformed output stops the still-running producer" "$([[ -e "$OC_ABORTED" ]] && echo stopped || echo alive)" "stopped"
-		chk "malformed output does not wait for producer EOF" "$((SECONDS - started < 2 && 1 || 0))" "1"
+	if [[ "$scene" == malformed || "$scene" == incomplete ]]; then
+		chk "$scene output stops the still-running producer" "$([[ -e "$OC_ABORTED" ]] && echo stopped || echo alive)" "stopped"
+		chk "$scene output does not wait for producer exit" "$((SECONDS - started < 2 && 1 || 0))" "1"
 	fi
 done
 

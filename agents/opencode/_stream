@@ -48,6 +48,15 @@ resume_prompt() {
 		printf '%s' "$answer"
 		return 0
 	fi
+	# Before control sessions became adapter-owned, OpenCode advertised its raw
+	# id. Only a restart carry-over has this marker, so accept that legacy shape
+	# without treating an ordinary foreign session as OpenCode's.
+	if [[ -n "$session" && "$answer" == *"--- carried from the interrupted run "* ]]; then
+		RESUME_SESSION=$session
+		echo "resuming the interrupted OpenCode conversation (session ${RESUME_SESSION:0:8})" >&2
+		printf '%s' "$answer"
+		return 0
+	fi
 	printf '%s' "The question you stopped on has been answered: ${answer}
 
 Carry on from there.
@@ -329,9 +338,34 @@ render_stream() {
 			;;
 		esac
 	done
-	[[ $seen -eq 1 ]] || { echo "opencode emitted no structured events" >&2; return 2; }
+	[[ $seen -eq 1 ]] || {
+		echo "opencode emitted no structured events" >&2
+		_OPENCODE_STREAM_INCOMPLETE=1
+		return 2
+	}
 	[[ $errors -eq 0 ]] || return 1
-	[[ $finished -eq 1 ]] || { echo "opencode stream ended without step_finish" >&2; return 2; }
+	[[ $finished -eq 1 ]] || {
+		echo "opencode stream ended without step_finish" >&2
+		_OPENCODE_STREAM_INCOMPLETE=1
+		return 2
+	}
+}
+
+_opencode_child_done() {
+	local pid=${_OPENCODE_CHILD_PID:-} stat state
+	[[ -n "$pid" ]] || return 0
+	if ! kill -0 "$pid" 2>/dev/null; then
+		return 0
+	fi
+	# A child that closed stdout and exited may remain a zombie until wait. It
+	# is done; do not turn its real exit status into a synthetic TERM status.
+	if [[ -r "/proc/$pid/stat" ]]; then
+		stat=$(<"/proc/$pid/stat")
+		stat=${stat#*) }
+		state=${stat%% *}
+		[[ "$state" == Z ]] && return 0
+	fi
+	return 1
 }
 
 _opencode_invoke_child() {
@@ -346,6 +380,8 @@ _opencode_invoke_child() {
 	_OPENCODE_STREAM_SESSION=""
 	_OPENCODE_CHILD_WAITED=0
 	_OPENCODE_STREAM_ABORTED=0
+	_OPENCODE_STREAM_INCOMPLETE=0
+	_OPENCODE_STREAM_FORCED_STOP=0
 	_OPENCODE_CAPTURE_STREAM=1
 	OPENCODE_DISABLE_AUTOUPDATE=1 "$bin" "$@" <<<"$prompt" >"$fifo" &
 	_OPENCODE_CHILD_PID=$!
@@ -353,6 +389,11 @@ _opencode_invoke_child() {
 	# Validation can reject one event while the producer remains alive with the
 	# FIFO open. Stop and reap it before waiting, just as cancellation does.
 	if [[ "$_OPENCODE_STREAM_ABORTED" == 1 && "$_OPENCODE_CHILD_WAITED" != 1 ]]; then
+		_opencode_stop_child
+	fi
+	if [[ "$_OPENCODE_STREAM_INCOMPLETE" == 1 && "$_OPENCODE_CHILD_WAITED" != 1 ]] &&
+		! _opencode_child_done; then
+		_OPENCODE_STREAM_FORCED_STOP=1
 		_opencode_stop_child
 	fi
 	if [[ "$_OPENCODE_CHILD_WAITED" == 1 ]]; then
@@ -372,6 +413,7 @@ _opencode_invoke_child() {
 		return "$render_status"
 	fi
 	[[ "$_OPENCODE_STREAM_ABORTED" == 1 ]] && return "$render_status"
+	[[ "$_OPENCODE_STREAM_FORCED_STOP" == 1 ]] && return "$render_status"
 	[[ $child_status -eq 0 ]] || return "$child_status"
 	return "$render_status"
 }

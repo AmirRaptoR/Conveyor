@@ -300,7 +300,8 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 	// bad agent invocation: the answer is kept and the session dropped, because
 	// a resume that did not work names a conversation worth abandoning.
 	resume := s.answers.Get(item.ID)
-	for resume.Stage != "" && resume.Stage != target {
+	expectedScript := s.targetScriptBinding(item.Source, target)
+	for (resume.Stage != "" && resume.Stage != target) || (resume.Script != "" && resume.Script != expectedScript) {
 		spent, takeErr := s.answers.Take(item.ID, resume)
 		if takeErr != nil {
 			fmt.Fprintf(os.Stderr, "conveyor: %s: could not discard input armed for stage %s before entering %s: %v\n",
@@ -343,7 +344,9 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 			// kept: a resume that did not work names a conversation worth
 			// abandoning, but the reply and the button they pressed were
 			// never actually acted on and should reach the run that is.
-			_ = s.answers.Set(item.ID, model.Resume{Answer: resume.Answer, Stage: resume.Stage, Manual: resume.Manual})
+			_ = s.answers.Set(item.ID, model.Resume{
+				Answer: resume.Answer, Stage: resume.Stage, Script: resume.Script, Manual: resume.Manual,
+			})
 		}
 	default:
 		spent, err := s.answers.Take(item.ID, resume)
