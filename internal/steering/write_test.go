@@ -118,3 +118,34 @@ func TestAppendCommandRefusesDuplicateIDAndPhysicalLineLimit(t *testing.T) {
 		t.Fatal("command beyond physical-line cap was appended")
 	}
 }
+
+func TestAppendCarriedFollowsCommandsAndRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.jsonl")
+	os.WriteFile(path, nil, 0o600)
+	for i := 0; i < MaxCommands; i++ {
+		cmd := Command{
+			ID: fmt.Sprintf("c%d", i), At: time.Now(), Kind: KindInstruction,
+			Text: "x", ItemID: "i", RunID: "r",
+		}
+		if _, err := AppendCommand(path, cmd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seq, err := AppendCarried(path, time.Now(), []CarriedEntry{{ID: "c0", State: StateCarried, Reason: "carried"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq != MaxCommands+1 {
+		t.Fatalf("carried seq = %d, want %d", seq, MaxCommands+1)
+	}
+	res := Load(filepath.Dir(path), false)
+	if len(res.Commands) != MaxCommands || res.Commands[0].State != StateCarried {
+		t.Fatalf("carried record did not round-trip after %d commands: %+v", MaxCommands, res.Commands[0])
+	}
+	if _, err := AppendCarried(path, time.Now(), nil); err == nil {
+		t.Fatal("second carried record was accepted")
+	}
+	if _, err := AppendCommand(path, Command{ID: "late", At: time.Now(), Kind: KindPause, ItemID: "i", RunID: "r"}); err == nil {
+		t.Fatal("command after carried record was accepted")
+	}
+}

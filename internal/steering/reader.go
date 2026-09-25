@@ -77,6 +77,10 @@ func (r *CommandReader) Poll(path string) []CommandEvent {
 			events = append(events, r.reject(reason))
 			return r.capReached()
 		}
+		if rec.Command != nil && len(r.commandIDs) >= MaxCommands {
+			r.capped = true
+			return true
+		}
 		if rec.Command != nil && r.commandIDs[rec.Command.ID] {
 			events = append(events, r.reject("command id is not unique"))
 			return r.capReached()
@@ -86,6 +90,10 @@ func (r *CommandReader) Poll(path string) []CommandEvent {
 		}
 		r.acceptedN++
 		events = append(events, CommandEvent{Accepted: true, Record: rec, Line: r.lineNum})
+		if rec.Carried != nil {
+			r.capped = true
+			return true
+		}
 		return r.capReached()
 	})
 	r.offset, r.buf, r.skipping = cur.Offset, cur.Buf, cur.Skipping
@@ -97,7 +105,9 @@ func (r *CommandReader) Poll(path string) []CommandEvent {
 }
 
 func (r *CommandReader) capReached() bool {
-	if r.lineNum >= MaxCommands {
+	// A run may contain MaxCommands command records plus its one restart
+	// carry-over record. The command count above still refuses a 51st command.
+	if r.lineNum >= MaxCommands+1 {
 		r.capped = true
 	}
 	return r.capped
