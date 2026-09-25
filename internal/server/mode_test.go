@@ -233,8 +233,15 @@ func TestManualModeRunsNoSchedulerButTickAdvancesOnce(t *testing.T) {
 	s.refresh(s.ctx)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.button(ctx, ModeManual)
+	buttonDone := make(chan struct{})
+	go func() {
+		defer close(buttonDone)
+		s.button(ctx, ModeManual)
+	}()
+	defer func() {
+		cancel()
+		<-buttonDone
+	}()
 	// No s.schedule goroutine started, matching what Run does for manual.
 
 	time.Sleep(120 * time.Millisecond)
@@ -244,7 +251,16 @@ func TestManualModeRunsNoSchedulerButTickAdvancesOnce(t *testing.T) {
 
 	s.tick <- struct{}{}
 	waitFor(t, "the tick to perform one transition", func() bool { return countLines(stageRuns) == 1 })
-	time.Sleep(80 * time.Millisecond)
+	// Wait for the whole transition goroutine to finish — not a fixed sleep,
+	// which races the tempdir cleanup below whenever the run takes longer
+	// than the guess (control.jsonl/control-ack.jsonl's tailer among the
+	// steps after the stage script itself exits). s.working.Delete(item.ID)
+	// is transition's own first-registered defer, so it fires last, after
+	// runOne and everything runner.Run waits on have completed.
+	waitFor(t, "the transition to fully settle", func() bool {
+		_, running := s.working.Load("s1:1")
+		return !running
+	})
 	if n := countLines(stageRuns); n != 1 {
 		t.Errorf("%d stage run(s) after one tick, want exactly 1", n)
 	}
