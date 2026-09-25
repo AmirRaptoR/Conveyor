@@ -80,6 +80,7 @@ if [[ -f "$scene/write_result" ]]; then
 	result=$(jq -c '
 		if .blocked == true then {v:1,outcome:"blocked",kind:(.kind // "decision"),reason:(.reason // "stopped"),questions:.questions}
 		elif .noop == true then {v:1,outcome:"noop",reason:.reason}
+		elif .outcome == "waiting" then .
 		else . + {v:1,outcome:"success"} end |
 		with_entries(select(.value != null))' "$scene/write_result")
 fi
@@ -208,6 +209,14 @@ touch "$tmp/scene/exit_nonzero"
 rc=$(run_implement 107)
 chk "(h) a nonzero claude exit keeps its own status" "$rc" "7"
 chk "    and writes no no-output mark"               "$(result_written)" "empty"
+
+# --- (i) a valid model wait defers before provider postconditions ------------
+scene; pr_fixture 111
+printf '{"v":1,"outcome":"waiting","waiting":{"why":"checks are running"}}' >"$tmp/scene/write_result"
+rc=$(run_implement 111)
+chk "(i) a model-written wait exits 10" "$rc" "10"
+chk "    its waiting reason survives" "$(jq -r .waiting.why "$CONVEYOR_RESULT")" "checks are running"
+chk "    provider postconditions are not consulted" "$(grep -c '^pr list' "$tmp/scene/gh_calls" || true)" "1"
 
 # --- the prompt: the escape hatch has a shape, distinct from decision_brief --
 scene; pr_fixture 108

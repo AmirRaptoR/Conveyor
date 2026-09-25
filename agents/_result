@@ -158,8 +158,18 @@ result_write_json() {
 	[[ -n "${CONVEYOR_RESULT:-}" ]] || return 1
 	secrets=$(secret_values_json) || return 1
 	redacted=$(jq -c --argjson secrets "$secrets" '
-		walk(if type == "string" then reduce $secrets[] as $secret (.;
-			split($secret) | join("[REDACTED]")) else . end)' <<<"$json" 2>/dev/null) || return 1
+		def redact_string: reduce $secrets[] as $secret (.; split($secret) | join("[REDACTED]"));
+		def available_key($object; $base; $n):
+			($base + if $n == 1 then "" else "-" + ($n | tostring) end) as $key |
+			if ($object | has($key)) then available_key($object; $base; $n + 1) else $key end;
+		def redact:
+			if type == "object" then reduce to_entries[] as $entry ({};
+				available_key(.; ($entry.key | redact_string); 1) as $key |
+				. + {($key): ($entry.value | redact)})
+			elif type == "array" then map(redact)
+			elif type == "string" then redact_string
+			else . end;
+		redact' <<<"$json" 2>/dev/null) || return 1
 	jq -e 'type == "object" and .v == 1 and (.outcome | type == "string")' >/dev/null 2>&1 <<<"$redacted" || return 1
 	dir=$(dirname "$CONVEYOR_RESULT")
 	tmp=$(mktemp "$dir/.result.XXXXXX") || return 1
@@ -177,6 +187,11 @@ result_accept() {
 	result_validate_model "$parsed" || return 1
 	normalized=$(result_normalize "$parsed" "$session") || return 1
 	result_write_json "$normalized"
+}
+
+result_is_waiting() {
+	[[ -s "${CONVEYOR_RESULT:-}" ]] &&
+		[[ "$(jq -r '.outcome // empty' "$CONVEYOR_RESULT" 2>/dev/null)" == waiting ]]
 }
 
 result_quarantine() {

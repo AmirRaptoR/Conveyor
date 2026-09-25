@@ -268,8 +268,9 @@ render_stream() {
 			jq -e '.part | type == "object" and (.id | type == "string" and length > 0) and .type == "text" and (.text | type == "string")' >/dev/null 2>&1 <<<"$line" || {
 				echo "opencode emitted a malformed text event" >&2; _OPENCODE_STREAM_ABORTED=1; return 2; }
 			id=$(jq -r .part.id <<<"$line")
-			text=$(jq -r .part.text <<<"$line")
-			text=$(redact_text "$text")
+			# NUL-delimited reads preserve trailing newlines in each text fragment.
+			IFS= read -r -d '' text < <(jq -jr '.part.text, "\u0000"' <<<"$line")
+			IFS= read -r -d '' text < <(redact_text "$text"; printf '\0')
 			[[ -n "${texts[$id]+seen}" ]] || text_ids+=("$id")
 			previous=${texts[$id]-}
 			[[ "$text" == "$previous" ]] && continue
@@ -385,9 +386,10 @@ _opencode_child_done() {
 _opencode_invoke_child() {
 	local prompt=$1 bin=$2
 	shift 2
-	local fifo="$_OPENCODE_TMP/events" render_status child_status
+	local fifo="$_OPENCODE_TMP/events" stderr="$_OPENCODE_TMP/stderr" render_status child_status
 	rm -f "$fifo"
 	mkfifo "$fifo" || return 1
+	: >"$stderr"
 	: >"$CLAUDE_RAW"
 	: >"$CLAUDE_SAID"
 	: >"$CLAUDE_FINAL"
@@ -399,7 +401,7 @@ _opencode_invoke_child() {
 	_OPENCODE_STREAM_INCOMPLETE=0
 	_OPENCODE_STREAM_FORCED_STOP=0
 	_OPENCODE_CAPTURE_STREAM=1
-	OPENCODE_DISABLE_AUTOUPDATE=1 env -u CONVEYOR_RESULT "$bin" "$@" <<<"$prompt" >"$fifo" &
+	OPENCODE_DISABLE_AUTOUPDATE=1 env -u CONVEYOR_RESULT "$bin" "$@" <<<"$prompt" >"$fifo" 2>"$stderr" &
 	_OPENCODE_CHILD_PID=$!
 	if render_stream <"$fifo"; then render_status=0; else render_status=$?; fi
 	# Validation can reject one event while the producer remains alive with the
@@ -422,6 +424,8 @@ _opencode_invoke_child() {
 	_OPENCODE_CHILD_PID=""
 	_OPENCODE_CAPTURE_STREAM=0
 	rm -f "$fifo"
+	redact_stream <"$stderr" >&2
+	rm -f "$stderr"
 
 	# 20 and 30 are adapter decisions made after a valid safe boundary; the
 	# child's TERM/KILL status is expected and must not replace them.
@@ -510,6 +514,7 @@ $(result_brief)"
 		rm -f "$(limit_file)" 2>/dev/null || true
 		final=$(<"$CLAUDE_FINAL")
 		if result_accept "$final" "${session:+opencode:$session}"; then
+			result_is_waiting && return 10
 			return 0
 		fi
 		if [[ "$_OPENCODE_RESULT_AMBIGUOUS" == 1 ]]; then
@@ -526,6 +531,7 @@ $(result_brief)"
 		if [[ $correction_result -eq 0 ]]; then
 			final=$(<"$CLAUDE_FINAL")
 			if result_accept "$final" "${session:+opencode:$session}"; then
+				result_is_waiting && return 10
 				return 0
 			fi
 			failure="the agent's single result correction was still missing, ambiguous, or invalid"

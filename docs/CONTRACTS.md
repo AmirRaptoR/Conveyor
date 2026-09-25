@@ -358,7 +358,9 @@ provider and board readers keep consuming the same top-level fields:
 
 `outcome` is exactly `success`, `blocked`, `noop` or `waiting`. `blocked`
 requires `kind` and `reason`; `noop` requires `reason`; `waiting` requires
-`waiting.why` and permits a UTC `waiting.until`. A block may carry
+`waiting.why` and permits a UTC `waiting.until`, and the adapter returns exit
+10 so every stage takes the ordinary deferral path before its postconditions.
+A block may carry
 `questions` in the AskUserQuestion shape. A successful task may carry the
 task-specific fields the adapter requested: `dispositions`, `priority`,
 `after`, `part`, `of`, `verdict` or `summary`. Unknown fields, unknown
@@ -382,7 +384,8 @@ the precise failure class and the resumable session. It never corrects twice.
 
 Before logs or envelopes leave the adapter, exact non-empty values from
 environment names containing `token`, `secret`, `password`, `key` or
-`credential` (case-insensitive) are replaced with `[REDACTED]`. Persistence is
+`credential` (case-insensitive) are replaced with `[REDACTED]`, including
+JSON-escaped forms, object keys and model-child stderr. Persistence is
 a mode-`0600` temporary file in the result directory followed by rename, so an
 interruption exposes either the prior complete envelope or the new complete
 one, never a partial write.

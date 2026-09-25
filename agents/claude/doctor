@@ -118,6 +118,9 @@ investigate() {
 		echo "the doctor itself stopped: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
 		exit 20
 	fi
+	if [[ $rc -eq 10 ]] && result_is_waiting; then
+		exit 10
+	fi
 	if [[ $rc -ne 0 ]]; then
 		echo "the doctor's own invocation exited $rc" >&2
 		exit 1

@@ -226,6 +226,10 @@ if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 	exit 20 # the agent wrote its own reason; leave it exactly as written
 fi
 
+if [[ $rc -eq 10 ]] && result_is_waiting; then
+	exit 10
+fi
+
 # The model's own stop above always wins; this is the adapter's inference for
 # when it says nothing at all. Only checked on a clean exit — `hit_limit` and
 # `hit_max_turns` already caught the two known conditions that leave a run

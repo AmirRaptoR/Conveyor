@@ -104,4 +104,8 @@ if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 	exit 20
 fi
 
+if [[ $rc -eq 10 ]] && result_is_waiting; then
+	exit 10
+fi
+
 exit $rc

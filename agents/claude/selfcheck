@@ -369,6 +369,13 @@ secret)
 	jq -nc --arg text "$RESULT_SECRET" '{type:"assistant",session_id:"result-session",message:{content:[{type:"text",text:$text}]}}'
 	jq -nc --arg text "$RESULT_SECRET" '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"success",summary:$text}}'
 	;;
+stderr-secret)
+	printf 'provider stderr: %s / %s\n' "$RESULT_SECRET" "$RESULT_ESCAPED" >&2
+	jq -nc '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"success"}}'
+	;;
+waiting)
+	jq -nc '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"waiting",waiting:{why:"checks are running"}}}'
+	;;
 invalid)
 	jq -nc --arg result 'still not json' '{type:"result",subtype:"success",is_error:false,session_id:"result-session",result:$result}'
 	;;
@@ -410,6 +417,9 @@ chk "a second invalid result quarantines" "$(run_result_scene invalid):$(cat "$R
 chk "the invalid result has a precise kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "invalid-result"
 chk "the invalid result is not a question" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
 
+chk "a waiting final returns the deferral exit" "$(run_result_scene waiting)" "10"
+chk "the waiting reason is persisted" "$(jq -r .waiting.why "$CONVEYOR_RESULT")" "checks are running"
+
 export API_TOKEN='result-secret-112' RESULT_SECRET='result-secret-112'
 export RESULT_SCENE=secret
 rm -f "$RESULT_CALLS" "$RESULT_ENV" "$RESULT_ARGS".*
@@ -418,6 +428,18 @@ secret_log=$(run_claude 'do the task' 2>&1)
 chk "secret values are absent from rendered logs" "$(grep -c 'result-secret-112' <<<"$secret_log" || true)" "0"
 chk "secret values are redacted in persisted results" "$(jq -r .summary "$CONVEYOR_RESULT")" "[REDACTED]"
 unset API_TOKEN RESULT_SECRET
+
+export API_SECRET='quoted"secret\value'
+export RESULT_SECRET="$API_SECRET"
+RESULT_ESCAPED=$(jq -nr --arg value "$API_SECRET" '$value | @json')
+RESULT_ESCAPED=${RESULT_ESCAPED:1:${#RESULT_ESCAPED}-2}
+export RESULT_ESCAPED RESULT_SCENE=stderr-secret
+rm -f "$RESULT_CALLS" "$RESULT_ENV" "$RESULT_ARGS".*
+: >"$CONVEYOR_RESULT"
+secret_log=$(run_claude 'do the task' 2>&1)
+chk "literal secrets are absent from Claude stderr" "$(grep -Fc -- "$API_SECRET" <<<"$secret_log" || true)" "0"
+chk "JSON-escaped secrets are absent from Claude stderr" "$(grep -Fc -- "$RESULT_ESCAPED" <<<"$secret_log" || true)" "0"
+unset API_SECRET RESULT_SECRET RESULT_ESCAPED
 
 chk "an incomplete stream fails without correction" "$(run_result_scene incomplete):$(cat "$RESULT_CALLS")" "2:1"
 chk "an incomplete stream persists nothing" "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"

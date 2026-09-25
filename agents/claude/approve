@@ -429,6 +429,9 @@ state of the branch, redoing whatever investigation already happened."
 		echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
 		exit 20
 	fi
+	if [[ $rc -eq 10 ]] && result_is_waiting; then
+		exit 10
+	fi
 	if [[ $rc -ne 0 ]]; then
 		blocked error "the agent exited $rc while addressing the review threads on #$pr. Last it said: $(last_said)"
 	fi
@@ -737,6 +740,9 @@ continues the same merge rather than starting over."
 			agent_asked
 			echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
 			exit 20
+		fi
+		if [[ $rc -eq 10 ]] && result_is_waiting; then
+			exit 10
 		fi
 		if [[ $rc -ne 0 ]]; then
 			blocked error "the agent exited $rc while resolving the merge conflict on #$pr. Last it said: $(last_said)"

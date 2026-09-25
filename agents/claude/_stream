@@ -339,10 +339,10 @@ _claude_invoke() {
 	# CONVEYOR_RESULT belongs to this parent adapter and is deliberately absent
 	# from the model process's environment.
 	if [[ "${STREAM:-1}" == 0 ]]; then
-		env -u CONVEYOR_RESULT claude -p "$prompt" --output-format stream-json --verbose "${flags[@]}" |
+		env -u CONVEYOR_RESULT claude -p "$prompt" --output-format stream-json --verbose "${flags[@]}" 2> >(redact_stream >&2) |
 			tee "$CLAUDE_RAW" | render_stream | _plan_route_claude_stream | redact_stream | tee "$CLAUDE_SAID" >/dev/null
 	else
-		env -u CONVEYOR_RESULT claude -p "$prompt" --output-format stream-json --verbose "${flags[@]}" |
+		env -u CONVEYOR_RESULT claude -p "$prompt" --output-format stream-json --verbose "${flags[@]}" 2> >(redact_stream >&2) |
 			tee "$CLAUDE_RAW" | render_stream | _plan_route_claude_stream | redact_stream | tee "$CLAUDE_SAID"
 	fi
 	statuses=("${PIPESTATUS[@]}")
@@ -376,6 +376,7 @@ $(result_brief)"
 	session=$(claude_session)
 	final=$(_claude_final)
 	if [[ -n "$final" ]] && result_accept "$final" "$session"; then
+		result_is_waiting && return 10
 		return 0
 	fi
 	failure="the agent completed without one valid version-1 final result"
@@ -384,6 +385,7 @@ $(result_brief)"
 	if [[ $rc -eq 0 ]]; then
 		final=$(_claude_final)
 		if [[ -n "$final" ]] && result_accept "$final" "$session"; then
+			result_is_waiting && return 10
 			return 0
 		fi
 		failure="the agent's single result correction was still missing, ambiguous, or invalid"

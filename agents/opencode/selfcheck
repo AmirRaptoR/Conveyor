@@ -58,9 +58,22 @@ success)
 	;;
 secrets)
 	text=$(jq -nc --arg summary "saw $SHORT_KEY and $API_SECRET" '{v:1,outcome:"success",summary:$summary}')
+	printf 'provider stderr: %s / %s\n' "$API_SECRET" "$ESCAPED_SECRET" >&2
 	jq -nc '{type:"step_start",timestamp:1,sessionID:"ses-secrets",part:{id:"start",type:"step-start"}}'
 	jq -nc --arg text "$text" '{type:"text",timestamp:2,sessionID:"ses-secrets",part:{id:"text",type:"text",text:$text}}'
 	jq -nc '{type:"step_finish",timestamp:3,sessionID:"ses-secrets",part:{id:"finish",type:"step-finish",reason:"stop"}}'
+	;;
+waiting)
+	printf '%s\n' \
+		'{"type":"step_start","timestamp":1,"sessionID":"ses-waiting","part":{"id":"start","type":"step-start"}}' \
+		'{"type":"text","timestamp":2,"sessionID":"ses-waiting","part":{"id":"text","type":"text","text":"{\"v\":1,\"outcome\":\"waiting\",\"waiting\":{\"why\":\"checks are running\"}}"}}' \
+		'{"type":"step_finish","timestamp":3,"sessionID":"ses-waiting","part":{"id":"finish","type":"step-finish","reason":"stop"}}'
+	;;
+split-fenced)
+	jq -nc --arg text $'```json\n' '{type:"step_start",timestamp:1,sessionID:"ses-fenced",part:{id:"start",type:"step-start"}}, {type:"text",timestamp:2,sessionID:"ses-fenced",part:{id:"one",type:"text",text:$text}}'
+	jq -nc --arg text $'{"v":1,"outcome":"success","summary":"split fenced"}\n' '{type:"text",timestamp:3,sessionID:"ses-fenced",part:{id:"two",type:"text",text:$text}}'
+	jq -nc --arg text '```' '{type:"text",timestamp:4,sessionID:"ses-fenced",part:{id:"three",type:"text",text:$text}}'
+	jq -nc '{type:"step_finish",timestamp:5,sessionID:"ses-fenced",part:{id:"finish",type:"step-finish",reason:"stop"}}'
 	;;
 invalid-once|invalid-always)
 	text='not json'
@@ -210,6 +223,9 @@ done
 
 reset_invocations
 export OC_SCENE=secrets SHORT_KEY=abc API_SECRET='quoted"secret\value'
+ESCAPED_SECRET=$(jq -nr --arg value "$API_SECRET" '$value | @json')
+ESCAPED_SECRET=${ESCAPED_SECRET:1:${#ESCAPED_SECRET}-2}
+export ESCAPED_SECRET
 set +e
 out=$(run_claude 'return secrets for the fixture' 2>&1)
 rc=$?
@@ -221,7 +237,25 @@ chk "a short secret is absent from backend logs" "$(grep -Fc -- "$SHORT_KEY" <<<
 chk "a literal complex secret is absent from backend logs" "$(grep -Fc -- "$API_SECRET" <<<"$out" || true)" "0"
 chk "a JSON-escaped secret is absent from backend logs" "$(grep -Fc -- "$escaped_secret" <<<"$out" || true)" "0"
 chk "secret values are absent from the persisted result" "$(jq -r .summary "$CONVEYOR_RESULT")" "saw [REDACTED] and [REDACTED]"
-unset SHORT_KEY API_SECRET
+unset SHORT_KEY API_SECRET ESCAPED_SECRET
+
+reset_invocations
+export OC_SCENE=waiting
+set +e
+run_claude 'wait for checks' >/dev/null 2>&1
+rc=$?
+set -e
+chk "an OpenCode waiting final returns the deferral exit" "$rc" "10"
+chk "the OpenCode waiting reason is persisted" "$(jq -r .waiting.why "$CONVEYOR_RESULT")" "checks are running"
+
+reset_invocations
+export OC_SCENE=split-fenced
+set +e
+run_claude 'return a split fence' >/dev/null 2>&1
+rc=$?
+set -e
+chk "split fenced text preserves boundary newlines" "$rc:$(cat "$OC_CALLS")" "0:1"
+chk "the split fenced payload is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "split fenced"
 
 reset_invocations
 export OC_SCENE=invalid-once
