@@ -78,8 +78,9 @@ peer, and the socket is the only door with no password on it (#94).
 ## Invariants — do not break these
 
 - **stdout/stderr are logs and are never parsed.** Structured data comes back
-  only via `$CONVEYOR_RESULT` and, for a live plan, `$CONVEYOR_PLAN`. An AI
-  stage script emits megabytes of prose.
+  via `$CONVEYOR_RESULT`, the live `$CONVEYOR_PLAN`, or the control
+  acknowledgement channel; commands go in through their own control channel.
+  An AI stage script emits megabytes of prose.
 - **A plan is a third channel, not a parsed log line.** `$CONVEYOR_PLAN`
   (`plan.jsonl` in the run directory, pre-created 0600, engine-owned so a
   source's `env:` cannot redirect it) is where a run appends one JSON todo
@@ -96,6 +97,27 @@ peer, and the socket is the only door with no password on it (#94).
   `plan` event and the final report all read this channel; `panel.js`'s old
   log-parsing `parseTodos` is gone, and no board code reads plan structure out
   of a log line.
+- **Control is a fourth and fifth channel, never scheduler input.** Every run
+  gets engine-owned, pre-created `0600` `control.jsonl`
+  (`$CONVEYOR_CONTROL`, engine writes, script reads) and `control-ack.jsonl`
+  (`$CONVEYOR_CONTROL_ACK`, script writes, engine tails). They are versioned,
+  append-only and one-writer each. A run advertises accepted kinds in its first
+  `hello`; there is no config switch. Commands bind to the exact item, live run
+  and the adapter session reported at enqueue time (possibly still empty), live
+  in that run directory, and resolve from the first ack, a carry-over record or
+  the engine's run-ended derivation. A
+  script owns where it polls: OpenCode advertises `instruction` and `pause` and
+  polls only at an observed `step_finish` with no observed active tool; Claude
+  advertises nothing. That boundary does not promise the backend has not moved
+  ahead before the adapter reads it, so delivery stops gracefully first and
+  resumed work must inspect the tree. On `serve` restart, queued instructions
+  from only the newest interrupted stage run enter §5a's one-shot armed answer
+  with at-least-once/content-deduplicated carry-over; pauses are dropped and no
+  command is replayed into a later control file. Limits bound lines, records
+  and deliveries, and malformed channel data never fails a run. Steering never
+  moves an item, selects or skips a stage, changes order or claims a slot;
+  `pause` affects flow only when its script exits 20 through the ordinary mark
+  path. Cancel remains the immediate process-group kill outside this channel.
 - **The engine writes provider state before running a stage**, never after, and
   stage scripts never call `move` themselves. A crash mid-stage then leaves a
   truthful record and the item is not handed out twice.
