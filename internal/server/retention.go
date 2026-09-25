@@ -23,8 +23,13 @@ type SweepResult struct {
 	BytesFreed int64
 	// Pinned names each surviving run individually, with why, so pinned
 	// evidence cannot pile up unnoticed.
-	Pinned  []string
-	Horizon time.Time
+	Pinned []string
+	// DeletedRuns is the id of every run directory actually removed, so a
+	// caller holding an in-memory index keyed by run id (a cached plan
+	// entry, say) can evict exactly what retention just deleted rather than
+	// re-deriving it from Deleted's count.
+	DeletedRuns []string
+	Horizon     time.Time
 }
 
 // sweepRoot deletes run directories whose day directory is strictly before
@@ -101,6 +106,7 @@ func sweepRoot(root string, cutoff time.Time, pinned func(RunMeta) (bool, string
 			}
 			res.Deleted++
 			res.BytesFreed += sz
+			res.DeletedRuns = append(res.DeletedRuns, m.ID)
 		}
 		if !keepDay {
 			if err := os.Remove(dayDir); err != nil && !os.IsNotExist(err) {
@@ -166,14 +172,40 @@ func (s *Server) pinnedFunc() func(RunMeta) (bool, string) {
 // is as visible as one that did.
 func (s *Server) runSweep(w io.Writer) {
 	cutoff := time.Now().Add(-s.cfg.Logs.Retention.D())
-	res, err := sweepRoot(s.run.Root, cutoff, s.pinnedFunc())
+	pinned := s.pinnedFunc()
+	s.runStoreMu.Lock()
+	res, err := sweepRoot(s.run.Root, cutoff, pinned)
 
 	s.mu.Lock()
 	if res.Deleted > 0 {
 		s.everSwept = true
+		s.runStoreGen++
 	}
 	s.sweepHorizon = res.Horizon
+	if len(res.DeletedRuns) > 0 {
+		deleted := make(map[string]bool, len(res.DeletedRuns))
+		for _, id := range res.DeletedRuns {
+			deleted[id] = true
+		}
+		// A swept run yields no plan: evict the cached card entry the same
+		// way a recovered one would find nothing, rather than leaving a
+		// summary on the board that points at a run directory no longer
+		// there to back it up.
+		for itemID, p := range s.plans {
+			if deleted[p.RunID] {
+				delete(s.plans, itemID)
+				s.planGeneration[itemID]++
+			}
+		}
+		for itemID, p := range s.planMisses {
+			if deleted[p.RunID] {
+				delete(s.planMisses, itemID)
+				s.planGeneration[itemID]++
+			}
+		}
+	}
 	s.mu.Unlock()
+	s.runStoreMu.Unlock()
 
 	fmt.Fprintf(w, "conveyor: retention sweep: deleted %d run(s), %d bytes reclaimed, %d pinned, horizon %s\n",
 		res.Deleted, res.BytesFreed, len(res.Pinned), res.Horizon.Format("2006-01-02"))

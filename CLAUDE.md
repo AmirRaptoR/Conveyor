@@ -78,7 +78,24 @@ peer, and the socket is the only door with no password on it (#94).
 ## Invariants — do not break these
 
 - **stdout/stderr are logs and are never parsed.** Structured data comes back
-  only via `$CONVEYOR_RESULT`. An AI stage script emits megabytes of prose.
+  only via `$CONVEYOR_RESULT` and, for a live plan, `$CONVEYOR_PLAN`. An AI
+  stage script emits megabytes of prose.
+- **A plan is a third channel, not a parsed log line.** `$CONVEYOR_PLAN`
+  (`plan.jsonl` in the run directory, pre-created 0600, engine-owned so a
+  source's `env:` cannot redirect it) is where a run appends one JSON todo
+  revision per line — versioned, agent-neutral, read live by the runner
+  while the script still runs rather than only after it exits, which is what
+  `$CONVEYOR_RESULT` cannot do. `internal/plan` validates each line (a
+  strictly increasing `rev`, a closed three-word `status` enum, size caps);
+  a malformed one is rejected and logged, never fails the run. `agents/_plan`
+  (`plan_start`, `plan_publish`) is the one writer, and every shipped model
+  call maps its own backend's todo event into it — `TodoWrite` for Claude,
+  `todowrite` for OpenCode. Publishing one is an adapter's promise, never
+  required: the engine derives no meaning from a plan's contents and never
+  scores, requires or blocks on one existing. `/api/state`'s `plans`, the SSE
+  `plan` event and the final report all read this channel; `panel.js`'s old
+  log-parsing `parseTodos` is gone, and no board code reads plan structure out
+  of a log line.
 - **The engine writes provider state before running a stage**, never after, and
   stage scripts never call `move` themselves. A crash mid-stage then leaves a
   truthful record and the item is not handed out twice.

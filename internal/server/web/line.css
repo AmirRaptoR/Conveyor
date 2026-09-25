@@ -118,6 +118,15 @@
   margin-top:7px; display:flex; gap:9px; align-items:center; flex-wrap:wrap;
   color:var(--faint); font-size:10.5px; letter-spacing:.04em;
 }
+.item .plan-progress {
+  display:flex; gap:6px; align-items:baseline; margin-top:7px; min-width:0;
+  color:var(--dim); font-size:11.5px;
+}
+.item .plan-progress.live { color:var(--ink); }
+.item .plan-progress.live .plan-count { color:var(--run); font-weight:600; }
+.item .plan-progress.last .plan-count { color:var(--faint); }
+.item .plan-step { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.item .plan-rejected { color:var(--stop); white-space:nowrap; }
 .item .prio { font-variant-numeric:tabular-nums; }
 .item .age { font-variant-numeric:tabular-nums; }
 /* Priority is loud in the badge, not on the edge: the edge says where the

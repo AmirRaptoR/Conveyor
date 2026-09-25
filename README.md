@@ -372,6 +372,7 @@ every healthy source. There is no shared fallback to inherit by accident.
 | `$CONVEYOR_ITEM_ID` `$CONVEYOR_ITEM_REF` | the item, and the id its provider knows it by |
 | `$CONVEYOR_SOURCE` `$CONVEYOR_STAGE` | which source, which stage is being entered |
 | `$CONVEYOR_WORKDIR` `$CONVEYOR_RESULT` | where it runs, and where to write structured output |
+| `$CONVEYOR_PLAN` | append-only, one JSON todo revision per line — a live plan/progress channel, engine-owned and never overridable |
 | the source's `env:` + the script's `params:` | configuration the engine carries and never reads |
 | stdin | the whole item as JSON, plus `stage` and `from` |
 
@@ -519,11 +520,15 @@ One contract for every script, in full in
 - **stdin** — a JSON object with the item and the transition
 - **stdout / stderr** — logs, streamed live, **never parsed**
 - **`$CONVEYOR_RESULT`** — a file to write structured output to
+- **`$CONVEYOR_PLAN`** — an append-only file for a live plan: one JSON todo
+  revision per line, published with `agents/_plan`'s `plan_start`/`plan_publish`
 - **exit code** — the transition
 
-Logs and data are separate channels on purpose. An AI stage script writes
-megabytes of prose to stdout; treating that as a data channel is how this kind of
-system breaks.
+Logs, the result and the plan are three separate channels on purpose. An AI
+stage script writes megabytes of prose to stdout; treating that as a data
+channel is how this kind of system breaks. The plan channel exists because
+the result file is read only once, after the script exits, and so cannot
+carry live progress through a long-running stage.
 
 ## Running the checks
 

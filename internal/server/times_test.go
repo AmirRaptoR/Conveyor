@@ -223,13 +223,19 @@ sources:
 	s.inFlight.Add(1)
 	go s.transition(t.Context(), model.Item{ID: "s1:1", Source: "s1", Stage: "backlog"}, "working")
 
-	waitFor(t, "the run to appear active", func() bool { return len(s.activeList()) > 0 })
+	waitFor(t, "the stage run to appear active", func() bool {
+		active := s.activeList()
+		return len(active) > 0 && active[0].RunID != ""
+	})
 	got := s.activeList()[0]
 	if got.StartedAt.IsZero() {
 		t.Fatal("startedAt is zero while the stage script is running")
 	}
 	if got.StartedAt.Before(before) {
 		t.Errorf("startedAt = %v, want at or after %v", got.StartedAt, before)
+	}
+	if !runner.ValidID(got.RunID) {
+		t.Errorf("runId = %q, want the active stage run id", got.RunID)
 	}
 	waitFor(t, "the transition to finish", func() bool { return s.inFlight.Load() == 0 })
 }

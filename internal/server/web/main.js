@@ -3,8 +3,9 @@
 // live event stream, the duration ticker, and the first poll.
 import { $ } from "./dom.js";
 import { load, loadDoctor, fault } from "./shared.js";
-import { tickDurations } from "./board.js";
+import { draw, tickDurations } from "./board.js";
 import { openItemId, followRun, logPending, logBuffer, loadHistory, renderLine, trimLog } from "./panel.js";
+import { applyPlanEvent } from "./plans.js";
 
 // How the board finds out anything changed. The stream is the fast path and
 // the poll is the one that is always right — the stream is a live TCP
@@ -30,6 +31,15 @@ function onMessage(ev) {
     log.appendChild(renderLine(e.line));
     trimLog(log);
     if (pinned) log.scrollTop = log.scrollHeight;
+    return;
+  }
+  if (e.kind === "plan") {
+    if (applyPlanEvent(e)) draw();
+    // OnStart's state event and the first plan write can cross while the
+    // state fetch is in flight. Re-read the compact server summary so the
+    // card cannot wait for the slow poll merely because that first response
+    // saw the active run just before it saw its plan.
+    refresh();
     return;
   }
   if (e.kind === "transition" && openItemId && e.transition?.item?.id === openItemId) loadHistory(openItemId);

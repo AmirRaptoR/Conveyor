@@ -2,10 +2,38 @@
 # Mock delivery. A real one would be:
 #   claude -p "/deliver-issue --once $CONVEYOR_ITEM_REF" --max-turns 200
 set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/../_plan"
+
 payload=$(cat)
 echo "implementing $(jq -r '.item.id' <<<"$payload")"
-for step in "branch" "red test" "implement" "suite" "review" "merge"; do
-  echo "  $step"; sleep 0.4
+
+steps=(branch "red test" implement suite review merge)
+
+# publish_progress <upto> — one revision naming every step's status, so a
+# mock pipeline demonstrates the same live per-step progress a real adapter's
+# TodoWrite/todowrite mapping produces, with no model involved.
+publish_progress() {
+	local upto=$1 todos="[]" i status
+	for i in "${!steps[@]}"; do
+		status="pending"
+		if ((i < upto)); then
+			status="completed"
+		elif ((i == upto)); then
+			status="in_progress"
+		fi
+		todos=$(jq -c --arg text "${steps[$i]}" --arg status "$status" '. + [{text: $text, status: $status}]' <<<"$todos")
+	done
+	plan_publish "$todos"
+}
+
+plan_start "mock implement"
+for i in "${!steps[@]}"; do
+	publish_progress "$i"
+	echo "  ${steps[$i]}"
+	sleep 0.4
 done
+publish_progress "${#steps[@]}"
+
 jq -n '{pr:123,merged:true}' >"$CONVEYOR_RESULT"
 echo "done"

@@ -183,6 +183,7 @@ record_session() {
 # own `source ../_blocked` line right after this one then finds it already
 # there, and no path sources the file twice.
 declare -f is_condition_kind >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_blocked"
+declare -f plan_publish >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_plan"
 
 # agent_asked classifies what the model wrote in $CONVEYOR_RESULT as a
 # question or leaves it a condition, following the kind the model actually
@@ -252,18 +253,19 @@ last_said() {
 # (CONTRACTS §2 — stdout stays logs), it just stops throwing the one useful
 # fact away.
 #
-# TodoWrite is the one tool call whose argument the frontend also reads back
-# structurally (index.html's parseTodos, presentation only, same tier as the
-# `  · Name: arg` shape below) — so its input goes out whole, never through
-# the [0:100] cut everything else gets. The plan is only ever a few short
-# lines; there is nothing here worth truncating.
+# TodoWrite is the one tool call whose argument reaches structured state, via
+# $CONVEYOR_PLAN rather than the log (#110): its input goes out whole, tagged
+# with the CONVEYOR_PLAN_TODOS: sentinel _plan_route_claude_stream (below)
+# intercepts and replaces with a human summary before anything reaches
+# CLAUDE_SAID or the run's own log — never through the [0:100] cut everything
+# else gets, since the plan is only ever a few short lines.
 render_stream() {
 	jq -j --unbuffered '
 		if .type == "assistant" then
 			(.message.content[]? |
 				if .type == "text" then .text
 				elif .type == "tool_use" and .name == "TodoWrite" then
-					"\n  · TodoWrite: \(.input.todos // [] | tostring)\n"
+					"\nCONVEYOR_PLAN_TODOS:\(.input.todos // [] | tostring)\n"
 				elif .type == "tool_use" then
 					"\n  · \(.name): \((.input.command // .input.file_path // .input.pattern
 					                   // .input.description // "") | tostring | .[0:100])\n"
@@ -277,6 +279,35 @@ render_stream() {
 				"\n"
 			else "\n" end
 		else empty end' 2>/dev/null
+}
+
+# _plan_route_claude_stream reads render_stream's output and intercepts the
+# CONVEYOR_PLAN_TODOS: line it tags a TodoWrite call with: maps Claude's
+# {content, status, activeForm} shape into the plan protocol (content -> text,
+# activeForm -> active, both derived ids and duplicate-text suffixes left to
+# plan_publish/agents/_plan) and publishes it live, in the same pass the
+# stream is already read in — which is what makes the board update mid-run
+# rather than only after the whole conversation ends. Every other line passes
+# through unchanged, so this adds no new failure mode to a run that publishes
+# no plan: an unparsable payload is simply not published, silently.
+_plan_route_claude_stream() {
+	local line
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		if [[ "$line" == CONVEYOR_PLAN_TODOS:* ]]; then
+			local raw="${line#CONVEYOR_PLAN_TODOS:}" mapped
+			mapped=$(jq -c '[.[] | {text: (.content // ""), status: (.status // ""), active: (.activeForm // "")}
+				| if .active == "" then del(.active) else . end]' <<<"$raw" 2>/dev/null)
+			if [[ -n "$mapped" ]]; then
+				plan_publish "$mapped"
+				local total done_n
+				total=$(jq 'length' <<<"$mapped" 2>/dev/null || echo 0)
+				done_n=$(jq '[.[] | select(.status == "completed")] | length' <<<"$mapped" 2>/dev/null || echo 0)
+				echo "  · plan updated ($done_n/$total done)"
+			fi
+			continue
+		fi
+		printf '%s\n' "$line"
+	done
 }
 
 # run_claude "<prompt>" — honours STREAM=0 for the terse, final-message-only log.
@@ -297,6 +328,6 @@ run_claude() {
 		return "${PIPESTATUS[0]}"
 	fi
 	claude -p "$prompt" --output-format stream-json --verbose "${flags[@]}" |
-		tee "$CLAUDE_RAW" | render_stream | tee "$CLAUDE_SAID"
+		tee "$CLAUDE_RAW" | render_stream | _plan_route_claude_stream | tee "$CLAUDE_SAID"
 	return "${PIPESTATUS[0]}"
 }

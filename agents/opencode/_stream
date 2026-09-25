@@ -101,6 +101,19 @@ record_session() {
 }
 
 declare -f is_condition_kind >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_blocked"
+declare -f plan_publish >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_plan"
+
+# _plan_publish_opencode_todos <event-line> — maps a todowrite tool part's
+# completed input.todos into the plan protocol: OpenCode supplies its own id
+# (used verbatim; plan_publish trims and caps it), content maps to text,
+# status passes through unchanged. OpenCode has no equivalent of Claude's
+# activeForm, so active is left unset and a reader falls back to text.
+_plan_publish_opencode_todos() {
+	local line=$1 mapped
+	mapped=$(jq -c '[.part.state.input.todos[]? |
+		{id: (.id // ""), text: (.content // ""), status: (.status // "")}]' <<<"$line" 2>/dev/null) || return 0
+	plan_publish "$mapped"
+}
 
 agent_asked() {
 	local sess kind asked tmp
@@ -190,6 +203,9 @@ render_stream() {
 			key="$id:$status"
 			[[ -n "${tool_states[$key]+seen}" ]] && continue
 			tool_states[$key]=1
+			if [[ "$(jq -r .part.tool <<<"$line")" == todowrite && "$status" == completed ]]; then
+				_plan_publish_opencode_todos "$line"
+			fi
 			jq -r '"  · \(.part.tool): \(.part.state.title // .part.state.status) [\(.part.state.status)]"' <<<"$line"
 			seen=1
 			;;

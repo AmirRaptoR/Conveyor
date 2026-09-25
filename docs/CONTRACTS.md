@@ -166,18 +166,51 @@ author learns it once.
 | | |
 | --- | --- |
 | `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "blocked": false, "config": {...}}`, plus `"answer"` and `"session"` when this run follows a stop a person answered (§5a). For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "terminalStages": ["done"], "config": {...}}` — `terminalStages` is which of `stages` are terminal, so a list script can tell a finished item from one that merely stopped without keeping its own copy of the stage graph in source `env:` |
-| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, `CONVEYOR_DEADLINE` (§4b), `CONVEYOR_DEPENDENCIES_AT` when this stage's dependency policy is engine-owned (§4), `CONVEYOR_MANUAL` when a person armed one of this stage's `actions:` for this run (§5b), plus everything in the source's `env:` block |
+| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_PLAN` (path to append a live plan/todo revision, §2a), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, `CONVEYOR_DEADLINE` (§4b), `CONVEYOR_DEPENDENCIES_AT` when this stage's dependency policy is engine-owned (§4), `CONVEYOR_MANUAL` when a person armed one of this stage's `actions:` for this run (§5b), plus everything in the source's `env:` block |
 
 **Output** is split deliberately:
 
 | Channel | Carries |
 | --- | --- |
 | `stdout` + `stderr` | **Logs only.** Streamed live to the UI, line by line, interleaved in order. Never parsed. |
-| `$CONVEYOR_RESULT` | **Structured data only.** A JSON file the script writes. Absent means "no data". A list script may write the legacy item array or `{ "items": [...], "warnings": [{"itemId":"...", "reason":"..."}] }`; warnings are non-fatal and shown to the operator. |
+| `$CONVEYOR_RESULT` | **Structured data only.** A JSON file the script writes, read once, after the process exits. Absent means "no data". A list script may write the legacy item array or `{ "items": [...], "warnings": [{"itemId":"...", "reason":"..."}] }`; warnings are non-fatal and shown to the operator. |
+| `$CONVEYOR_PLAN` | **A live plan, appended to while the script runs** (§2a). One JSON todo revision per line; the engine tails it, so a long-running stage can show progress before it exits — the one thing `$CONVEYOR_RESULT` cannot do. |
 
-Logs and data are separated because an AI agent writes megabytes of prose to
-stdout. Parsing data out of that is how this kind of system breaks. If a script
-writes nothing to the result file, it simply produced no data.
+Logs, the result and the plan are three separate channels on purpose. An AI
+agent writes megabytes of prose to stdout; parsing data out of that is how
+this kind of system breaks. If a script writes nothing to the result file, it
+simply produced no data — and a script that publishes no plan produces no
+plan entry, never a warning: publishing one is an adapter's promise, never
+required by the engine or the config (CLAUDE.md's extension-seam invariant).
+
+### 2a. The plan channel
+
+`$CONVEYOR_PLAN` (pre-created `0600` in the run directory, named `plan.jsonl`
+on disk) is engine-owned the way `CONVEYOR_DEADLINE` is: a source's `env:` or
+a script's `params:` cannot redirect it elsewhere. One line is one revision:
+
+```
+{"v":1,"rev":1,"at":"<RFC3339>","todos":[{"id":"...","text":"...","status":"pending|in_progress|completed","active":"..."}]}
+```
+
+`rev` is a strictly increasing integer starting at 1 (a rejected line still
+consumes one, so the sequence never needs a separate counter); `active` is
+optional, shown while `status` is `in_progress`, and a reader falls back to
+`text` when it is absent. Unknown fields are ignored, so a future revision of
+this protocol can extend the shape without breaking a running board; an
+unknown `v` is rejected. The engine derives no meaning from `status` beyond
+validating it against that three-word enum — progress and "current step" are
+computed by whoever reads the revision, never by the script or the engine.
+
+`agents/_plan`'s `plan_publish` (append one revision) and `plan_start`
+(publish a single placeholder `in_progress` todo, idempotent once the file
+already has a line) are the one writer; `internal/plan.Validate` is the one
+reader-side check, applied identically whether the line came from a real
+adapter or a hand-written one. A malformed line — bad JSON, a non-increasing
+`rev`, a todo missing `id`/`text`, an invalid `status`, a line over 64 KiB —
+is rejected and logged (as an `engine`-stream log line, capped and
+summarized), never fails the run, and never touches the item's mark: a plan
+is presentation and record-keeping, and the scheduler never learns it exists.
 
 **Exit codes** are the whole control flow:
 
@@ -734,6 +767,9 @@ data/runs/<yyyy-mm-dd>/<run-id>/
   stdin.json     exactly what was piped in
   log.txt        stdout and stderr interleaved in real order, each line stamped
   result.json    whatever the script wrote to $CONVEYOR_RESULT (may be absent)
+  plan.jsonl     the plan channel (§2a): one JSON todo revision per accepted
+                 line, always present (may be empty) — pre-created the same
+                 way result.json is
 ```
 
 Self-contained is the point: a failed run can be `tar`'d and handed to someone

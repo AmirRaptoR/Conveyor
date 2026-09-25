@@ -398,6 +398,7 @@ ${thread_text}"
 
 	full=$(resume_prompt "$payload" "$full")
 
+	plan_start "approve"
 	set +e
 	MAX_TURNS="${MAX_TURNS:-40}" \
 		ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep}" \
@@ -703,6 +704,7 @@ $(decision_brief)"
 
 		full=$(resume_prompt "$payload" "$full")
 
+		plan_start "approve"
 		set +e
 		MAX_TURNS="${MAX_TURNS:-40}" \
 			ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep}" \

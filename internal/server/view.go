@@ -113,6 +113,12 @@ type State struct {
 	// neither reads Why nor acts on Until; it is here so a card can draw a
 	// live countdown instead of looking stopped.
 	Waiting map[string]model.Waiting `json:"waiting,omitempty"`
+	// Plans is each item's current plan summary, keyed by item id — what a
+	// card needs to draw progress and a current step, and what survives
+	// refresh and a restart. Present only for an item whose current stage
+	// has actually published a plan; the engine derives no meaning from its
+	// contents beyond the counts and the current step already computed here.
+	Plans map[string]PlanView `json:"plans,omitempty"`
 	// Active is every transition running right now. The board lights those
 	// stations; without it the page cannot tell work from stillness.
 	Active []Active `json:"active"`
@@ -171,6 +177,7 @@ type Active struct {
 	Stage  string `json:"stage"`
 	ItemID string `json:"itemId"`
 	Title  string `json:"title"`
+	RunID  string `json:"runId,omitempty"`
 	// StartedAt is when this transition's stage script began, so the board
 	// can say how long the run in flight has been running.
 	StartedAt time.Time `json:"startedAt"`
@@ -189,6 +196,39 @@ type ItemTime struct {
 	// CONTRACTS §6 pins against retention so the stage-age chip never goes
 	// blank out from under a currently-listed item.
 	RunID string `json:"-"`
+}
+
+// PlanView is one item's current plan summary — counts and the current step,
+// never the todo list itself, so a large board's state payload does not grow
+// with plan size (the panel reads the full list off GET /api/runs/{id}).
+//
+// Stage is recorded beside the rest so a stale entry — the item has moved on
+// since this was written — is dropped rather than shown against the wrong
+// card, the same discipline ItemTime uses.
+type PlanView struct {
+	RunID string    `json:"runId"`
+	Stage string    `json:"stage"`
+	Rev   int       `json:"rev"`
+	At    time.Time `json:"at"`
+	Total int       `json:"total"`
+	// Completed and InProgress are computed off the revision, never carried
+	// as protocol fields of their own — plan.Revision.Progress is the one
+	// place that arithmetic lives.
+	Completed  int    `json:"completed"`
+	InProgress string `json:"inProgress"`
+	// Rejected is the running rejected-line count for the run that produced
+	// this entry, so a misbehaving adapter is visible on the card without
+	// opening a file.
+	Rejected int `json:"rejected"`
+}
+
+// planCursor records that recovery has already inspected the newest matching
+// run and found no accepted revision. It is deliberately private: absence is
+// not plan state for the API, only a reason not to rescan all run history on
+// every discovery pass.
+type planCursor struct {
+	Stage string
+	RunID string
 }
 
 // TransitionError is an infrastructure failure a transition hit for an item —
@@ -383,8 +423,13 @@ type Server struct {
 	// so it must not hang off r.Context(), which is cancelled at the reply.
 	ctx context.Context
 
-	mu    sync.RWMutex
-	state State
+	mu sync.RWMutex
+	// runStoreMu keeps retention deletion mutually exclusive with server-side
+	// history and API reads. Runner writes are already protected by the
+	// running-outcome retention rule; this lock prevents a completed directory
+	// disappearing halfway through a read.
+	runStoreMu sync.RWMutex
+	state      State
 	// blocks is the note beside each mark, kept in memory and recovered from
 	// run history after a restart: the runs are the durable record, this is
 	// only the index into them that a board read cannot afford to rebuild.
@@ -394,6 +439,20 @@ type Server struct {
 	// the durable record, this is only the index into them a board read
 	// cannot afford to rebuild.
 	times map[string]ItemTime
+	// plans is each item's current plan summary, kept in memory and
+	// recovered from the newest kind:"stage" run of the item in its current
+	// stage, the same way times is — plan.jsonl in that run's own directory
+	// is the durable record, this is only the index a board read cannot
+	// afford to rebuild by re-parsing it on every poll. Cleared the moment a
+	// new transition for the item is dispatched; stage changes and board
+	// pruning clear it, while State also filters defensively by stage.
+	plans map[string]PlanView
+	// planMisses is the negative counterpart to plans. planGeneration rejects
+	// a history scan that began before a dispatch or live update; runStoreGen
+	// rejects one that began before retention deleted what it read.
+	planMisses     map[string]planCursor
+	planGeneration map[string]uint64
+	runStoreGen    uint64
 	// transitionErrs is the last infrastructure error a transition hit for an
 	// item — an initial provider move that failed, an unknown source or
 	// stage — kept the same way blocks and times are: State.Warnings is
@@ -620,6 +679,9 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 	}
 	s.blocks = map[string]Block{}
 	s.times = map[string]ItemTime{}
+	s.plans = map[string]PlanView{}
+	s.planMisses = map[string]planCursor{}
+	s.planGeneration = map[string]uint64{}
 	s.transitionErrs = map[string]TransitionError{}
 	s.paused = map[string]PauseView{}
 	s.cancels = map[string]CancelView{}
@@ -655,6 +717,13 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 		}
 		s.hub.publish(event{Kind: "log", RunID: runID, Line: &l})
 	}
+	prevStart := r.OnStart
+	r.OnStart = func(run model.Run) {
+		if prevStart != nil {
+			prevStart(run)
+		}
+		s.noteRunStarted(run)
+	}
 	// Every run this Runner executes — list, move, stage, doctor, status —
 	// reaches here, which is what lets one place notice a persistence fault
 	// without a check threaded through every call site that starts a run.
@@ -664,6 +733,16 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 			prevResult(res)
 		}
 		s.notePersistFault(res)
+		s.finishPlanRun(res)
+	}
+	// Every accepted plan revision and every rejection reaches here live,
+	// the same way OnLog makes logs live — see handlePlanUpdate.
+	prevPlan := r.OnPlan
+	r.OnPlan = func(runID, itemID string, u runner.PlanUpdate) {
+		if prevPlan != nil {
+			prevPlan(runID, itemID, u)
+		}
+		s.handlePlanUpdate(runID, itemID, u)
 	}
 	return s
 }

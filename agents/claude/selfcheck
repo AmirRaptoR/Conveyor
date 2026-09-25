@@ -318,4 +318,23 @@ chk "a curly apostrophe is still recognised" "$(hit_limit && echo yes)" "yes"
 : > "$CLAUDE_SAID"
 chk "an empty transcript is not a quota stop" "$(hit_limit && echo yes)" ""
 
+# 14. A TodoWrite tool call maps into the plan protocol (#110): content ->
+# text, activeForm -> active, the sentinel line never reaches the human log.
+tmp_plan=$(mktemp -d)
+export CONVEYOR_PLAN="$tmp_plan/plan.jsonl"
+: >"$CONVEYOR_PLAN"
+event='{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[
+	{"content":"read the issue","status":"completed","activeForm":"Reading the issue"},
+	{"content":"write the fix","status":"in_progress","activeForm":"Writing the fix"}
+]}}]}}'
+out=$(printf '%s\n' "$event" | render_stream | _plan_route_claude_stream)
+chk "TodoWrite publishes one revision" "$(wc -l <"$CONVEYOR_PLAN" | tr -d ' ')" "1"
+chk "content maps to text"            "$(jq -r '.todos[0].text' "$CONVEYOR_PLAN")" "read the issue"
+chk "status passes through"           "$(jq -r '.todos[0].status' "$CONVEYOR_PLAN")" "completed"
+chk "activeForm maps to active"       "$(jq -r '.todos[1].active' "$CONVEYOR_PLAN")" "Writing the fix"
+chk "the sentinel never reaches the human log" "$(grep -c CONVEYOR_PLAN_TODOS <<<"$out")" "0"
+chk "a human summary is printed instead" "$(grep -c 'plan updated (1/2 done)' <<<"$out")" "1"
+rm -rf "$tmp_plan"
+unset CONVEYOR_PLAN
+
 exit $fail

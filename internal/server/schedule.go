@@ -279,6 +279,12 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 	defer s.cancelFns.Delete(item.ID)
 	s.mu.Lock()
 	delete(s.cancels, item.ID)
+	// A new transition starting is a clean slate for the card: whatever the
+	// last stage's plan said is not this one's, even before the first
+	// plan_start of the new run has a chance to say otherwise.
+	delete(s.plans, item.ID)
+	s.planMisses[item.ID] = planCursor{Stage: target}
+	s.planGeneration[item.ID]++
 	s.mu.Unlock()
 
 	s.setActive(item.ID, &Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title, StartedAt: time.Now()})
@@ -380,6 +386,18 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// if it has one, is left untouched.
 	if tr.Item.Stage != tr.From {
 		s.times[tr.Item.ID] = ItemTime{Stage: tr.Item.Stage, EnteredStage: now, RunID: tr.RunID}
+	}
+	// A plan belongs to the stage script that produced it. If this transition
+	// moved on (or its initial provider move failed and left the item behind),
+	// neither its accepted summary nor its negative recovery cursor may trail
+	// the item into a different stage.
+	if p, ok := s.plans[tr.Item.ID]; ok && p.Stage != tr.Item.Stage {
+		delete(s.plans, tr.Item.ID)
+		s.planGeneration[tr.Item.ID]++
+	}
+	if p, ok := s.planMisses[tr.Item.ID]; ok && p.Stage != tr.Item.Stage {
+		delete(s.planMisses, tr.Item.ID)
+		s.planGeneration[tr.Item.ID]++
 	}
 	// tr.Err is set on an infrastructure failure — an initial provider move
 	// that failed before any script ran (tr.Outcome == "") is the one F04
@@ -493,6 +511,29 @@ func (s *Server) setActive(itemID string, a *Active) {
 	} else {
 		s.active.Store(itemID, *a)
 	}
+	s.mu.Lock()
+	s.state.Active = s.activeList()
+	s.mu.Unlock()
+	s.hub.publish(event{Kind: "state"})
+}
+
+// noteRunStarted fills in the run identity once the stage runner has created
+// it. Provider moves for the same item are deliberately ignored: a card's
+// active transition is the stage run whose plan can be live on that card.
+func (s *Server) noteRunStarted(run model.Run) {
+	if run.Kind != "stage" || run.ItemID == "" {
+		return
+	}
+	v, ok := s.active.Load(run.ItemID)
+	if !ok {
+		return
+	}
+	a := v.(Active)
+	if a.Source != run.Source || a.Stage != run.To {
+		return
+	}
+	a.RunID = run.ID
+	s.active.Store(run.ItemID, a)
 	s.mu.Lock()
 	s.state.Active = s.activeList()
 	s.mu.Unlock()

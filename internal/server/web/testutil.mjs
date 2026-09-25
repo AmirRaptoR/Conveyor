@@ -151,7 +151,7 @@ export async function page({ fetch: fetchImpl, now } = {}) {
 
   const v = ++generation;
   const mods = await Promise.all(
-    ["board.js", "shared.js", "panel.js", "drag.js", "report.js", "rail.js", "device.js", "inbox.js"]
+    ["board.js", "shared.js", "panel.js", "plans.js", "drag.js", "report.js", "rail.js", "device.js", "inbox.js"]
       .map(name => import(`./${name}?v=${v}`)));
   const mod = Object.assign({}, ...mods.map(m => ({ ...m })));
 

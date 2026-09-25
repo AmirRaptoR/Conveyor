@@ -86,6 +86,7 @@ the result back. Report what you concluded and why in your normal output."
 # or a $CONVEYOR_RESULT the model never wrote is treated exactly like "found no
 # predecessor" — logged, never turned into a mark, because this stage has no
 # waiting to do (see the header comment).
+plan_start "prioritise"
 MAX_TURNS="${MAX_TURNS:-30}" \
 	ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Glob,Grep}" \
 	run_claude "$full"

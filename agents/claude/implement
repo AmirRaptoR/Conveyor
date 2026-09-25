@@ -185,6 +185,7 @@ $(deadline_brief)"
 # A person may have answered the question this stage stopped on last time.
 full=$(resume_prompt "$payload" "$full")
 
+plan_start "implement"
 set +e
 MAX_TURNS="${MAX_TURNS:-200}" \
 	ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep,Agent,Skill}" \

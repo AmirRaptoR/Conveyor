@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/plan"
 )
 
 // LogLine is one line of script output, stamped and tagged with its stream.
@@ -91,6 +92,10 @@ const maxLineBytes = 64 * 1024
 // Runner writes run directories under Root.
 type Runner struct {
 	Root string
+	// OnStart, if set, is called after the run's directory and initial metadata
+	// exist, immediately before its process is started. It gives live views the
+	// run id while the run is still active rather than only after it returns.
+	OnStart func(run model.Run)
 	// OnLog, if set, is called for every line as it is produced — this is what
 	// makes logs live in the UI. Called from a single goroutine, in order.
 	OnLog func(runID string, line LogLine)
@@ -100,10 +105,38 @@ type Runner struct {
 	// notice a persistence fault (Result.Run.Error naming one) without
 	// threading a check through every call site that starts a run.
 	OnResult func(res *Result)
+	// OnPlan, if set, is called for every accepted revision and every
+	// rejected line the tailer notices on plan.jsonl while the run is live,
+	// and once more after it exits. It mirrors OnLog but also carries the
+	// item id, since the server keys plan state by item rather than by run.
+	OnPlan func(runID, itemID string, update PlanUpdate)
+}
+
+// PlanUpdate is a snapshot of a run's plan channel at the moment one line was
+// accepted or rejected: the latest accepted revision (absent when there is
+// none yet) and the running rejected-line count. It is what OnPlan hands the
+// server, matching the shape both the SSE plan event and /api/state's plans
+// need.
+type PlanUpdate struct {
+	Revision    plan.Revision
+	HasRevision bool
+	Accepted    int
+	Rejected    int
+	// Kind and Stage are the run's own Spec.Kind and Spec.To, carried so a
+	// caller keying board state by item can tell a stage run targeting a
+	// real stage — the only kind that ever produces a card entry — apart
+	// from a list, move, doctor or status run publishing to the same item.
+	Kind  string
+	Stage string
 }
 
 // gracePeriod is how long a script gets to exit after SIGTERM before SIGKILL.
 const gracePeriod = 30 * time.Second
+
+// tickInterval is how often the plan.jsonl tailer polls while a run is live.
+// A var, not a const, so tests can shrink it instead of sleeping a full
+// second per assertion.
+var tickInterval = time.Second
 
 func New(root string) *Runner { return &Runner{Root: root} }
 
@@ -257,8 +290,18 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	if err := os.WriteFile(resultPath, nil, 0o600); err != nil {
 		return nil, err
 	}
-	env, envMap := buildEnv(spec, resultPath, deadline)
+	// planPath is pre-created the same way and for the same reason: the
+	// script's own append (`>>`) must open a file already at 0600, not one
+	// its own redirection created at the process's default mode.
+	planPath := filepath.Join(dir, "plan.jsonl")
+	if err := os.WriteFile(planPath, nil, 0o600); err != nil {
+		return nil, err
+	}
+	env, envMap := buildEnv(spec, resultPath, planPath, deadline)
 	run.Env = envMap
+	if r.OnStart != nil {
+		r.OnStart(run)
+	}
 
 	cmd := exec.Command(script)
 	cmd.Dir = spec.Workdir
@@ -293,6 +336,62 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	go func() { defer wg.Done(); scan(stdout, "stdout", emit) }()
 	go func() { defer wg.Done(); scan(stderr, "stderr", emit) }()
 
+	// planReader tails plan.jsonl on its own ~1s ticker while the process
+	// runs and does one final read after it exits — the third goroutine
+	// runner.go's own doc comment on the tailer names. curRev/curOK/rejected
+	// are this closure's own running snapshot, updated strictly in event
+	// order, so a caller of OnPlan never sees a rejection reported against a
+	// revision that has not been accepted yet even when several lines land
+	// within one tick.
+	itemID := ""
+	if spec.Item != nil {
+		itemID = spec.Item.ID
+	}
+	var curRev plan.Revision
+	var curOK bool
+	acceptedSoFar := 0
+	rejectedSoFar := 0
+	handlePlanEvents := func(events []plan.Event) {
+		for _, ev := range events {
+			switch {
+			case ev.Stopped, ev.Summary:
+				emit("engine", "plan.jsonl: "+ev.Reason)
+			case ev.Accepted:
+				curRev, curOK = ev.Revision, true
+				acceptedSoFar++
+				if r.OnPlan != nil {
+					r.OnPlan(runID, itemID, PlanUpdate{Revision: curRev, HasRevision: curOK, Accepted: acceptedSoFar, Rejected: rejectedSoFar, Kind: spec.Kind, Stage: spec.To})
+				}
+			default:
+				rejectedSoFar++
+				if ev.Diagnose {
+					emit("engine", fmt.Sprintf("plan.jsonl line %d rejected: %s", ev.Line, ev.Reason))
+				}
+				if r.OnPlan != nil {
+					r.OnPlan(runID, itemID, PlanUpdate{Revision: curRev, HasRevision: curOK, Accepted: acceptedSoFar, Rejected: rejectedSoFar, Kind: spec.Kind, Stage: spec.To})
+				}
+			}
+		}
+	}
+	planReader := plan.NewReader()
+	planStop := make(chan struct{})
+	var planWG sync.WaitGroup
+	planWG.Add(1)
+	go func() {
+		defer planWG.Done()
+		ticker := time.NewTicker(tickInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				handlePlanEvents(planReader.Poll(planPath))
+			case <-planStop:
+				handlePlanEvents(planReader.Final(planPath))
+				return
+			}
+		}
+	}()
+
 	// The pgid is the leader's own PID, by construction of setPgid — captured
 	// now because Getpgid(pid) stops working once the leader is reaped, while
 	// this number keeps identifying the group for as long as any member of it
@@ -326,6 +425,8 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 
 	wg.Wait()
 	waitErr := cmd.Wait()
+	close(planStop)
+	planWG.Wait()
 
 	timedOut := false
 	select {
@@ -510,7 +611,7 @@ func trimNewline(s string) string {
 	return s
 }
 
-func buildEnv(spec Spec, resultPath string, deadline time.Time) ([]string, map[string]string) {
+func buildEnv(spec Spec, resultPath, planPath string, deadline time.Time) ([]string, map[string]string) {
 	own := map[string]string{
 		"CONVEYOR_RESULT":  resultPath,
 		"CONVEYOR_WORKDIR": spec.Workdir,
@@ -538,6 +639,11 @@ func buildEnv(spec Spec, resultPath string, deadline time.Time) ([]string, map[s
 	for k, v := range spec.Env {
 		own[k] = v
 	}
+	// Applied last, and so unconditionally winning over spec.Env: a source's
+	// env: or a script's params: must not be able to redirect the plan
+	// channel elsewhere. CONVEYOR_RESULT above does not get the same
+	// treatment yet — a pre-existing gap, not one this protocol closes.
+	own["CONVEYOR_PLAN"] = planPath
 	env := os.Environ()
 	for k, v := range own {
 		env = append(env, k+"="+v)
