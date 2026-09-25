@@ -18,6 +18,24 @@
 _CONTROL_MAX_DELIVERIES=${CONTROL_MAX_DELIVERIES:-10}
 _CONTROL_WRAP_UP_GRACE=${WRAP_UP_GRACE:-300}
 
+# control_instruction_brief <instruction> — prompt used when an adapter
+# resumes a model session to deliver a person's mid-run instruction. Keep the
+# recovery discipline here so every steerable backend gives the same warning
+# about work left between the observed boundary and the child stopping.
+control_instruction_brief() {
+	local instruction=$1
+	printf '%s' "A person sent this instruction while your run was in progress:
+
+--- mid-run instruction ---
+${instruction}
+--- end mid-run instruction ---
+
+The original task still stands. The working tree may contain partial work from
+the step that just ended. Before building on it, read the current status and
+the full diff, verify what is there, and then either build on it or discard it
+deliberately and say why. Never commit changes you have not read and verified."
+}
+
 # _control_ready — are both control channel variables set and usable: the
 # ack file writable if it exists, its directory writable if not, and the
 # command file at least readable.

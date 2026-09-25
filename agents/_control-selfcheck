@@ -107,7 +107,14 @@ chk "control_poll returns nothing past wrap-up" "$polled" ""
 chk "past-wrap-up reason" "$(jq -r 'select(.type=="ack" and .id=="w1") | .reason' "$CONVEYOR_CONTROL_ACK")" "past wrap-up"
 unset CONVEYOR_DEADLINE WRAP_UP_GRACE
 
-# 8. every helper is a silent no-op with the variables unset.
+# 8. the shared delivery brief keeps the original task in force and tells the
+# resumed agent to inspect partial work before building on it.
+brief=$(control_instruction_brief "change the API name")
+chk "the instruction brief carries the instruction" "$(grep -c 'change the API name' <<<"$brief")" "1"
+chk "the instruction brief keeps the original task" "$(grep -c 'original task still stands' <<<"$brief")" "1"
+chk "the instruction brief requires reading partial work" "$(grep -c 'read the current status' <<<"$brief")" "1"
+
+# 9. every channel helper is a silent no-op with the variables unset.
 unset CONVEYOR_CONTROL CONVEYOR_CONTROL_ACK
 out=$(control_hello instruction 2>&1)
 rc=$?
