@@ -32,6 +32,19 @@ if [[ "${1:-}" == "--pure" && "${2:-}" == "models" ]]; then
 fi
 printf '%s\n' "$@" >"$OC_ARGS"
 cat >"$OC_PROMPT"
+run_no=1
+if [[ -s "$OC_CALLS" ]]; then run_no=$(($(cat "$OC_CALLS") + 1)); fi
+printf '%s\n' "$run_no" >"$OC_CALLS"
+cp "$OC_ARGS" "$OC_ARGS.$run_no"
+cp "$OC_PROMPT" "$OC_PROMPT.$run_no"
+printf '%s\n' "$run_no" >>"$OC_STARTS"
+printf '%s\n' "$$" >>"$OC_PIDS"
+if [[ -n "${CONVEYOR_CONTROL_ACK:-}" && -s "${CONVEYOR_CONTROL_ACK:-}" ]] &&
+	jq -e 'select(.type == "hello")' "$CONVEYOR_CONTROL_ACK" >/dev/null 2>&1; then
+	printf 'yes\n' >>"$OC_HELLO_BEFORE_RUN"
+else
+	printf 'no\n' >>"$OC_HELLO_BEFORE_RUN"
+fi
 case "${OC_SCENE:-success}" in
 success)
 	printf '%s\n' \
@@ -60,21 +73,77 @@ sleep)
 	echo "$!" >"$OC_CHILD"
 	wait
 	;;
+steering|delivery-fail|pause)
+	if ((run_no > 1)); then
+		if jq -e --arg id "${OC_COMMAND_ID:-}" 'select(.type == "ack" and .id == $id)' \
+			"$CONVEYOR_CONTROL_ACK" >/dev/null 2>&1; then
+			echo early >"$OC_EARLY_ACK"
+		fi
+		if [[ "$OC_SCENE" == delivery-fail ]]; then exit 73; fi
+		printf '%s\n' \
+			'{"type":"step_start","timestamp":6,"sessionID":"ses-steer","part":{"id":"continued-start","type":"step-start"}}' \
+			'{"type":"text","timestamp":7,"sessionID":"ses-steer","part":{"id":"continued-text","type":"text","text":"continued"}}' \
+			'{"type":"step_finish","timestamp":8,"sessionID":"ses-steer","part":{"id":"continued-finish","type":"step-finish"}}'
+		exit 0
+	fi
+	if [[ "${OC_STOP_MODE:-term}" == term ]]; then
+		trap 'echo TERM >>"$OC_SIGNALS"; exit 0' TERM
+	else
+		trap '' TERM
+	fi
+	mapfile -t boundary_lines <"$OC_BOUNDARY_FIXTURE"
+	printf '%s\n' "${boundary_lines[@]:0:3}"
+	sleep 0.2
+	if jq -e --arg id "${OC_COMMAND_ID:-}" 'select(.type == "ack" and .id == $id)' \
+		"$CONVEYOR_CONTROL_ACK" >/dev/null 2>&1; then
+		echo unsafe >"$OC_UNSAFE_ACK"
+	fi
+	printf '%s\n' "${boundary_lines[@]:3}"
+	while :; do sleep 0.05; done
+	;;
+boundary-exit)
+	cat "$OC_BOUNDARY_FIXTURE"
+	;;
 esac
 STUB
 chmod +x "$tmp/bin/opencode"
 
 export PATH="$tmp/bin:$PATH"
 export XDG_STATE_HOME="$tmp/state"
-export OC_ARGS="$tmp/args" OC_PROMPT="$tmp/prompt"
+export OC_ARGS="$tmp/args" OC_PROMPT="$tmp/prompt" OC_CALLS="$tmp/calls" OC_STARTS="$tmp/starts" OC_PIDS="$tmp/pids"
+export OC_HELLO_BEFORE_RUN="$tmp/hello-before-run" OC_SIGNALS="$tmp/signals"
+export OC_EARLY_ACK="$tmp/early-ack" OC_UNSAFE_ACK="$tmp/unsafe-ack"
+export OC_BOUNDARY_FIXTURE="$here/fixtures/steering-boundaries-synthetic.jsonl"
 export MODEL=openai/gpt-test VARIANT=high AGENT=build
 export CONVEYOR_SOURCE=test CONVEYOR_STAGE=working CONVEYOR_ITEM_REF=7
 
 source "$here/_stream"
-trap 'rm -rf "$tmp"; rm -f "$CLAUDE_SAID" "$CLAUDE_RAW"' EXIT
+trap 'rm -rf "$tmp" "$_OPENCODE_TMP"' EXIT
 
 fail=0
 chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+reset_invocations() {
+	rm -f "$OC_CALLS" "$OC_STARTS" "$OC_PIDS" "$OC_HELLO_BEFORE_RUN" "$OC_SIGNALS" \
+		"$OC_EARLY_ACK" "$OC_UNSAFE_ACK" "$OC_ARGS".* "$OC_PROMPT".*
+}
+
+reset_control() {
+	export CONVEYOR_CONTROL="$tmp/control.jsonl"
+	export CONVEYOR_CONTROL_ACK="$tmp/control-ack.jsonl"
+	export CONVEYOR_RESULT="$tmp/control-result.json"
+	: >"$CONVEYOR_CONTROL"
+	: >"$CONVEYOR_CONTROL_ACK"
+	rm -f "$CONVEYOR_RESULT"
+	unset _CONTROL_SESSION _CONTROL_ACCEPTS _OPENCODE_CONTROL_HELLO_SENT RESUME_SESSION
+}
+
+append_command() {
+	# append_command <seq> <id> <kind> <text> <session>
+	jq -nc --argjson seq "$1" --arg id "$2" --arg kind "$3" --arg text "$4" --arg session "$5" \
+		'{v:1,type:"command",seq:$seq,id:$id,at:"2026-09-25T12:00:00Z",kind:$kind,text:$text,itemId:"test:7",runId:"run-1",session:$session,by:"amir"}' \
+		>>"$CONVEYOR_CONTROL"
+}
 
 OC_SCENE=success
 export OC_SCENE
@@ -99,6 +168,124 @@ set -e
 chk "the sanitized live 1.18.32 tool transcript parses" "$rc" "0"
 chk "the live fixture renders its completed tool" "$(grep -c 'bash: pwd \[completed\]' <<<"$fixture")" "1"
 chk "the live fixture renders final text" "$(grep -c '^done$' <<<"$fixture")" "1"
+
+# The OpenCode boundary owns its child and only polls after a step_finish at
+# which every observed tool part is terminal. The synthetic fixture puts an
+# unsafe boundary first, then a safe one; the stub stays alive after the safe
+# boundary so TERM/KILL behaviour is observable rather than a race with exit.
+reset_invocations
+reset_control
+append_command 1 instruct-1 instruction "use the smaller API" ""
+export OC_COMMAND_ID=instruct-1 OC_SCENE=steering OC_STOP_MODE=term CONTROL_STOP_GRACE=2
+set +e
+run_claude 'original task' >"$tmp/steering.log" 2>&1
+rc=$?
+set -e
+chk "a delivered instruction keeps the run successful" "$rc" "0"
+chk "hello is present before the first model child starts" "$(sed -n '1p' "$OC_HELLO_BEFORE_RUN")" "yes"
+chk "hello is the first ack record" "$(jq -rs '.[0].type' "$CONVEYOR_CONTROL_ACK")" "hello"
+chk "the first event records its raw session" "$(jq -rs '.[1] | [.type,.session] | join(":")' "$CONVEYOR_CONTROL_ACK")" "session:ses-steer"
+chk "the unsafe step boundary was not polled" "$([[ -e "$OC_UNSAFE_ACK" ]] && echo polled || echo skipped)" "skipped"
+chk "the first child receives TERM at the safe boundary" "$(grep -c '^TERM$' "$OC_SIGNALS" || true)" "1"
+chk "an instruction starts a second child" "$(cat "$OC_CALLS")" "2"
+chk "the resumed child gets the same session" "$(grep -A1 -Fx -- '--session' "$OC_ARGS.2" | tail -1)" "ses-steer"
+chk "the resumed prompt carries the instruction" "$(grep -c 'use the smaller API' "$OC_PROMPT.2")" "1"
+chk "the resumed prompt says the original task still stands" "$(grep -c 'original task still stands' "$OC_PROMPT.2")" "1"
+chk "the resumed prompt requires reading partial work" "$(grep -c 'read the current status' "$OC_PROMPT.2")" "1"
+chk "the instruction is consumed after the second child starts" "$(jq -r 'select(.type=="ack" and .id=="instruct-1") | .state' "$CONVEYOR_CONTROL_ACK")" "consumed"
+chk "the instruction was not acked before that child started" "$([[ -e "$OC_EARLY_ACK" ]] && echo early || echo ordered)" "ordered"
+
+# If the stopped child ignores TERM it is killed after the grace. A replacement
+# that then exits without one event did not start usefully, so the instruction
+# is rejected instead of disappearing as consumed.
+reset_invocations
+reset_control
+append_command 1 failed-1 instruction "try another route" ""
+export OC_COMMAND_ID=failed-1 OC_SCENE=delivery-fail OC_STOP_MODE=ignore CONTROL_STOP_GRACE=1
+set +e
+run_claude 'original task' >"$tmp/delivery-fail.log" 2>&1
+rc=$?
+set -e
+first_pid=$(sed -n '1p' "$OC_PIDS")
+chk "a replacement start failure preserves its exit" "$rc" "73"
+chk "TERM-ignoring child is gone after KILL fallback" "$(kill -0 "$first_pid" 2>/dev/null && echo alive || echo gone)" "gone"
+chk "failed delivery is rejected" "$(jq -r 'select(.type=="ack" and .id=="failed-1") | .state' "$CONVEYOR_CONTROL_ACK")" "rejected"
+chk "failed delivery has the stable reason" "$(jq -r 'select(.type=="ack" and .id=="failed-1") | .reason' "$CONVEYOR_CONTROL_ACK")" "delivery failed"
+
+# Pause stops at the same boundary, writes the resumable marked result before
+# acknowledging, and does not launch a replacement child.
+reset_invocations
+reset_control
+append_command 1 pause-1 pause "ignored" ""
+export OC_COMMAND_ID=pause-1 OC_SCENE=pause OC_STOP_MODE=term CONTROL_STOP_GRACE=2
+set +e
+run_claude 'original task' >"$tmp/pause.log" 2>&1
+rc=$?
+set -e
+chk "pause exits 20" "$rc" "20"
+chk "pause does not start a replacement child" "$(cat "$OC_CALLS")" "1"
+chk "pause is acked consumed" "$(jq -r 'select(.type=="ack" and .id=="pause-1") | .state' "$CONVEYOR_CONTROL_ACK")" "consumed"
+chk "pause writes a blocked result" "$(jq -r .blocked "$CONVEYOR_RESULT")" "true"
+chk "pause has its own kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "paused"
+chk "pause is a person's question" "$(jq -r .asked "$CONVEYOR_RESULT")" "true"
+chk "pause keeps the prefixed result session" "$(jq -r .session "$CONVEYOR_RESULT")" "opencode:ses-steer"
+chk "pause names requester and request time" "$(jq -r .reason "$CONVEYOR_RESULT")" "paused by amir at 2026-09-25T12:00:00Z"
+
+RESUME_SESSION=""
+pause_payload=$(jq -c '. + {answer:"continue"}' "$CONVEYOR_RESULT")
+resume_prompt "$pause_payload" 'original task' >/dev/null 2>&1
+chk "a handed-back pause restores the raw OpenCode session" "$RESUME_SESSION" "ses-steer"
+reset_invocations
+unset CONVEYOR_CONTROL CONVEYOR_CONTROL_ACK _OPENCODE_CONTROL_HELLO_SENT
+export OC_SCENE=success
+run_claude 'continue' >/dev/null
+chk "the handed-back pause resumes instead of starting cold" "$(grep -A1 -Fx -- '--session' "$OC_ARGS" | tail -1)" "ses-steer"
+
+# The helper's rejection paths are exercised through the real adapter boundary,
+# not only in agents/_control-selfcheck.
+reset_invocations
+reset_control
+append_command 1 stale-1 instruction "old" "ses-other"
+export OC_COMMAND_ID=stale-1 OC_SCENE=boundary-exit
+run_claude 'reject stale' >/dev/null
+chk "a stale session is rejected at the boundary" "$(jq -r 'select(.type=="ack" and .id=="stale-1") | .reason' "$CONVEYOR_CONTROL_ACK")" "stale session"
+
+reset_invocations
+reset_control
+append_command 1 unsupported-1 dance "move" ""
+export OC_COMMAND_ID=unsupported-1 OC_SCENE=boundary-exit
+run_claude 'reject kind' >/dev/null
+chk "an unadvertised kind is rejected at the boundary" "$(jq -r 'select(.type=="ack" and .id=="unsupported-1") | .reason' "$CONVEYOR_CONTROL_ACK")" "unsupported kind"
+
+reset_invocations
+reset_control
+append_command 1 ceiling-1 instruction "one too many" ""
+_CONTROL_MAX_DELIVERIES=0
+export OC_COMMAND_ID=ceiling-1 OC_SCENE=boundary-exit
+run_claude 'reject ceiling' >/dev/null
+chk "the delivery ceiling is enforced at the boundary" "$(jq -r 'select(.type=="ack" and .id=="ceiling-1") | .reason' "$CONVEYOR_CONTROL_ACK")" "too many deliveries in one run"
+_CONTROL_MAX_DELIVERIES=10
+
+reset_invocations
+reset_control
+append_command 1 wrap-1 instruction "too late" ""
+export CONVEYOR_DEADLINE=$(date -u -d '+60 seconds' +%Y-%m-%dT%H:%M:%SZ)
+export OC_COMMAND_ID=wrap-1 OC_SCENE=boundary-exit
+run_claude 'reject wrap-up' >/dev/null
+chk "the wrap-up guard is enforced at the boundary" "$(jq -r 'select(.type=="ack" and .id=="wrap-1") | .reason' "$CONVEYOR_CONTROL_ACK")" "past wrap-up"
+unset CONVEYOR_DEADLINE
+
+unset CONVEYOR_CONTROL CONVEYOR_CONTROL_ACK _OPENCODE_CONTROL_HELLO_SENT _CONTROL_SESSION _CONTROL_ACCEPTS
+for helper in hello session poll ack; do
+	case "$helper" in
+	hello) out=$(control_hello instruction 2>&1); rc=$? ;;
+	session) out=$(control_session session-1 2>&1); rc=$? ;;
+	poll) out=$(control_poll 2>&1); rc=$? ;;
+	ack) out=$(control_ack command-1 consumed 2>&1); rc=$? ;;
+	esac
+	chk "control_$helper is a silent no-op without channels" "$rc:$out" "0:"
+done
+unset RESUME_SESSION OC_COMMAND_ID OC_STOP_MODE CONTROL_STOP_GRACE
 
 export CONVEYOR_PLAN="$tmp/plan.jsonl"
 : >"$CONVEYOR_PLAN"

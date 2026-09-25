@@ -19,3 +19,12 @@ written to the same event shape `tool-run-1.18.32.jsonl` was captured in
 `agents/opencode/_stream`'s mapping (`_plan_publish_opencode_todos`) reads.
 Replace this file with a captured one, and update this note, the day a real
 `todowrite` transcript is available.
+
+`steering-boundaries-synthetic.jsonl` is **synthetic, not captured**. It puts a
+`step_finish` before a tool part reaches a terminal state, then reports that
+same tool as completed before a second `step_finish`. The first ordering is a
+deliberately adversarial protocol case used to prove the adapter does not poll
+for control commands while any observed tool part is still outstanding; the
+second boundary is where polling is safe. It uses only event and part shapes
+already covered by the captured fixture above, but it is not evidence that the
+pinned CLI emits this exact ordering in practice.

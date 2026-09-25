@@ -6,6 +6,7 @@ import { stageBy, startable, startItem, saveOrder, handBack } from "./drag.js";
 import { openAsk, openReport } from "./report.js";
 import { renderPanelRelationships } from "./relationships.js";
 import { beginPanelPlan, applyPlanSnapshot } from "./plans.js";
+import { selectPanelRun, applySteeringSnapshot } from "./steering.js";
 
 export { renderPanelRelationships } from "./relationships.js";
 
@@ -39,6 +40,7 @@ export async function inspect(id, title, stage) {
   $("#ptitle").focus();
   setLogStatus("loading", "Loading…");
   beginPanelPlan(null);
+  selectPanelRun(null, id, title, state?.mode);
   lastBlockSig.delete(id);
   refreshOpenStop(id, true);
   renderPanelActions(id);
@@ -391,6 +393,7 @@ async function showRun(id) {
   followRun = id;
   const gen = ++logGen;
   const planRequest = beginPanelPlan(id);
+  selectPanelRun(id, openItemId, openItemTitle, state?.mode);
   // `followRun === id` alone cannot tell apart the first click on a run from
   // a later re-click on the same run — A, then B, then A again leaves two
   // in-flight fetches that both satisfy that check. `gen` is what actually
@@ -426,6 +429,7 @@ async function showRun(id) {
     const r = await res.json();
     lines = r.lines || [];
     runPlan = r.plan || null;
+    applySteeringSnapshot(r, state?.mode);
   } catch {
     if (stale()) return;
     setLogStatus("error", "Could not load this run.");
@@ -516,6 +520,7 @@ export function closePanel() {
   if (openItemId) lastBlockSig.delete(openItemId);
   openItemId = null; openItemTitle = null; followRun = null;
   beginPanelPlan(null);
+  selectPanelRun(null, null, null, state?.mode);
   logPending = false; logBuffer = [];
   // Back to whichever card or `.need` button opened the panel, by identity —
   // looked up fresh rather than a stored node, since a draw() while the panel
@@ -533,6 +538,6 @@ $("#scrim").onclick = closePanel;
 // dialog" breaks the moment this handler also fires for the same keypress.
 addEventListener("keydown", e => {
   if (e.key !== "Escape") return;
-  if ($("#ask").open) return;
+  if ($("#ask").open || $("#cancel").open) return;
   closePanel();
 });

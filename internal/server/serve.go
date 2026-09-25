@@ -228,6 +228,7 @@ func (s *Server) handler() (tcp, socket http.Handler, err error) {
 	mux.HandleFunc("POST /api/pause", s.mutationGuard(s.handlePause))
 	mux.HandleFunc("POST /api/resume", s.mutationGuard(s.handleResume))
 	mux.HandleFunc("POST /api/items/{id}/cancel", s.mutationGuard(s.handleCancel))
+	mux.HandleFunc("POST /api/items/{id}/steer", s.mutationGuard(s.handleSteer))
 	mux.HandleFunc("POST /api/items/{id}/budget-override", s.mutationGuard(s.handleBudgetOverride))
 	mux.HandleFunc("POST /api/items/{id}/budget-restore", s.mutationGuard(s.handleBudgetRestore))
 	mux.HandleFunc("POST /api/doctor", s.mutationGuard(s.handleDoctorStart))

@@ -109,8 +109,13 @@ place in `refining`, and then `nothing to do`.
 
 ### Serving the board
 
-`conveyor serve` runs the pipeline and renders it. On your own machine that is
-all there is to it:
+`conveyor serve` runs the pipeline and renders it. The item panel can queue an
+instruction or pause for an adapter-owned safe boundary when the live run
+advertises those capabilities, cancel any live run immediately, and answer a
+run that has stopped. OpenCode advertises instruction and pause today; Claude
+does not, so its live runs offer Cancel now but no steering controls. Commands
+and acknowledgements update live and remain in that run's history. On your own
+machine that is all there is to it:
 
 ```bash
 ./conveyor serve -c conveyor.yaml -addr 127.0.0.1:8090
@@ -373,6 +378,8 @@ every healthy source. There is no shared fallback to inherit by accident.
 | `$CONVEYOR_SOURCE` `$CONVEYOR_STAGE` | which source, which stage is being entered |
 | `$CONVEYOR_WORKDIR` `$CONVEYOR_RESULT` | where it runs, and where to write structured output |
 | `$CONVEYOR_PLAN` | append-only, one JSON todo revision per line — a live plan/progress channel, engine-owned and never overridable |
+| `$CONVEYOR_CONTROL` | engine-to-script `instruction` and `pause` records for this run; read only at boundaries the script owns |
+| `$CONVEYOR_CONTROL_ACK` | script-to-engine capability, session and command acknowledgements; append-only like the plan channel |
 | the source's `env:` + the script's `params:` | configuration the engine carries and never reads |
 | stdin | the whole item as JSON, plus `stage` and `from` |
 
@@ -522,13 +529,15 @@ One contract for every script, in full in
 - **`$CONVEYOR_RESULT`** — a file to write structured output to
 - **`$CONVEYOR_PLAN`** — an append-only file for a live plan: one JSON todo
   revision per line, published with `agents/_plan`'s `plan_start`/`plan_publish`
+- **`$CONVEYOR_CONTROL` / `$CONVEYOR_CONTROL_ACK`** — the versioned live
+  command/acknowledgement pair; capability is advertised by the run and the
+  script decides when it is safe to read a command
 - **exit code** — the transition
 
-Logs, the result and the plan are three separate channels on purpose. An AI
-stage script writes megabytes of prose to stdout; treating that as a data
-channel is how this kind of system breaks. The plan channel exists because
-the result file is read only once, after the script exits, and so cannot
-carry live progress through a long-running stage.
+The channels stay separate on purpose. An AI stage script writes megabytes of
+prose to stdout; treating that as data is how this kind of system breaks. The
+plan channel carries live progress out of a run, while the two control files
+carry bounded commands in and explicit capability and resolution back out.
 
 ## Running the checks
 

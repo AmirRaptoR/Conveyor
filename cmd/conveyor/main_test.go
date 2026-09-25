@@ -107,3 +107,66 @@ func TestObserveDoesNotSettleInterruptedRuns(t *testing.T) {
 		})
 	}
 }
+
+func TestObserveCarryOverWritesNothing(t *testing.T) {
+	dir := t.TempDir()
+	runsRoot := filepath.Join(dir, "runs")
+	runDir := filepath.Join(runsRoot, "2026-09-24", "120000.000-observe")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"id":"120000.000-observe","source":"s1","itemId":"s1:1","kind":"stage","to":"working","outcome":"interrupted"}`
+	control := `{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"instruction","text":"keep me","itemId":"s1:1","runId":"120000.000-observe","session":"","by":"amir"}` + "\n"
+	if err := os.WriteFile(filepath.Join(runDir, "meta.json"), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "control.jsonl"), []byte(control), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "control-ack.jsonl"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Dir: dir}
+	s := server.New(cfg, runner.New(runsRoot))
+	if err := carryOverForServe(s, server.ModeObserve); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "answers.json")); !os.IsNotExist(err) {
+		t.Fatalf("observe created answers.json: %v", err)
+	}
+	got, _ := os.ReadFile(filepath.Join(runDir, "control.jsonl"))
+	if string(got) != control {
+		t.Fatal("observe changed control.jsonl")
+	}
+}
+
+func TestInterruptedSweepUsedByRunAndTickDoesNotCarryAnswers(t *testing.T) {
+	dir := t.TempDir()
+	runsRoot := filepath.Join(dir, "runs")
+	runDir := filepath.Join(runsRoot, "2026-09-24", "120000.000-cli")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := model.Run{ID: "120000.000-cli", Source: "s1", ItemID: "s1:1", Kind: "stage", To: "working", Outcome: model.OutcomeRunning, StartedAt: time.Now()}
+	b, _ := json.Marshal(run)
+	if err := os.WriteFile(filepath.Join(runDir, "meta.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	control := `{"v":1,"type":"command","seq":1,"id":"c1","at":"2026-09-24T12:00:00Z","kind":"instruction","text":"keep me","itemId":"s1:1","runId":"120000.000-cli","session":"","by":"amir"}` + "\n"
+	if err := os.WriteFile(filepath.Join(runDir, "control.jsonl"), []byte(control), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Dir: dir}
+	release, err := own(cfg, runner.New(runsRoot), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if _, err := os.Stat(filepath.Join(dir, "answers.json")); !os.IsNotExist(err) {
+		t.Fatalf("shared run/tick sweep created answers.json: %v", err)
+	}
+	got, _ := os.ReadFile(filepath.Join(runDir, "control.jsonl"))
+	if string(got) != control {
+		t.Fatal("shared run/tick sweep changed control.jsonl")
+	}
+}

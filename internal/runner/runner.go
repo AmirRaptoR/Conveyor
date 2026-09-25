@@ -29,6 +29,7 @@ import (
 
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/plan"
+	"github.com/AmirRaptoR/Conveyor/internal/steering"
 )
 
 // LogLine is one line of script output, stamped and tagged with its stream.
@@ -96,6 +97,11 @@ type Runner struct {
 	// exist, immediately before its process is started. It gives live views the
 	// run id while the run is still active rather than only after it returns.
 	OnStart func(run model.Run)
+	// OnProcessExit, if set, is called immediately after cmd.Wait returns and
+	// before the final plan and control-ack reads begin. A caller closing an
+	// operation registry here can therefore wait for an in-flight write and
+	// know the final read includes it, while refusing every later write.
+	OnProcessExit func(run model.Run)
 	// OnLog, if set, is called for every line as it is produced — this is what
 	// makes logs live in the UI. Called from a single goroutine, in order.
 	OnLog func(runID string, line LogLine)
@@ -110,6 +116,10 @@ type Runner struct {
 	// and once more after it exits. It mirrors OnLog but also carries the
 	// item id, since the server keys plan state by item rather than by run.
 	OnPlan func(runID, itemID string, update PlanUpdate)
+	// OnSteering is the control channel's counterpart to OnPlan. It fires for
+	// every complete ack line, accepted or rejected, and once after process
+	// exit with Final set so unresolved commands become rejected: run ended.
+	OnSteering func(runID, itemID string, update SteeringUpdate)
 }
 
 // PlanUpdate is a snapshot of a run's plan channel at the moment one line was
@@ -128,6 +138,17 @@ type PlanUpdate struct {
 	// from a list, move, doctor or status run publishing to the same item.
 	Kind  string
 	Stage string
+}
+
+// SteeringUpdate is the resolved steering snapshot after one ack-channel
+// event. Kind and Stage are callback metadata, not protocol fields, and keep
+// non-stage runs out of card state without suppressing their per-run SSE/API
+// record.
+type SteeringUpdate struct {
+	Resolution steering.Resolution
+	Kind       string
+	Stage      string
+	Final      bool
 }
 
 // gracePeriod is how long a script gets to exit after SIGTERM before SIGKILL.
@@ -297,12 +318,20 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	if err := os.WriteFile(planPath, nil, 0o600); err != nil {
 		return nil, err
 	}
-	env, envMap := buildEnv(spec, resultPath, planPath, deadline)
-	run.Env = envMap
-	if r.OnStart != nil {
-		r.OnStart(run)
+	// controlPath/controlAckPath are pre-created the same way and for the
+	// same reason as planPath: a script's own append must open a file
+	// already at 0600, and a source's env: must not be able to redirect
+	// either channel elsewhere (see buildEnv).
+	controlPath := filepath.Join(dir, "control.jsonl")
+	if err := os.WriteFile(controlPath, nil, 0o600); err != nil {
+		return nil, err
 	}
-
+	controlAckPath := filepath.Join(dir, "control-ack.jsonl")
+	if err := os.WriteFile(controlAckPath, nil, 0o600); err != nil {
+		return nil, err
+	}
+	env, envMap := buildEnv(spec, resultPath, planPath, controlPath, controlAckPath, deadline)
+	run.Env = envMap
 	cmd := exec.Command(script)
 	cmd.Dir = spec.Workdir
 	cmd.Env = env
@@ -329,6 +358,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 			r.OnResult(res)
 		}
 		return res, fmt.Errorf("start %s: %w", script, err)
+	}
+	if r.OnStart != nil {
+		r.OnStart(run)
 	}
 
 	var wg sync.WaitGroup
@@ -374,19 +406,73 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		}
 	}
 	planReader := plan.NewReader()
-	planStop := make(chan struct{})
-	var planWG sync.WaitGroup
-	planWG.Add(1)
+	ackReader := steering.NewAckReader()
+	tailStop := make(chan struct{})
+	var tailWG sync.WaitGroup
+	tailWG.Add(1)
+	steeringDiagnosed, steeringSuppressed := 0, 0
+	diagnoseSteering := func(text string) {
+		if steeringDiagnosed < 10 {
+			steeringDiagnosed++
+			emit("engine", text)
+		} else {
+			steeringSuppressed++
+		}
+	}
+	lastOrphans, lastDuplicates, lastHellos := 0, 0, 0
+	var ackRecords []steering.AckRecord
+	publishSteering := func(final bool) {
+		res := steering.LoadWithAcks(dir, ackRecords, ackReader.Rejected(), ackReader.MaxSeq(), ackReader.Lines(), final)
+		for lastOrphans < res.OrphanAcks {
+			diagnoseSteering("control-ack.jsonl: orphan ack ignored")
+			lastOrphans++
+		}
+		for lastDuplicates < res.DuplicateAcks {
+			diagnoseSteering("control-ack.jsonl: duplicate ack ignored")
+			lastDuplicates++
+		}
+		for lastHellos < res.IgnoredHellos {
+			diagnoseSteering("control-ack.jsonl: second hello ignored")
+			lastHellos++
+		}
+		if r.OnSteering != nil {
+			r.OnSteering(runID, itemID, SteeringUpdate{Resolution: res, Kind: spec.Kind, Stage: spec.To, Final: final})
+		}
+	}
+	handleAckEvents := func(events []steering.AckEvent) {
+		for _, ev := range events {
+			switch {
+			case ev.Stopped:
+				emit("engine", ev.Reason)
+			case ev.Summary:
+				// Rejections have already passed through diagnoseSteering one by
+				// one; one combined summary is emitted below at finalization.
+				continue
+			case !ev.Accepted:
+				diagnoseSteering(fmt.Sprintf("control-ack.jsonl line %d rejected: %s", ev.Line, ev.Reason))
+				publishSteering(false)
+			default:
+				ackRecords = append(ackRecords, ev.Record)
+				publishSteering(false)
+			}
+		}
+	}
 	go func() {
-		defer planWG.Done()
+		defer tailWG.Done()
 		ticker := time.NewTicker(tickInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				handlePlanEvents(planReader.Poll(planPath))
-			case <-planStop:
+				handleAckEvents(ackReader.Poll(controlAckPath))
+			case <-tailStop:
 				handlePlanEvents(planReader.Final(planPath))
+				handleAckEvents(ackReader.Final(controlAckPath))
+				publishSteering(true)
+				if steeringSuppressed > 0 {
+					emit("engine", fmt.Sprintf("control-ack.jsonl: %d further diagnostics suppressed", steeringSuppressed))
+				}
 				return
 			}
 		}
@@ -425,8 +511,11 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 
 	wg.Wait()
 	waitErr := cmd.Wait()
-	close(planStop)
-	planWG.Wait()
+	if r.OnProcessExit != nil {
+		r.OnProcessExit(run)
+	}
+	close(tailStop)
+	tailWG.Wait()
 
 	timedOut := false
 	select {
@@ -611,7 +700,7 @@ func trimNewline(s string) string {
 	return s
 }
 
-func buildEnv(spec Spec, resultPath, planPath string, deadline time.Time) ([]string, map[string]string) {
+func buildEnv(spec Spec, resultPath, planPath, controlPath, controlAckPath string, deadline time.Time) ([]string, map[string]string) {
 	own := map[string]string{
 		"CONVEYOR_RESULT":  resultPath,
 		"CONVEYOR_WORKDIR": spec.Workdir,
@@ -640,10 +729,12 @@ func buildEnv(spec Spec, resultPath, planPath string, deadline time.Time) ([]str
 		own[k] = v
 	}
 	// Applied last, and so unconditionally winning over spec.Env: a source's
-	// env: or a script's params: must not be able to redirect the plan
-	// channel elsewhere. CONVEYOR_RESULT above does not get the same
-	// treatment yet — a pre-existing gap, not one this protocol closes.
+	// env: or a script's params: must not be able to redirect the plan or
+	// control channels elsewhere. CONVEYOR_RESULT above does not get the
+	// same treatment yet — a pre-existing gap, not one this protocol closes.
 	own["CONVEYOR_PLAN"] = planPath
+	own["CONVEYOR_CONTROL"] = controlPath
+	own["CONVEYOR_CONTROL_ACK"] = controlAckPath
 	env := os.Environ()
 	for k, v := range own {
 		env = append(env, k+"="+v)

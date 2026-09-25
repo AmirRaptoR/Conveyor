@@ -10,6 +10,7 @@ import { openItemId, inspect, renderPanelActions, renderPanelRelationships, refr
 import { dragging, justDragged, refusals, stageBy, wireDrag, wireQueue } from "./drag.js";
 import { renderInbox } from "./inbox.js";
 import { cardPlan } from "./plans.js";
+import { applySteeringState } from "./steering.js";
 
 // A draw() that lands mid-drag defers instead of touching #rail (see draw()
 // and shouldDeferDraw above); the drag's own dragend runs the one redraw that
@@ -49,6 +50,7 @@ let byId = new Map();
 let terminal = new Set();
 export function draw() {
   if (!state) return;
+  applySteeringState(state);
   // A draw() mid-drag would tear out the very node the drag is holding onto
   // (see wireDrag) — deferred here, and run once, exactly, from dragend.
   // `state` above is already current; only the rebuild waits.

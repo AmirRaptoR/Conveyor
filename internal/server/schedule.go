@@ -285,6 +285,9 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 	delete(s.plans, item.ID)
 	s.planMisses[item.ID] = planCursor{Stage: target}
 	s.planGeneration[item.ID]++
+	delete(s.steering, item.ID)
+	s.steeringMisses[item.ID] = planCursor{Stage: target}
+	s.steeringGen[item.ID]++
 	s.mu.Unlock()
 
 	s.setActive(item.ID, &Active{Source: item.Source, Stage: target, ItemID: item.ID, Title: item.Title, StartedAt: time.Now()})
@@ -398,6 +401,14 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	if p, ok := s.planMisses[tr.Item.ID]; ok && p.Stage != tr.Item.Stage {
 		delete(s.planMisses, tr.Item.ID)
 		s.planGeneration[tr.Item.ID]++
+	}
+	if v, ok := s.steering[tr.Item.ID]; ok && v.Stage != tr.Item.Stage {
+		delete(s.steering, tr.Item.ID)
+		s.steeringGen[tr.Item.ID]++
+	}
+	if v, ok := s.steeringMisses[tr.Item.ID]; ok && v.Stage != tr.Item.Stage {
+		delete(s.steeringMisses, tr.Item.ID)
+		s.steeringGen[tr.Item.ID]++
 	}
 	// tr.Err is set on an infrastructure failure — an initial provider move
 	// that failed before any script ran (tr.Outcome == "") is the one F04

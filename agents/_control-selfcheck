@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Checks agents/_control, the shared steering-ack publisher every adapter
+# that supports it sources. Touches only a throwaway control.jsonl /
+# control-ack.jsonl pair; runs no model.
+#
+#   agents/_control-selfcheck
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/_control"
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+reset_channel() {
+	unset _CONTROL_SESSION _CONTROL_ACCEPTS _CONTROL_DELIVERED
+	export CONVEYOR_CONTROL="$tmp/control.jsonl"
+	export CONVEYOR_CONTROL_ACK="$tmp/control-ack.jsonl"
+	: >"$CONVEYOR_CONTROL"
+	: >"$CONVEYOR_CONTROL_ACK"
+}
+
+append_command() {
+	# append_command <seq> <id> <kind> <text> <session>
+	jq -nc --argjson seq "$1" --arg id "$2" --arg kind "$3" --arg text "$4" --arg session "$5" \
+		'{v:1, type:"command", seq:$seq, id:$id, at:"2026-09-24T12:00:00Z", kind:$kind, text:$text, itemId:"i1", runId:"r1", session:$session, by:"amir"}' \
+		>>"$CONVEYOR_CONTROL"
+}
+
+# 1. control_hello writes one ack line naming what this run accepts, before
+# any session is known.
+reset_channel
+control_hello instruction pause
+chk "control_hello writes one line" "$(wc -l <"$CONVEYOR_CONTROL_ACK" | tr -d ' ')" "1"
+chk "hello type"    "$(jq -r '.type' "$CONVEYOR_CONTROL_ACK")" "hello"
+chk "hello accepts"  "$(jq -c '.accepts' "$CONVEYOR_CONTROL_ACK")" '["instruction","pause"]'
+chk "hello seq is 1" "$(jq -r '.seq' "$CONVEYOR_CONTROL_ACK")" "1"
+
+# 2. control_session records the session, once per distinct id.
+control_session "abc123"
+chk "control_session writes a session line" "$(wc -l <"$CONVEYOR_CONTROL_ACK" | tr -d ' ')" "2"
+control_session "abc123"
+chk "control_session is idempotent per id" "$(wc -l <"$CONVEYOR_CONTROL_ACK" | tr -d ' ')" "2"
+control_session "def456"
+chk "control_session writes again on a different id" "$(wc -l <"$CONVEYOR_CONTROL_ACK" | tr -d ' ')" "3"
+
+# 3. control_poll returns a queued command at a matching session and no
+# unadvertised kind, in file order; acking it removes it from further polls.
+reset_channel
+control_hello instruction pause
+control_session "s1"
+append_command 2 c1 instruction "do the thing" ""
+polled=$(control_poll)
+chk "control_poll returns the queued command" "$(jq -r '.id' <<<"$polled")" "c1"
+control_ack c1 consumed
+polled2=$(control_poll)
+chk "control_poll returns nothing once acked" "$polled2" ""
+
+# 4. a stale-session command is rejected and skipped, not returned.
+reset_channel
+control_hello instruction pause
+control_session "current"
+append_command 2 stale instruction "old" "not-current"
+append_command 3 fresh instruction "new" ""
+polled=$(control_poll)
+chk "control_poll skips the stale-session command" "$(jq -r '.id' <<<"$polled")" "fresh"
+chk "the stale command was acked rejected" "$(jq -r 'select(.type=="ack" and .id=="stale") | .state' "$CONVEYOR_CONTROL_ACK")" "rejected"
+chk "the stale command's reason"           "$(jq -r 'select(.type=="ack" and .id=="stale") | .reason' "$CONVEYOR_CONTROL_ACK")" "stale session"
+
+# 5. a command of an unadvertised kind is rejected.
+reset_channel
+control_hello instruction
+append_command 2 p1 pause "" ""
+polled=$(control_poll)
+chk "control_poll returns nothing for an unadvertised kind" "$polled" ""
+chk "unadvertised kind acked rejected" "$(jq -r 'select(.type=="ack" and .id=="p1") | .state' "$CONVEYOR_CONTROL_ACK")" "rejected"
+chk "unadvertised kind reason"         "$(jq -r 'select(.type=="ack" and .id=="p1") | .reason' "$CONVEYOR_CONTROL_ACK")" "unsupported kind"
+
+# 6. the delivery ceiling rejects the 11th instruction in one run.
+reset_channel
+control_hello instruction
+for i in $(seq 1 11); do
+	append_command "$((i + 1))" "d$i" instruction "go" ""
+done
+delivered=0
+for i in $(seq 1 11); do
+	p=$(control_poll)
+	[[ -n "$p" ]] || break
+	id=$(jq -r '.id' <<<"$p")
+	control_ack "$id" consumed
+	delivered=$((delivered + 1))
+done
+chk "only 10 instructions delivered" "$delivered" "10"
+chk "the 11th is acked rejected"     "$(jq -r 'select(.type=="ack" and .id=="d11") | .state' "$CONVEYOR_CONTROL_ACK")" "rejected"
+chk "the 11th's reason"              "$(jq -r 'select(.type=="ack" and .id=="d11") | .reason' "$CONVEYOR_CONTROL_ACK")" "too many deliveries in one run"
+
+# 7. an instruction is refused past the wrap-up grace.
+reset_channel
+control_hello instruction
+export CONVEYOR_DEADLINE=$(date -u -d "+60 seconds" +%Y-%m-%dT%H:%M:%SZ)
+export WRAP_UP_GRACE=300
+append_command 2 w1 instruction "go" ""
+polled=$(control_poll)
+chk "control_poll returns nothing past wrap-up" "$polled" ""
+chk "past-wrap-up reason" "$(jq -r 'select(.type=="ack" and .id=="w1") | .reason' "$CONVEYOR_CONTROL_ACK")" "past wrap-up"
+unset CONVEYOR_DEADLINE WRAP_UP_GRACE
+
+# 8. the shared delivery brief keeps the original task in force and tells the
+# resumed agent to inspect partial work before building on it.
+brief=$(control_instruction_brief "change the API name")
+chk "the instruction brief carries the instruction" "$(grep -c 'change the API name' <<<"$brief")" "1"
+chk "the instruction brief keeps the original task" "$(grep -c 'original task still stands' <<<"$brief")" "1"
+chk "the instruction brief requires reading partial work" "$(grep -c 'read the current status' <<<"$brief")" "1"
+
+# 9. every channel helper is a silent no-op with the variables unset.
+unset CONVEYOR_CONTROL CONVEYOR_CONTROL_ACK
+out=$(control_hello instruction 2>&1)
+rc=$?
+chk "control_hello with no channel: exit 0" "$rc" "0"
+chk "control_hello with no channel: silent" "$out" ""
+out=$(control_poll 2>&1)
+rc=$?
+chk "control_poll with no channel: exit 0" "$rc" "0"
+chk "control_poll with no channel: silent" "$out" ""
+
+exit $fail

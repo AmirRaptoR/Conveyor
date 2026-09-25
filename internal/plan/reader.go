@@ -1,10 +1,9 @@
 package plan
 
 import (
-	"bytes"
 	"fmt"
-	"io"
-	"os"
+
+	"github.com/AmirRaptoR/Conveyor/internal/linefeed"
 )
 
 // maxDiagnostics bounds how many rejection events in one run are worth an
@@ -72,47 +71,45 @@ func (r *Reader) Last() (Revision, bool) {
 // Poll reads whatever is new at path since the last call and returns the
 // events it produced, in file order. Once tailing has stopped (a Stopped
 // event was ever produced), Poll is a no-op returning nil.
+//
+// The byte-offset tailing, partial-line buffering and oversized-fragment
+// handling are internal/linefeed's, shared with internal/steering's ack
+// reader; this method owns only what is specific to the plan protocol —
+// Validate, the revision/rejection counters and the accepted-revision cap.
 func (r *Reader) Poll(path string) []Event {
 	if r.stopped || r.capped {
 		return nil
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		r.stopped = true
-		return []Event{{Stopped: true, Reason: "plan.jsonl unreadable: " + err.Error()}}
-	}
-	if info.Size() < r.offset {
-		r.stopped = true
-		return []Event{{Stopped: true, Reason: "plan.jsonl truncated below the held offset"}}
-	}
-	if info.Size() == r.offset {
-		return nil
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		r.stopped = true
-		return []Event{{Stopped: true, Reason: "plan.jsonl unreadable: " + err.Error()}}
-	}
-	defer f.Close()
-	if _, err := f.Seek(r.offset, os.SEEK_SET); err != nil {
-		r.stopped = true
-		return []Event{{Stopped: true, Reason: "plan.jsonl unreadable: " + err.Error()}}
-	}
 	var events []Event
-	buf := make([]byte, 32*1024)
-	for !r.capped {
-		n, readErr := f.Read(buf)
-		if n > 0 {
-			r.offset += int64(n)
-			events = append(events, r.consume(buf[:n])...)
+	cur := linefeed.Cursor{Offset: r.offset, Buf: r.buf, Skipping: r.skipping}
+	stopped, reason := linefeed.Poll(&cur, path, MaxLineBytes, func(data []byte, oversize bool) bool {
+		r.lineNum++
+		if oversize {
+			events = append(events, r.reject("line too long"))
+			return r.capped
 		}
-		if readErr != nil {
-			if readErr != io.EOF {
-				r.stopped = true
-				events = append(events, Event{Stopped: true, Reason: "plan.jsonl unreadable: " + readErr.Error()})
-			}
-			break
+		if r.acceptedN >= MaxRevisions {
+			return true
 		}
+		rev, reason := Validate(data, r.lastRev)
+		if reason != "" {
+			events = append(events, r.reject(reason))
+			return r.capped
+		}
+		r.lastRev = rev.Rev
+		r.lastAccepted = &rev
+		r.acceptedN++
+		events = append(events, Event{Accepted: true, Revision: rev, Line: r.lineNum})
+		if r.acceptedN == MaxRevisions {
+			r.capped = true
+			return true
+		}
+		return false
+	})
+	r.offset, r.buf, r.skipping = cur.Offset, cur.Buf, cur.Skipping
+	if stopped {
+		r.stopped = true
+		events = append(events, Event{Stopped: true, Reason: "plan.jsonl " + reason})
 	}
 	return events
 }
@@ -129,12 +126,13 @@ func (r *Reader) Final(path string) []Event {
 		if !r.capped {
 			events = r.Poll(path)
 		}
-		if len(r.buf) > 0 && !r.skipping {
+		cur := linefeed.Cursor{Offset: r.offset, Buf: r.buf, Skipping: r.skipping}
+		if data, truncated := linefeed.Final(&cur); truncated {
 			r.lineNum++
 			events = append(events, r.reject("truncated final line"))
-			r.buf = nil
+			_ = data
 		}
-		r.skipping = false
+		r.offset, r.buf, r.skipping = cur.Offset, cur.Buf, cur.Skipping
 	}
 	if r.rejectedN > r.diagnosedN {
 		events = append(events, Event{
@@ -143,71 +141,6 @@ func (r *Reader) Final(path string) []Event {
 		})
 	}
 	return events
-}
-
-func (r *Reader) consume(data []byte) []Event {
-	var events []Event
-	for {
-		nl := bytes.IndexByte(data, '\n')
-		if nl == -1 {
-			if !r.skipping {
-				r.buf = append(r.buf, data...)
-				if len(r.buf) > MaxLineBytes {
-					r.lineNum++
-					events = append(events, r.reject("line too long"))
-					r.buf = nil
-					r.skipping = true
-				}
-			}
-			return events
-		}
-		if r.capped {
-			return events
-		}
-		line := data[:nl]
-		data = data[nl+1:]
-
-		if r.skipping {
-			r.skipping = false
-			continue
-		}
-
-		full := line
-		if len(r.buf) > 0 {
-			full = append(r.buf, line...)
-			r.buf = nil
-		}
-		r.lineNum++
-
-		if r.acceptedN >= MaxRevisions {
-			continue
-		}
-
-		if len(full)+1 > MaxLineBytes {
-			events = append(events, r.reject("line too long"))
-			if r.capped {
-				return events
-			}
-			continue
-		}
-
-		rev, reason := Validate(full, r.lastRev)
-		if reason == "" {
-			r.lastRev = rev.Rev
-			r.lastAccepted = &rev
-			r.acceptedN++
-			events = append(events, Event{Accepted: true, Revision: rev, Line: r.lineNum})
-			if r.acceptedN == MaxRevisions {
-				r.capped = true
-				return events
-			}
-		} else {
-			events = append(events, r.reject(reason))
-			if r.capped {
-				return events
-			}
-		}
-	}
 }
 
 func (r *Reader) reject(reason string) Event {

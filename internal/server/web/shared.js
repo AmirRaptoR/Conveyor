@@ -48,18 +48,27 @@ export const fmtBytes = n => {
 let skew = 0;
 export const nowMs = () => Date.now() - skew;
 
+let loadGen = 0;
+
 export async function load() {
+  const gen = ++loadGen;
+  const stale = () => gen !== loadGen;
   let res;
   try {
     res = await fetch("/api/state");
-  } catch { fault("disconnected"); return; }
+  } catch { if (!stale()) fault("disconnected"); return; }
+  if (stale()) return;
   // A 500 still answered the request — it is the server saying something is
   // wrong, not the network failing to reach it, and the two must read
   // differently or an operator chases a cable for a bug on the box.
   if (!res.ok) { fault(`server error (HTTP ${res.status})`); return; }
   const served = Date.parse(res.headers.get("Date"));
+  let next;
+  try { next = await res.json(); }
+  catch { if (!stale()) fault("server returned invalid state"); return; }
+  if (stale()) return;
   if (!isNaN(served)) skew = Date.now() - served;
-  state = await res.json();
+  state = next;
   draw();
 }
 

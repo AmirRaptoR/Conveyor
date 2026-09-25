@@ -3,9 +3,21 @@
 # Pinned because `run --format json` is a CLI projection, not a stable API.
 
 OPENCODE_SUPPORTED_VERSION=1.18.32
-CLAUDE_SAID=$(mktemp)
-CLAUDE_RAW=$(mktemp)
-trap 'rm -f "$CLAUDE_SAID" "$CLAUDE_RAW"' EXIT
+_OPENCODE_TMP=$(mktemp -d)
+CLAUDE_SAID="$_OPENCODE_TMP/said"
+CLAUDE_RAW="$_OPENCODE_TMP/raw"
+trap 'rm -rf "$_OPENCODE_TMP"' EXIT
+# The outer run's process group can receive TERM (a cancellation, a timeout)
+# while the CLI child backgrounded in _opencode_invoke_child is still running.
+# Left untrapped, bash terminates this shell on that signal immediately,
+# without ever reaching the wait _opencode_invoke_child's own normal path
+# does — so nothing in this tree reaps the child, and once it too dies from
+# the same broadcast signal it is left for whatever the OS reparents it to,
+# which is exactly what can keep the process group looking alive to the
+# runner's own cleanup poll. _opencode_stop_child is a no-op when no child is
+# currently in flight, so this is safe to fire on every TERM this process
+# ever sees, not only mid-invocation.
+trap '_opencode_stop_child; exit 143' TERM
 
 opencode_bin() { printf '%s' "${OPENCODE_BIN:-opencode}"; }
 
@@ -102,6 +114,7 @@ record_session() {
 
 declare -f is_condition_kind >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_blocked"
 declare -f plan_publish >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_plan"
+declare -f control_poll >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_control"
 
 # _plan_publish_opencode_todos <event-line> — maps a todowrite tool part's
 # completed input.todos into the plan protocol: OpenCode supplies its own id
@@ -143,13 +156,79 @@ last_said() {
 	grep -v '^\s*$' "$CLAUDE_SAID" | tail -n 3 | tr -s '[:space:]' ' ' | cut -c1-300
 }
 
+_opencode_emit() {
+	printf '%s\n' "$1"
+	if [[ "${_OPENCODE_CAPTURE_STREAM:-0}" == 1 ]]; then
+		printf '%s\n' "$1" >>"$CLAUDE_SAID" || true
+	fi
+}
+
+_opencode_tools_terminal() {
+	local status
+	for status in "$@"; do
+		[[ "$status" == completed || "$status" == error ]] || return 1
+	done
+	return 0
+}
+
+# The child may already have exited by the time its step_finish reaches us.
+# Otherwise ask it to stop first, wait for the configured grace, and only then
+# kill it. Conveyor's outer process-group cancellation remains the owner when
+# the whole stage is cancelled or times out.
+_opencode_stop_child() {
+	local pid=${_OPENCODE_CHILD_PID:-} grace=${CONTROL_STOP_GRACE:-15} deadline status
+	[[ -n "$pid" ]] || return 0
+	[[ "$grace" =~ ^[0-9]+$ ]] || grace=15
+	if kill -0 "$pid" 2>/dev/null; then
+		kill -TERM "$pid" 2>/dev/null || true
+		deadline=$((SECONDS + grace))
+		while kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)); do
+			sleep 0.05
+		done
+		if kill -0 "$pid" 2>/dev/null; then
+			kill -KILL "$pid" 2>/dev/null || true
+		fi
+	fi
+	if wait "$pid" 2>/dev/null; then status=0; else status=$?; fi
+	_OPENCODE_CHILD_STATUS=$status
+	_OPENCODE_CHILD_WAITED=1
+}
+
+_opencode_pause() {
+	local command=$1 session=$2 id by at reason
+	id=$(jq -r '.id' <<<"$command")
+	by=$(jq -r '.by // ""' <<<"$command")
+	at=$(jq -r '.at // ""' <<<"$command")
+	reason="paused by $by at $at"
+	if [[ -z "${CONVEYOR_RESULT:-}" ]] ||
+		! jq -n --arg session "opencode:$session" --arg reason "$reason" \
+			'{blocked:true, kind:"paused", asked:true, session:$session, reason:$reason}' \
+			>"$CONVEYOR_RESULT"; then
+		control_ack "$id" rejected "delivery failed"
+		return 1
+	fi
+	control_ack "$id" consumed
+	return 20
+}
+
 render_stream() {
-	local line type session="" current seen=0 finished=0 errors=0 detail id text previous status key
+	local line type session="" current seen=0 finished=0 errors=0 detail id text previous status key command kind rendered
 	declare -A parts=()
 	declare -A texts=()
 	declare -A tool_states=()
+	declare -A tool_status=()
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		[[ -z "$line" ]] && continue
+		if [[ "${_OPENCODE_CAPTURE_STREAM:-0}" == 1 ]]; then
+			printf '%s\n' "$line" >>"$CLAUDE_RAW" || true
+		fi
+		# A line proves a restarted child made it far enough to produce its
+		# stream. Resolve the instruction only now; an exec/start failure leaves
+		# no line and is rejected by run_claude below.
+		if [[ -n "${_OPENCODE_PENDING_ID:-}" ]]; then
+			control_ack "$_OPENCODE_PENDING_ID" consumed
+			_OPENCODE_PENDING_ID=""
+		fi
 		if ! jq -e 'type == "object" and (.type | type == "string" and length > 0)
 			and (.timestamp | type == "number" and floor == .)
 			and (.sessionID | type == "string" and length > 0)' \
@@ -163,6 +242,8 @@ render_stream() {
 			return 2
 		fi
 		session=$current
+		_OPENCODE_STREAM_SESSION=$session
+		control_session "$session"
 		type=$(jq -r .type <<<"$line")
 		case "$type" in
 		step_start)
@@ -179,9 +260,9 @@ render_stream() {
 			previous=${texts[$id]-}
 			[[ "$text" == "$previous" ]] && continue
 			if [[ -n "$previous" && "$text" == "$previous"* ]]; then
-				printf '%s\n' "${text:${#previous}}"
+				_opencode_emit "${text:${#previous}}"
 			else
-				printf '%s\n' "$text"
+				_opencode_emit "$text"
 			fi
 			texts[$id]=$text
 			seen=1
@@ -200,13 +281,15 @@ render_stream() {
 				echo "opencode emitted a malformed tool_use event" >&2; return 2; }
 			id=$(jq -r .part.id <<<"$line")
 			status=$(jq -r .part.state.status <<<"$line")
+			tool_status[$id]=$status
 			key="$id:$status"
 			[[ -n "${tool_states[$key]+seen}" ]] && continue
 			tool_states[$key]=1
 			if [[ "$(jq -r .part.tool <<<"$line")" == todowrite && "$status" == completed ]]; then
 				_plan_publish_opencode_todos "$line"
 			fi
-			jq -r '"  · \(.part.tool): \(.part.state.title // .part.state.status) [\(.part.state.status)]"' <<<"$line"
+			rendered=$(jq -r '"  · \(.part.tool): \(.part.state.title // .part.state.status) [\(.part.state.status)]"' <<<"$line")
+			_opencode_emit "$rendered"
 			seen=1
 			;;
 		step_finish)
@@ -215,12 +298,26 @@ render_stream() {
 			id=$(jq -r .part.id <<<"$line"); [[ -n "${parts[$id]+seen}" ]] && continue; parts[$id]=1
 			finished=1
 			seen=1
+			if [[ -n "${_OPENCODE_CHILD_PID:-}" ]] &&
+				_opencode_tools_terminal "${tool_status[@]}"; then
+				command=$(control_poll)
+				if [[ -n "$command" ]]; then
+					_opencode_stop_child
+					_OPENCODE_CONTROL_COMMAND=$command
+					kind=$(jq -r '.kind' <<<"$command")
+					if [[ "$kind" == pause ]]; then
+						_opencode_pause "$command" "$session"
+						return $?
+					fi
+					return 30
+				fi
+			fi
 			;;
 		error)
 			jq -e '.error | type == "object"' >/dev/null 2>&1 <<<"$line" || {
 				echo "opencode emitted a malformed error event" >&2; return 2; }
 			detail=$(jq -r '.error.data.message // .error.message // .error.name // "unknown error"' <<<"$line")
-			printf '[opencode stopped: %s] %s\n' "$(jq -r '.error.name // "error"' <<<"$line")" "$detail"
+			_opencode_emit "[opencode stopped: $(jq -r '.error.name // "error"' <<<"$line")] $detail"
 			errors=1
 			seen=1
 			;;
@@ -232,6 +329,41 @@ render_stream() {
 	[[ $seen -eq 1 ]] || { echo "opencode emitted no structured events" >&2; return 2; }
 	[[ $errors -eq 0 ]] || return 1
 	[[ $finished -eq 1 ]] || { echo "opencode stream ended without step_finish" >&2; return 2; }
+}
+
+_opencode_invoke_child() {
+	local prompt=$1 bin=$2
+	shift 2
+	local fifo="$_OPENCODE_TMP/events" render_status child_status
+	rm -f "$fifo"
+	mkfifo "$fifo" || return 1
+	: >"$CLAUDE_RAW"
+	: >"$CLAUDE_SAID"
+	_OPENCODE_CONTROL_COMMAND=""
+	_OPENCODE_STREAM_SESSION=""
+	_OPENCODE_CHILD_WAITED=0
+	_OPENCODE_CAPTURE_STREAM=1
+	OPENCODE_DISABLE_AUTOUPDATE=1 "$bin" "$@" <<<"$prompt" >"$fifo" &
+	_OPENCODE_CHILD_PID=$!
+	if render_stream <"$fifo"; then render_status=0; else render_status=$?; fi
+	if [[ "$_OPENCODE_CHILD_WAITED" == 1 ]]; then
+		child_status=$_OPENCODE_CHILD_STATUS
+	elif wait "$_OPENCODE_CHILD_PID"; then
+		child_status=0
+	else
+		child_status=$?
+	fi
+	_OPENCODE_CHILD_PID=""
+	_OPENCODE_CAPTURE_STREAM=0
+	rm -f "$fifo"
+
+	# 20 and 30 are adapter decisions made after a valid safe boundary; the
+	# child's TERM/KILL status is expected and must not replace them.
+	if [[ $render_status -eq 20 || $render_status -eq 30 ]]; then
+		return "$render_status"
+	fi
+	[[ $child_status -eq 0 ]] || return "$child_status"
+	return "$render_status"
 }
 
 validate_opencode() {
@@ -269,21 +401,40 @@ validate_opencode() {
 
 # Compatibility name used by the shared stage policy.
 run_claude() {
-	local prompt=$1 bin result
+	local prompt=$1 bin result command id text session pending_id="" next_prompt
 	local -a flags
 	validate_opencode || return $?
 	bin=$(opencode_bin)
-	flags=(--pure run --format json --model "$MODEL" --agent "${AGENT:-build}" --dir "$PWD"
-		--title "conveyor:${CONVEYOR_SOURCE:-unknown}:${CONVEYOR_ITEM_REF:-unknown}:${CONVEYOR_STAGE:-unknown}")
-	[[ -n "${VARIANT:-}" ]] && flags+=(--variant "$VARIANT")
-	[[ -n "${RESUME_SESSION:-}" ]] && flags+=(--session "$RESUME_SESSION")
+	if [[ -z "${_OPENCODE_CONTROL_HELLO_SENT:-}" ]]; then
+		control_hello instruction pause
+		_OPENCODE_CONTROL_HELLO_SENT=1
+	fi
 
-	OPENCODE_DISABLE_AUTOUPDATE=1 "$bin" "${flags[@]}" <<<"$prompt" |
-		tee "$CLAUDE_RAW" | render_stream | tee "$CLAUDE_SAID"
-	local -a statuses=("${PIPESTATUS[@]}")
-	if [[ ${statuses[0]} -ne 0 ]]; then return "${statuses[0]}"; fi
-	if [[ ${statuses[1]} -ne 0 || ${statuses[3]} -ne 0 ]]; then return 1; fi
-	result=${statuses[2]}
+	next_prompt=$prompt
+	session=${RESUME_SESSION:-}
+	while true; do
+		flags=(--pure run --format json --model "$MODEL" --agent "${AGENT:-build}" --dir "$PWD"
+			--title "conveyor:${CONVEYOR_SOURCE:-unknown}:${CONVEYOR_ITEM_REF:-unknown}:${CONVEYOR_STAGE:-unknown}")
+		[[ -n "${VARIANT:-}" ]] && flags+=(--variant "$VARIANT")
+		[[ -n "$session" ]] && flags+=(--session "$session")
+		_OPENCODE_PENDING_ID=$pending_id
+		if _opencode_invoke_child "$next_prompt" "$bin" "${flags[@]}"; then result=0; else result=$?; fi
+
+		if [[ -n "$pending_id" && -n "${_OPENCODE_PENDING_ID:-}" ]]; then
+			control_ack "$pending_id" rejected "delivery failed"
+			_OPENCODE_PENDING_ID=""
+		fi
+		if [[ $result -eq 30 ]]; then
+			command=$_OPENCODE_CONTROL_COMMAND
+			id=$(jq -r '.id' <<<"$command")
+			text=$(jq -r '.text' <<<"$command")
+			session=$_OPENCODE_STREAM_SESSION
+			next_prompt=$(control_instruction_brief "$text")
+			pending_id=$id
+			continue
+		fi
+		break
+	done
 	if [[ $result -eq 0 ]]; then
 		rm -f "$(limit_file)" 2>/dev/null || true
 	fi

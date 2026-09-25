@@ -440,6 +440,24 @@ func TestOnStartCarriesLiveRunIdentity(t *testing.T) {
 	}
 }
 
+func TestOnStartDoesNotFireWhenProcessFailsToStart(t *testing.T) {
+	r := New(t.TempDir())
+	started := false
+	result := false
+	r.OnStart = func(model.Run) { started = true }
+	r.OnResult = func(*Result) { result = true }
+	_, err := r.Run(context.Background(), Spec{Script: "/not/here", Kind: "stage", Workdir: t.TempDir()})
+	if err == nil {
+		t.Fatal("expected start failure")
+	}
+	if started {
+		t.Fatal("OnStart fired for a process that never started")
+	}
+	if !result {
+		t.Fatal("OnResult did not fire for the failed start")
+	}
+}
+
 // meta.json is written to a temp file and renamed into place, so a run that
 // dies mid-write leaves the previous meta.json intact rather than truncated.
 func TestMetaJSONWriteIsAtomic(t *testing.T) {

@@ -619,7 +619,18 @@ func cmdServe(args []string) error {
 		return err
 	}
 	defer release()
-	return server.New(cfg, r, c.release).Run(ctx, server.Addr(*addr), mode)
+	srv := server.New(cfg, r, c.release)
+	if err := carryOverForServe(srv, mode); err != nil {
+		return err
+	}
+	return srv.Run(ctx, server.Addr(*addr), mode)
+}
+
+func carryOverForServe(s *server.Server, mode server.Mode) error {
+	if !mode.Settles() {
+		return nil
+	}
+	return s.CarryOverInterrupted()
 }
 
 // resolveMode turns -mode and -watch into the single Mode Run needs.

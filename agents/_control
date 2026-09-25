@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# Sourced by the agent adapters. The one writer of $CONVEYOR_CONTROL_ACK —
+# control-ack.jsonl in the run directory — the mirror image of agents/_plan:
+# where that helper publishes what the run is doing, this one answers what a
+# person asked it to do mid-run (see internal/steering and issue #111).
+#
+# A control channel is never something a run can fail over: every function
+# here is always a no-op exiting 0, whatever goes wrong — no
+# CONVEYOR_CONTROL/CONVEYOR_CONTROL_ACK, an unwritable path, a malformed
+# command line. The one thing that reaches stderr is a reason, for a human
+# reading the log.
+#
+# State that must survive across calls within one run — the advertised
+# accepts set, the current session, how many instructions have been
+# delivered — lives in shell variables, because this file is sourced once
+# into the adapter's own long-lived shell process for the run.
+
+_CONTROL_MAX_DELIVERIES=${CONTROL_MAX_DELIVERIES:-10}
+_CONTROL_WRAP_UP_GRACE=${WRAP_UP_GRACE:-300}
+
+# control_instruction_brief <instruction> — prompt used when an adapter
+# resumes a model session to deliver a person's mid-run instruction. Keep the
+# recovery discipline here so every steerable backend gives the same warning
+# about work left between the observed boundary and the child stopping.
+control_instruction_brief() {
+	local instruction=$1
+	printf '%s' "A person sent this instruction while your run was in progress:
+
+--- mid-run instruction ---
+${instruction}
+--- end mid-run instruction ---
+
+The original task still stands. The working tree may contain partial work from
+the step that just ended. Before building on it, read the current status and
+the full diff, verify what is there, and then either build on it or discard it
+deliberately and say why. Never commit changes you have not read and verified."
+}
+
+# _control_ready — are both control channel variables set and usable: the
+# ack file writable if it exists, its directory writable if not, and the
+# command file at least readable.
+_control_ready() {
+	[[ -n "${CONVEYOR_CONTROL:-}" ]] || return 1
+	[[ -n "${CONVEYOR_CONTROL_ACK:-}" ]] || return 1
+	[[ -r "$CONVEYOR_CONTROL" ]] || return 1
+	if [[ -e "$CONVEYOR_CONTROL_ACK" ]]; then
+		[[ -w "$CONVEYOR_CONTROL_ACK" ]] || return 1
+	else
+		[[ -w "$(dirname -- "$CONVEYOR_CONTROL_ACK")" ]] || return 1
+	fi
+	command -v jq >/dev/null 2>&1 || return 1
+	return 0
+}
+
+# _control_next_seq — the current line count of $CONVEYOR_CONTROL_ACK plus
+# one, so a rejected line still consumes a number and the sequence stays
+# strictly increasing with no counter file — the rule agents/_plan already
+# follows for `rev`.
+_control_next_seq() {
+	local n=0
+	[[ -s "$CONVEYOR_CONTROL_ACK" ]] && n=$(wc -l <"$CONVEYOR_CONTROL_ACK" | tr -d ' ')
+	echo $((n + 1))
+}
+
+_control_append() {
+	printf '%s\n' "$1" >>"$CONVEYOR_CONTROL_ACK" 2>/dev/null || {
+		echo "agents/_control: CONVEYOR_CONTROL_ACK not writable" >&2
+		return 1
+	}
+}
+
+# control_hello <kind...> — announce, once, what kinds this run accepts.
+# Called with no ready channel, this is a silent no-op like everything else
+# here; called more than once in one run is tolerated (the reader ignores a
+# second hello) but the caller contract says once, before the first model
+# call.
+control_hello() {
+	_control_ready || return 0
+	_CONTROL_ACCEPTS=" $* "
+	local accepts_json seq at line
+	accepts_json=$(jq -nc '$ARGS.positional' --args "$@")
+	seq=$(_control_next_seq)
+	at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	line=$(jq -nc --argjson seq "$seq" --arg at "$at" --argjson accepts "$accepts_json" --arg session "${_CONTROL_SESSION:-}" \
+		'{v: 1, type: "hello", seq: $seq, at: $at, accepts: $accepts, session: $session}')
+	_control_append "$line"
+}
+
+# control_session <id> — record the session the run is currently in.
+# Idempotent per id: a second call naming the same session is a no-op, so a
+# backend that reports its session on every event does not flood the ack
+# channel.
+control_session() {
+	_control_ready || return 0
+	local id=$1
+	[[ "$id" == "${_CONTROL_SESSION:-}" ]] && return 0
+	_CONTROL_SESSION="$id"
+	local seq at line
+	seq=$(_control_next_seq)
+	at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	line=$(jq -nc --argjson seq "$seq" --arg at "$at" --arg session "$id" \
+		'{v: 1, type: "session", seq: $seq, at: $at, session: $session}')
+	_control_append "$line"
+}
+
+# control_ack <id> consumed|rejected [reason] — resolve one command.
+control_ack() {
+	_control_ready || return 0
+	local id=$1 state=$2 reason=${3:-}
+	local seq at line
+	seq=$(_control_next_seq)
+	at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	line=$(jq -nc --argjson seq "$seq" --arg at "$at" --arg id "$id" --arg state "$state" --arg reason "$reason" \
+		'{v: 1, type: "ack", seq: $seq, at: $at, id: $id, state: $state, reason: $reason}')
+	_control_append "$line"
+}
+
+# _control_already_acked <id> — has any ack line already named this id.
+_control_already_acked() {
+	local id=$1
+	[[ -s "$CONVEYOR_CONTROL_ACK" ]] || return 1
+	local l
+	while IFS= read -r l; do
+		jq -e . >/dev/null 2>&1 <<<"$l" || continue
+		if [[ "$(jq -r '.type // ""' <<<"$l")" == "ack" && "$(jq -r '.id // ""' <<<"$l")" == "$id" ]]; then
+			return 0
+		fi
+	done <"$CONVEYOR_CONTROL_ACK"
+	return 1
+}
+
+# _control_kind_of <id> — the kind of the command in $CONVEYOR_CONTROL that
+# carries this id, or nothing (and failure) if none does.
+_control_kind_of() {
+	local id=$1
+	[[ -s "$CONVEYOR_CONTROL" ]] || return 1
+	local l
+	while IFS= read -r l; do
+		jq -e . >/dev/null 2>&1 <<<"$l" || continue
+		if [[ "$(jq -r '.type // ""' <<<"$l")" == "command" && "$(jq -r '.id // ""' <<<"$l")" == "$id" ]]; then
+			jq -r '.kind' <<<"$l"
+			return 0
+		fi
+	done <"$CONVEYOR_CONTROL"
+	return 1
+}
+
+# _control_delivered_count — how many instruction-kind commands have already
+# been handed to the caller and reached a delivery outcome (consumed, or
+# rejected as "delivery failed") — never a shell variable, since control_poll
+# is always called through command substitution by its caller (it prints its
+# result), which forks a subshell and would silently drop any counter kept
+# only in memory. Recomputed from the two files on disk instead, so it
+# survives that and a restart alike.
+_control_delivered_count() {
+	local count=0
+	if [[ -s "$CONVEYOR_CONTROL_ACK" ]]; then
+		local l
+		while IFS= read -r l; do
+			jq -e . >/dev/null 2>&1 <<<"$l" || continue
+			[[ "$(jq -r '.type // ""' <<<"$l")" == "ack" ]] || continue
+			local id state reason kind
+			id=$(jq -r '.id // ""' <<<"$l")
+			state=$(jq -r '.state // ""' <<<"$l")
+			reason=$(jq -r '.reason // ""' <<<"$l")
+			if [[ "$state" == "consumed" || "$reason" == "delivery failed" ]]; then
+				kind=$(_control_kind_of "$id") || continue
+				[[ "$kind" == "instruction" ]] && count=$((count + 1))
+			fi
+		done <"$CONVEYOR_CONTROL_ACK"
+	fi
+	echo "$count"
+}
+
+# _control_past_wrap_up — less than WRAP_UP_GRACE seconds remain before
+# CONVEYOR_DEADLINE. An unset deadline means no deadline and never triggers
+# this, the same reading agents/_deadline gives it.
+_control_past_wrap_up() {
+	[[ -n "${CONVEYOR_DEADLINE:-}" ]] || return 1
+	local deadline_epoch now_epoch
+	deadline_epoch=$(date -u -d "$CONVEYOR_DEADLINE" +%s 2>/dev/null) || return 1
+	now_epoch=$(date -u +%s)
+	((deadline_epoch - now_epoch < _CONTROL_WRAP_UP_GRACE))
+}
+
+# control_poll — print the next command from $CONVEYOR_CONTROL still without
+# an ack, in file order, or nothing. A command that fails a filter along the
+# way (stale session, unsupported kind, the delivery ceiling, the wrap-up
+# guard) is acked rejected with the stated reason and skipped, rather than
+# stopping the scan — so one bad command never hides a good one behind it.
+control_poll() {
+	_control_ready || return 0
+	[[ -s "$CONVEYOR_CONTROL" ]] || return 0
+	local n i
+	n=$(wc -l <"$CONVEYOR_CONTROL" | tr -d ' ')
+	for ((i = 1; i <= n; i++)); do
+		local raw
+		raw=$(sed -n "${i}p" "$CONVEYOR_CONTROL")
+		jq -e . >/dev/null 2>&1 <<<"$raw" || continue
+		[[ "$(jq -r '.type // ""' <<<"$raw")" == "command" ]] || continue
+		local id
+		id=$(jq -r '.id // ""' <<<"$raw")
+		[[ -n "$id" ]] || continue
+		_control_already_acked "$id" && continue
+
+		local kind session
+		kind=$(jq -r '.kind // ""' <<<"$raw")
+		session=$(jq -r '.session // ""' <<<"$raw")
+
+		if [[ -n "$session" && "$session" != "${_CONTROL_SESSION:-}" ]]; then
+			control_ack "$id" rejected "stale session"
+			continue
+		fi
+		if [[ " ${_CONTROL_ACCEPTS:-} " != *" $kind "* ]]; then
+			control_ack "$id" rejected "unsupported kind"
+			continue
+		fi
+		if [[ "$kind" == "instruction" ]]; then
+			if (($(_control_delivered_count) >= _CONTROL_MAX_DELIVERIES)); then
+				control_ack "$id" rejected "too many deliveries in one run"
+				continue
+			fi
+			if _control_past_wrap_up; then
+				control_ack "$id" rejected "past wrap-up"
+				continue
+			fi
+		fi
+		printf '%s\n' "$raw"
+		return 0
+	done
+	return 0
+}

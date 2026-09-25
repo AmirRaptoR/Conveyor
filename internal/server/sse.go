@@ -15,7 +15,7 @@ import (
 // --- SSE -------------------------------------------------------------------
 
 type event struct {
-	Kind       string               `json:"kind"` // log | state | polling | transition | plan
+	Kind       string               `json:"kind"` // log | state | polling | transition | plan | steering
 	RunID      string               `json:"runId,omitempty"`
 	ItemID     string               `json:"itemId,omitempty"`
 	Line       *runner.LogLine      `json:"line,omitempty"`
@@ -25,9 +25,10 @@ type event struct {
 	// count for the run named by RunID — published for every accepted
 	// revision and every rejection alike, so a run that publishes one good
 	// revision and then only bad ones still moves the board's count.
-	Plan     *plan.Revision `json:"plan,omitempty"`
-	Accepted *int           `json:"accepted,omitempty"`
-	Rejected *int           `json:"rejected,omitempty"`
+	Plan     *plan.Revision   `json:"plan,omitempty"`
+	Accepted *int             `json:"accepted,omitempty"`
+	Rejected *int             `json:"rejected,omitempty"`
+	Steering *RunSteeringView `json:"steering,omitempty"`
 }
 
 type hub struct {

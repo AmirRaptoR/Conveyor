@@ -203,6 +203,18 @@ func (s *Server) runSweep(w io.Writer) {
 				s.planGeneration[itemID]++
 			}
 		}
+		for itemID, v := range s.steering {
+			if deleted[v.RunID] {
+				delete(s.steering, itemID)
+				s.steeringGen[itemID]++
+			}
+		}
+		for itemID, v := range s.steeringMisses {
+			if deleted[v.RunID] {
+				delete(s.steeringMisses, itemID)
+				s.steeringGen[itemID]++
+			}
+		}
 	}
 	s.mu.Unlock()
 	s.runStoreMu.Unlock()

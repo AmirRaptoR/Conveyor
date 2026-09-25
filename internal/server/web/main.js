@@ -6,6 +6,7 @@ import { load, loadDoctor, fault } from "./shared.js";
 import { draw, tickDurations } from "./board.js";
 import { openItemId, followRun, logPending, logBuffer, loadHistory, renderLine, trimLog } from "./panel.js";
 import { applyPlanEvent } from "./plans.js";
+import { applySteeringEvent } from "./steering.js";
 
 // How the board finds out anything changed. The stream is the fast path and
 // the poll is the one that is always right — the stream is a live TCP
@@ -40,6 +41,10 @@ function onMessage(ev) {
     // card cannot wait for the slow poll merely because that first response
     // saw the active run just before it saw its plan.
     refresh();
+    return;
+  }
+  if (e.kind === "steering") {
+    applySteeringEvent(e);
     return;
   }
   if (e.kind === "transition" && openItemId && e.transition?.item?.id === openItemId) loadHistory(openItemId);

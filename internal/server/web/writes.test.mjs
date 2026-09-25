@@ -46,6 +46,22 @@ test("load: a 2xx response draws", async () => {
   assert.equal(p.el("#rail").writes, 1, "a successful load rebuilds the board exactly once");
 });
 
+test("load: an older state response cannot overwrite a newer request", async () => {
+  const pending = [];
+  const p = await page({ fetch: async () => new Promise(resolve => pending.push(resolve)) });
+  const older = p.mod.load();
+  const newer = p.mod.load();
+  const response = value => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => value });
+
+  pending[1](response({ items: [], updatedAt: "2026-09-25T12:00:02Z" }));
+  await newer;
+  assert.equal(p.el("#rail").writes, 1);
+
+  pending[0](response({ items: [{ id: "stale" }], updatedAt: "2026-09-25T12:00:01Z" }));
+  await older;
+  assert.equal(p.el("#rail").writes, 1, "the superseded response must not redraw stale state");
+});
+
 // ---- startItem() — POST /api/items/{id}/start ---------------------------
 
 test("startItem: a network rejection is caught and reported, not thrown", async () => {

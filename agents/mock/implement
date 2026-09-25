@@ -4,9 +4,13 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/../_plan"
+source "$here/../_control"
 
 payload=$(cat)
-echo "implementing $(jq -r '.item.id' <<<"$payload")"
+item_id=$(jq -r '.item.id' <<<"$payload")
+echo "implementing $item_id"
+
+session="mock:$item_id"
 
 steps=(branch "red test" implement suite review merge)
 
@@ -27,11 +31,46 @@ publish_progress() {
 	plan_publish "$todos"
 }
 
+# handle_command <line> — honour one command control_poll returned: an
+# instruction is acked consumed and logged so the step loop continues; a
+# pause is acked consumed, writes a paused $CONVEYOR_RESULT the way
+# agents/opencode/_stream's pause path does, and ends the run with exit 20 —
+# a person's decision, not a condition, so it must never look like one of
+# the ordinary exits below.
+handle_command() {
+	local line=$1 id kind text by at
+	id=$(jq -r '.id' <<<"$line")
+	kind=$(jq -r '.kind' <<<"$line")
+	by=$(jq -r '.by' <<<"$line")
+	at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	case "$kind" in
+	pause)
+		control_ack "$id" consumed
+		jq -n --arg session "$session" --arg reason "paused by $by at $at" \
+			'{blocked: true, kind: "paused", asked: true, session: $session, reason: $reason}' \
+			>"$CONVEYOR_RESULT"
+		echo "paused by $by"
+		exit 20
+		;;
+	instruction)
+		text=$(jq -r '.text' <<<"$line")
+		echo "  instruction from $by: $text"
+		control_ack "$id" consumed
+		;;
+	esac
+}
+
+control_hello instruction pause
+control_session "$session"
+
 plan_start "mock implement"
 for i in "${!steps[@]}"; do
 	publish_progress "$i"
 	echo "  ${steps[$i]}"
 	sleep 0.4
+
+	cmd=$(control_poll)
+	[[ -n "$cmd" ]] && handle_command "$cmd"
 done
 publish_progress "${#steps[@]}"
 

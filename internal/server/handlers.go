@@ -81,13 +81,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	// run starts — is what the live plan is actually keyed against, and
 	// takes precedence here so a fresh run's plan is not dropped from every
 	// poll until discovery happens to relist it.
-	stageOf := make(map[string]string, len(st.Items))
-	for _, it := range st.Items {
-		stageOf[it.ID] = it.Stage
-	}
-	for _, a := range st.Active {
-		stageOf[a.ItemID] = a.Stage
-	}
+	stageOf := effectiveStages(st.Items, st.Active)
 	if len(s.plans) > 0 {
 		st.Plans = make(map[string]PlanView, len(s.plans))
 		for id, p := range s.plans {
@@ -97,6 +91,17 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(st.Plans) == 0 {
 			st.Plans = nil
+		}
+	}
+	if len(s.steering) > 0 {
+		st.Steering = make(map[string]SteeringSummary, len(s.steering))
+		for id, v := range s.steering {
+			if cur, onBoard := stageOf[id]; onBoard && v.Stage == cur {
+				st.Steering[id] = v
+			}
+		}
+		if len(st.Steering) == 0 {
+			st.Steering = nil
 		}
 	}
 	st.TransitionErrors = make(map[string]TransitionError, len(s.transitionErrs))

@@ -15,6 +15,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/push"
+	"github.com/AmirRaptoR/Conveyor/internal/registry"
 	"github.com/AmirRaptoR/Conveyor/internal/release"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 	"github.com/AmirRaptoR/Conveyor/internal/store"
@@ -119,6 +120,9 @@ type State struct {
 	// has actually published a plan; the engine derives no meaning from its
 	// contents beyond the counts and the current step already computed here.
 	Plans map[string]PlanView `json:"plans,omitempty"`
+	// Steering is each item's compact control-channel state. Full commands
+	// stay on GET /api/runs/{id} and steering SSE events.
+	Steering map[string]SteeringSummary `json:"steering,omitempty"`
 	// Active is every transition running right now. The board lights those
 	// stations; without it the page cannot tell work from stillness.
 	Active []Active `json:"active"`
@@ -229,6 +233,26 @@ type PlanView struct {
 type planCursor struct {
 	Stage string
 	RunID string
+}
+
+// SteeringSummary is the bounded card/state representation of one run's
+// control channel. AckSeq and Version disambiguate updates whose command
+// MaxSeq is equal but whose ack state or malformed count changed.
+type SteeringSummary struct {
+	RunID     string   `json:"runId"`
+	Stage     string   `json:"stage"`
+	Session   string   `json:"session"`
+	Accepts   []string `json:"accepts"`
+	Queued    int      `json:"queued"`
+	Consumed  int      `json:"consumed"`
+	Rejected  int      `json:"rejected"`
+	Carried   int      `json:"carried"`
+	Dropped   int      `json:"dropped"`
+	Malformed int      `json:"malformed"`
+	MaxSeq    int      `json:"maxSeq"`
+	AckSeq    int      `json:"ackSeq"`
+	Version   int      `json:"version"`
+	Live      bool     `json:"live"`
 }
 
 // TransitionError is an infrastructure failure a transition hit for an item —
@@ -452,6 +476,9 @@ type Server struct {
 	// rejects one that began before retention deleted what it read.
 	planMisses     map[string]planCursor
 	planGeneration map[string]uint64
+	steering       map[string]SteeringSummary
+	steeringMisses map[string]planCursor
+	steeringGen    map[string]uint64
 	runStoreGen    uint64
 	// transitionErrs is the last infrastructure error a transition hit for an
 	// item — an initial provider move that failed, an unknown source or
@@ -532,6 +559,14 @@ type Server struct {
 	// without touching any other run's context.
 	cancelFns sync.Map
 	active    sync.Map // itemID -> Active, one entry per transition in flight
+	// liveRuns is the live-run registry (#111): the one place that knows a
+	// stage process is actually running right now and where its run
+	// directory is. Opened in Runner.OnStart and closed in
+	// Runner.OnProcessExit, before the runner's final control-channel read, so
+	// an entry exists exactly while the process is live — active cannot serve
+	// this, since it is set before Engine.Advance and survives the post-stage
+	// provider move.
+	liveRuns *registry.Registry
 	// working is which items have a transition in flight, recorded before the
 	// goroutine starts rather than from inside it.
 	//
@@ -670,6 +705,7 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 		wake:         make(chan struct{}, 1),
 		ctx:          context.Background(),
 		drainGrace:   drainGrace,
+		liveRuns:     registry.New(),
 	}
 	s.pushSubs = push.OpenStore(filepath.Join(cfg.DataDir(), "push.json"))
 	if keys, err := push.LoadKeys(filepath.Join(cfg.DataDir(), "vapid.json")); err != nil {
@@ -682,6 +718,9 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 	s.plans = map[string]PlanView{}
 	s.planMisses = map[string]planCursor{}
 	s.planGeneration = map[string]uint64{}
+	s.steering = map[string]SteeringSummary{}
+	s.steeringMisses = map[string]planCursor{}
+	s.steeringGen = map[string]uint64{}
 	s.transitionErrs = map[string]TransitionError{}
 	s.paused = map[string]PauseView{}
 	s.cancels = map[string]CancelView{}
@@ -722,13 +761,40 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 		if prevStart != nil {
 			prevStart(run)
 		}
+		// Only a stage run naming a real item and target stage is ever
+		// steerable — a list, move, doctor or status run never is.
+		if run.Kind == "stage" && run.ItemID != "" && run.To != "" {
+			s.liveRuns.Open(run.ItemID, registry.Entry{RunID: run.ID, Dir: run.Dir, Stage: run.To})
+			s.mu.Lock()
+			s.steeringGen[run.ItemID]++
+			s.steering[run.ItemID] = SteeringSummary{RunID: run.ID, Stage: run.To, Live: true}
+			delete(s.steeringMisses, run.ItemID)
+			s.mu.Unlock()
+		}
+		// noteRunStarted publishes state. The live steering summary above must
+		// already exist when a client reacts to that publication.
 		s.noteRunStarted(run)
+	}
+	prevProcessExit := r.OnProcessExit
+	r.OnProcessExit = func(run model.Run) {
+		if run.Kind == "stage" && run.ItemID != "" {
+			s.liveRuns.Close(run.ItemID, run.ID)
+		}
+		if prevProcessExit != nil {
+			prevProcessExit(run)
+		}
 	}
 	// Every run this Runner executes — list, move, stage, doctor, status —
 	// reaches here, which is what lets one place notice a persistence fault
 	// without a check threaded through every call site that starts a run.
 	prevResult := r.OnResult
 	r.OnResult = func(res *runner.Result) {
+		// Defensive and harmless if OnProcessExit already closed it. This also
+		// keeps synthetic results and future early-return paths from leaking an
+		// entry if they ever acquire one.
+		if res != nil && res.Run.Kind == "stage" && res.Run.ItemID != "" {
+			s.liveRuns.Close(res.Run.ItemID, res.Run.ID)
+		}
 		if prevResult != nil {
 			prevResult(res)
 		}
@@ -743,6 +809,13 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 			prevPlan(runID, itemID, u)
 		}
 		s.handlePlanUpdate(runID, itemID, u)
+	}
+	prevSteering := r.OnSteering
+	r.OnSteering = func(runID, itemID string, u runner.SteeringUpdate) {
+		if prevSteering != nil {
+			prevSteering(runID, itemID, u)
+		}
+		s.handleSteeringUpdate(runID, itemID, u)
 	}
 	return s
 }

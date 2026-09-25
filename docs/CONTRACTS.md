@@ -166,7 +166,7 @@ author learns it once.
 | | |
 | --- | --- |
 | `stdin` | A JSON object: `{"item": {...}, "stage": "in-progress", "from": "ready", "blocked": false, "config": {...}}`, plus `"answer"` and `"session"` when this run follows a stop a person answered (§5a). For `list` scripts there is no item: `{"source": "midgame", "stages": ["backlog","ready",…], "terminalStages": ["done"], "config": {...}}` — `terminalStages` is which of `stages` are terminal, so a list script can tell a finished item from one that merely stopped without keeping its own copy of the stage graph in source `env:` |
-| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_PLAN` (path to append a live plan/todo revision, §2a), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, `CONVEYOR_DEADLINE` (§4b), `CONVEYOR_DEPENDENCIES_AT` when this stage's dependency policy is engine-owned (§4), `CONVEYOR_MANUAL` when a person armed one of this stage's `actions:` for this run (§5b), plus everything in the source's `env:` block |
+| env | `CONVEYOR_RESULT` (path to write structured output), `CONVEYOR_PLAN` (path to append a live plan/todo revision, §2a), `CONVEYOR_CONTROL` and `CONVEYOR_CONTROL_ACK` (the live command and acknowledgement paths, §2b), `CONVEYOR_WORKDIR`, `CONVEYOR_SOURCE`, `CONVEYOR_STAGE`, `CONVEYOR_ITEM_ID`, `CONVEYOR_ITEM_REF`, `CONVEYOR_DEADLINE` (§4b), `CONVEYOR_DEPENDENCIES_AT` when this stage's dependency policy is engine-owned (§4), `CONVEYOR_MANUAL` when a person armed one of this stage's `actions:` for this run (§5b), plus everything in the source's `env:` block |
 
 **Output** is split deliberately:
 
@@ -175,13 +175,15 @@ author learns it once.
 | `stdout` + `stderr` | **Logs only.** Streamed live to the UI, line by line, interleaved in order. Never parsed. |
 | `$CONVEYOR_RESULT` | **Structured data only.** A JSON file the script writes, read once, after the process exits. Absent means "no data". A list script may write the legacy item array or `{ "items": [...], "warnings": [{"itemId":"...", "reason":"..."}] }`; warnings are non-fatal and shown to the operator. |
 | `$CONVEYOR_PLAN` | **A live plan, appended to while the script runs** (§2a). One JSON todo revision per line; the engine tails it, so a long-running stage can show progress before it exits — the one thing `$CONVEYOR_RESULT` cannot do. |
+| `$CONVEYOR_CONTROL` | **Commands into a live run** (§2b). The engine appends versioned `instruction` and `pause` records; the script reads them only at boundaries it considers safe. |
+| `$CONVEYOR_CONTROL_ACK` | **Capability and acknowledgements out of a live run** (§2b). The script appends versioned `hello`, `session` and `ack` records; the engine tails them. |
 
-Logs, the result and the plan are three separate channels on purpose. An AI
-agent writes megabytes of prose to stdout; parsing data out of that is how
-this kind of system breaks. If a script writes nothing to the result file, it
-simply produced no data — and a script that publishes no plan produces no
-plan entry, never a warning: publishing one is an adapter's promise, never
-required by the engine or the config (CLAUDE.md's extension-seam invariant).
+These channels are separate on purpose. An AI agent writes megabytes of prose
+to stdout; parsing data out of that is how this kind of system breaks. If a
+script writes nothing to the result file, it simply produced no data — and a
+script that publishes no plan or capability produces no corresponding board
+entry, never a warning: both are adapter promises, never requirements of the
+engine or the config (CLAUDE.md's extension-seam invariant).
 
 ### 2a. The plan channel
 
@@ -211,6 +213,86 @@ adapter or a hand-written one. A malformed line — bad JSON, a non-increasing
 is rejected and logged (as an `engine`-stream log line, capped and
 summarized), never fails the run, and never touches the item's mark: a plan
 is presentation and record-keeping, and the scheduler never learns it exists.
+
+### 2b. The control channel
+
+Every run gets two more engine-named, pre-created `0600` files in its run
+directory. `$CONVEYOR_CONTROL` names `control.jsonl`, written only by the
+engine and read by the script; `$CONVEYOR_CONTROL_ACK` names
+`control-ack.jsonl`, written only by the script and tailed by the engine. A
+source's `env:` or a script's `params:` cannot redirect either one. Empty files
+are normal. Keeping one writer per append-only file avoids cross-process writer
+coordination and, more importantly, makes a command part of exactly one archived
+run rather than something that can leak into its successor.
+
+Both files contain newline-terminated, versioned JSON records with a strictly
+increasing `seq` starting at 1 in each file. A command record carries its
+`id`, `kind` (`instruction` or `pause`), text, time and requester, and the exact
+item, run and current adapter session the server bound it to. The session may
+still be empty before a backend has reported one; in that window the run
+binding is the structural guard. Once a session is known, a client naming a
+different one is refused and a queued command bound to a superseded session is
+rejected as stale. The server writes the record before returning `202`.
+`by` is the existing `requestedBy` audit value: an authenticated username when
+TCP Basic Auth is configured, but caller-supplied or empty when auth is disabled
+or the request uses the deliberately unauthenticated local Unix socket.
+
+Capability comes from the process, never config. A script that supports this
+protocol first appends one `hello` record naming the command kinds it accepts,
+then `session` records when its backend handle changes, and an `ack` resolving
+each command as `consumed` or `rejected`. The board offers Add instruction or
+Pause after current step only for the current live stage run and only for kinds
+in that run's first valid `hello`; cancellation remains the separate immediate
+process-group kill. The shipped OpenCode adapter advertises `instruction` and
+`pause`. The Claude adapter advertises nothing, so neither steering control is
+offered for a Claude run. There is no `steerable:` config key and a script that
+does not advertise the protocol keeps working unchanged.
+
+The script owns the safe boundary because only its adapter understands its
+backend. `agents/_control` is the shipped acknowledgement writer and command
+reader, but an adapter chooses when to call `control_poll`. OpenCode polls only
+at an observed `step_finish` where every tool part it has seen is terminal. It
+then asks the child to stop, waits briefly before escalating to KILL, and either
+resumes the same OpenCode session with the instruction or writes a resumable
+`paused` stop and exits 20. This guarantees where the adapter makes its
+decision, not that the backend has begun no further work between emitting and
+the adapter reading that event. A normal instruction therefore never asks the
+adapter to interrupt an observed active tool, while immediate Cancel retains
+its deliberately stronger semantics.
+
+The files are the persistent record. A command is `queued` until the first ack
+that names it makes it `consumed` or `rejected`; the first ack wins. Restart
+carry-over may instead resolve it as `carried` or `dropped`, and a command still
+unresolved when an ordinary run ends is shown as `rejected: run ended`. The
+board exposes the compact current-stage summary in `/api/state`, the full
+per-run record from `GET /api/runs/{id}`, and live updates over SSE. Recovery
+uses the newest stage run for an item in its current stage, just as plan
+recovery does. Malformed lines are diagnosed in the engine log, with a cap,
+and never fail or mark the run; unknown record types and fields are ignored,
+while an unknown protocol version is rejected.
+
+If `conveyor serve` is restarted, startup examines only each item's newest
+stage run and only when that run was settled as interrupted. Queued
+instructions are appended, in order, to the existing one-shot armed answer
+(§5a), carrying the OpenCode session when one is available; carry-over is
+at-least-once with content deduplication because the answer file and run file
+cannot be updated atomically. A queued pause is dropped because the process it
+would have stopped is already gone. The outcome is appended as a `carried`
+record to the old run's control file. Nothing is replayed into a later run's
+control channel. Observe mode, `conveyor run` and `conveyor tick` do not perform
+this carry-over.
+
+The protocol is bounded: 50 commands and 200 acknowledgement lines per run,
+64 KiB per line, 1024 code points of instruction text and 500 of acknowledgement
+reason. The shipped helper delivers at most `CONTROL_MAX_DELIVERIES`
+instructions per run (10 by default) and rejects one too close to
+`CONVEYOR_DEADLINE` to clear `WRAP_UP_GRACE`; unusable channel paths are a
+no-op rather than a reason to fail work.
+
+Steering is not flow control. A command does not move an item, choose or skip a
+stage, affect `pipeline.Target`, claim a slot, or change scheduler order. A
+pause marks the item only because the script writes the ordinary blocked result
+and exits 20. The scheduler does not know the channel exists.
 
 **Exit codes** are the whole control flow:
 
@@ -770,6 +852,10 @@ data/runs/<yyyy-mm-dd>/<run-id>/
   plan.jsonl     the plan channel (§2a): one JSON todo revision per accepted
                  line, always present (may be empty) — pre-created the same
                  way result.json is
+  control.jsonl  engine-to-script commands (§2b), always present (may be empty)
+  control-ack.jsonl
+                  script-to-engine capability, session and acknowledgements
+                  (§2b), always present (may be empty)
 ```
 
 Self-contained is the point: a failed run can be `tar`'d and handed to someone
@@ -958,6 +1044,12 @@ which stores them, hands them back once, and never reads either: what resuming
 says the answer into the conversation that asked it; an adapter with only the
 answer leads its original prompt with it and starts fresh, which costs the
 rediscovery but never costs the answer.
+
+This is also the recovery path for an instruction left queued when `serve`
+stopped (§2b): it is appended to the armed answer and reaches the next run once,
+with the carried session when available, rather than being copied into that
+run's control channel. A control-channel `pause` becomes an ordinary asked
+`paused` mark, so handing it back here resumes by the same rule.
 
 An answer is spent when it is handed over. A second run of the same stage is not
 a second reply to one question.
