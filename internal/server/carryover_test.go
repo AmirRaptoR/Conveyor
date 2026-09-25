@@ -177,7 +177,7 @@ func TestCarryOverLayersAnswerInSequenceAndKeepsExistingSessionOnConflict(t *tes
 	}
 	wantAnswer := before.Answer + "\n\n--- carried from the interrupted run " + runID + " ---\nfirst\n\nsecond"
 	got := s.answers.Get("s1:1")
-	if got.Answer != wantAnswer || got.Session != before.Session || got.Manual != before.Manual {
+	if got.Answer != wantAnswer || got.Session != before.Session || got.Manual != before.Manual || got.ControlCarryover {
 		t.Fatalf("layered answer = %+v, want answer %q with existing session/manual", got, wantAnswer)
 	}
 	for _, cmd := range steering.Load(dir, false).Commands {
@@ -300,6 +300,43 @@ func TestCarryOverBindsAnAlreadyCarriedLegacyAnswer(t *testing.T) {
 	got := s.answers.Get("s1:1")
 	if got.Stage != "working" || got.Script == "" || got.Session != "raw-legacy-session" {
 		t.Fatalf("legacy carry-over was not safely bound without rewriting its session: %+v", got)
+	}
+}
+
+func TestLegacyCarryOverWithNoScriptIdentityIsRemoved(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	runID := "120000.000-no-script"
+	dir := interruptedRun(t, s, runID)
+	queuedCommand(t, dir, "c1", runID, steering.KindInstruction, "cannot bind me")
+	if _, err := steering.AppendCarried(filepath.Join(dir, "control.jsonl"), time.Now(), []steering.CarriedEntry{{
+		ID: "c1", State: steering.StateCarried,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	metaBytes, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta model.Run
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		t.Fatal(err)
+	}
+	meta.Script = ""
+	metaBytes, _ = json.Marshal(meta)
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), metaBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	block := "\n\n--- carried from the interrupted run " + runID + " ---\ncannot bind me"
+	if err := s.answers.Set("s1:1", model.Resume{Answer: block, Session: "raw-session"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.CarryOverInterrupted(); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.answers.Get("s1:1"); got != (model.Resume{}) {
+		t.Fatalf("unbound legacy carry-over survived: %+v", got)
 	}
 }
 

@@ -431,7 +431,8 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 			To:      to,
 			Timeout: timeout,
 			Stdin: model.StageInput{Item: item, Stage: to, From: from,
-				Answer: resume.Answer, Session: resume.Session, Manual: resume.Manual},
+				Answer: resume.Answer, Session: resume.Session, ControlCarryover: resume.ControlCarryover,
+				Manual: resume.Manual},
 		})
 		if runErr != nil && res == nil {
 			// A genuine infrastructure failure before the script had any

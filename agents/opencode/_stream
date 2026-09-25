@@ -35,9 +35,10 @@ record_model() {
 }
 
 resume_prompt() {
-	local payload=$1 default=$2 answer session
+	local payload=$1 default=$2 answer session control_carryover
 	answer=$(jq -r '.answer // ""' <<<"$payload")
 	session=$(jq -r '.session // ""' <<<"$payload")
+	control_carryover=$(jq -r '.controlCarryover // false' <<<"$payload")
 	if [[ -z "$answer" ]]; then
 		printf '%s' "$default"
 		return 0
@@ -51,7 +52,7 @@ resume_prompt() {
 	# Before control sessions became adapter-owned, OpenCode advertised its raw
 	# id. Only a restart carry-over has this marker, so accept that legacy shape
 	# without treating an ordinary foreign session as OpenCode's.
-	if [[ -n "$session" && "$answer" == *"--- carried from the interrupted run "* ]]; then
+	if [[ -n "$session" && "$control_carryover" == true ]]; then
 		RESUME_SESSION=$session
 		echo "resuming the interrupted OpenCode conversation (session ${RESUME_SESSION:0:8})" >&2
 		printf '%s' "$answer"

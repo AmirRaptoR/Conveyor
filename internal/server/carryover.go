@@ -91,6 +91,12 @@ func (s *Server) carryOverRun(run RunMeta) error {
 			if armed.Session == "" && res.Session != "" {
 				armed.Session, changed = res.Session, true
 			}
+			if res.Session != "" {
+				legacyControl := armed.Session == res.Session
+				if armed.ControlCarryover != legacyControl {
+					armed.ControlCarryover, changed = legacyControl, true
+				}
+			}
 			if changed {
 				if err := s.answers.Set(run.ItemID, armed); err != nil {
 					return err
@@ -100,12 +106,14 @@ func (s *Server) carryOverRun(run RunMeta) error {
 			armed.Answer += block
 			armed.Stage = run.To
 			armed.Script = binding
+			armed.ControlCarryover = true
 			if res.Session != "" {
 				switch {
 				case armed.Session == "":
 					armed.Session = res.Session
 				case armed.Session != res.Session:
 					reason += "; session conflict: kept the existing armed-answer session"
+					armed.ControlCarryover = false
 				}
 			}
 			if err := s.answers.Set(run.ItemID, armed); err != nil {
@@ -134,7 +142,13 @@ func (s *Server) bindLegacyCarryOver(run RunMeta, session string, instructions [
 	}
 	binding, err := runScriptBinding(run)
 	if err != nil || (armed.Script != "" && armed.Script != binding) {
-		return nil
+		armed.Answer = strings.Replace(armed.Answer, block, "", 1)
+		if strings.TrimSpace(armed.Answer) == "" {
+			armed = model.Resume{}
+		} else {
+			armed.ControlCarryover = false
+		}
+		return s.answers.Set(run.ItemID, armed)
 	}
 	changed := false
 	if armed.Stage == "" {
@@ -145,6 +159,12 @@ func (s *Server) bindLegacyCarryOver(run RunMeta, session string, instructions [
 	}
 	if armed.Session == "" && session != "" {
 		armed.Session, changed = session, true
+	}
+	if session != "" {
+		legacyControl := armed.Session == session
+		if armed.ControlCarryover != legacyControl {
+			armed.ControlCarryover, changed = legacyControl, true
+		}
 	}
 	if changed {
 		return s.answers.Set(run.ItemID, armed)

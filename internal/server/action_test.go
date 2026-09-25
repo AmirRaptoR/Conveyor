@@ -134,6 +134,25 @@ func TestAnActionAndAnAnswerBothSurvive(t *testing.T) {
 	}
 }
 
+func TestActionDoesNotRebindInputFromAReplacedScript(t *testing.T) {
+	cfg, r := boardWithAction(t)
+	s := New(cfg, r)
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "working"}}
+	if err := s.answers.Set("s1:1", model.Resume{
+		Answer: "stale instruction", Stage: "working", Script: "path:old-script", ControlCarryover: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if w := postAction(t, s, "s1:1", "merge-now"); w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d (%s), want 204", w.Code, w.Body.String())
+	}
+	got := s.answers.Get("s1:1")
+	if got.Answer != "" || got.ControlCarryover || got.Manual != "merge-now" {
+		t.Fatalf("action rebound stale script input: %+v", got)
+	}
+}
+
 // The stage's actions reach the board, because the board offers exactly what
 // the config declares and invents nothing.
 func TestActionsAreHandedToTheBoard(t *testing.T) {

@@ -334,14 +334,14 @@ chk "resume uses the exact session" "$(grep -A1 -Fx -- '--session' "$OC_ARGS" | 
 
 RESUME_SESSION=""
 legacy_answer=$'\n\n--- carried from the interrupted run 120000.000-old ---\ncontinue safely'
-legacy_payload=$(jq -nc --arg answer "$legacy_answer" --arg session "ses-legacy" '{answer:$answer,session:$session}')
+legacy_payload=$(jq -nc --arg answer "$legacy_answer" --arg session "ses-legacy" '{answer:$answer,session:$session,controlCarryover:true}')
 prompt=$(resume_prompt "$legacy_payload" 'original' 2>/dev/null)
 resume_prompt "$legacy_payload" 'original' >/dev/null 2>&1
 chk "a legacy carried control session keeps its opaque handle" "$RESUME_SESSION" "ses-legacy"
 chk "legacy carry-over resumes with the carried instruction" "$prompt" "$legacy_answer"
 
 RESUME_SESSION=""
-resume_prompt '{"answer":"continue","session":"foreign-session"}' 'original' >/dev/null 2>&1
+resume_prompt '{"answer":"continue","session":"foreign-session","controlCarryover":false}' 'original' >/dev/null 2>&1
 chk "an ordinary unprefixed session remains foreign" "${RESUME_SESSION:-}" ""
 
 export CONVEYOR_RESULT="$tmp/result"
