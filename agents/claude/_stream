@@ -67,7 +67,7 @@ claude_model() {
 # It never fails, because the adapter's exit status is the run's verdict and a
 # note about the run has no business changing it.
 record_model() {
-	local model
+	local model line
 	model=$(claude_model) || return 0
 	[[ -n "$model" && "$model" != "null" ]] || return 0
 	# `|| true` is the whole of "it never fails": stdout here is a pipe to the
@@ -76,7 +76,8 @@ record_model() {
 	# without this the adapter leaves on the note's status and never reaches
 	# `exit $rc`. A run that did the work would then be recorded as a failure
 	# because the line describing it could not be written.
-	echo "model: $model" || true
+	line=$(redact_text "model: $model") || line="model: [REDACTED]"
+	echo "$line" || true
 	return 0
 }
 

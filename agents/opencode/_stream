@@ -31,8 +31,10 @@ claude_session() {
 claude_model() { printf '%s' "${MODEL:-}"; }
 
 record_model() {
+	local line
 	[[ -n "${MODEL:-}" ]] || return 0
-	printf 'model: %s%s agent: %s\n' "$MODEL" "${VARIANT:+ variant: $VARIANT}" "${AGENT:-build}" || true
+	line=$(redact_text "model: $MODEL${VARIANT:+ variant: $VARIANT} agent: ${AGENT:-build}") || line="model: [REDACTED]"
+	printf '%s\n' "$line" || true
 	return 0
 }
 

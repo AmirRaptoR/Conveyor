@@ -60,6 +60,13 @@ export API_KEY='waiting'
 result_accept '{"v":1,"outcome":"waiting","waiting":{"why":"waiting for checks"}}'
 chk "schema discriminators survive colliding secret values" "$(jq -c '[.outcome,.waiting.why]' "$CONVEYOR_RESULT")" '["waiting","[REDACTED] for checks"]'
 unset API_KEY
+export API_SECRET='private-token'
+result_accept '{"v":1,"outcome":"blocked","kind":"private-token","reason":"choose"}'
+chk "a secret-valued kind becomes a valid safe classification" "$(jq -r .kind "$CONVEYOR_RESULT")" "redacted"
+export API_SECRET='2026-09-25T18:00:00Z'
+result_accept '{"v":1,"outcome":"waiting","waiting":{"why":"later","until":"2026-09-25T18:00:00Z"}}'
+chk "a secret-valued deadline is dropped rather than leaked" "$(jq -r '.waiting | has("until")' "$CONVEYOR_RESULT")" "false"
+unset API_SECRET
 export PRIVATE_KEY=$'multi-secret-top\nmulti-secret-bottom'
 multiline_log=$(printf '%s\n' "$PRIVATE_KEY" | redact_stream)
 chk "multiline secrets cannot be reconstructed from log lines" "$(grep -Ec 'multi-secret-(top|bottom)' <<<"$multiline_log" || true)" "0"

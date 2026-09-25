@@ -168,6 +168,9 @@ printf '%s\n' \
 MODEL="claude-opus-5"  # what was asked for; the stream says what actually ran
 chk "the model is read from the stream" "$(claude_model)" "claude-sonnet-5[1m]"
 chk "and recorded on one line"          "$(record_model)" "model: claude-sonnet-5[1m]"
+export API_SECRET='sonnet-5'
+chk "model metadata is redacted" "$(record_model)" "model: claude-[REDACTED][1m]"
+unset API_SECRET
 
 # 8. no events — STREAM=0, or a run that died before the first one. Nothing is
 #    printed rather than an empty model: line, and the exit status is untouched,

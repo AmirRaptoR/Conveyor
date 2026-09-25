@@ -222,6 +222,9 @@ chk "text events become logs" "$(grep -c 'work complete' <<<"$out")" "1"
 chk "tool output is not logged" "$(grep -c 'SECRET TOOL OUTPUT' <<<"$out" || true)" "0"
 chk "the session is captured" "$(claude_session)" "ses-good"
 chk "the selected model is recorded" "$(record_model)" "model: openai/gpt-test variant: high agent: build"
+export API_SECRET=gpt-test
+chk "OpenCode model metadata is redacted" "$(record_model)" "model: openai/[REDACTED] variant: high agent: build"
+unset API_SECRET
 chk "the task leads the prompt" "$(sed -n '1p' "$OC_PROMPT")" "do the work"
 chk "the result contract is appended" "$(grep -c 'versioned result contract' "$OC_PROMPT")" "1"
 chk "the model child cannot see CONVEYOR_RESULT" "$(grep -c exposed "$OC_RESULT_ENV" || true)" "0"

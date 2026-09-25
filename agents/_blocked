@@ -127,7 +127,7 @@ decision_brief() {
 
 	One entry per question, two to four options each, the one you would pick
 	listed first. This is the AskUserQuestion shape; that tool is not available
-	here, so the file is how you ask. A person answers on the board and the
+	here, so the final response is how you ask. A person answers on the board and the
 	reply reaches this same conversation. Do not write an engine result file.
 	Do not stop for something you can
 	verify yourself, and do not stop because a dependency is open — say so in

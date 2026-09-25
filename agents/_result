@@ -170,6 +170,7 @@ result_write_json() {
 	secrets=$(secret_values_json) || return 1
 	redacted=$(jq -c --argjson secrets "$secrets" '
 		def redact_string: reduce $secrets[] as $secret (.; split($secret) | join("[REDACTED]"));
+		def contains_secret: . as $value | reduce $secrets[] as $secret (false; . or ($value | contains($secret)));
 		def available_key($object; $base; $n):
 			($base + if $n == 1 then "" else "-" + ($n | tostring) end) as $key |
 			if ($object | has($key)) then available_key($object; $base; $n + 1) else $key end;
@@ -183,6 +184,8 @@ result_write_json() {
 			elif type == "array" then to_entries | map(. as $entry | $entry.value | redact($path + [$entry.key]))
 			elif type == "string" then if protected_value($path) then . else redact_string end
 			else . end;
+		(if (.kind | type == "string" and contains_secret) then .kind = "redacted" else . end) |
+		(if (.waiting.until | type == "string" and contains_secret) then del(.waiting.until) else . end) |
 		redact([])' <<<"$json" 2>/dev/null) || return 1
 	jq -e 'type == "object" and .v == 1 and (.outcome | type == "string")' >/dev/null 2>&1 <<<"$redacted" || return 1
 	dir=$(dirname "$CONVEYOR_RESULT")
