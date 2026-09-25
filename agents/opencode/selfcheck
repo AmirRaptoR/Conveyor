@@ -248,6 +248,19 @@ set -e
 chk "an OpenCode waiting final returns the deferral exit" "$rc" "10"
 chk "the OpenCode waiting reason is persisted" "$(jq -r .waiting.why "$CONVEYOR_RESULT")" "checks are running"
 
+for collision in 1 v waiting; do
+	reset_invocations
+	export API_KEY=$collision
+	if [[ "$collision" == waiting ]]; then export OC_SCENE=waiting; expected=10; else export OC_SCENE=success; expected=0; fi
+	set +e
+	run_claude 'return a result despite schema-shaped secrets' >/dev/null 2>&1
+	rc=$?
+	set -e
+	chk "secret value '$collision' cannot corrupt raw result parsing" "$rc" "$expected"
+	chk "secret value '$collision' preserves the result discriminator" "$(jq -r .outcome "$CONVEYOR_RESULT")" "$([[ "$collision" == waiting ]] && echo waiting || echo success)"
+	unset API_KEY
+done
+
 reset_invocations
 export OC_SCENE=split-fenced
 set +e

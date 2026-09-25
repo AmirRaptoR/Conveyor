@@ -106,7 +106,7 @@ result_parse() {
 # result_validate_model <json> validates the untrusted model-owned portion.
 # Trusted compatibility fields are added only after this succeeds.
 result_validate_model() {
-	local json=$1
+	local json=$1 until normalized_until
 	jq -e '
 		type == "object" and
 		((keys - ["v","outcome","kind","reason","questions","waiting",
@@ -143,7 +143,11 @@ result_validate_model() {
 		 elif .outcome == "waiting" then .waiting != null and .kind == null and .reason == null and .questions == null and
 			.dispositions == null and .priority == null and .after == null and .part == null and .of == null and .verdict == null and .summary == null
 		 else .kind == null and .reason == null and .questions == null and .waiting == null end)
-	' >/dev/null 2>&1 <<<"$json"
+	' >/dev/null 2>&1 <<<"$json" || return 1
+	until=$(jq -r '.waiting.until // empty' <<<"$json") || return 1
+	[[ -z "$until" ]] && return 0
+	normalized_until=$(date -u -d "$until" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || return 1
+	[[ "$normalized_until" == "$until" ]]
 }
 
 result_normalize() {
@@ -169,14 +173,17 @@ result_write_json() {
 		def available_key($object; $base; $n):
 			($base + if $n == 1 then "" else "-" + ($n | tostring) end) as $key |
 			if ($object | has($key)) then available_key($object; $base; $n + 1) else $key end;
-		def redact:
+		def protected_value($path):
+			$path == ["outcome"] or $path == ["kind"] or $path == ["waiting","until"];
+		def redact($path):
 			if type == "object" then reduce to_entries[] as $entry ({};
-				available_key(.; ($entry.key | redact_string); 1) as $key |
-				. + {($key): ($entry.value | redact)})
-			elif type == "array" then map(redact)
-			elif type == "string" then redact_string
+				($entry.key | if $path == ["dispositions"] then redact_string else . end) as $base |
+				available_key(.; $base; 1) as $key |
+				. + {($key): ($entry.value | redact($path + [$entry.key]))})
+			elif type == "array" then to_entries | map(. as $entry | $entry.value | redact($path + [$entry.key]))
+			elif type == "string" then if protected_value($path) then . else redact_string end
 			else . end;
-		redact' <<<"$json" 2>/dev/null) || return 1
+		redact([])' <<<"$json" 2>/dev/null) || return 1
 	jq -e 'type == "object" and .v == 1 and (.outcome | type == "string")' >/dev/null 2>&1 <<<"$redacted" || return 1
 	dir=$(dirname "$CONVEYOR_RESULT")
 	tmp=$(mktemp "$dir/.result.XXXXXX") || return 1

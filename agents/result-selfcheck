@@ -23,6 +23,7 @@ for bad in \
 	'{"v":2,"outcome":"success"}' \
 	'{"v":1,"outcome":"success","unknown":true}' \
 	'{"v":1,"outcome":"blocked","kind":"decision"}' \
+	'{"v":1,"outcome":"waiting","waiting":{"why":"later","until":"2026-99-99T99:99:99Z"}}' \
 	'{"v":1,"outcome":"success"} {"v":1,"outcome":"success"}' \
 	$'prose\n```json\n{"v":1,"outcome":"success"}\n```' \
 	'{"v":1,"outcome":"success"'; do
@@ -35,6 +36,8 @@ result_accept '{"v":1,"outcome":"blocked","kind":"decision","reason":"choose","q
 chk "a question gets trusted compatibility fields" "$(jq -c '[.blocked,.asked,.session]' "$CONVEYOR_RESULT")" '[true,true,"sess-q"]'
 result_accept '{"v":1,"outcome":"blocked","kind":"dependency","reason":"wait"}'
 chk "a condition is not promoted to a question" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
+result_accept '{"v":1,"outcome":"waiting","waiting":{"why":"later","until":"2026-09-25T18:00:00Z"}}'
+chk "a real UTC waiting timestamp is accepted" "$(jq -r .waiting.until "$CONVEYOR_RESULT")" "2026-09-25T18:00:00Z"
 
 export API_TOKEN='secret-value-112'
 result_accept '{"v":1,"outcome":"success","summary":"saw secret-value-112"}'
@@ -49,6 +52,10 @@ chk "short non-empty secrets are redacted" "$(jq -r .summary "$CONVEYOR_RESULT")
 chk "JSON-escaped log text is redacted" "$(redact_text "$escaped" | grep -c 'quoted\\\"secret\\\\value' || true)" "0"
 result_accept '{"v":1,"outcome":"success","dispositions":{"abc":"one","[REDACTED]":"two"}}'
 chk "secret-bearing object keys are redacted without collision loss" "$(jq -c '.dispositions | to_entries' "$CONVEYOR_RESULT")" '[{"key":"[REDACTED]","value":"one"},{"key":"[REDACTED]-2","value":"two"}]'
+export API_KEY='waiting'
+result_accept '{"v":1,"outcome":"waiting","waiting":{"why":"waiting for checks"}}'
+chk "schema discriminators survive colliding secret values" "$(jq -c '[.outcome,.waiting.why]' "$CONVEYOR_RESULT")" '["waiting","[REDACTED] for checks"]'
+unset API_KEY
 export PRIVATE_KEY=$'multi-secret-top\nmulti-secret-bottom'
 multiline_log=$(printf '%s\n' "$PRIVATE_KEY" | redact_stream)
 chk "multiline secrets cannot be reconstructed from log lines" "$(grep -Ec 'multi-secret-(top|bottom)' <<<"$multiline_log" || true)" "0"
