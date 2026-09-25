@@ -211,6 +211,9 @@ type StageInput struct {
 	// alone and starts fresh, which still beats asking the same question twice.
 	Answer  string `json:"answer,omitempty"`
 	Session string `json:"session,omitempty"`
+	// ControlCarryover distinguishes an interrupted-run instruction from a
+	// person's answer so an adapter can migrate its own older session shape.
+	ControlCarryover bool `json:"controlCarryover,omitempty"`
 	// Manual is the name of an action a person pressed on the board, armed
 	// for exactly this run and spent by it. It is how a human overrides a
 	// wait the script would otherwise sit out — "merge now" rather than
@@ -230,8 +233,18 @@ type StageInput struct {
 // exactly as it treats Item.Raw. What resuming *means* is the adapter's
 // business, because it differs per agent and some cannot resume at all.
 type Resume struct {
-	Answer  string `json:"answer,omitempty"`
-	Session string `json:"session,omitempty"`
+	Answer           string `json:"answer,omitempty"`
+	Session          string `json:"session,omitempty"`
+	ControlCarryover bool   `json:"controlCarryover,omitempty"`
+	// Stage binds an armed value to the stage that was waiting for it. Empty
+	// preserves answers written before this field existed; new writes always
+	// set it so a provider-side stage change cannot deliver stale input to a
+	// different script.
+	Stage string `json:"stage,omitempty"`
+	// Script binds Stage to the executable that was waiting. The value is an
+	// engine-only stable identity; adapters still receive only Answer and
+	// Session, both opaque.
+	Script string `json:"script,omitempty"`
 	// Manual is an action a person pressed, armed for the next run of that
 	// item's stage and spent by it. Kept here rather than in a store of its
 	// own because it is the same fact in the same shape — something a person

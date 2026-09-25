@@ -232,7 +232,9 @@ item, run and current adapter session the server bound it to. The session may
 still be empty before a backend has reported one; in that window the run
 binding is the structural guard. Once a session is known, a client naming a
 different one is refused and a queued command bound to a superseded session is
-rejected as stale. The server writes the record before returning `202`.
+rejected as stale. The session is opaque to the engine and remains exactly the
+value the adapter advertised. The server writes the record before returning
+`202`.
 `by` is the existing `requestedBy` audit value: an authenticated username when
 TCP Basic Auth is configured, but caller-supplied or empty when auth is disabled
 or the request uses the deliberately unauthenticated local Unix socket.
@@ -274,13 +276,15 @@ while an unknown protocol version is rejected.
 If `conveyor serve` is restarted, startup examines only each item's newest
 stage run and only when that run was settled as interrupted. Queued
 instructions are appended, in order, to the existing one-shot armed answer
-(§5a), carrying the OpenCode session when one is available; carry-over is
-at-least-once with content deduplication because the answer file and run file
-cannot be updated atomically. A queued pause is dropped because the process it
-would have stopped is already gone. The outcome is appended as a `carried`
-record to the old run's control file. Nothing is replayed into a later run's
-control channel. Observe mode, `conveyor run` and `conveyor tick` do not perform
-this carry-over.
+(§5a), carrying the adapter's opaque session when one is available and binding
+the armed value to the interrupted run's target stage. A provider-side stage
+or script change therefore drops that stale input instead of handing it to
+another script. Carry-over is at-least-once with content deduplication because the
+answer file and run file cannot be updated atomically. A queued pause is dropped
+because the process it would have stopped is already gone. The outcome is
+appended as a `carried` record to the old run's control file. Nothing is replayed
+into a later run's control channel. Observe mode, `conveyor run` and `conveyor
+tick` do not perform this carry-over.
 
 The protocol is bounded: 50 commands and 200 acknowledgement lines per run,
 64 KiB per line, 1024 code points of instruction text and 500 of acknowledgement
