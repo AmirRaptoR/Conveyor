@@ -479,15 +479,11 @@ script entry's `params:`. Refine, implement, review and approve share the same
 deterministic worktree, dependency, pull-request and postcondition policy as
 the Claude adapters; only the model runner beneath that policy changes.
 
-The shipped `reviewer` adapter is the narrow multi-backend exception for the
-review policy. It runs the ordinary Claude review while Claude's status is not
-confirmed `limited`, selects the same policy on Codex when it is, and also
-falls through to Codex when Claude returns an exact quota-limit result during
-the call. `CLAUDE_MODEL` and `CODEX_MODEL` name the two models. Its combined
-status is `limited` only when both underlying status scripts confirm a limit;
-a failed, malformed or otherwise inconclusive probe remains `unknown`. This is
-adapter selection: the engine schema, stage routing and result contract do not
-learn what a backend is.
+The shipped `reviewer` adapter is a Codex-only review alias. It delegates both
+review execution and status directly to the Codex adapter and uses
+`CODEX_MODEL` when supplied. It never probes or selects Claude. Keeping this as
+adapter policy means the engine schema, stage routing and result contract do
+not learn what a backend is.
 
 Codex CLI `0.150.1` is the supported event contract. The adapter consumes
 `codex exec --json`, requires one stable `thread.started`, one turn and one

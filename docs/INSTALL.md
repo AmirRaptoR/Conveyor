@@ -34,8 +34,7 @@ depends on all of them at once.
 
 | Prerequisite | Needed for | Prove it |
 | --- | --- | --- |
-| Codex CLI **0.150.1** | `agents/codex/{refine,implement,review,approve,status}` | `codex --version` |
-| Claude Code and Codex CLI | `agents/reviewer/{review,status}` (Claude-first review, Codex quota fallback) | `claude --version; codex --version` |
+| Codex CLI **0.150.1** | `agents/codex/{refine,implement,review,approve,status}` and the Codex-only `agents/reviewer/{review,status}` alias | `codex --version` |
 | OpenCode CLI **1.18.32** | `agents/opencode/{refine,implement,review,approve}` | `opencode --version` |
 | Node.js | the UI test suite (`*.test.mjs`), run by `./check` | `node --version` |
 | systemd | running the engine as a service (`deploy/conveyor.service.example`) | `systemctl --version` |
@@ -50,15 +49,14 @@ host's Codex catalogue (`~/.codex/models_cache.json`):
 | --- | --- | --- |
 | `refining` | `codex` | `gpt-5.6-sol`; specification quality governs every later stage |
 | `in-progress` | `codex` | `gpt-5.6-sol`; implementation is high-consequence work |
-| `review` | `reviewer` | Claude `claude-sonnet-5` while available, then `gpt-5.6-sol` on a confirmed pre-run or in-run Claude quota limit |
+| `review` | `reviewer` | `gpt-5.6-sol`; the adapter never probes or selects Claude |
 | `approving` | `codex` | `gpt-5.6-terra`; the model path is a rare, bounded review-thread repair |
 
 The same catalogue also advertises `gpt-5.6-luna`. It is deliberately not
 assigned: there is no separate low-risk model stage in this pipeline, and
 inventing one only to consume a cheaper model would change the workflow. All
 four stages reserve the shared `codex` resource conservatively, including
-review while Claude is primary and approving while its deterministic gate does
-not need a model.
+approving while its deterministic gate does not need a model.
 
 OpenCode is pinned exactly because `opencode run --format json` is a CLI event
 projection rather than a versioned protocol. Disable its auto-update and install
