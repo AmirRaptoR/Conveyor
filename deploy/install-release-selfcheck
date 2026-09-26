@@ -27,6 +27,7 @@ local_scripts="$tmp/local-scripts"
 mkdir -p "$local_scripts/source-one"
 printf '#!/bin/sh\nexit 0\n' >"$local_scripts/_sync"
 printf '#!/bin/sh\nexit 0\n' >"$local_scripts/source-one/deploy"
+printf '#!/bin/sh\nexit 1\n' >"$local_scripts/source-one/deploy.bak"
 chmod +x "$local_scripts/_sync" "$local_scripts/source-one/deploy"
 
 cat >"$tmp/systemctl" <<'SH'
@@ -89,6 +90,7 @@ deploy "$prefix" selfcheck-one >/dev/null
 CONVEYOR_RELEASE_DIR="$prefix/current" "$prefix/current/conveyor" version | grep -q 'selfcheck-one'
 [[ -x "$prefix/current/agents/_sync" ]]
 [[ -x "$prefix/current/agents/local-source-one/deploy" ]]
+[[ ! -e "$prefix/current/agents/local-source-one/deploy.bak" ]]
 jq -e '.files["agents/_sync"] and .files["agents/local-source-one/deploy"]' \
   "$prefix/current/release.json" >/dev/null
 
