@@ -397,7 +397,19 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// The action is the person's replacement for the deterministic wait. Its
+	// durable recovery entry must go with the in-memory deferral, or a restart
+	// before dispatch would restore the old diagnosis over the armed action.
 	s.mu.Lock()
+	// Serialize the durable delete with applyTransition's durable write. If a
+	// run was already finishing when the button was pressed, either its wait is
+	// persisted first and deleted here, or it observes the armed action and does
+	// not recreate that wait.
+	if err := s.recovery.Delete("item", item.ID); err != nil {
+		s.mu.Unlock()
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	delete(s.resting, item.ID)
 	delete(s.restingAt, item.ID)
 	delete(s.waiting, item.ID)
@@ -409,7 +421,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 
 // answerThenUnblock records an answer against a marked item, if there is one,
 // and then clears its mark — the sequence handleUnblock performs for a person
-// typing into a card, and the doctor sweep performs for a script's verdict.
+// typing into a card.
 //
 // The session comes out of the block while it still exists: clearing the mark
 // is what forgets why the item stopped, and the conversation that asked is
@@ -625,17 +637,7 @@ func waitingAt(dir string) (model.Waiting, bool) {
 	if err != nil {
 		return model.Waiting{}, false
 	}
-	var v struct {
-		Waiting *model.Waiting `json:"waiting"`
-	}
-	if json.Unmarshal(b, &v) != nil || v.Waiting == nil {
-		return model.Waiting{}, false
-	}
-	// Neither half said anything: not a wait, just an empty object.
-	if v.Waiting.Until.IsZero() && strings.TrimSpace(v.Waiting.Why) == "" {
-		return model.Waiting{}, false
-	}
-	return *v.Waiting, true
+	return waitingData(b)
 }
 
 // applyAgentStates turns what the agents said into what the scheduler does.
@@ -765,23 +767,6 @@ func (s *Server) agentPaused(agent string) bool {
 	return false
 }
 
-// anyPaused reports whether any agent is being held back. It is what stops the
-// stall timer clearing marks into a closed door.
-func (s *Server) anyPaused() bool {
-	s.mu.RLock()
-	names := make([]string, 0, len(s.paused))
-	for name := range s.paused {
-		names = append(names, name)
-	}
-	s.mu.RUnlock()
-	for _, name := range names {
-		if s.agentPaused(name) {
-			return true
-		}
-	}
-	return false
-}
-
 // limitKind is the one word in the agents' blocked vocabulary the engine acts
 // on. It is still the scripts' word, not the engine's: agents/_blocked defines
 // it, and an agent that never says it simply never gets this behaviour.
@@ -859,7 +844,7 @@ func (s *Server) unblock(ctx context.Context, item model.Item) error {
 // unblockKind is unblock with an optional compare-and-clear guard. Migration
 // passes dependencyKind so a newer decision/error mark wins instead of being
 // erased by an old snapshot. All clearing writes share the per-item claim,
-// which closes the same race against a concurrent answer or doctor pass.
+// which closes the same race against a concurrent answer.
 func (s *Server) unblockKind(ctx context.Context, item model.Item, expectedKind string) error {
 	if _, busy := s.unblocking.LoadOrStore(item.ID, struct{}{}); busy {
 		return fmt.Errorf("a mark-clearing write is already in progress")

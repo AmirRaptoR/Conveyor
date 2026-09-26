@@ -82,15 +82,6 @@ resources:
 #   maxRunsPerDay: 200   # the whole board's dispatch ceiling for one UTC day
 
 poll: 5m              # how often to re-list every source
-retryStalled: 1h      # when EVERY item is marked and nothing can move at all,
-                      # clear the marks this often and let the line try again. A
-                      # total stall is almost always the outside world — every
-                      # agent over its usage limit, a credential that expired
-                      # overnight — and that comes back on its own hours after
-                      # the board gave up. The guard is "everything" on purpose:
-                      # while one item can still move, a mark is a decision
-                      # waiting on a person, and clearing it just spends an agent
-                      # run to be told the same thing. Unset means never.
 timeout: 90m          # default per-script timeout; stages may override
 discovery: 2m         # how long one source's list script may run before that
                       # poll treats it as failed and falls back to its
@@ -307,10 +298,6 @@ sources:
         # points this at its own script and calls agents/git/cleanup from it if
         # it wants the git half too.
         agent: git
-      doctor:
-        # A reserved key — no stage names it. POST /api/doctor sweeps every
-        # marked item through it. Try it: mark an item, then run the sweep.
-        agent: mock
 
   # A real source, for comparison — swap `agent: claude` for `agent: codex` and
   # only this repository changes:
@@ -384,17 +371,6 @@ sources:
   #         # smaller job than producing one.
   #         MODEL: claude-sonnet-5
   #         PROMPT: "/review $REF"
-  #     doctor:
-  #       # A reserved key — no stage names it. `POST /api/doctor` sweeps every
-  #       # item this repository has marked through it, one at a time, on
-  #       # demand: reads the mark's kind and reason and this item's own run
-  #       # history, and decides whether to retry it, resume it, or leave it
-  #       # for a person. A source declaring none simply has its marked items
-  #       # skipped by a sweep — this is not required to onboard a repository.
-  #       agent: claude
-  #       params:
-  #         MODEL: claude-sonnet-5
-  #
   # Leaving MODEL unset is a choice too, and the one this repository ships:
   # every adapter then inherits whatever the operator's CLI is configured with,
   # which today resolves to claude-opus-5[1m] — the most expensive tier, at the

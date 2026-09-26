@@ -151,9 +151,6 @@ export function draw() {
   const all = $("#unblock-all");
   all.hidden = !marked || !controls.unblockAll;
   all.textContent = `Unblock all (${marked})`;
-  // Diagnose reads a reason before acting, so it is offered wherever a mark
-  // exists to read — the same condition as the blunter Unblock all.
-  $("#diagnose").hidden = !marked || !controls.diagnose;
   $("#tick").hidden = !controls.tick;
   const releaseBadge = $("#release-badge");
   const rel = state.release || {};

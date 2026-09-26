@@ -331,25 +331,3 @@ test("#refresh: a rejected fetch surfaces an error with no unhandled rejection",
   await assert.doesNotReject(btn.onclick());
   assert.equal(faults(p).length, 1);
 });
-
-// ---- startDoctor() — POST /api/doctor ------------------------------------
-
-test("startDoctor: a non-409 failure surfaces an error", async () => {
-  const p = await page({ fetch: async () => ({ ok: false, status: 500, text: async () => "sweep failed" }) });
-  await p.mod.startDoctor(true);
-  assert.equal(faults(p).length, 1);
-});
-
-test("startDoctor: the existing 409 alert is preserved", async () => {
-  const p = await page({ fetch: async () => ({ ok: false, status: 409, text: async () => "" }) });
-  await p.mod.startDoctor(true);
-  assert.equal(p.calls.alert.length, 1);
-  assert.equal(p.calls.alert[0], "A sweep is already running.");
-  assert.equal(faults(p).length, 0);
-});
-
-test("startDoctor: a rejected sweep request produces no unhandled rejection", async () => {
-  const p = await page({ fetch: async () => { throw new Error("down"); } });
-  await assert.doesNotReject(p.mod.startDoctor(true));
-  assert.equal(faults(p).length, 1);
-});

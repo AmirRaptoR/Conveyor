@@ -56,6 +56,12 @@ type Spec struct {
 	Item    *model.Item
 	From    string
 	To      string
+	// Transient runs a deterministic recovery probe through the same timeout,
+	// process-group and private-channel boundary as an ordinary invocation,
+	// but publishes no callbacks and leaves no run-history directory. Probes
+	// must not look like stage work, spend model runs, or notify on an unchanged
+	// condition; their structured result is still returned to the caller.
+	Transient bool
 }
 
 // Result is a finished run plus whatever the script wrote to the result file.
@@ -107,7 +113,7 @@ type Runner struct {
 	OnLog func(runID string, line LogLine)
 	// OnResult, if set, is called once for every run this Runner executes,
 	// after its final meta.json write (or failed attempt at one) — list,
-	// move, stage, doctor, status, all of it. It is what lets a single place
+	// move, stage, status, all of it. It is what lets a single place
 	// notice a persistence fault (Result.Run.Error naming one) without
 	// threading a check through every call site that starts a run.
 	OnResult func(res *Result)
@@ -135,7 +141,7 @@ type PlanUpdate struct {
 	// Kind and Stage are the run's own Spec.Kind and Spec.To, carried so a
 	// caller keying board state by item can tell a stage run targeting a
 	// real stage — the only kind that ever produces a card entry — apart
-	// from a list, move, doctor or status run publishing to the same item.
+	// from a list, move or status run publishing to the same item.
 	Kind  string
 	Stage string
 }
@@ -178,6 +184,17 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	started := time.Now()
 	runID := fmt.Sprintf("%s-%s", started.UTC().Format("150405.000"), randSuffix())
 	dir := filepath.Join(r.Root, started.UTC().Format("2006-01-02"), runID)
+	if spec.Transient {
+		if err := os.MkdirAll(r.Root, 0o700); err != nil {
+			return nil, fmt.Errorf("create probe root: %w", err)
+		}
+		var err error
+		dir, err = os.MkdirTemp(r.Root, ".probe-")
+		if err != nil {
+			return nil, fmt.Errorf("create probe dir: %w", err)
+		}
+		defer os.RemoveAll(dir)
+	}
 	// 0o700: a run directory holds prompts, a person's typed answer (stdin.json)
 	// and logs, all meant for the operator who runs conveyor and nobody else.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -219,7 +236,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 			lines = lines[len(lines)-maxLogLines:]
 		}
 		mu.Unlock()
-		if r.OnLog != nil {
+		if !spec.Transient && r.OnLog != nil {
 			r.OnLog(runID, line)
 		}
 	}
@@ -237,6 +254,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	// persistErr always carries it, whatever else went wrong first.
 	var persistErr string
 	persist := func() {
+		if spec.Transient {
+			return
+		}
 		mu.Lock()
 		lwErr := logWriteErr
 		mu.Unlock()
@@ -354,12 +374,12 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 		run.ExitCode = -1
 		r.finish(&run, started, persist)
 		res := &Result{Run: run, Log: lines, PersistErr: persistErr}
-		if r.OnResult != nil {
+		if !spec.Transient && r.OnResult != nil {
 			r.OnResult(res)
 		}
 		return res, fmt.Errorf("start %s: %w", script, err)
 	}
-	if r.OnStart != nil {
+	if !spec.Transient && r.OnStart != nil {
 		r.OnStart(run)
 	}
 
@@ -391,7 +411,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 			case ev.Accepted:
 				curRev, curOK = ev.Revision, true
 				acceptedSoFar++
-				if r.OnPlan != nil {
+				if !spec.Transient && r.OnPlan != nil {
 					r.OnPlan(runID, itemID, PlanUpdate{Revision: curRev, HasRevision: curOK, Accepted: acceptedSoFar, Rejected: rejectedSoFar, Kind: spec.Kind, Stage: spec.To})
 				}
 			default:
@@ -399,7 +419,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 				if ev.Diagnose {
 					emit("engine", fmt.Sprintf("plan.jsonl line %d rejected: %s", ev.Line, ev.Reason))
 				}
-				if r.OnPlan != nil {
+				if !spec.Transient && r.OnPlan != nil {
 					r.OnPlan(runID, itemID, PlanUpdate{Revision: curRev, HasRevision: curOK, Accepted: acceptedSoFar, Rejected: rejectedSoFar, Kind: spec.Kind, Stage: spec.To})
 				}
 			}
@@ -435,7 +455,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 			diagnoseSteering("control-ack.jsonl: second hello ignored")
 			lastHellos++
 		}
-		if r.OnSteering != nil {
+		if !spec.Transient && r.OnSteering != nil {
 			r.OnSteering(runID, itemID, SteeringUpdate{Resolution: res, Kind: spec.Kind, Stage: spec.To, Final: final})
 		}
 	}
@@ -511,7 +531,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 
 	wg.Wait()
 	waitErr := cmd.Wait()
-	if r.OnProcessExit != nil {
+	if !spec.Transient && r.OnProcessExit != nil {
 		r.OnProcessExit(run)
 	}
 	close(tailStop)
@@ -578,7 +598,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 			emit("engine", "result.json is not valid JSON; ignoring")
 		}
 	}
-	if r.OnResult != nil {
+	if !spec.Transient && r.OnResult != nil {
 		r.OnResult(res)
 	}
 	return res, nil
@@ -641,8 +661,7 @@ func writeMeta(run *model.Run, dir string) error {
 
 // redactedValue stands in for any env value not worth ever writing to disk or
 // handing back over the API — a source's env:, provider.params: or
-// scripts.*.params:, which is exactly where a token lives (model.DoctorRun
-// exists for the same reason, one layer out). The CONVEYOR_ prefix is safe to
+// scripts.*.params:, which is exactly where a token lives. The CONVEYOR_ prefix is safe to
 // keep verbatim: it is paths, ids and a deadline, nothing the engine itself
 // did not already hand the script in the clear.
 const redactedValue = "«redacted»"
@@ -836,10 +855,10 @@ func WriteMeta(run *model.Run) error {
 	return writeMeta(run, run.Dir)
 }
 
-// PendingMove finds the most recent stage run for an item, at the given
-// stage, that finished successfully but whose outgoing move to another stage
-// was never confirmed — the durable fact a recovering Advance needs to retry
-// only that move instead of re-running a stage that already succeeded.
+// PendingMove finds the most recent stage run for an item, at the given stage,
+// whose outgoing move or mark was never confirmed — the durable fact a
+// recovering Advance needs to retry only the provider write instead of
+// re-running a stage that already completed.
 //
 // Newest first: a stage retried more than once leaves one run per attempt,
 // and only the latest's pending move is still current. Runs newer than it for
@@ -884,7 +903,8 @@ func PendingMove(root, itemID, stage string) (model.Run, bool) {
 				continue
 			}
 			run.Dir = dir
-			if run.Outcome == model.OutcomeSuccess && run.NextStage != "" && !run.MoveConfirmed {
+			if !run.MoveConfirmed && ((run.Outcome == model.OutcomeSuccess && run.NextStage != "") ||
+				(run.Outcome == model.OutcomeBlocked && run.PendingMark)) {
 				return run, true
 			}
 			return model.Run{}, false

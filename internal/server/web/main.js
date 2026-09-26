@@ -2,7 +2,7 @@
 // module with side effects of its own beyond wiring its own handlers — the
 // live event stream, the duration ticker, and the first poll.
 import { $ } from "./dom.js";
-import { load, loadDoctor, fault } from "./shared.js";
+import { load, fault } from "./shared.js";
 import { draw, tickDurations } from "./board.js";
 import { openItemId, followRun, logPending, logBuffer, loadHistory, renderLine, trimLog } from "./panel.js";
 import { applyPlanEvent } from "./plans.js";
@@ -73,7 +73,7 @@ function connect() {
   };
 }
 
-function refresh() { load(); loadDoctor(); }
+function refresh() { load(); }
 
 // Awake and visible: poll regardless of the stream. Hidden tabs cost nothing
 // and learn what they missed the moment they come back.

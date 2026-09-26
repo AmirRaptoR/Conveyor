@@ -141,7 +141,7 @@ type Run struct {
 	ID     string `json:"id"`
 	Source string `json:"source"`
 	ItemID string `json:"itemId,omitempty"`
-	// Kind is "list", "move", "stage", "doctor", "status" or "preflight".
+	// Kind is "list", "move", "stage", "status" or "preflight".
 	Kind   string `json:"kind"`
 	Script string `json:"script"`
 	// From and To are stage names; empty for list runs.
@@ -162,17 +162,18 @@ type Run struct {
 	Env  map[string]string `json:"env,omitempty"`
 	Item *Item             `json:"item,omitempty"`
 
-	// NextStage, MoveConfirmed and MoveAttempts are the durable pending-
-	// transition record (F04): a stage run that finished successfully but
-	// whose *outgoing* move to NextStage has not yet been confirmed. Written
+	// NextStage/PendingMark, MoveConfirmed and MoveAttempts are the durable
+	// pending-provider-write record (F04): a stage run whose outgoing move or
+	// mark has not yet been confirmed. Written
 	// against the run that produced them, not a new store — CONTRACTS §6
 	// already makes a run directory self-contained, and this is one more
 	// fact about the run it belongs to. A recovery that finds NextStage set
-	// and MoveConfirmed false retries only the move, never the script that
-	// already succeeded; MoveAttempts bounds that retry so a provider that
-	// keeps refusing the write eventually marks the item instead of retrying
-	// forever.
+	// and MoveConfirmed false retries only the provider write, never the script
+	// that already completed.
 	NextStage     string `json:"nextStage,omitempty"`
+	PendingMark   bool   `json:"pendingMark,omitempty"`
+	MarkKind      string `json:"markKind,omitempty"`
+	MarkReason    string `json:"markReason,omitempty"`
 	MoveConfirmed bool   `json:"moveConfirmed,omitempty"`
 	MoveAttempts  int    `json:"moveAttempts,omitempty"`
 }
@@ -257,62 +258,23 @@ type Resume struct {
 //
 // Written into $CONVEYOR_RESULT beside a `noop` exit: "nothing to do yet, and
 // here is the moment that changes". The engine stores it and hands it to the
-// board, which draws the countdown; it never reads Why and never acts on
-// Until. A stage that waits for something with no deadline — a review, a
-// person — simply gives no Until, and the board says what it is waiting for
-// without a clock.
+// board, which draws the countdown. Untyped waits remain presentation-only;
+// typed waits use Class, Key and Until for deterministic recovery while Why
+// remains display text. A stage that waits for something with no deadline
+// simply gives no Until, and the board says what it is waiting for without a
+// clock.
 //
 // It exists because a resting item is otherwise indistinguishable from a
 // stuck one: both sit still, and only the script knows which.
 type Waiting struct {
 	Until time.Time `json:"until,omitempty"`
 	Why   string    `json:"why,omitempty"`
-}
-
-// DoctorInput is the JSON piped to a doctor script's stdin: one marked item,
-// why it stopped, and its own run history. Its own shape, deliberately not
-// StageInput — whose From means "the previous stage" and would be a lie here,
-// since a doctor invocation follows no stage at all.
-type DoctorInput struct {
-	Item    *Item       `json:"item"`
-	Stage   string      `json:"stage"`
-	Blocked bool        `json:"blocked"`
-	Block   DoctorBlock `json:"block"`
-	// Runs is this item's own run history, newest first, capped at 20 — every
-	// kind, including earlier doctor runs. A directory retention has swept, or
-	// that the script cannot read, is the script's problem to tolerate.
-	Runs []DoctorRun `json:"runs"`
-}
-
-// DoctorBlock is why the item stopped, trimmed for a doctor script. Session is
-// deliberately absent — it is the agent's own handle on the conversation that
-// stopped, spent by the engine itself when it records an answer, and never
-// something a script reads or forwards.
-type DoctorBlock struct {
-	Kind   string    `json:"kind,omitempty"`
-	Reason string    `json:"reason"`
-	Stage  string    `json:"stage"`
-	RunID  string    `json:"runId,omitempty"`
-	At     time.Time `json:"at"`
-	Asked  bool      `json:"asked"`
-}
-
-// DoctorRun is one run of an item's history, trimmed for a doctor script.
-// Deliberately not Run: Run.Env and Run.Item would hand every source
-// parameter — tokens included — to a model, while Run.Dir is json:"-" so the
-// one field the script actually needs, the path to that run's own files, is
-// not even there. Adding Dir to Run is not the fix — RunMeta embeds Run and
-// would leak filesystem paths through the existing /api/runs.
-type DoctorRun struct {
-	ID         string    `json:"id"`
-	Kind       string    `json:"kind"`
-	Stage      string    `json:"stage,omitempty"` // Run.To — empty for a list run
-	Outcome    Outcome   `json:"outcome"`
-	ExitCode   int       `json:"exitCode"`
-	TimedOut   bool      `json:"timedOut"`
-	StartedAt  time.Time `json:"startedAt"`
-	FinishedAt time.Time `json:"finishedAt"`
-	Dir        string    `json:"dir"`
+	// Class is the closed recovery policy: network, poll, until, quota or
+	// worktree. Empty preserves an ordinary untyped deferral. Key is opaque
+	// adapter state compared only for equality, so an unchanged diagnosis can
+	// back off without running the stage again.
+	Class string `json:"class,omitempty"`
+	Key   string `json:"key,omitempty"`
 }
 
 // ListInput is the JSON piped to a list script's stdin.

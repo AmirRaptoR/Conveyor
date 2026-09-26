@@ -17,8 +17,7 @@ ref=$(jq -r '.item.ref' <<<"$payload")
 pr_lookup "$ref" open
 case "$PR_STATUS" in
 unavailable)
-	echo "could not identify the pull request for #$ref; deferring" >&2
-	exit 10
+	recovers network pr-identity "could not identify the pull request for issue #$ref; waiting before checking GitHub again"
 	;;
 conflict)
 	asks decision "$PR_CONFLICT_REASON Repair the PR marker, closing reference, or branch before this item can proceed."
@@ -31,6 +30,7 @@ none)
 	;;
 esac
 pr=$PR_NUMBER
+probe_changed
 
 echo "reviewing PR #$pr for item #$ref"
 

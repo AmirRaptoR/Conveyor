@@ -11,6 +11,7 @@ import (
 
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
+	"github.com/AmirRaptoR/Conveyor/internal/store"
 )
 
 // claimRefusal is why claimAndLaunch declined to start a transition.
@@ -339,14 +340,16 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 		// failed before any script had the chance to consume the answer. It
 		// must survive to be handed to whichever run actually receives it.
 	case tr.Outcome == model.OutcomeFailure || tr.Outcome == model.OutcomeTimeout:
-		if resume.Answer != "" && resume.Session != "" {
-			// The session is dropped and everything else a person said is
-			// kept: a resume that did not work names a conversation worth
-			// abandoning, but the reply and the button they pressed were
-			// never actually acted on and should reach the run that is.
-			_ = s.answers.Set(item.ID, model.Resume{
-				Answer: resume.Answer, Stage: resume.Stage, Script: resume.Script, Manual: resume.Manual,
+		if resume != (model.Resume{}) {
+			// A reply survives a failed resume, but its stale conversation and
+			// one-shot manual override do not. Compare-and-replace preserves
+			// anything newly armed while this run was in flight.
+			_, replaceErr := s.answers.ReplaceIf(item.ID, resume, model.Resume{
+				Answer: resume.Answer, Stage: resume.Stage, Script: resume.Script,
 			})
+			if replaceErr != nil {
+				fmt.Fprintf(os.Stderr, "conveyor: %s: could not spend failed run's manual input: %v\n", item.ID, replaceErr)
+			}
 		}
 	default:
 		spent, err := s.answers.Take(item.ID, resume)
@@ -374,7 +377,73 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 // interrupted job — running an agent over it a second time. The provider is
 // still the authority; this only stops the cache lying in the gap.
 func (s *Server) applyTransition(tr *pipeline.Transition) {
+	wait, hasWait := waitingAt(tr.RunDir)
+	var recovery *store.RecoveryEntry
+	typedWaitRecovery := false
+	if tr.Outcome == model.OutcomeNoop && hasWait &&
+		recoveryClass(wait.Class) && (wait.Key != "" || wait.Class == recoveryUntil) {
+		typedWaitRecovery = true
+		observed := store.RecoveryEntry{
+			Scope: "item", ID: tr.Item.ID, Source: tr.Item.Source,
+			Stage: tr.Stage, Script: s.targetScriptBinding(tr.Item.Source, tr.Stage),
+			Class: wait.Class, Key: wait.Key, Why: wait.Why, NotBefore: wait.Until,
+		}
+		old, _ := s.recovery.Get("item", tr.Item.ID)
+		next := nextRecovery(old, observed, time.Now())
+		recovery = &next
+		wait.Until = next.NotBefore
+	}
+	// Provider transitions happen outside adapter scripts, so their recovery
+	// cannot be delegated to an adapter probe. Back them off in the same durable
+	// ledger and wake the ordinary transition at the deadline. A successful
+	// stage with an unconfirmed outgoing move is resumed from run metadata, so
+	// this never re-runs the model.
+	_, recoverySourceOK := s.cfg.Source(tr.Item.Source)
+	if recovery == nil && recoverySourceOK && tr.Stage != "" && tr.Err != nil && tr.ProviderWritePending {
+		key := recoveryTransitionPrefix + tr.Stage
+		switch {
+		case tr.Blocked || (tr.Outcome == model.OutcomeBlocked && tr.Next == ""):
+			key = recoveryMarkPrefix + tr.Stage
+		case tr.Next != "":
+			key = recoveryMovePrefix + tr.Next
+		}
+		observed := store.RecoveryEntry{
+			Scope: "item", ID: tr.Item.ID, Source: tr.Item.Source,
+			Stage: tr.Item.Stage, Script: s.targetScriptBinding(tr.Item.Source, tr.Stage),
+			Class: recoveryNetwork, Key: key, Why: tr.Err.Error(),
+		}
+		old, _ := s.recovery.Get("item", tr.Item.ID)
+		next := nextRecovery(old, observed, time.Now())
+		recovery = &next
+		wait = model.Waiting{Class: next.Class, Key: next.Key, Why: next.Why, Until: next.NotBefore}
+		hasWait = true
+	}
+
 	s.mu.Lock()
+	manualOverride := false
+	if typedWaitRecovery {
+		armed := s.answers.Get(tr.Item.ID)
+		manualOverride = armed.Manual != "" && armed.Stage == tr.Stage &&
+			armed.Script == s.targetScriptBinding(tr.Item.Source, tr.Stage)
+		if manualOverride {
+			recovery = nil
+			hasWait = false
+		}
+	}
+	// Keep the durable mutation under the same item-state lock used by manual
+	// actions. This closes the gap where an action deleted an old wait and a
+	// finishing run recreated it afterwards.
+	if recovery != nil {
+		if err := s.recovery.Put(*recovery); err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: %s: persist recovery: %v\n", tr.Item.ID, err)
+		}
+	} else if !manualOverride {
+		if old, exists := s.recovery.Get("item", tr.Item.ID); exists {
+			if _, err := s.recovery.DeleteIf(old); err != nil {
+				fmt.Fprintf(os.Stderr, "conveyor: %s: clear recovery: %v\n", tr.Item.ID, err)
+			}
+		}
+	}
 	for i := range s.state.Items {
 		if s.state.Items[i].ID == tr.Item.ID {
 			s.state.Items[i] = tr.Item
@@ -448,14 +517,14 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// same reason: nothing ran, nothing changed, and retrying it on every
 	// scheduler wake instead of waiting for the next listing would hammer a
 	// provider that is already failing.
-	if (tr.Outcome == model.OutcomeNoop && tr.From == tr.Stage) || (tr.Outcome == "" && tr.Err != nil) {
+	if !manualOverride && ((tr.Outcome == model.OutcomeNoop && tr.From == tr.Stage) || tr.ProviderWritePending || (tr.Outcome == "" && tr.Err != nil)) {
 		s.resting[tr.Item.ID] = true
 		s.restingAt[tr.Item.ID] = now
 		// What it said it is waiting for, if it said anything. Set and
 		// cleared together with the deferral, so a countdown can never
 		// outlive the wait it was counting down to.
-		if wt, ok := waitingAt(tr.RunDir); ok {
-			s.waiting[tr.Item.ID] = wt
+		if hasWait {
+			s.waiting[tr.Item.ID] = wait
 		} else {
 			delete(s.waiting, tr.Item.ID)
 		}

@@ -61,8 +61,7 @@ if [[ -n "${REPO:-}" ]]; then
 	item_landed "$ref"
 	case "$LANDED" in
 	unavailable)
-		echo "could not tell whether #$ref already landed; deferring rather than risk redoing work already done" >&2
-		exit 10
+		recovers network landed "could not tell whether issue #$ref already landed; waiting before checking GitHub again"
 		;;
 	yes)
 		echo "issue #$ref is already closed by merged pull request #$LANDED_PR; nothing to implement"
@@ -76,18 +75,20 @@ if [[ -n "${REPO:-}" ]]; then
 	# decision from the complete board; repeating a different "issue closed"
 	# predicate here can clear/re-mark the same item forever.
 	if [[ -z "${CONVEYOR_DEPENDENCIES_AT:-}" ]]; then
-		waiting=$(open_dependencies "$body")
+		open_dependencies "$body" >/dev/null
+		if [[ -n "$DEPENDENCIES_UNAVAILABLE" ]]; then
+			recovers network "dependencies:$DEPENDENCIES_UNAVAILABLE" "could not read dependencies $DEPENDENCIES_UNAVAILABLE for issue #$ref; waiting before checking GitHub again"
+		fi
+		waiting=$OPEN_DEPENDENCIES
 		if [[ -n "$waiting" ]]; then
-			blocked dependency "waits on $waiting, still open. Nothing is wrong with \
-this item; Diagnose clears it once they close."
+			recovers poll "dependency:$waiting" "waits on $waiting, still open; the dependency check will wake this item when they close"
 		fi
 	fi
 
 	pr_lookup "$ref" open
 	case "$PR_STATUS" in
 	unavailable)
-		echo "could not tell whether #$ref already has an open pull request; deferring rather than risk opening a second one" >&2
-		exit 10
+		recovers network pr-identity "could not tell whether issue #$ref already has an open pull request; waiting before checking GitHub again"
 		;;
 	conflict)
 		asks decision "$PR_CONFLICT_REASON Repair the PR marker, closing reference, or branch before this item can proceed."
@@ -109,10 +110,20 @@ open a second one, and do not restart the work from scratch."
 	esac
 fi
 
+if [[ "${CONVEYOR_RECOVERY_PROBE:-}" == "1" && "${CONVEYOR_RECOVERY_CLASS:-}" == "poll" &&
+	"${CONVEYOR_RECOVERY_KEY:-}" == draft:* ]]; then
+	if [[ "$PR_OUTCOME" == "one" && "$PR_DRAFT" == "true" ]]; then
+		recovers poll "draft:$PR_NUMBER" "pull request #$PR_NUMBER, which closes issue #$ref, is still a draft; waiting for it to be marked ready"
+	fi
+	probe_changed
+fi
+probe_changed_unless worktree
+
 # This item's own directory. The repository the human works in is never touched
 # and never has to be clean; two items in one repository no longer share a tree,
 # so they can run at the same time.
 wt=$(item_worktree "$CONVEYOR_SOURCE" "$ref" "$head")
+probe_changed
 cd "$wt"
 
 # A dirty tree here is this item's own leftovers — a previous run for THIS issue
@@ -273,8 +284,7 @@ if [[ -n "${REPO:-}" ]]; then
 	pr_lookup "$ref" open
 	case "$PR_STATUS" in
 	unavailable)
-		echo "could not confirm whether the agent's work landed a pull request for #$ref; deferring rather than reporting nothing landed" >&2
-		exit 10
+		recovers network pr-postcondition "could not confirm whether the work landed a pull request for issue #$ref; waiting before checking GitHub again"
 		;;
 	conflict)
 		asks decision "$PR_CONFLICT_REASON Repair the PR marker, closing reference, or branch before this item can proceed."
@@ -289,8 +299,7 @@ if [[ -n "${REPO:-}" ]]; then
 		item_landed "$ref"
 		case "$LANDED" in
 		unavailable)
-			echo "could not confirm whether the agent's work landed a pull request for #$ref; deferring rather than reporting nothing landed" >&2
-			exit 10
+			recovers network landed-postcondition "could not confirm whether the work landed for issue #$ref; waiting before checking GitHub again"
 			;;
 		yes)
 			echo "issue #$ref is already closed by merged pull request #$LANDED_PR; the work landed"
@@ -317,10 +326,8 @@ limit looks exactly like this."
 	# above already has, because a non-zero run that also left a draft is
 	# exactly the silent case this exists to catch.
 	if [[ "$PR_DRAFT" == "true" ]]; then
-		blocked draft "pull request #$PR_NUMBER, which closes issue #$ref, is \
-still a draft. A pull request must be marked ready before this item can \
-advance; an implement run that did not reach \`gh pr ready\` is the usual \
-cause."
+		recovers poll "draft:$PR_NUMBER" "pull request #$PR_NUMBER, which closes issue #$ref, is \
+still a draft; waiting for it to be marked ready"
 	fi
 	pr=$PR_NUMBER
 	echo "opened PR #$pr"

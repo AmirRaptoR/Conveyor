@@ -11,7 +11,7 @@ import (
 // named to the script by CONVEYOR_CONTROL / CONVEYOR_CONTROL_ACK — the
 // mirror image of plan.jsonl's own uniform creation across every Kind.
 func TestControlChannelCreatedForEveryKind(t *testing.T) {
-	for _, kind := range []string{"list", "move", "stage", "doctor", "status", "preflight"} {
+	for _, kind := range []string{"list", "move", "stage", "status", "preflight"} {
 		t.Run(kind, func(t *testing.T) {
 			r := New(t.TempDir())
 			res, err := r.Run(context.Background(), Spec{

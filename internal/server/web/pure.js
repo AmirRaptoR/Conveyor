@@ -53,7 +53,7 @@ export function startableRule(from, into, stages) {
 // reader checking this against the acceptance criteria wants to see.
 export function controlsForMode(mode) {
   const enabled = mode !== "observe";
-  return { tick: enabled, unblockAll: enabled, diagnose: enabled, handBack: enabled, dragStart: enabled };
+  return { tick: enabled, unblockAll: enabled, handBack: enabled, dragStart: enabled };
 }
 
 // The same http(s)-only rule paraInline already applies to a report's own

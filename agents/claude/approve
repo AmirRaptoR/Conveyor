@@ -130,11 +130,11 @@ gh_json() {
 	local out
 	if ! out=$(gh "$@" 2>&1); then
 		echo "gh $* failed: $out" >&2
-		exit 10
+		recovers network github-api "GitHub is unavailable while checking issue #$ref for approval"
 	fi
 	if ! jq -e . >/dev/null 2>&1 <<<"$out"; then
 		echo "gh $* returned something that is not JSON: $out" >&2
-		exit 10
+		recovers network github-api "GitHub returned an unreadable response while checking issue #$ref for approval"
 	fi
 	printf '%s' "$out"
 }
@@ -145,7 +145,7 @@ gh_do() {
 	local out
 	if ! out=$(gh "$@" 2>&1); then
 		echo "gh $* failed: $out" >&2
-		exit 10
+		recovers network github-api "GitHub is unavailable while updating issue #$ref during approval"
 	fi
 	printf '%s' "$out"
 }
@@ -165,7 +165,7 @@ discover_pr() {
 	case "$PR_STATUS" in
 	unavailable)
 		echo "could not identify the pull request for #$ref; deferring" >&2
-		exit 10
+		recovers network pr-identity "GitHub is unavailable while identifying the pull request for issue #$ref"
 		;;
 	conflict)
 		asks decision "$PR_CONFLICT_REASON Repair the PR marker, closing reference, or branch before this item can proceed."
@@ -211,6 +211,7 @@ check_hold() {
 	pr_labels=$(gh_json issue view "$pr" --repo "$REPO" --json labels --jq '[.labels[].name]')
 
 	if wearing "$BLOCKED_LABEL" "$pr_labels"; then
+		probe_changed
 		gh_do pr edit "$pr" --repo "$REPO" --remove-label "$BLOCKED_LABEL" >/dev/null
 		blocked human-review "a $BLOCKED_LABEL label on pull request #$pr is holding this for a human. Remove it to resume."
 	fi
@@ -361,6 +362,7 @@ address_threads() {
 	local wt
 	wt=$(item_worktree "$CONVEYOR_SOURCE" "$ref" "$head_ref") ||
 		blocked worktree "could not prepare a worktree for #$ref on branch $head_ref."
+	probe_changed
 	cd "$wt"
 	before=$(git rev-parse HEAD)
 	echo "  worktree: $wt (branch $(git branch --show-current))" >&2
@@ -596,6 +598,7 @@ resolve_conflict() {
 
 	wt=$(item_worktree "$CONVEYOR_SOURCE" "$ref" "$head_ref") ||
 		blocked worktree "could not prepare a worktree for #$ref on branch $head_ref to resolve its merge conflict."
+	probe_changed
 	cd "$wt"
 	git_dir=$(git rev-parse --git-dir)
 
@@ -615,7 +618,7 @@ resolve_conflict() {
 		# was never refreshed (agents/_worktree:80-90); fetch and reset before
 		# merging so resolution never starts from a stale commit (criterion 15).
 		git fetch --quiet origin "$head_ref" "$base_ref" 2>&1 ||
-			blocked worktree "fetching origin/$head_ref and origin/$base_ref for #$ref failed."
+			recovers network "git-fetch:$head_ref:$base_ref" "fetching origin/$head_ref and origin/$base_ref for #$ref failed"
 		git show-ref --verify --quiet "refs/remotes/origin/$head_ref" ||
 			blocked worktree "origin/$head_ref does not exist for #$ref."
 		git show-ref --verify --quiet "refs/remotes/origin/$base_ref" ||
@@ -649,11 +652,11 @@ resolve_conflict() {
 					blocked conflict "pushing the merge that resolved #$pr's conflict with $base_ref was rejected as non-fast-forward."
 				fi
 				echo "pushing the merge that resolved #$pr's conflict with $base_ref failed: $clean_push_out" >&2
-				exit 10
+				recovers network "git-push:$head_ref" "pushing the merge that resolved #$pr's conflict with $base_ref failed"
 			fi
 			post_conflict_marker "$(git rev-parse HEAD)" "$base_oid"
 			echo "merged $base_ref into $head_ref cleanly for #$pr; no model run" >&2
-			exit 10
+			recovers poll "conflict-pushed:$pr:$(git rev-parse HEAD):$base_oid" "waiting for GitHub to observe the conflict resolution pushed for PR #$pr"
 		fi
 		mapfile -t conflicted < <(git diff --name-only --diff-filter=U)
 	else
@@ -691,6 +694,7 @@ resolve_conflict() {
 	# is nothing left to ask the model, and asking anyway would spend a run to
 	# be told so — the same waste the mark this replaces used to spend a poll on.
 	if [[ "$resolved" -eq 0 ]]; then
+		probe_changed
 		local full rc
 		full="${CONFLICT_PROMPT:-$CONFLICT_PROMPT_DEFAULT}
 
@@ -800,12 +804,12 @@ continues the same merge rather than starting over."
 			blocked conflict "pushing the resolved conflict for #$pr to $head_ref was rejected as non-fast-forward."
 		fi
 		echo "pushing the resolved conflict for #$pr failed: $push_out" >&2
-		exit 10
+		recovers network "git-push:$head_ref" "pushing the resolved conflict for #$pr failed"
 	fi
 
 	post_conflict_marker "$(git rev-parse HEAD)" "$base_oid"
 	echo "resolved and pushed a fix for #$pr's merge conflict" >&2
-	exit 10
+	recovers poll "conflict-pushed:$pr:$(git rev-parse HEAD):$base_oid" "waiting for GitHub to observe the conflict resolution pushed for PR #$pr"
 }
 
 # check_gates_once — gates 2 through 13. Exits directly (10 or 20) for any
@@ -819,6 +823,7 @@ check_gates_once() {
 
 	case "$pr_state" in
 	MERGED)
+		probe_changed
 		echo "PR #$pr is already merged" >&2
 		drop_worktree "$CONVEYOR_SOURCE" "$ref"
 		exit 0
@@ -832,7 +837,7 @@ check_gates_once() {
 	fetch_details
 
 	if [[ "$(jq -r '.isDraft' <<<"$details")" == "true" ]]; then
-		waits "pull request #$pr is a draft; waiting for it to be marked ready"
+		recovers poll "draft:$pr" "pull request #$pr is a draft; waiting for it to be marked ready"
 	fi
 
 	# Gate 14a, reachable from any poll: a PR this same script enqueued (or one
@@ -841,17 +846,28 @@ check_gates_once() {
 	# already-queued PR or be redundant on one with auto-merge enabled. GitHub
 	# finishes it in its own time; this script only waits.
 	if [[ "$(jq -r '.isInMergeQueue' <<<"$details")" == "true" ]]; then
-		echo "PR #$pr is already queued to merge; waiting for GitHub to finish it" >&2
-		exit 10
+		recovers poll "merge-queue:$pr" "PR #$pr is already queued to merge; waiting for GitHub to finish it"
 	fi
 	if jq -e '.autoMergeRequest != null' >/dev/null 2>&1 <<<"$details"; then
-		echo "PR #$pr already has auto-merge enabled; waiting for GitHub to finish it" >&2
-		exit 10
+		recovers poll "auto-merge:$pr" "PR #$pr already has auto-merge enabled; waiting for GitHub to finish it"
 	fi
 
 	local mergeable
 	mergeable=$(jq -r '.mergeable' <<<"$details")
 	if [[ "$mergeable" == "CONFLICTING" ]]; then
+		if [[ "${CONVEYOR_RECOVERY_PROBE:-}" == "1" && "${CONVEYOR_RECOVERY_CLASS:-}" == "worktree" ]]; then
+			probe_head=$(jq -r '.headRefName' <<<"$details")
+			item_worktree "$CONVEYOR_SOURCE" "$ref" "$probe_head" >/dev/null
+			probe_changed
+		fi
+		if [[ "${CONVEYOR_RECOVERY_PROBE:-}" == "1" && "${CONVEYOR_RECOVERY_CLASS:-}" == "network" &&
+			"${CONVEYOR_RECOVERY_KEY:-}" == git-* ]]; then
+			if ! git ls-remote origin >/dev/null 2>&1; then
+				recovers network "$CONVEYOR_RECOVERY_KEY" "cannot reach origin while reconciling PR #$pr's conflict"
+			fi
+			probe_changed
+		fi
+		probe_changed
 		# A conflict is work before it is a decision. Most are a base that moved
 		# under a branch review already left behind, and a rebase applies
 		# cleanly; only one that does not is worth a person. Tried on the
@@ -906,8 +922,7 @@ check_gates_once() {
 		resolve_conflict # exits 10 or 20; never returns
 	fi
 	if [[ "$mergeable" != "MERGEABLE" ]]; then
-		echo "PR #$pr's mergeability is not yet known ($mergeable); waiting" >&2
-		exit 10
+		recovers poll "mergeable:$pr:$mergeable" "PR #$pr's mergeability is not yet known ($mergeable); waiting"
 	fi
 
 	local rollup status_rc
@@ -919,8 +934,7 @@ check_gates_once() {
 	case $status_rc in
 	2) blocked checks "a status check on pull request #$pr failed (rollup: $rollup)." ;;
 	1)
-		echo "checks on PR #$pr are still running (rollup: $rollup)" >&2
-		exit 10
+		recovers poll "checks:$pr:$rollup" "checks on PR #$pr are still running (rollup: $rollup)"
 		;;
 	esac
 
@@ -932,6 +946,7 @@ check_gates_once() {
 		'[.[] | select(any(.comments.nodes[]; (.body // "") | contains($s)))]' <<<"$unresolved")
 
 	if [[ "$(jq 'length' <<<"$unanswered")" -gt 0 ]]; then
+		probe_changed
 		address_threads "$unanswered" # exits 10 or 20; never returns
 	fi
 	if [[ "$(jq 'length' <<<"$answered")" -gt 0 ]]; then
@@ -953,7 +968,8 @@ check_gates_once() {
 		if manual_action merge-now; then
 			echo "PR #$pr has been quiet for only ${elapsed}s of ${QUIET}s, but merge-now was pressed" >&2
 		else
-			waits "waiting for pull request #$pr to stay quiet for ${QUIET}s; any activity restarts the clock" \
+			recovers until "quiet:$pr:$base:$QUIET" \
+				"waiting for pull request #$pr to stay quiet for ${QUIET}s; any activity restarts the clock" \
 				"$((base + QUIET))"
 		fi
 	else
@@ -962,6 +978,7 @@ check_gates_once() {
 }
 
 check_gates_once
+probe_changed
 echo "re-checking immediately before merging, to close the window since the check above" >&2
 check_gates_once
 
@@ -970,8 +987,7 @@ check_gates_once
 # the merge call must be about this one SHA.
 head_oid=$(jq -r '.headRefOid' <<<"$details")
 if [[ -z "$head_oid" || "$head_oid" == "null" ]]; then
-	echo "PR #$pr's head commit is unexpectedly unknown right before merging; deferring" >&2
-	exit 10
+	recovers poll "head-oid:$pr" "PR #$pr's head commit is unexpectedly unknown right before merging"
 fi
 
 echo "merging PR #$pr at $head_oid" >&2
@@ -1006,11 +1022,11 @@ after_raw=$(gh api graphql -f query='
 	}' -F owner="$owner" -F name="$name" -F number="$pr" \
 	--jq '.data.repository.pullRequest' 2>&1) || {
 	echo "confirming the merge of PR #$pr (already issued at $head_oid) failed: $after_raw" >&2
-	exit 10
+	recovers network github-api "GitHub is unavailable while confirming the merge already issued for PR #$pr"
 }
 if ! jq -e . >/dev/null 2>&1 <<<"$after_raw"; then
 	echo "confirming the merge of PR #$pr (already issued at $head_oid) returned something that is not JSON: $after_raw" >&2
-	exit 10
+	recovers network github-api "GitHub returned an unreadable response while confirming the merge already issued for PR #$pr"
 fi
 after="$after_raw"
 after_state=$(jq -r '.state' <<<"$after")
@@ -1027,13 +1043,12 @@ if [[ "$after_head" != "$head_oid" ]]; then
 	# that landed in the gap regardless of what gh reported. New activity, not
 	# a fault: the quiet clock restarts on it next poll.
 	echo "PR #$pr's head moved from $head_oid to $after_head; deferring to recheck" >&2
-	exit 10
+	recovers poll "head-moved:$pr:$after_head" "PR #$pr's head moved after the merge attempt; waiting to recheck its gates"
 fi
 
 if [[ "$(jq -r '.isInMergeQueue' <<<"$after")" == "true" ]] ||
 	jq -e '.autoMergeRequest != null' >/dev/null 2>&1 <<<"$after"; then
-	echo "PR #$pr is queued to merge (or has auto-merge enabled); waiting for GitHub to finish it" >&2
-	exit 10
+	recovers poll "merge-queue:$pr" "PR #$pr is queued to merge (or has auto-merge enabled); waiting for GitHub to finish it"
 fi
 
 if [[ "$merge_rc" -ne 0 ]]; then
@@ -1044,4 +1059,4 @@ fi
 # nor queued: an unexpected state. Deferring costs one more poll; treating it
 # as done without confirming it is the bug this gate exists to close.
 echo "gh pr merge #$pr reported success but the PR is not yet observed merged; deferring" >&2
-exit 10
+recovers poll "merge-observation:$pr:$head_oid" "PR #$pr accepted a merge request but is not yet observed merged"

@@ -114,8 +114,7 @@ func LoadTemplate(path string) (*Template, error) {
 }
 
 // ScriptChoice is which agent: or script: a stage's script name resolves to
-// in the drafted source — one per distinct script name any stage requires,
-// plus doctor when the operator opts into it.
+// in the drafted source — one per distinct script name any stage requires.
 type ScriptChoice struct {
 	Name   string
 	Agent  string

@@ -22,8 +22,7 @@ var netListen = net.Listen
 
 // Run serves until ctx is done. mode is what this process is willing to do to
 // the pipeline: auto drives it, manual only moves an item when the tick
-// button is pressed, and observe never runs a stage, a move or a doctor
-// script at all.
+// button is pressed, and observe never runs a stage or move script at all.
 //
 // The guarantee it makes: when Run returns, nothing it started is still
 // writing under the data directory. cmdServe releases the owner lock in a
@@ -125,9 +124,7 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 	s.spawn(func() { s.button(runCtx, mode) })
 	if mode.Runs() {
 		s.spawn(func() { s.schedule(runCtx) })
-		if d := s.cfg.RetryStalled.D(); d > 0 {
-			s.spawn(func() { s.stalled(runCtx, d) })
-		}
+		s.spawn(func() { s.recover(runCtx) })
 		s.spawn(func() { s.sweep(runCtx) })
 	}
 
@@ -180,7 +177,7 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 	}
 	// The HTTP listener is down the moment runCtx is cancelled, but a
 	// transition already launched keeps running — a stage script, an agent, a
-	// git push — and so does discovery, a doctor sweep, a push send, any
+	// git push — and so does discovery, a push send, any
 	// request still writing order.json or answers.json. The deferred cancel()
 	// stops every loop above; the deferred drain() is what actually waits for
 	// all of that, transitions and everything else, before Run hands back
@@ -231,8 +228,6 @@ func (s *Server) handler() (tcp, socket http.Handler, err error) {
 	mux.HandleFunc("POST /api/items/{id}/steer", s.mutationGuard(s.handleSteer))
 	mux.HandleFunc("POST /api/items/{id}/budget-override", s.mutationGuard(s.handleBudgetOverride))
 	mux.HandleFunc("POST /api/items/{id}/budget-restore", s.mutationGuard(s.handleBudgetRestore))
-	mux.HandleFunc("POST /api/doctor", s.mutationGuard(s.handleDoctorStart))
-	mux.HandleFunc("GET /api/doctor", s.handleDoctorGet)
 	mux.HandleFunc("GET /api/push/key", s.handlePushKey)
 	mux.HandleFunc("POST /api/push/subscribe", s.handlePushSubscribe)
 	mux.HandleFunc("POST /api/push/unsubscribe", s.handlePushUnsubscribe)
@@ -256,7 +251,7 @@ func (s *Server) handler() (tcp, socket http.Handler, err error) {
 func (s *Server) mutationGuard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.mode.Mutates() {
-			http.Error(w, "observe mode: nothing here ever runs a stage, a move or a doctor script", http.StatusForbidden)
+			http.Error(w, "observe mode: nothing here ever runs a stage or move script", http.StatusForbidden)
 			return
 		}
 		next(w, r)
@@ -352,7 +347,7 @@ const drainGrace = 45 * time.Second
 // drain waits for every transition already claimed — schedule's launches,
 // handleStart, and the tick button's own advance — and every other goroutine
 // Run started that still has work outstanding — the loops themselves, a
-// background refresh or doctor sweep, a push send, a request still writing to
+// background refresh or recovery probe, a push send, a request still writing to
 // the data directory — to finish, or gives up after drainGrace and says what
 // is still running rather than hanging forever on a run that will not.
 //
@@ -397,7 +392,7 @@ func (s *Server) drain() {
 // spawn runs f in its own goroutine, counted in shutdownWork until it
 // returns. Every goroutine Run starts directly (a loop) or a handler spawns
 // that runs a script or writes under the data directory (a background
-// refresh, a doctor sweep, unblockAll, a push send) goes through this, so
+// refresh, a recovery probe, unblockAll, a push send) goes through this, so
 // drain actually waits for it instead of only for a transition.
 func (s *Server) spawn(f func()) {
 	s.shutdownWork.Add(1)

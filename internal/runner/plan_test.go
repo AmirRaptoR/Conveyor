@@ -13,10 +13,10 @@ import (
 )
 
 // Every run gets a plan.jsonl, pre-created 0600, named to the script by
-// CONVEYOR_PLAN — list, move, stage, doctor, status, preflight and an inline
+// CONVEYOR_PLAN — list, move, stage, status, preflight and an inline
 // run: body alike, since Run() handles every Kind uniformly.
 func TestPlanChannelCreatedForEveryKind(t *testing.T) {
-	for _, kind := range []string{"list", "move", "stage", "doctor", "status", "preflight"} {
+	for _, kind := range []string{"list", "move", "stage", "status", "preflight"} {
 		t.Run(kind, func(t *testing.T) {
 			r := New(t.TempDir())
 			res, err := r.Run(context.Background(), Spec{
@@ -74,8 +74,8 @@ func TestPlanChannelCreatedForInlineScript(t *testing.T) {
 func TestPlanChannelCannotBeOverridden(t *testing.T) {
 	r := New(t.TempDir())
 	res, err := r.Run(context.Background(), Spec{
-		Script:  script(t, `echo "$CONVEYOR_PLAN" > "$CONVEYOR_RESULT"`),
-		Kind:    "stage", Workdir: t.TempDir(), Source: "test",
+		Script: script(t, `echo "$CONVEYOR_PLAN" > "$CONVEYOR_RESULT"`),
+		Kind:   "stage", Workdir: t.TempDir(), Source: "test",
 		Env: map[string]string{"CONVEYOR_PLAN": "/tmp/evil-plan.jsonl"},
 	})
 	if err != nil {
@@ -136,7 +136,7 @@ sleep 0.15
 
 // OnPlan carries the run's own Kind and target Stage, so a subscriber keying
 // board state by item can tell a stage run targeting a real stage apart from
-// a list, move, doctor or status run publishing against the same item — the
+// a list, move or status run publishing against the same item — the
 // only distinction that decides whether a revision may ever reach a card.
 func TestOnPlanCarriesKindAndStage(t *testing.T) {
 	r := New(t.TempDir())

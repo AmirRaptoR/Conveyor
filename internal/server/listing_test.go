@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
@@ -18,12 +19,14 @@ func twoSourceBoard(t *testing.T) (*config.Config, *runner.Runner, string) {
 	dir := t.TempDir()
 	failMarker := filepath.Join(dir, "fail")
 	writeScript(t, filepath.Join(dir, "providers", "good", "list.sh"), `#!/bin/sh
+echo x >> `+filepath.Join(dir, "good-lists")+`
 cat > "$CONVEYOR_RESULT" <<'JSON'
 [{"id":"good:1","ref":"1","source":"good","stage":"backlog","title":"steady work"}]
 JSON
 `)
 	writeScript(t, filepath.Join(dir, "providers", "good", "move.sh"), "#!/bin/sh\nexit 0\n")
 	writeScript(t, filepath.Join(dir, "providers", "flaky", "list.sh"), `#!/bin/sh
+echo x >> `+filepath.Join(dir, "flaky-lists")+`
 if [ -e "`+failMarker+`" ]; then
   echo "the API is down" >&2
   exit 1
@@ -105,12 +108,54 @@ func TestAFailedListingRetainsThatSourcesItems(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeScript(t, filepath.Join(dir, "providers", "flaky", "list.sh"), "#!/bin/sh\nexit 0\n")
+	retry, ok := s.recovery.Get("source", "flaky")
+	if !ok {
+		t.Fatal("failed listing did not record source recovery")
+	}
+	retry.NotBefore = time.Now().Add(-time.Second)
+	if err := s.recovery.Put(retry); err != nil {
+		t.Fatal(err)
+	}
 	s.refresh(s.ctx)
 	s.mu.RLock()
 	final := ids(s.state.Items)
 	s.mu.RUnlock()
 	if contains(final, "flaky:1") {
 		t.Errorf("items = %v, want flaky:1 gone after a successful listing that omits it", final)
+	}
+}
+
+func TestListingBackoffSurvivesRestartAndIsolatesSources(t *testing.T) {
+	cfg, r, dir := twoSourceBoard(t)
+	s := New(cfg, r)
+	s.ctx = context.Background()
+	s.refresh(s.ctx)
+	if err := os.WriteFile(filepath.Join(dir, "fail"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.refresh(s.ctx)
+	if got := countLines(filepath.Join(dir, "flaky-lists")); got != 2 {
+		t.Fatalf("flaky listing attempts = %d, want initial success plus one failure", got)
+	}
+
+	// The next ordinary refresh keeps listing the healthy source but skips the
+	// failed one until its persisted deadline.
+	s.refresh(s.ctx)
+	if got := countLines(filepath.Join(dir, "flaky-lists")); got != 2 {
+		t.Fatalf("flaky source ignored backoff and ran %d times", got)
+	}
+	if got := countLines(filepath.Join(dir, "good-lists")); got != 3 {
+		t.Fatalf("healthy source listed %d times, want all three refreshes", got)
+	}
+
+	restarted := New(cfg, r)
+	restarted.ctx = context.Background()
+	restarted.refresh(restarted.ctx)
+	if got := countLines(filepath.Join(dir, "flaky-lists")); got != 2 {
+		t.Fatalf("restart forgot flaky source backoff: %d attempts", got)
+	}
+	if got := countLines(filepath.Join(dir, "good-lists")); got != 4 {
+		t.Fatalf("restart held unrelated healthy source: %d attempts", got)
 	}
 }
 

@@ -65,14 +65,14 @@ func TestHandlePlanUpdateRejectionKeepsLastGoodRevision(t *testing.T) {
 	}
 }
 
-// A move, doctor, list or status run publishing a revision is recorded in
+// A move, list or status run publishing a revision is recorded in
 // its own run directory (served by GET /api/runs/{id}) and never reaches a
 // card.
 func TestHandlePlanUpdateIgnoresNonStageKindsForTheCard(t *testing.T) {
 	cfg, r := boardFor(t)
 	s := New(cfg, r)
 	rev := plan.Revision{V: 1, Rev: 1, At: time.Now(), Todos: []plan.Todo{{ID: "a", Text: "x", Status: plan.StatusPending}}}
-	for _, kind := range []string{"move", "doctor", "list", "status", "preflight"} {
+	for _, kind := range []string{"move", "list", "status", "preflight"} {
 		s.handlePlanUpdate("r1", "s1:1", runner.PlanUpdate{Revision: rev, HasRevision: true, Kind: kind, Stage: "working"})
 	}
 	if _, ok := s.plans["s1:1"]; ok {

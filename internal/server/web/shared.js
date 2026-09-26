@@ -74,54 +74,6 @@ export async function load() {
 
 export function fault(msg) { $("#lamp").className = "lamp down"; $("#line1").textContent = msg; }
 
-// The doctor's own sweep, drawn separately from /api/state: it outlives any
-// one poll and has to keep showing rows settle while a sweep is running,
-// whether or not anything else on the board changed.
-let doctorSweep = null;
-export async function loadDoctor() {
-  try { doctorSweep = await (await fetch("/api/doctor")).json(); } catch { return; }
-  drawDoctor();
-}
-
-function drawDoctor() {
-  const box = $("#doctor");
-  const sw = doctorSweep;
-  if (!sw || !(sw.results || []).length) { box.innerHTML = ""; return; }
-  // A dry run is never worded as a change: "would clear/leave", not "cleared",
-  // and the head says outright that nothing happened yet.
-  const verb = { cleared: sw.apply ? "cleared" : "would clear", left: sw.apply ? "left" : "would leave",
-    failed: "failed", skipped: "skipped", pending: "pending" };
-  box.innerHTML = `<div class="doctor-sweep">
-      <div class="dhead">
-        <b>Diagnose</b>
-        <span class="${sw.apply ? "dapply" : "dstate"}">${sw.apply ? "applying" : "dry run — nothing changed yet"}</span>
-        <span class="dstate">${sw.running ? "running…" : "finished"}</span>
-        ${(!sw.running && !sw.apply) ? `<button class="ctl" id="doctor-apply">Apply</button>` : ""}
-      </div>
-      ${sw.results.map(r => `<div class="drow ${esc(r.status)}">
-        <span class="ditem">${esc(r.item)}</span>
-        <span class="dstatus">${esc(verb[r.status] || r.status)}</span>
-        <span class="dwhy">${esc(r.why || "")}</span>
-      </div>`).join("")}
-    </div>`;
-  const applyBtn = $("#doctor-apply");
-  if (applyBtn) applyBtn.onclick = () => startDoctor(true);
-}
-
-export async function startDoctor(apply) {
-  let res;
-  try {
-    res = await fetch("/api/doctor", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ apply }),
-    });
-  } catch { fault("could not start the sweep: disconnected"); return; }
-  if (res.status === 409) { alert("A sweep is already running."); return; }
-  if (!res.ok) { fault((await res.text()).trim() || `could not start the sweep (HTTP ${res.status})`); return; }
-  loadDoctor();
-}
-
 // The identity of a focused card/`.more`/`.need` button, or of an agent's open
 // `<details>`, in a shape `findFocusTarget`/a `data-agent` lookup can find
 // again after the subtree it lives in is rebuilt. `el.closest` rather than a

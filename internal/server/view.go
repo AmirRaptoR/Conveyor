@@ -548,6 +548,10 @@ type Server struct {
 	// operator-defined execution ceiling is a decision, not a fact a status
 	// script rediscovers, so a restart must not silently forget it (#39).
 	budgets *store.Budgets
+	// recovery is every deterministic wait and per-source retry deadline. It
+	// is persisted because a restart must not turn backoff into an immediate
+	// retry or forget what unchanged condition a probe is comparing.
+	recovery *store.Recovery
 	// cancels is the audit record of a run an operator cancelled, kept until
 	// that item's next transition starts and overwrites it. Memory-only: a
 	// restart has no run left in flight to cancel, so there is nothing here
@@ -583,7 +587,7 @@ type Server struct {
 	// outcome routed as though it were the other's.
 	working sync.Map // itemID -> struct{}, held for the life of a transition
 	// unblocking serialises provider writes that clear one item's mark. A
-	// migration, doctor sweep and human answer can otherwise race from the
+	// migration and human answer can otherwise race from the
 	// same snapshot and let an older clear erase a newer decision.
 	unblocking sync.Map // itemID -> struct{}, held for one mark-clearing write
 	// resting is the items left alone until the next listing, by ID.
@@ -634,23 +638,18 @@ type Server struct {
 	wake     chan struct{}
 	inFlight atomic.Int64
 	// shutdownWork counts everything drain must wait for that is not a
-	// transition: the loops Run starts (poll, button, schedule, stalled,
-	// sweep), the goroutines a handler spawns that run a script or write a
-	// data file (refresh, runDoctorSweep, unblockAll, a push send), and every
+	// transition: the loops Run starts (poll, button, schedule, sweep), the
+	// goroutines a handler spawns that run a script or write a data file
+	// (refresh, unblockAll, a push send), and every
 	// in-flight HTTP request. Tracked apart from inFlight so inFlight keeps
-	// meaning exactly "transitions" for handleState's Running and for
-	// stalled/schedule's own checks, and so drain's give-up message can still
+	// meaning exactly "transitions" for handleState's Running and schedule's
+	// own checks, and so drain's give-up message can still
 	// name which items a stuck *transition* belongs to — something this
 	// counter alone cannot say.
 	shutdownWork atomic.Int64
 	// polling guards discovery against itself: the ticker and the button both
 	// ask for it, and running every list script twice at once buys nothing.
 	polling atomic.Bool
-
-	// doctorMu guards doctorSweep, which the sweep's own goroutine mutates as
-	// each row settles and GET /api/doctor reads concurrently.
-	doctorMu    sync.Mutex
-	doctorSweep *Sweep
 
 	// Push notifications: the VAPID key pair the browser subscribes against
 	// and the subscriptions taken. Nil keys means the data dir refused the
@@ -662,7 +661,7 @@ type Server struct {
 	verify *authVerifier
 	// mode is what this process is willing to do to the pipeline: auto (the
 	// scheduler drives it), manual (only the tick button does) or observe
-	// (nothing here ever runs a stage, a move or a doctor script). Set once,
+	// (nothing here ever runs a stage or move script). Set once,
 	// by Run, before any goroutine or route can read it.
 	mode Mode
 	// cop rejects unsafe cross-origin requests to every mutation route (F08).
@@ -701,6 +700,7 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 		answers:      store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
 		manualPauses: store.OpenPauses(filepath.Join(cfg.DataDir(), "pauses.json")),
 		budgets:      store.OpenBudgets(filepath.Join(cfg.DataDir(), "budgets.json")),
+		recovery:     store.OpenRecovery(filepath.Join(cfg.DataDir(), "recovery.json")),
 		tick:         make(chan struct{}, 1),
 		wake:         make(chan struct{}, 1),
 		ctx:          context.Background(),
@@ -727,7 +727,16 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 	s.resting = map[string]bool{}
 	s.restingAt = map[string]time.Time{}
 	s.waiting = map[string]model.Waiting{}
-	s.waiting = map[string]model.Waiting{}
+	for _, entry := range s.recovery.All() {
+		if entry.Scope != "item" {
+			continue
+		}
+		s.resting[entry.ID] = true
+		s.restingAt[entry.ID] = entry.NotBefore
+		s.waiting[entry.ID] = model.Waiting{
+			Class: entry.Class, Key: entry.Key, Why: entry.Why, Until: entry.NotBefore,
+		}
+	}
 	s.confirmedAt = map[string]time.Time{}
 	s.sourceGen = map[string]time.Time{}
 	s.answerInfo = map[string]AnswerView{}
@@ -762,7 +771,7 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 			prevStart(run)
 		}
 		// Only a stage run naming a real item and target stage is ever
-		// steerable — a list, move, doctor or status run never is.
+		// steerable — a list, move or status run never is.
 		if run.Kind == "stage" && run.ItemID != "" && run.To != "" {
 			s.liveRuns.Open(run.ItemID, registry.Entry{RunID: run.ID, Dir: run.Dir, Stage: run.To})
 			s.mu.Lock()
@@ -784,7 +793,7 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 			prevProcessExit(run)
 		}
 	}
-	// Every run this Runner executes — list, move, stage, doctor, status —
+	// Every run this Runner executes — list, move, stage, status —
 	// reaches here, which is what lets one place notice a persistence fault
 	// without a check threaded through every call site that starts a run.
 	prevResult := r.OnResult

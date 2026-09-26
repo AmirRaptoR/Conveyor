@@ -115,6 +115,32 @@ func (a *Answers) Take(id string, spent model.Resume) (bool, error) {
 	return true, nil
 }
 
+// ReplaceIf atomically rewrites exactly the input a run received. A newer
+// answer or action armed while that run was in flight is left untouched.
+func (a *Answers) ReplaceIf(id string, old, replacement model.Resume) (bool, error) {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	a.dataMu.RLock()
+	cur, ok := a.m[id]
+	a.dataMu.RUnlock()
+	if !ok || cur != old {
+		return false, nil
+	}
+	next := a.snapshot()
+	if replacement == (model.Resume{}) {
+		delete(next, id)
+	} else {
+		next[id] = replacement
+	}
+	if err := a.persist(next); err != nil {
+		return false, err
+	}
+	a.dataMu.Lock()
+	a.m = next
+	a.dataMu.Unlock()
+	return true, nil
+}
+
 // snapshot copies the current answers. Called only from within a writeMu
 // critical section, so the copy it starts from cannot change under it before
 // persist writes it out.

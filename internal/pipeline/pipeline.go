@@ -267,7 +267,11 @@ type Transition struct {
 	RunID    string `json:"runId,omitempty"`
 	RunDir   string `json:"runDir,omitempty"`
 	Attempts int    `json:"attempts,omitempty"`
-	Err      error  `json:"-"`
+	// ProviderWritePending means the script (if any) has finished but its
+	// provider move or mark did not. The server backs this transition off and
+	// must not cache/notify the desired mark before the provider confirms it.
+	ProviderWritePending bool  `json:"providerWritePending,omitempty"`
+	Err                  error `json:"-"`
 }
 
 // Engine advances items. It owns no state beyond locks and attempt counts:
@@ -348,12 +352,27 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 		return tr, nil
 	}
 
+	// A recovery re-entry into the very stage the item is already in (F04):
+	// if the last run of this stage for this item already succeeded and only
+	// its provider write never got confirmed, retry that write directly. In
+	// particular, do not first clear a pending mark: that would create an
+	// observable unblocked window and a second provider-side notification.
+	if to == from {
+		if pending, ok := runner.PendingMove(e.runner.Root, item.ID, to); ok {
+			if pending.PendingMark {
+				return e.resumePendingMark(ctx, client, item, tr, pending)
+			}
+			return e.resumePendingMove(ctx, client, item, tr, pending)
+		}
+	}
+
 	// Entering a stage writes the mark as well as the stage, and it writes it
 	// off. The scheduler never hands over a marked item, so reaching here means
 	// a person cleared it — saying so out loud keeps the provider honest even
 	// if they cleared only half of it.
 	if _, err := client.Move(ctx, item, to, source.Mark{}); err != nil {
 		tr.Err = err
+		tr.ProviderWritePending = true
 		return tr, err
 	}
 	tr.Item = *item
@@ -362,17 +381,6 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	if !stage.Runs() {
 		tr.Outcome = model.OutcomeNoop
 		return tr, nil
-	}
-
-	// A recovery re-entry into the very stage the item is already in (F04):
-	// if the last run of this stage for this item already succeeded and only
-	// its outgoing move never got confirmed, the stage does not run again —
-	// only the move is retried. Re-running a stage script that already did
-	// its work is the side effect this exists to stop.
-	if to == from {
-		if pending, ok := runner.PendingMove(e.runner.Root, item.ID, to); ok {
-			return e.resumePendingMove(ctx, client, item, tr, pending)
-		}
 	}
 
 	src := mustSource(e.cfg, srcName)
@@ -464,12 +472,23 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	// engine writes provider state before it runs anything, is an interrupted
 	// job the next pass simply re-runs.
 	if mark.Blocked {
+		res.Run.PendingMark = true
+		res.Run.MarkKind = mark.Kind
+		res.Run.MarkReason = mark.Reason
+		metaErr := runner.WriteMeta(&res.Run)
 		if _, err := client.Move(ctx, item, to, mark); err != nil {
-			tr.Err = err
-			return tr, err
+			tr.Blocked = false
+			tr.ProviderWritePending = true
+			tr.Err = errors.Join(err, metaErr)
+			return tr, tr.Err
+		}
+		res.Run.MoveConfirmed = true
+		if err := runner.WriteMeta(&res.Run); err != nil {
+			metaErr = errors.Join(metaErr, fmt.Errorf("persist provider mark confirmation: %w", err))
 		}
 		tr.Item = *item
-		return tr, runErr
+		tr.Err = metaErr
+		return tr, errors.Join(runErr, metaErr)
 	}
 	if next == "" || next == to {
 		return tr, runErr
@@ -479,24 +498,33 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	// still finds NextStage set and knows the script does not need re-running
 	// — only the move does.
 	res.Run.NextStage = next
-	_ = runner.WriteMeta(&res.Run)
+	if err := runner.WriteMeta(&res.Run); err != nil {
+		// The stage already succeeded, but without a durable pending record a
+		// restart would run it again. Fail closed on the provider instead.
+		reason := fmt.Sprintf("%s finished, but Conveyor could not persist its pending move to %s: %v", to, next, err)
+		fallback := source.Mark{Blocked: true, Kind: "error", Reason: reason}
+		if _, markErr := client.Move(ctx, item, to, fallback); markErr != nil {
+			tr.ProviderWritePending = true
+			tr.Err = errors.Join(err, markErr)
+			return tr, tr.Err
+		}
+		tr.Item = *item
+		tr.Blocked, tr.Kind, tr.Reason = true, fallback.Kind, fallback.Reason
+		tr.Err = err
+		return tr, err
+	}
 	if _, err := client.Move(ctx, item, next, source.Mark{}); err != nil {
+		tr.ProviderWritePending = true
 		tr.Err = err
 		return tr, err
 	}
 	res.Run.MoveConfirmed = true
-	_ = runner.WriteMeta(&res.Run)
+	if err := runner.WriteMeta(&res.Run); err != nil {
+		tr.Err = fmt.Errorf("persist move confirmation to %s: %w", next, err)
+	}
 	tr.Item = *item
-	return tr, runErr
+	return tr, errors.Join(runErr, tr.Err)
 }
-
-// maxMoveAttempts bounds how many times resumePendingMove retries an
-// outgoing write that keeps failing after its stage already succeeded,
-// before marking the item so a person decides. Not configuration — a
-// provider write either recovers in a poll or two or it needs a person,
-// and this is the same order of magnitude as the rest of the engine's
-// fixed retry constants (CLAUDE.md: RESUME_MAX_ATTEMPTS).
-const maxMoveAttempts = 3
 
 // resumePendingMove retries only the outgoing move a previous, successful run
 // of this stage left unconfirmed (F04) — never the stage script itself.
@@ -505,36 +533,51 @@ func (e *Engine) resumePendingMove(ctx context.Context, client *source.Client, i
 	tr.RunID = pending.ID
 	tr.RunDir = pending.Dir
 	next := pending.NextStage
+	tr.Next = next
 
 	if _, err := client.Move(ctx, item, next, source.Mark{}); err != nil {
 		pending.MoveAttempts++
 		tr.Attempts = pending.MoveAttempts
 		tr.Err = err
-		if pending.MoveAttempts >= maxMoveAttempts {
-			mark := source.Mark{Blocked: true, Kind: "error",
-				Reason: fmt.Sprintf("%s: the stage finished but moving it on to %s kept failing: %s", pending.To, next, err)}
-			if _, mErr := client.Move(ctx, item, pending.To, mark); mErr == nil {
-				tr.Item = *item
-				tr.Blocked = true
-				tr.Reason = mark.Reason
-				tr.Kind = mark.Kind
-				// Marked: this pending move is settled one way or another,
-				// so it must not be found and retried again.
-				pending.MoveConfirmed = true
-				_ = runner.WriteMeta(&pending)
-				return tr, err
-			}
-			// The mark itself could not be written either; leave the
-			// pending record as is and let the next poll try again.
+		tr.ProviderWritePending = true
+		if metaErr := runner.WriteMeta(&pending); metaErr != nil {
+			tr.Err = errors.Join(err, fmt.Errorf("persist pending move attempt: %w", metaErr))
 		}
-		_ = runner.WriteMeta(&pending)
 		return tr, err
 	}
 	pending.MoveConfirmed = true
-	_ = runner.WriteMeta(&pending)
+	if err := runner.WriteMeta(&pending); err != nil {
+		tr.Err = fmt.Errorf("persist move confirmation to %s: %w", next, err)
+	}
 	tr.Item = *item
 	tr.Next = next
-	return tr, nil
+	return tr, tr.Err
+}
+
+func (e *Engine) resumePendingMark(ctx context.Context, client *source.Client, item *model.Item, tr *Transition, pending model.Run) (*Transition, error) {
+	tr.Outcome = model.OutcomeBlocked
+	tr.RunID = pending.ID
+	tr.RunDir = pending.Dir
+	mark := source.Mark{Blocked: true, Kind: pending.MarkKind, Reason: pending.MarkReason}
+	if _, err := client.Move(ctx, item, pending.To, mark); err != nil {
+		pending.MoveAttempts++
+		tr.Attempts = pending.MoveAttempts
+		tr.ProviderWritePending = true
+		tr.Err = err
+		if metaErr := runner.WriteMeta(&pending); metaErr != nil {
+			tr.Err = errors.Join(err, fmt.Errorf("persist pending mark attempt: %w", metaErr))
+		}
+		return tr, tr.Err
+	}
+	pending.MoveConfirmed = true
+	if err := runner.WriteMeta(&pending); err != nil {
+		tr.Err = fmt.Errorf("persist mark confirmation: %w", err)
+	}
+	tr.Item = *item
+	tr.Blocked = true
+	tr.Kind = pending.MarkKind
+	tr.Reason = pending.MarkReason
+	return tr, tr.Err
 }
 
 // route decides what happens after a stage script exits: where the item goes,
@@ -777,8 +820,7 @@ func Pick(cfg *config.Config, items []model.Item, order []string, d Deps) (*mode
 // finishedAt first (falling back to listing order when it is empty or does
 // not parse as RFC 3339); a marked item and a queue with no exit keep the
 // rungs Pick would use if they were workable — manual order, then priority,
-// then listing order — which is the doctor sweep's order too, unaffected by
-// any of this since it only ever walks marked items.
+// then listing order.
 func Order(cfg *config.Config, items []model.Item, order []string, d Deps) []model.Item {
 	pos := index(order)
 	depths := stageDepths(cfg)
@@ -884,9 +926,7 @@ func better(a, b candidate) bool {
 	}
 	if !a.workable {
 		// Both are off the queue entirely. Finished work sorts ahead of the
-		// rest — marked items and queues with no exit — which is what keeps
-		// the doctor sweep's order over marked items untouched: it never sees
-		// a terminal item in the first place.
+		// rest — marked items and queues with no exit.
 		if a.terminal != b.terminal {
 			return a.terminal
 		}

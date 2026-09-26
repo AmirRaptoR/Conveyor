@@ -85,7 +85,7 @@ test("startableRule: an empty stage list has no first stage to start out of", ()
 // controlsForMode runs inside the vm sandbox, so an object it returns and an
 // object literal written in this file are cross-realm and never
 // reference-equal even with identical own properties.
-const controlFields = ["tick", "unblockAll", "diagnose", "handBack", "dragStart"];
+const controlFields = ["tick", "unblockAll", "handBack", "dragStart"];
 
 test("controlsForMode: observe offers none of the five mutating controls", () => {
   const got = controlsForMode("observe");

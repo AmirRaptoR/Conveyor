@@ -23,8 +23,8 @@ drains the mock pipeline in priority order and marks a blocked item in place.
 `conveyor serve` runs the pipeline and renders it: the board, live logs over
 SSE, run history, drag-to-reorder, drag out of the backlog to start an item now
 (`POST /api/items/{id}/start`), each mark's reason on its card with a hand-back
-button, `Unblock all`, a `Diagnose` sweep, and a strip saying how each agent is
-doing. An Inbox tab beside it (#40) is the same items again, reordered around
+button, `Unblock all`, and a strip saying how each agent is doing. An Inbox tab
+beside it (#40) is the same items again, reordered around
 attention rather than stage: a question, a failure, a dependency wait, a quota
 limit and a resting "pending" item are five distinct labels, never one grey
 "blocked", and a source that has not been listed recently marks its own items
@@ -36,14 +36,12 @@ second implementation of hand-back, Answer, or the report/history/log it
 already carries. It advances items on its own — `-watch`
 is what makes it observe without touching anything. Discovery, scheduling and
 the tick button are three goroutines, deliberately: a 90-minute stage must not
-be able to stop every source being listed. `Diagnose` (`POST /api/doctor`)
-sweeps every marked item through its source's `doctor:` script, reading each
-one's own reason before deciding whether to retry it, resume it or leave it
-for a person — a third, more careful exception to "only a person clears a
-mark" (CONTRACTS §6). Dry run by default; a person presses `Apply` once the
-sweep has shown what it would do. `agents/claude/doctor` and `agents/mock/doctor`
-are the shipped policies; a source declaring no `doctor:` just has its marked
-items skipped by a sweep.
+be able to stop every source being listed. Recovery is blocker-specific:
+network failures back off per source, typed item waits use persisted transient
+adapter probes with no run history or model dispatch, dependencies wake from a
+fresh listing, and quota follows the reset reported by the agent. An unchanged
+diagnosis creates no stage run or notification; a changed one permits one
+ordinary run to record and route the new state.
 
 The board is an installable app (`web/manifest.webmanifest`, `web/sw.js`) and
 sends Web Push when an item asks a question or reaches a terminal stage —
@@ -271,13 +269,15 @@ peer, and the socket is the only door with no password on it (#94).
   deploy nobody reviewed; the pipeline is authored ahead of time, not steered
   card by card. A busy slot is a refusal naming what holds it, not a queue.
 - **A stop is either a question or a condition, and the script says which.** A
-  condition (`limit`, `worktree`, a network that was down) may have passed, so
-  the engine clears it in bulk: `Unblock all`, `retryStalled`, a quota
-  returning. A question (`asked: true` in `$CONVEYOR_RESULT`, what `asks` in
-  `agents/_blocked` writes) is never bulk-cleared and never counts towards a
-  stall — nobody answers a question by waiting, and handing it back unanswered
-  spends a run to be asked it again. Condition is the default because it is the
-  safe one to get wrong. The engine reads the flag, never the word beside it.
+  condition (`limit`, `worktree`, a network that was down) may have passed, but
+  the engine never guesses that from time alone: new deterministic conditions
+  use typed waits, while an existing mark stays until a person clears it or a
+  narrow authoritative reconciliation owns its kind. A question (`asked: true`
+  in `$CONVEYOR_RESULT`, what `asks` in `agents/_blocked` writes) is never
+  auto-cleared — nobody answers a question by waiting, and handing it back
+  unanswered spends a run to be asked it again. Condition is the default
+  because it is the safe one to get wrong. The engine reads the flag, never the
+  word beside it.
   For a model-written stop the split lives in `agents/_result`'s
   `CONDITION_KINDS`/`is_condition_kind`: `agent_asked` (`agents/claude/_stream`)
   derives `asked` from the kind the model actually declared, never forces it
@@ -308,8 +308,8 @@ peer, and the socket is the only door with no password on it (#94).
   `Issue.closedByPullRequestsReferences` rather than a page of `pr list` —
   because no *open* PR is not the same as nothing landed: it may already be
   merged, and a guard that cannot tell those apart marks a finished item
-  `no-output` forever, since a merged PR never becomes open again for
-  `retryStalled` to find. This is not a second way to pick a pull request to
+  `no-output` forever, since a merged PR never becomes open again on a later
+  retry. This is not a second way to pick a pull request to
   work on; it only ever answers whether this item is already done, and stays
   the one place both implement and review ask that question.
 - **An item sequenced behind an open issue is not started.** `agents/_deps`
@@ -317,10 +317,10 @@ peer, and the socket is the only door with no password on it (#94).
   bare "Depends on:" line followed by one markdown list item per predecessor,
   which is the shape a refined issue actually writes and which used to
   declare nothing (the keyword line had no number on it, and a line break is
-  a sentence break); implement stops before the worktree with a `dependency`
-  mark on configurations that have not enabled the engine gate. Once any
-  stage declares `dependenciesAt`, a successful listing automatically removes
-  those legacy script marks and the computed hold owns the condition instead;
+  a sentence break); implement stops before the worktree with a typed dependency
+  poll on configurations that have not enabled the engine gate. Once any stage
+  declares `dependenciesAt`, a successful listing automatically removes old
+  script-authored `dependency` marks and the computed hold owns the condition;
   questions and other mark kinds remain untouched. A gated stage receives
   `CONVEYOR_DEPENDENCIES_AT`, and `agents/claude/implement` uses its presence
   to stand down the older "issue is open" preflight so it cannot recreate the
@@ -405,15 +405,12 @@ peer, and the socket is the only door with no password on it (#94).
   non-terminal stage, say. A recovered run-history reason always wins when
   there is one; the listing's is only the fallback for the gap where no run
   explains the mark at all.
-- **Only a person clears a mark**, with two exceptions, and both are the outside
-  world coming back rather than a decision being made. `retryStalled:` clears
-  them all when *every* item is marked and the line cannot move at all — the
-  guard is "everything" deliberately. And an agent's `status` going `limited` →
-  `ok` clears the marks of kind `limit`, those and no others: the script itself
-  said nothing was wrong with the item, and the quota returning is the whole
-  answer. A `decision` mark is never touched — no amount of waiting produces an
-  answer only a person has, and clearing it spends an agent run to be told the
-  same thing.
+- **Only a person clears a mark**, except for state the engine can verify: an
+  agent's `status` going `limited` → `ok` clears only `limit`; enabling
+  `dependenciesAt` migrates only legacy `dependency` marks to computed holds;
+  and tracking reconciliation clears only its own lifecycle marks. Typed waits
+  are not marks and recover without provider writes. A `decision` mark is never
+  touched — no amount of waiting produces an answer only a person has.
 - **A stop can be answered, and answering is unblocking.** `POST
   /api/items/{id}/unblock` takes `{"answer": "…"}`; the reply reaches the next
   run of that stage in its stdin as `answer`, beside the `session` the agent
@@ -562,11 +559,9 @@ or a source: every stage naming that agent meets the same wall in every
 repository, so marking items one at a time was only a way of discovering the
 same fact once per item. The first refused run pauses the agent too — a `limit`
 mark is account-level news, and waiting for the next probe costs a whole poll of
-runs to be told what that one just said. `retryStalled` stands down while
-anything is paused, because its premise is that the cause may have passed and
-this is a cause with a known end. Stages that run no agent keep moving, and the
-tick button still overrides. Nothing wedges it shut: a probe that fails, or an
-agent with no status script at all, lifts the pause rather than holding it.
+runs to be told what that one just said. Stages that run no agent keep moving,
+and the tick button still overrides. Nothing wedges it shut: a probe that fails,
+or an agent with no status script at all, lifts the pause rather than holding it.
 
 ## The extension seam
 

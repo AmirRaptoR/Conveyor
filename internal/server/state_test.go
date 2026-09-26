@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
@@ -352,49 +350,6 @@ func writeBlockedRun(t *testing.T, root, itemID, stage, result string) {
 	if err := os.WriteFile(filepath.Join(dir, "result.json"), []byte(result), 0o644); err != nil {
 		t.Fatal(err)
 	}
-}
-
-// The stall retry is guarded on "everything", not "something": while one item
-// can still move, a mark is a decision, and clearing it spends an agent run to
-// be told the same thing again.
-func TestStallRetryWaitsWhileAnythingCanStillMove(t *testing.T) {
-	cfg, r := boardFor(t)
-	s := New(cfg, r)
-	s.ctx = t.Context()
-	s.state.Items = []model.Item{
-		{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true},
-		{ID: "s1:2", Source: "s1", Stage: "backlog"}, // this one can still go
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	go s.stalled(ctx, 10*time.Millisecond)
-	time.Sleep(60 * time.Millisecond)
-	cancel()
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if !s.state.Items[0].Blocked {
-		t.Error("the mark was cleared while another item could still move")
-	}
-}
-
-// And when nothing at all can move, it hands the board back.
-func TestStallRetryClearsATotallyStalledBoard(t *testing.T) {
-	cfg, r := boardFor(t)
-	s := New(cfg, r)
-	s.ctx = t.Context()
-	s.state.Items = []model.Item{
-		{ID: "s1:1", Source: "s1", Stage: "working", Blocked: true},
-		{ID: "s1:2", Source: "s1", Stage: "backlog", Blocked: true},
-		{ID: "s1:3", Source: "s1", Stage: "done"}, // finished: not a way forward
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	go s.stalled(ctx, 10*time.Millisecond)
-	waitFor(t, "the stalled board to be handed back", func() bool {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		return !s.state.Items[0].Blocked && !s.state.Items[1].Blocked
-	})
 }
 
 // A held item is not a blocked item. Blocked is a mark somebody has to

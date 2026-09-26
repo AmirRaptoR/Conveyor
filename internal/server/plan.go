@@ -13,7 +13,7 @@ import (
 // handlePlanUpdate is Runner.OnPlan: called for every accepted revision and
 // every rejection, live, while a run is in flight, and once more after it
 // exits. It updates the item's card summary only for a stage run naming a
-// real target stage — a list, move, doctor or status run publishing a
+// real target stage — a list, move or status run publishing a
 // revision is recorded in its own run directory (read straight off disk by
 // GET /api/runs/{id}) and never reaches a card — and always publishes the SSE
 // event, whatever the run's kind, so the panel can follow any run it is

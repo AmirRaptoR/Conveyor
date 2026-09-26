@@ -311,10 +311,14 @@ Move it aside or remove it by hand."
 			/^branch /   { if ($0 == "branch " b) { print p; exit } }
 		')
 		if [[ -n "$held" && "$held" != "$wt" ]]; then
-			blocked worktree "branch '$branch' is already checked out at $held, not this \
-item's worktree ($wt); refusing to touch another checkout to reclaim it."
+			recovers worktree "branch:$branch:$held" "branch '$branch' is already checked out at $held, not this \
+item's worktree ($wt); refusing to touch another checkout to reclaim it"
 		fi
 	fi
+
+	# A worktree probe may prune stale registrations and reclaim spent Conveyor
+	# worktrees above, but it never starts the stage or creates a fresh checkout.
+	probe_changed
 
 	mkdir -p "$(dirname "$wt")" || return 1
 	git fetch --quiet origin --prune 2>/dev/null || true

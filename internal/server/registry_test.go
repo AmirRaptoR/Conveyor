@@ -84,7 +84,7 @@ func TestLiveRunsRegistryClosesBeforeProviderMove(t *testing.T) {
 	}
 }
 
-// A list, move, doctor or status run is never steerable and must never
+// A list, move or status run is never steerable and must never
 // reach the registry — only a "stage" run with a real item id and target
 // stage does.
 func TestLiveRunsRegistryIgnoresNonStageRuns(t *testing.T) {

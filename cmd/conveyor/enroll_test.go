@@ -89,7 +89,6 @@ func fullAnswers() map[string]string {
 	return map[string]string{
 		"SOURCE": "s2", "WORKDIR": "./repo1", "PROVIDER": "fake",
 		"GREETING": "hi there", "work": "agent:fakeagent",
-		"DOCTOR_ENABLED": "n",
 	}
 }
 
@@ -113,26 +112,8 @@ func TestEnrollFlowHappyPath(t *testing.T) {
 	if !strings.Contains(block, "work:\n") || !strings.Contains(block, "agent: fakeagent") {
 		t.Errorf("block missing the script choice: %s", block)
 	}
-	if strings.Contains(block, "doctor") {
-		t.Errorf("doctor was declined; block should not mention it: %s", block)
-	}
 	if leftover := asker.Leftover(); len(leftover) != 0 {
 		t.Errorf("leftover answers not consumed: %v", leftover)
-	}
-}
-
-func TestEnrollFlowWithDoctor(t *testing.T) {
-	cfg, _ := enrollTestCfg(t)
-	answers := fullAnswers()
-	answers["DOCTOR_ENABLED"] = "y"
-	answers["doctor"] = "agent:fakeagent"
-	asker := &enroll.Asker{Answers: answers, Out: &bytes.Buffer{}}
-	_, block, err := enrollFlow(cfg, asker)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(block, "doctor:") {
-		t.Errorf("block missing the opted-in doctor script: %s", block)
 	}
 }
 
@@ -393,7 +374,6 @@ func TestEnrollAgainstMockTemplateProducesAValidExampleConfig(t *testing.T) {
 		"-answer", "prioritise=agent:mock",
 		"-answer", "implement=agent:mock",
 		"-answer", "cleanup=agent:git",
-		"-answer", "DOCTOR_ENABLED=n",
 	}
 
 	oldStdout, oldStderr, oldStdin := os.Stdout, os.Stderr, stdin

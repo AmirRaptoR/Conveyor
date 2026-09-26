@@ -75,6 +75,7 @@ _write_stop() {
 # except that one caller, so this changes no existing behaviour.
 blocked() {
 	local kind=$1 reason=$2
+	probe_changed
 	_write_stop --arg kind "$kind" --arg reason "$reason" '. + {outcome:"blocked", blocked:true, kind:$kind, reason:$reason}'
 	echo "blocked ($kind): $reason" >&2
 	exit 20
@@ -84,14 +85,14 @@ blocked() {
 #
 # The same mark, with one bit more: `asked`. A stop is one of two things and
 # they are not interchangeable. A condition — out of quota, a dirty checkout, a
-# network that was down — may have passed by the time anyone looks, so clearing
-# it in bulk and trying again is a reasonable thing for a tired operator or a
-# timer to do. A question has not passed. Nobody answered it by waiting, and
+# network that was down — may have passed by the time anyone looks, so an
+# adapter may represent it as a typed deterministic wait. A question has not
+# passed. Nobody answered it by waiting, and
 # handing it back unanswered spends an agent run to be asked it a second time.
 #
-# So the engine bulk-clears conditions and never bulk-clears questions: not on
-# `Unblock all`, not on `retryStalled`, not when an agent's quota returns. The
-# only thing that clears a question is a person answering it on the card.
+# Automatic recovery never clears a question. `Unblock all` is a person's
+# explicit action and skips them; the only thing that clears one is a person
+# answering it on the card.
 #
 # Condition is the default because it is the safe one to get wrong: a condition
 # wrongly retried costs one run, a question wrongly cleared costs the run *and*
@@ -123,6 +124,7 @@ decision_brief() {
 
 asks() {
 	local kind=$1 question=$2
+	probe_changed
 	_write_stop --arg kind "$kind" --arg reason "$question" \
 		'. + {outcome:"blocked", blocked:true, kind:$kind, reason:$reason, asked:true}'
 	echo "asks ($kind): $question" >&2
@@ -151,6 +153,44 @@ waits() {
 		'. + {outcome:"waiting", waiting:({why:$why} + (if $until == "" then {} else {until:$until} end))}'
 	echo "waiting: $why" >&2
 	exit 10
+}
+
+# recovers <class> <key> <why> [<unix seconds>] — a deterministic wait whose
+# adapter can be re-entered in probe mode without dispatching its model. Class
+# is engine vocabulary; key is opaque and changes only when the observed
+# condition changes. Unlike a plain wait, listings do not create another stage
+# run: the scheduler invokes a transient probe after the class's deadline.
+recovers() {
+	local class=$1 key=$2 why=$3 until_epoch=${4:-}
+	local until=""
+	[[ -n "$until_epoch" ]] && until=$(date -u -d "@$until_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+	_write_stop --arg class "$class" --arg key "$key" --arg why "$why" --arg until "$until" \
+		'. + {outcome:"waiting", waiting:({class:$class,key:$key,why:$why} + (if $until == "" then {} else {until:$until} end))}'
+	echo "waiting ($class): $why" >&2
+	exit 10
+}
+
+# A recovery probe is read-only. Reaching a path that would block, dispatch a
+# model, edit provider state, or otherwise act means the old diagnosis changed;
+# return success so the scheduler launches one ordinary stage run to record and
+# route the new state.
+probe_changed() {
+	if [[ "${CONVEYOR_RECOVERY_PROBE:-}" == "1" ]]; then
+		echo "recovery condition changed; handing back to the stage" >&2
+		exit 0
+	fi
+}
+
+# Continue through deterministic checks owned by the recovery class being
+# reconciled, while retaining the normal probe barrier for every other class.
+probe_changed_unless() {
+	local class
+	if [[ "${CONVEYOR_RECOVERY_PROBE:-}" == "1" ]]; then
+		for class in "$@"; do
+			[[ "${CONVEYOR_RECOVERY_CLASS:-}" == "$class" ]] && return 0
+		done
+	fi
+	probe_changed
 }
 
 # manual_action <name> — did a person press this button for this run?

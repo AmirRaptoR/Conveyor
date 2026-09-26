@@ -124,6 +124,7 @@ cat > "$CONVEYOR_RESULT" <<'JSON'
 []
 JSON
 `)
+	expireSourceRecovery(t, s, "s1")
 	s.refresh(context.Background())
 	s1 := sourceView(t, s, "s1")
 	if s1.ListError != "" {

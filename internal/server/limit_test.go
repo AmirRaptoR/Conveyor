@@ -342,7 +342,7 @@ sources:
 	s.ctx = context.Background()
 	item := model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"}
 	s.state.Items = []model.Item{item}
-	if err := s.answers.Set("s1:1", model.Resume{Answer: "keep backwards compatibility", Session: "sess-gone"}); err != nil {
+	if err := s.answers.Set("s1:1", model.Resume{Answer: "keep backwards compatibility", Session: "sess-gone", Manual: "merge-now"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -354,6 +354,9 @@ sources:
 	}
 	if left.Session != "" {
 		t.Errorf("session %q was kept; the next run would resume the same dead conversation", left.Session)
+	}
+	if left.Manual != "" {
+		t.Errorf("manual action %q was delivered more than once", left.Manual)
 	}
 }
 

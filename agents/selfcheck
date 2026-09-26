@@ -147,10 +147,11 @@ git -C "$tmp/repo" add .gitignore && git -C "$tmp/repo" commit --quiet -m gitign
 : >"$CONVEYOR_RESULT"
 out=""
 rc=0; out=$(cd "$tmp/repo" && item_worktree demo 71 review-branch 2>/dev/null) || rc=$?
-chk "a branch held by the primary checkout is refused" "$rc" "20"
+chk "a branch held by the primary checkout waits" "$rc" "10"
 chk "nothing is printed to use as a workdir"            "$out" ""
-chk "the mark names the branch"                         "$(jq -r '.reason | test("review-branch")' "$CONVEYOR_RESULT")" "true"
-chk "and the holding path"                              "$(jq -r '.reason | test("'"$tmp"'/repo")' "$CONVEYOR_RESULT")" "true"
+chk "the wait names its recovery class"                 "$(jq -r '.waiting.class' "$CONVEYOR_RESULT")" "worktree"
+chk "the wait names the branch"                         "$(jq -r '.waiting.why | test("review-branch")' "$CONVEYOR_RESULT")" "true"
+chk "and the holding path"                              "$(jq -r '.waiting.why | test("'"$tmp"'/repo")' "$CONVEYOR_RESULT")" "true"
 chk "the primary checkout's tracked file survives"      "$([[ -f "$tmp/repo/file.txt" ]] && echo yes)" "yes"
 chk "its .git survives"                                 "$([[ -d "$tmp/repo/.git" ]] && echo yes)" "yes"
 chk "and its ignored file survives"                     "$([[ -f "$tmp/repo/secret.env" ]] && echo yes)" "yes"
@@ -160,7 +161,7 @@ git -C "$tmp/repo" commit --quiet --allow-empty -m 'local only, never pushed'
 local_sha=$(git -C "$tmp/repo" rev-parse HEAD)
 : >"$CONVEYOR_RESULT"
 rc=0; (cd "$tmp/repo" && item_worktree demo 71 review-branch >/dev/null 2>&1) || rc=$?
-chk "the refusal is the same with a local-only commit" "$rc" "20"
+chk "the wait is the same with a local-only commit" "$rc" "10"
 chk "the commit is still reachable afterward" "$(git -C "$tmp/repo" rev-parse HEAD)" "$local_sha"
 
 # a dirty primary checkout is refused exactly the same way — clean is not what
@@ -169,7 +170,7 @@ echo dirty >"$tmp/repo/file.txt"
 : >"$CONVEYOR_RESULT"
 out=""
 rc=0; out=$(cd "$tmp/repo" && item_worktree demo 71 review-branch 2>/dev/null) || rc=$?
-chk "a dirty primary checkout is refused too"   "$rc" "20"
+chk "a dirty primary checkout waits too"        "$rc" "10"
 chk "still nothing printed to use as a workdir" "$out" ""
 git -C "$tmp/repo" checkout --quiet -- file.txt
 
@@ -180,8 +181,16 @@ git -C "$tmp/repo" worktree add --quiet -B external-branch "$elsewhere" origin/m
 echo work >"$elsewhere/mine.txt"
 : >"$CONVEYOR_RESULT"
 rc=0; (cd "$tmp/repo" && item_worktree demo 72 external-branch >/dev/null 2>&1) || rc=$?
-chk "an external worktree is refused"  "$rc" "20"
+chk "an external worktree waits"        "$rc" "10"
 chk "and it is left exactly as it was" "$([[ -f "$elsewhere/mine.txt" ]] && echo yes)" "yes"
+
+git -C "$tmp/repo" worktree remove --force "$elsewhere"
+: >"$CONVEYOR_RESULT"
+rc=0; (cd "$tmp/repo" && CONVEYOR_RECOVERY_PROBE=1 CONVEYOR_RECOVERY_CLASS=worktree \
+	item_worktree demo 72 external-branch >/dev/null 2>&1) || rc=$?
+chk "a worktree probe notices the holder disappeared" "$rc" "0"
+chk "and does not create a checkout during the probe" \
+	"$([[ -e "$WORKTREES/demo/72" ]] && echo present || echo gone)" "gone"
 
 # a branch held by another item's own managed worktree — the refusal names
 # both paths and neither directory is removed.
@@ -189,9 +198,9 @@ held_item=$(item_worktree demo 73)
 (cd "$held_item" && git checkout --quiet -b shared-branch)
 : >"$CONVEYOR_RESULT"
 rc=0; (cd "$tmp/repo" && item_worktree demo 74 shared-branch >/dev/null 2>&1) || rc=$?
-chk "a branch held by another managed worktree is refused" "$rc" "20"
-chk "the reason names the holder"            "$(jq -r ".reason | test(\"$held_item\")" "$CONVEYOR_RESULT")" "true"
-chk "and this item's own path"               "$(jq -r '.reason | test("demo/74")' "$CONVEYOR_RESULT")" "true"
+chk "a branch held by another managed worktree waits" "$rc" "10"
+chk "the reason names the holder"            "$(jq -r ".waiting.why | test(\"$held_item\")" "$CONVEYOR_RESULT")" "true"
+chk "and this item's own path"               "$(jq -r '.waiting.why | test("demo/74")' "$CONVEYOR_RESULT")" "true"
 chk "the holder still exists"                "$([[ -d "$held_item" ]] && echo yes)" "yes"
 chk "the requester's path was never created" "$([[ -e "$WORKTREES/demo/74" ]] && echo present || echo gone)" "gone"
 cd "$tmp/repo" && git checkout --quiet main
