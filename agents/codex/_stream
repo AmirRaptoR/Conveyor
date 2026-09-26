@@ -25,9 +25,11 @@ claude_session() {
 
 claude_model() { printf '%s' "${MODEL:-configured default}"; }
 
+codex_effort() { printf '%s' "${REASONING_EFFORT:-configured default}"; }
+
 record_model() {
 	local line
-	line=$(redact_text "model: $(claude_model) sandbox: ${CODEX_SANDBOX:-danger-full-access}${PROFILE:+ profile: $PROFILE}") || line="model: [REDACTED]"
+	line=$(redact_text "model: $(claude_model) effort: $(codex_effort) sandbox: ${CODEX_SANDBOX:-danger-full-access}${PROFILE:+ profile: $PROFILE}") || line="model: [REDACTED]"
 	printf '%s\n' "$line" || true
 	return 0
 }
@@ -266,6 +268,9 @@ _codex_invoke() {
 	[[ "$correction" == 1 ]] && sandbox=read-only
 	flags=(exec --json --color never --sandbox "$sandbox")
 	[[ -n "${MODEL:-}" ]] && flags+=(--model "$MODEL")
+	# A stage may pin effort independently of the operator's global Codex
+	# default. The key is fixed here; only its TOML value comes from params.
+	[[ -n "${REASONING_EFFORT:-}" ]] && flags+=(--config "model_reasoning_effort=$REASONING_EFFORT")
 	[[ -n "${PROFILE:-}" ]] && flags+=(--profile "$PROFILE")
 	if [[ -n "${RESUME_SESSION:-}" ]]; then
 		flags+=(resume "$RESUME_SESSION" -)
