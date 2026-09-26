@@ -18,7 +18,7 @@ import (
 func boardFor(t *testing.T) (*config.Config, *runner.Runner) {
 	t.Helper()
 	dir := t.TempDir()
-	writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), "#!/bin/sh\nprintf '[]' >\"$CONVEYOR_RESULT\"\n")
 	writeScript(t, filepath.Join(dir, "providers", "fake", "move.sh"), "#!/bin/sh\nexit 0\n")
 	writeScript(t, filepath.Join(dir, "work.sh"), "#!/bin/sh\nexit 0\n")
 	if err := os.MkdirAll(filepath.Join(dir, "repo"), 0o755); err != nil {

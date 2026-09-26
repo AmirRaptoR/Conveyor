@@ -578,12 +578,10 @@ func TestAgentsComeFromTheSourcesThatUseThem(t *testing.T) {
 	}
 }
 
-// logsConfig writes a config with an explicit logs: block, distinct from write()
-// which always leaves logs unset so defaulting can be exercised on its own.
-func logsConfig(t *testing.T, dir, logs string) string {
+func logsConfig(t *testing.T, dir, extra string) string {
 	t.Helper()
 	path := filepath.Join(dir, "conveyor.yaml")
-	body := "version: 1\n" + logs + stages[len("version: 1\n"):] + declared
+	body := "version: 1\n" + extra + stages[len("version: 1\n"):] + declared
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -592,10 +590,10 @@ func logsConfig(t *testing.T, dir, logs string) string {
 
 func TestSweepAtMustBeHHMM(t *testing.T) {
 	for _, tc := range []struct{ name, sweepAt string }{
-		{"not a time", "logs:\n  sweepAt: soon\n"},
-		{"minutes out of range", "logs:\n  sweepAt: \"04:75\"\n"},
-		{"hours out of range", "logs:\n  sweepAt: \"25:00\"\n"},
-		{"12-hour form", "logs:\n  sweepAt: \"4:00pm\"\n"},
+		{"not a time", "storage:\n  sweepAt: soon\n"},
+		{"minutes out of range", "storage:\n  sweepAt: \"04:75\"\n"},
+		{"hours out of range", "storage:\n  sweepAt: \"25:00\"\n"},
+		{"12-hour form", "storage:\n  sweepAt: \"4:00pm\"\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -615,27 +613,27 @@ func TestSweepAtValidPasses(t *testing.T) {
 	provider(t, dir)
 	script(t, filepath.Join(dir, "agents", "claude", "refine"))
 	workdir(t, filepath.Join(dir, "repo"))
-	cfg, err := Load(logsConfig(t, dir, "logs:\n  sweepAt: \"23:59\"\n"))
+	cfg, err := Load(logsConfig(t, dir, "storage:\n  sweepAt: \"23:59\"\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Logs.SweepAt != "23:59" {
-		t.Errorf("SweepAt = %q, want 23:59", cfg.Logs.SweepAt)
+	if cfg.Storage.SweepAt != "23:59" {
+		t.Errorf("SweepAt = %q, want 23:59", cfg.Storage.SweepAt)
 	}
 }
 
-func TestExplicitZeroRetentionIsALoadError(t *testing.T) {
+func TestOldLogsBlockHasMigrationError(t *testing.T) {
 	dir := t.TempDir()
 	provider(t, dir)
 	script(t, filepath.Join(dir, "agents", "claude", "refine"))
 	workdir(t, filepath.Join(dir, "repo"))
-	_, err := Load(logsConfig(t, dir, "logs:\n  retention: 0\n"))
-	if err == nil || !strings.Contains(err.Error(), "retention") {
-		t.Fatalf("error = %v, want it to name retention", err)
+	_, err := Load(logsConfig(t, dir, "logs:\n  retention: 30d\n"))
+	if err == nil || !strings.Contains(err.Error(), "logs has been replaced by storage") {
+		t.Fatalf("error = %v, want migration guidance", err)
 	}
 }
 
-func TestOmittedRetentionStillDefaultsTo30Days(t *testing.T) {
+func TestStorageDefaultsAndClasses(t *testing.T) {
 	dir := t.TempDir()
 	provider(t, dir)
 	script(t, filepath.Join(dir, "agents", "claude", "refine"))
@@ -644,8 +642,49 @@ func TestOmittedRetentionStillDefaultsTo30Days(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Logs.Retention.D() != 30*24*time.Hour {
-		t.Errorf("Retention = %v, want 30d default", cfg.Logs.Retention.D())
+	if cfg.Storage.Retention.Model.D() != 30*24*time.Hour || cfg.Storage.Retention.Failure.D() != 90*24*time.Hour || cfg.Storage.Retention.Polling.D() != 2*24*time.Hour || cfg.Storage.Retention.Status.D() != 7*24*time.Hour {
+		t.Errorf("retention defaults = %+v", cfg.Storage.Retention)
+	}
+	if cfg.Storage.MaxBytes <= 0 || cfg.Storage.TempMaxBytes <= 0 || cfg.Storage.HighWatermark >= cfg.Storage.CriticalWatermark {
+		t.Errorf("storage defaults = %+v", cfg.Storage)
+	}
+}
+
+func TestStorageRejectsUnsafeCeilings(t *testing.T) {
+	dir := t.TempDir()
+	provider(t, dir)
+	script(t, filepath.Join(dir, "agents", "claude", "refine"))
+	workdir(t, filepath.Join(dir, "repo"))
+	_, err := Load(logsConfig(t, dir, "storage:\n  maxBytes: 1GiB\n  tempMaxBytes: 1GiB\n  highWatermark: 95\n  criticalWatermark: 90\n"))
+	if err == nil || !strings.Contains(err.Error(), "highWatermark must be") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestStorageRejectsEveryExplicitZeroInsteadOfDefaultingIt(t *testing.T) {
+	tests := []struct {
+		name, yaml, want string
+	}{
+		{"max bytes", "maxBytes: 0B", "storage.maxBytes"},
+		{"temporary max bytes", "tempMaxBytes: 0B", "storage.tempMaxBytes"},
+		{"high watermark", "highWatermark: 0", "storage.highWatermark"},
+		{"critical watermark", "criticalWatermark: 0", "storage.criticalWatermark"},
+		{"model retention", "retention:\n    model: 0d", "storage.retention.model"},
+		{"failure retention", "retention:\n    failure: 0d", "storage.retention.failure"},
+		{"polling retention", "retention:\n    polling: 0d", "storage.retention.polling"},
+		{"status retention", "retention:\n    status: 0d", "storage.retention.status"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			provider(t, dir)
+			script(t, filepath.Join(dir, "agents", "claude", "refine"))
+			workdir(t, filepath.Join(dir, "repo"))
+			_, err := Load(logsConfig(t, dir, "storage:\n  "+tc.yaml+"\n"))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %s", err, tc.want)
+			}
+		})
 	}
 }
 

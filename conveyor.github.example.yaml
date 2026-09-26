@@ -41,9 +41,17 @@ timeout: 90m          # default per-script timeout; a source may override per
 discovery: 2m         # a listing is a handful of API calls, not agent work,
                       # and must not be able to delay any other source's
 
-logs:
-  retention: 30d
+storage:
+  maxBytes: 20GiB
+  tempMaxBytes: 4GiB
+  highWatermark: 80
+  criticalWatermark: 95
   sweepAt: "04:00"
+  retention:
+    model: 30d
+    failure: 90d
+    polling: 2d
+    status: 7d
 
 # ---------------------------------------------------------------------------
 # Stages — refine, implement, review, then the merge gate. `review` ends once

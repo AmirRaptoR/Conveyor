@@ -107,7 +107,7 @@ func TestAFailedListingRetainsThatSourcesItems(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "fail")); err != nil {
 		t.Fatal(err)
 	}
-	writeScript(t, filepath.Join(dir, "providers", "flaky", "list.sh"), "#!/bin/sh\nexit 0\n")
+	writeScript(t, filepath.Join(dir, "providers", "flaky", "list.sh"), "#!/bin/sh\nprintf '[]' >\"$CONVEYOR_RESULT\"\n")
 	retry, ok := s.recovery.Get("source", "flaky")
 	if !ok {
 		t.Fatal("failed listing did not record source recovery")

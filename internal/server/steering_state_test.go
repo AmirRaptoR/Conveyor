@@ -196,6 +196,7 @@ func TestSteeringLifecycleClearWrongStagePruneAndRetention(t *testing.T) {
 	writeSteeringFiles(t, dir, nil, []string{hello("old")})
 	s.steering["s1:7"] = SteeringSummary{RunID: runID, Stage: "working"}
 	s.steeringMisses["s1:8"] = planCursor{RunID: runID, Stage: "working"}
+	allowRunRetention(s)
 	s.runSweep(os.Stderr)
 	if _, ok := s.steering["s1:7"]; ok {
 		t.Fatal("retention left positive steering")

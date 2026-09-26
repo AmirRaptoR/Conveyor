@@ -231,6 +231,13 @@ peer, and the socket is the only door with no password on it (#94).
   exact release condition. One reasoned operator override grants one run in one
   item/stage and remains audited after use. Old all-transition ledgers require
   the explicit `budget-reset` archive flow; they are never silently reinterpreted.
+- **Storage pressure stops model dispatch, never discovery.** Four retention
+  classes bound model runs, failures, successful polling and status separately;
+  current blocker/arrival evidence remains pinned. At the high watermark only
+  new agent-backed stages pause. A listing still completes and validates as one
+  authoritative payload before replacing last-good source state, transient
+  recovery remains invisible, and temp/worktree reclaim requires explicit
+  Conveyor ownership and an expired lease rather than age or cleanliness alone.
 - **A script says what it is waiting for; a person says "not any more".** Exit
   10 with `{"waiting": {"until": …, "why": …}}` draws a live countdown on the
   card — a resting item and a stuck one look identical otherwise. A stage

@@ -63,7 +63,10 @@ type Config struct {
 	// a generic unknown-field message. Automatic recovery is blocker-specific;
 	// it never clears every mark because a timer elapsed.
 	RetryStalled removedRetryStalled `yaml:"retryStalled"`
-	Logs         Logs                `yaml:"logs"`
+	// Logs is retained only to produce an actionable migration error. Storage
+	// now owns retention because logs are only one of the bytes it bounds.
+	Logs    removedLogs `yaml:"logs"`
+	Storage Storage     `yaml:"storage"`
 	// Auth is who may open the board. Empty is allowed only on loopback; see
 	// internal/config/auth.go and Server.Run.
 	Auth    Auth     `yaml:"auth"`
@@ -82,6 +85,8 @@ type Config struct {
 	// Dir is the directory the config was loaded from; relative script paths
 	// resolve against it so a config is portable.
 	Dir string `yaml:"-"`
+
+	storageSet storagePresence `yaml:"-"`
 }
 
 type Concurrency struct {
@@ -114,38 +119,55 @@ type Budgets struct {
 	QuarantineAfter int `yaml:"quarantineAfter"`
 }
 
-type Logs struct {
-	Retention Duration `yaml:"retention"`
-	SweepAt   string   `yaml:"sweepAt"`
-	// retentionSet is whether `retention:` appeared in the config at all. An
-	// omitted key and an explicit `retention: 0` decode to the same zero
-	// Duration, but they mean different things — one wants the default, the
-	// other is a load error — and only the raw node tells them apart.
-	retentionSet bool
+type Storage struct {
+	MaxBytes          ByteSize  `yaml:"maxBytes"`
+	TempMaxBytes      ByteSize  `yaml:"tempMaxBytes"`
+	HighWatermark     int       `yaml:"highWatermark"`
+	CriticalWatermark int       `yaml:"criticalWatermark"`
+	SweepAt           string    `yaml:"sweepAt"`
+	Retention         Retention `yaml:"retention"`
+}
+
+type Retention struct {
+	Model   Duration `yaml:"model"`
+	Failure Duration `yaml:"failure"`
+	Polling Duration `yaml:"polling"`
+	Status  Duration `yaml:"status"`
+}
+
+type storagePresence struct {
+	maxBytes, tempMaxBytes, highWatermark, criticalWatermark bool
+	model, failure, polling, status                          bool
+}
+
+type ByteSize int64
+
+var byteSizeRe = regexp.MustCompile(`^(\d+)(B|KiB|MiB|GiB|TiB)$`)
+
+func (b *ByteSize) UnmarshalYAML(n *yaml.Node) error {
+	s := strings.TrimSpace(n.Value)
+	m := byteSizeRe.FindStringSubmatch(s)
+	if m == nil {
+		return fmt.Errorf("bad byte size %q (use B, KiB, MiB, GiB or TiB)", s)
+	}
+	var value int64
+	if _, err := fmt.Sscanf(m[1], "%d", &value); err != nil {
+		return err
+	}
+	shift := map[string]uint{"B": 0, "KiB": 10, "MiB": 20, "GiB": 30, "TiB": 40}[m[2]]
+	*b = ByteSize(value << shift)
+	return nil
 }
 
 type removedRetryStalled struct{}
+type removedLogs struct{}
 
 func (*removedRetryStalled) UnmarshalYAML(*yaml.Node) error {
 	return fmt.Errorf("retryStalled has been removed; delete it because blocker-specific recovery replaces bulk clearing")
 }
 
-// UnmarshalYAML decodes into an unexported-field-preserving alias so
-// retentionSet can be recorded from the raw node before that information is
-// lost to the zero value every other Duration field can't be told apart from.
-func (l *Logs) UnmarshalYAML(n *yaml.Node) error {
-	type plain Logs
-	var p plain
-	if err := n.Decode(&p); err != nil {
-		return err
-	}
-	*l = Logs(p)
-	for i := 0; i+1 < len(n.Content); i += 2 {
-		if n.Content[i].Value == "retention" {
-			l.retentionSet = true
-		}
-	}
-	return nil
+func (*removedLogs) UnmarshalYAML(*yaml.Node) error {
+	return fmt.Errorf("logs has been replaced by storage; move sweepAt to storage.sweepAt and choose storage.retention.model, failure, polling and status")
 }
 
 type Stage struct {
@@ -391,6 +413,7 @@ func LoadFromRoots(path, providers, agents string) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	c.storageSet = storageFieldsPresent(raw)
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
@@ -432,11 +455,32 @@ func (c *Config) applyDefaults() {
 	if c.Discovery == 0 {
 		c.Discovery = Duration(2 * time.Minute)
 	}
-	if !c.Logs.retentionSet && c.Logs.Retention == 0 {
-		c.Logs.Retention = Duration(30 * 24 * time.Hour)
+	if !c.storageSet.maxBytes {
+		c.Storage.MaxBytes = ByteSize(20 << 30)
 	}
-	if c.Logs.SweepAt == "" {
-		c.Logs.SweepAt = "04:00"
+	if !c.storageSet.tempMaxBytes {
+		c.Storage.TempMaxBytes = ByteSize(4 << 30)
+	}
+	if !c.storageSet.highWatermark {
+		c.Storage.HighWatermark = 80
+	}
+	if !c.storageSet.criticalWatermark {
+		c.Storage.CriticalWatermark = 95
+	}
+	if c.Storage.SweepAt == "" {
+		c.Storage.SweepAt = "04:00"
+	}
+	if !c.storageSet.model {
+		c.Storage.Retention.Model = Duration(30 * 24 * time.Hour)
+	}
+	if !c.storageSet.failure {
+		c.Storage.Retention.Failure = Duration(90 * 24 * time.Hour)
+	}
+	if !c.storageSet.polling {
+		c.Storage.Retention.Polling = Duration(2 * 24 * time.Hour)
+	}
+	if !c.storageSet.status {
+		c.Storage.Retention.Status = Duration(7 * 24 * time.Hour)
 	}
 	// A stage with no explicit success target advances to the next stage in
 	// order; the last stage has nowhere to go and must be terminal.
@@ -449,6 +493,54 @@ func (c *Config) applyDefaults() {
 			s.OnSuccess = c.Stages[i+1].Name
 		}
 	}
+}
+
+func storageFieldsPresent(raw []byte) storagePresence {
+	var doc yaml.Node
+	if yaml.Unmarshal(raw, &doc) != nil || len(doc.Content) == 0 {
+		return storagePresence{}
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return storagePresence{}
+	}
+	var out storagePresence
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value != "storage" || root.Content[i+1].Kind != yaml.MappingNode {
+			continue
+		}
+		storage := root.Content[i+1]
+		for j := 0; j+1 < len(storage.Content); j += 2 {
+			switch storage.Content[j].Value {
+			case "maxBytes":
+				out.maxBytes = true
+			case "tempMaxBytes":
+				out.tempMaxBytes = true
+			case "highWatermark":
+				out.highWatermark = true
+			case "criticalWatermark":
+				out.criticalWatermark = true
+			case "retention":
+				retention := storage.Content[j+1]
+				if retention.Kind != yaml.MappingNode {
+					continue
+				}
+				for k := 0; k+1 < len(retention.Content); k += 2 {
+					switch retention.Content[k].Value {
+					case "model":
+						out.model = true
+					case "failure":
+						out.failure = true
+					case "polling":
+						out.polling = true
+					case "status":
+						out.status = true
+					}
+				}
+			}
+		}
+	}
+	return out
 }
 
 // Stage returns a stage by name.
@@ -958,11 +1050,25 @@ func (c *Config) Validate() []string {
 	if c.Budgets.QuarantineAfter < 2 {
 		add("budgets.quarantineAfter must be at least 2, got %d", c.Budgets.QuarantineAfter)
 	}
-	if c.Logs.Retention <= 0 {
-		add("logs.retention must be greater than zero, got %s", time.Duration(c.Logs.Retention))
+	if c.Storage.MaxBytes <= 0 {
+		add("storage.maxBytes must be greater than zero")
 	}
-	if !sweepAtRe.MatchString(c.Logs.SweepAt) {
-		add("logs.sweepAt must be HH:MM (24-hour), got %q", c.Logs.SweepAt)
+	if c.Storage.TempMaxBytes <= 0 {
+		add("storage.tempMaxBytes must be greater than zero")
+	}
+	if c.Storage.HighWatermark < 1 || c.Storage.HighWatermark >= c.Storage.CriticalWatermark {
+		add("storage.highWatermark must be between 1 and criticalWatermark-1")
+	}
+	if c.Storage.CriticalWatermark < 2 || c.Storage.CriticalWatermark > 100 {
+		add("storage.criticalWatermark must be between 2 and 100")
+	}
+	if !sweepAtRe.MatchString(c.Storage.SweepAt) {
+		add("storage.sweepAt must be HH:MM (24-hour), got %q", c.Storage.SweepAt)
+	}
+	for name, d := range map[string]Duration{"model": c.Storage.Retention.Model, "failure": c.Storage.Retention.Failure, "polling": c.Storage.Retention.Polling, "status": c.Storage.Retention.Status} {
+		if d <= 0 {
+			add("storage.retention.%s must be greater than zero", name)
+		}
 	}
 
 	if len(c.Stages) < 2 {

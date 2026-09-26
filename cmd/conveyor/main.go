@@ -359,8 +359,9 @@ func cmdValidate(args []string) error {
 		}
 		fmt.Printf("    resources: %s\n", strings.Join(limits, ", "))
 	}
-	fmt.Printf("    poll %s, default timeout %s, log retention %s\n",
-		cfg.Poll.D(), cfg.Timeout.D(), cfg.Logs.Retention.D())
+	fmt.Printf("    poll %s, default timeout %s, storage %d bytes (model %s, failure %s, polling %s, status %s)\n",
+		cfg.Poll.D(), cfg.Timeout.D(), cfg.Storage.MaxBytes, cfg.Storage.Retention.Model.D(),
+		cfg.Storage.Retention.Failure.D(), cfg.Storage.Retention.Polling.D(), cfg.Storage.Retention.Status.D())
 	fmt.Println("    (* runs a script on enter, . terminal)")
 
 	// A repo that has not been onboarded is reported, not fatal: it must not

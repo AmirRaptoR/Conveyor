@@ -1,18 +1,45 @@
 package runner
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 )
+
+func archivedLog(t *testing.T, dir string) []byte {
+	t.Helper()
+	if b, err := os.ReadFile(filepath.Join(dir, "log.txt")); err == nil {
+		return b
+	}
+	f, err := os.Open(filepath.Join(dir, "log.txt.gz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	b, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
 
 func script(t *testing.T, body string) string {
 	t.Helper()
@@ -330,9 +357,9 @@ func TestDeadlineIsExportedAsAnInstant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CONVEYOR_DEADLINE = %q, want an RFC3339 instant: %v", got, err)
 	}
-	// The engine's own limit, not a second calculation of it: within a second
-	// of thirty minutes out.
-	if d := time.Until(at); d < 29*time.Minute+59*time.Second || d > 30*time.Minute {
+	// The engine's own limit, not a second calculation of it. Allow two seconds
+	// for RFC3339 truncation and race-instrumented process startup.
+	if d := time.Until(at); d < 29*time.Minute+58*time.Second || d > 30*time.Minute {
 		t.Errorf("deadline is %s away, want ~30m — it must be the limit the context enforces", d)
 	}
 	// And the script really received it, not just the record of the run.
@@ -388,10 +415,7 @@ func TestResultLogIsBoundedToLast1000Lines(t *testing.T) {
 	if res.Log[999].Text != "line 100000" {
 		t.Errorf("last kept line = %q, want line 100000", res.Log[999].Text)
 	}
-	b, err := os.ReadFile(filepath.Join(res.Run.Dir, "log.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	b := archivedLog(t, res.Run.Dir)
 	if n := strings.Count(string(b), "\n"); n != 100000 {
 		t.Errorf("log.txt has %d lines, want all 100000 on disk", n)
 	}
@@ -416,10 +440,7 @@ func TestOversizedLineIsCappedInMemoryNotOnDisk(t *testing.T) {
 	if !strings.Contains(long.Text, "truncated") {
 		t.Errorf("capped line has no truncation marker: %q", long.Text[:80])
 	}
-	b, err := os.ReadFile(filepath.Join(res.Run.Dir, "log.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	b := archivedLog(t, res.Run.Dir)
 	if n := strings.Count(string(b), "a"); n < 100000 {
 		t.Errorf("log.txt only has %d a's, want the full 100000-byte line on disk", n)
 	}
@@ -440,6 +461,320 @@ func TestOnResultFiresForEveryRun(t *testing.T) {
 	}
 	if got == nil || got.Run.ID != res.Run.ID {
 		t.Fatalf("OnResult did not fire with this run's result")
+	}
+}
+
+func TestRunDirectoryCreationFailureCleansPartialDirectoryAndReportsPersistenceFault(t *testing.T) {
+	r := New(filepath.Join(t.TempDir(), "runs"))
+	r.mkdirAll = func(path string, mode fs.FileMode) error {
+		if strings.Contains(path, string(filepath.Separator)+"runs"+string(filepath.Separator)) {
+			if err := os.MkdirAll(path, mode); err != nil {
+				return err
+			}
+			return syscall.ENOSPC
+		}
+		return os.MkdirAll(path, mode)
+	}
+	var callback *Result
+	r.OnResult = func(res *Result) { callback = res }
+	res, err := r.Run(context.Background(), Spec{Script: script(t, `exit 0`), Kind: "stage", Model: true, Workdir: t.TempDir()})
+	if err == nil || !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("Run error = %v, want ENOSPC", err)
+	}
+	if callback != res || res == nil || !strings.Contains(res.PersistErr, "create run dir") {
+		t.Fatalf("OnResult = %+v, result = %+v, want creation persistence fault", callback, res)
+	}
+	if _, err := os.Stat(res.Run.Dir); !os.IsNotExist(err) {
+		t.Fatalf("partial run directory remains: %v", err)
+	}
+}
+
+func TestScratchDirectoryCreationFailureCleansPartialDirectoriesAndReportsPersistenceFault(t *testing.T) {
+	r := New(filepath.Join(t.TempDir(), "runs"))
+	r.mkdir = func(path string, mode fs.FileMode) error {
+		if err := os.Mkdir(path, mode); err != nil {
+			return err
+		}
+		return syscall.ENOSPC
+	}
+	var callback *Result
+	r.OnResult = func(res *Result) { callback = res }
+	res, err := r.Run(context.Background(), Spec{Script: script(t, `exit 0`), Kind: "stage", Model: true, Workdir: t.TempDir()})
+	if err == nil || !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("Run error = %v, want ENOSPC", err)
+	}
+	if callback != res || res == nil || !strings.Contains(res.PersistErr, "create run temporary directory") {
+		t.Fatalf("OnResult = %+v, result = %+v, want creation persistence fault", callback, res)
+	}
+	if _, err := os.Stat(res.Run.Dir); !os.IsNotExist(err) {
+		t.Fatalf("run directory remains after scratch creation failure: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(r.TempRoot, res.Run.ID)); !os.IsNotExist(err) {
+		t.Fatalf("partial scratch directory remains: %v", err)
+	}
+}
+
+func TestUnchangedDiscoveryPayloadsUseOneCompressedBlob(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "runs")
+	r := New(root)
+	body := `printf '%s' '[{"id":"s:1"}]' >"$CONVEYOR_RESULT"`
+	for i := 0; i < 2; i++ {
+		res, err := r.Run(context.Background(), Spec{Script: script(t, body), Kind: "list", Workdir: t.TempDir(), Source: "s"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(filepath.Join(res.Run.Dir, "result.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), `"payload":"sha256:`) {
+			t.Fatalf("result reference = %s", b)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(filepath.Dir(root), "payloads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("payload blobs = %d, want one", len(entries))
+	}
+}
+
+func TestMalformedLargeDiscoveryResultIsCompressedButRemainsInvalid(t *testing.T) {
+	for _, kind := range []string{"list", "status"} {
+		t.Run(kind, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "runs")
+			r := New(root)
+			body := `dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' x >"$CONVEYOR_RESULT"`
+			res, err := r.Run(context.Background(), Spec{Script: script(t, body), Kind: kind, Workdir: t.TempDir(), Source: "s"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(res.Data) != 0 {
+				t.Fatalf("Data = %d bytes, want malformed result rejected", len(res.Data))
+			}
+			b, err := os.ReadFile(filepath.Join(res.Run.Dir, "result.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ref map[string]string
+			if json.Unmarshal(b, &ref) != nil || !strings.HasPrefix(ref["payload"], "sha256:") {
+				t.Fatalf("result reference = %s, want content-addressed payload", b)
+			}
+			blob := filepath.Join(filepath.Dir(root), "payloads", strings.TrimPrefix(ref["payload"], "sha256:")+".json.gz")
+			if info, err := os.Stat(blob); err != nil || info.Size() == 0 {
+				t.Fatalf("compressed malformed payload = (%v, %v), want non-empty blob", info, err)
+			}
+		})
+	}
+}
+
+func TestPayloadReferenceFailurePreservesResultAndPropagatesPersistErr(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "runs")
+	r := New(root)
+	res, err := r.Run(context.Background(), Spec{
+		Script: script(t, `printf '%s' '[{"id":"s:1"}]' >"$CONVEYOR_RESULT"; chmod 500 "$(dirname "$CONVEYOR_RESULT")"`),
+		Kind:   "list", Workdir: t.TempDir(), Source: "s",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(res.Run.Dir, 0o700) })
+	if !strings.Contains(res.PersistErr, "persist result reference") {
+		t.Fatalf("PersistErr = %q, want payload reference persistence failure", res.PersistErr)
+	}
+	b, err := os.ReadFile(filepath.Join(res.Run.Dir, "result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `[{"id":"s:1"}]` {
+		t.Fatalf("result after failed reference write = %s, want original complete payload", b)
+	}
+}
+
+func TestPayloadSweepFailsClosedOnUnreadableReference(t *testing.T) {
+	r := New(filepath.Join(t.TempDir(), "runs"))
+	runDir := filepath.Join(r.Root, "2026-01-01", "000000.000-run")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(runDir, "missing"), filepath.Join(runDir, "result.json")); err != nil {
+		t.Fatal(err)
+	}
+	payloadRoot := filepath.Join(filepath.Dir(r.Root), "payloads")
+	if err := os.MkdirAll(payloadRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	blob := filepath.Join(payloadRoot, strings.Repeat("a", 64)+".json.gz")
+	if err := os.WriteFile(blob, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.SweepPayloads(time.Now().Add(time.Hour)); err == nil {
+		t.Fatal("SweepPayloads succeeded despite an unreadable result reference")
+	}
+	if _, err := os.Stat(blob); err != nil {
+		t.Fatalf("payload was deleted while references were unreadable: %v", err)
+	}
+}
+
+func TestPayloadPublicationAndSweepAreSerialized(t *testing.T) {
+	r := New(filepath.Join(t.TempDir(), "runs"))
+	dir := filepath.Join(r.Root, "2026-01-01", "000000.000-run")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result := filepath.Join(dir, "result.json")
+	if err := os.WriteFile(result, []byte(`[]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			_ = r.referencePayload(result, []byte(strconv.Itoa(i)))
+		}(i)
+		go func() {
+			defer wg.Done()
+			_, _ = r.SweepPayloads(time.Now().Add(time.Hour))
+		}()
+	}
+	wg.Wait()
+	b, err := os.ReadFile(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ref struct {
+		Payload string `json:"payload"`
+	}
+	if err := json.Unmarshal(b, &ref); err != nil {
+		t.Fatalf("result reference is partial: %s: %v", b, err)
+	}
+	blob := filepath.Join(filepath.Dir(r.Root), "payloads", strings.TrimPrefix(ref.Payload, "sha256:")+".json.gz")
+	if _, err := os.Stat(blob); err != nil {
+		t.Fatalf("published reference names missing blob: %v", err)
+	}
+}
+
+func TestRunnerOwnsAndRemovesScriptTemporaryDirectory(t *testing.T) {
+	r := New(filepath.Join(t.TempDir(), "runs"))
+	seen := filepath.Join(t.TempDir(), "tmpdir")
+	body := `printf '%s' "$TMPDIR" >"` + seen + `"; touch "$TMPDIR/artifact"`
+	if _, err := r.Run(context.Background(), Spec{Script: script(t, body), Kind: "stage", Workdir: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(seen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(string(b)); !os.IsNotExist(err) {
+		t.Fatalf("scratch directory remains: %v", err)
+	}
+}
+
+func TestSweepTempRetainsAndReportsInvalidMarkers(t *testing.T) {
+	root := t.TempDir()
+	old := time.Now().Add(-48 * time.Hour)
+	cases := map[string]string{
+		"120000.000-badjson":  "not a lease\n",
+		"120000.000-empty":    `{}`,
+		"120000.000-mismatch": `{"runId":"120000.000-other","ended":true}`,
+		"120000.000-arbitrary": `{"runId":"120000.000-arbitrary","ended":true,
+"surprise":"anything"}`,
+	}
+	for name, contents := range cases {
+		dir := filepath.Join(root, name)
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(dir, ".conveyor-owned")
+		if err := os.WriteFile(marker, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(marker, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nonRegular := filepath.Join(root, "120000.000-unreadable")
+	if err := os.MkdirAll(filepath.Join(nonRegular, ".conveyor-owned"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(nonRegular, ".conveyor-owned"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	unowned := filepath.Join(root, "unowned")
+	if err := os.Mkdir(unowned, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := SweepTemp(root, time.Now().Add(-24*time.Hour))
+	if err == nil {
+		t.Fatal("SweepTemp succeeded despite invalid markers")
+	}
+	for _, want := range []string{"badjson", "empty", "mismatch", "arbitrary", "unreadable", "not a regular file"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("SweepTemp error %q does not report %q", err, want)
+		}
+	}
+	for name := range cases {
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Errorf("invalidly marked directory %s was not retained: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(nonRegular); err != nil {
+		t.Errorf("directory with unreadable marker was not retained: %v", err)
+	}
+	if _, err := os.Stat(unowned); err != nil {
+		t.Errorf("unowned dir touched: %v", err)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Errorf("symlink target touched: %v", err)
+	}
+}
+
+func TestSweepTempReclaimsExpiredRunLeaseEvenWhileServerPIDLives(t *testing.T) {
+	root := t.TempDir()
+	runID := "120000.000-old"
+	dir := filepath.Join(root, runID)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, ".conveyor-owned")
+	if err := writeTempLease(marker, tempLease{RunID: runID, PID: os.Getpid(), Deadline: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(marker, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SweepTemp(root, time.Now().Add(-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("expired run lease remained because the server PID is live: %v", err)
+	}
+}
+
+func TestCompactLogFailurePropagatesToPersistErrAndResultCallback(t *testing.T) {
+	r := New(filepath.Join(t.TempDir(), "runs"))
+	r.compactLog = func(string) error { return syscall.ENOSPC }
+	var callback *Result
+	r.OnResult = func(res *Result) { callback = res }
+
+	res, err := r.Run(context.Background(), Spec{
+		Script: script(t, `printf '%s\n' logged`), Kind: "stage", Workdir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.PersistErr, "compact log.txt") || !strings.Contains(res.PersistErr, syscall.ENOSPC.Error()) {
+		t.Fatalf("PersistErr = %q, want injected compaction failure", res.PersistErr)
+	}
+	if callback != res || !strings.Contains(callback.PersistErr, "compact log.txt") {
+		t.Fatalf("OnResult got %+v, want result carrying compaction persistence fault", callback)
 	}
 }
 

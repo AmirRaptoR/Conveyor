@@ -1,7 +1,7 @@
 import { $, esc } from "./dom.js";
 import { shouldDeferDraw, sourceDegraded, controlsForMode, isHttpUrl, stationEmptyText } from "./pure.js";
 import {
-  state, clock, fmtBytes, nowMs, focusDescriptor, findFocusTarget,
+  state, clock, fmtBytes, storageSummary, nowMs, focusDescriptor, findFocusTarget,
   sourceFilter, setSourceFilter, reconcileSourceFilter,
 } from "./shared.js";
 import { updateRailCtl } from "./rail.js";
@@ -168,9 +168,9 @@ export function draw() {
   // one figure, in the same strip as what is enrolled, because both answer
   // "what does this board's disk footprint look like right now".
   const storage = state.storage;
-  const storageChip = storage && storage.runs ? `<span class="src-chip storage" title="run store on disk">
+  const storageChip = storage && (storage.runs || storage.bytes) ? `<span class="src-chip storage ${esc(storage.level || "ok")}" title="${esc(storageSummary(storage))}">
         <span class="n">${fmtBytes(storage.bytes)}</span>
-        <span class="repo">${storage.runs} run${storage.runs === 1 ? "" : "s"}${
+        <span class="repo">${storage.level && storage.level !== "ok" ? `${esc(storage.level)} · ` : ""}${storage.runs} run${storage.runs === 1 ? "" : "s"}${
           storage.oldestDay ? ` retained since ${esc(storage.oldestDay)}` : ""}</span>
       </span>` : "";
   // The source chips are the Pipeline view's own filter (#93): a real

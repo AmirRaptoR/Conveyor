@@ -7,13 +7,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 )
 
 func neverPinned(RunMeta) (bool, string) { return false, "" }
+
+func allowRunRetention(s *Server) {
+	s.retentionReadyOnce.Do(func() { close(s.retentionReady) })
+}
 
 // A run directory whose day is strictly before the cutoff's UTC date is
 // deleted; one on or after it is kept, per CONTRACTS §6's day-based
@@ -109,6 +115,7 @@ func TestSweepToleratesAMissingRoot(t *testing.T) {
 func TestSweepPinsTheMarkingRunSoARestartStillRecoversTheReason(t *testing.T) {
 	cfg, r := boardFor(t)
 	s := New(cfg, r)
+	allowRunRetention(s)
 	day := filepath.Join(r.Root, "2020-01-01", "120000.000-mark")
 	if err := os.MkdirAll(day, 0o755); err != nil {
 		t.Fatal(err)
@@ -151,6 +158,7 @@ func TestSweepPinsTheMarkingRunSoARestartStillRecoversTheReason(t *testing.T) {
 func TestSweepPinsTheArrivalMoveSoARestartStillRecoversTheStageAge(t *testing.T) {
 	cfg, r := boardFor(t)
 	s := New(cfg, r)
+	allowRunRetention(s)
 	day := filepath.Join(r.Root, "2020-01-01", "120000.000-move")
 	if err := os.MkdirAll(day, 0o755); err != nil {
 		t.Fatal(err)
@@ -188,6 +196,7 @@ func TestSweepPinsTheArrivalMoveSoARestartStillRecoversTheStageAge(t *testing.T)
 func TestSweepDoesNotPinRunsOfItemsNoLongerOnTheBoard(t *testing.T) {
 	cfg, r := boardFor(t)
 	s := New(cfg, r)
+	allowRunRetention(s)
 	dir := writeTestRun(t, r.Root, "2020-01-01", "120000.000-stale", model.Run{
 		Source: "s1", ItemID: "s1:gone", Kind: "stage", Outcome: model.OutcomeBlocked, ExitCode: 20,
 	})
@@ -204,7 +213,7 @@ func TestSweepDoesNotPinRunsOfItemsNoLongerOnTheBoard(t *testing.T) {
 	}
 }
 
-// untilNextSweepAt paces the daily sweep off logs.sweepAt in the caller's own
+// untilNextSweepAt paces the daily sweep off storage.sweepAt in the caller's own
 // location, never in the past.
 func TestUntilNextSweepAtPacesToTheNextOccurrence(t *testing.T) {
 	now := time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC)
@@ -219,14 +228,12 @@ func TestUntilNextSweepAtPacesToTheNextOccurrence(t *testing.T) {
 	}
 }
 
-// /api/state carries how much the run store holds and how far back it
-// reaches, computed by walking file sizes rather than decoding any run's
-// meta.json.
-func TestStorageUseCountsRunsAndBytesWithoutReadingMetaJSON(t *testing.T) {
+// /api/state carries totals, retention-class bytes and projected daily growth.
+func TestStorageUseCountsRunsBytesClassesAndGrowth(t *testing.T) {
 	cfg, r := boardFor(t)
 	s := New(cfg, r)
 	writeTestRun(t, r.Root, "2020-01-01", "000000.000-a", model.Run{Outcome: model.OutcomeSuccess})
-	writeTestRun(t, r.Root, "2020-01-02", "000000.000-b", model.Run{Outcome: model.OutcomeSuccess})
+	writeTestRun(t, r.Root, time.Now().UTC().Format("2006-01-02"), "000000.000-b", model.Run{Kind: "status", StartedAt: time.Now(), Outcome: model.OutcomeSuccess})
 
 	v := s.storageUse()
 	if v.Runs != 2 {
@@ -237,6 +244,15 @@ func TestStorageUseCountsRunsAndBytesWithoutReadingMetaJSON(t *testing.T) {
 	}
 	if v.OldestDay != "2020-01-01" {
 		t.Errorf("OldestDay = %q, want 2020-01-01", v.OldestDay)
+	}
+	if v.ByClass["polling"] == 0 || v.ByClass["status"] == 0 {
+		t.Errorf("ByClass = %v, want polling and status bytes", v.ByClass)
+	}
+	if v.ProjectedGrowth == 0 {
+		t.Error("ProjectedGrowth = 0, want today's run bytes")
+	}
+	if v.MaxBytes == 0 || v.TempMaxBytes == 0 {
+		t.Errorf("ceilings missing: %+v", v)
 	}
 }
 
@@ -261,6 +277,7 @@ func TestSweepDoesNotRunUnderWatch(t *testing.T) {
 func TestSweepLogsASummaryLineAndNamesEachPinnedRun(t *testing.T) {
 	cfg, r := boardFor(t)
 	s := New(cfg, r)
+	allowRunRetention(s)
 	writeTestRun(t, r.Root, "2020-01-01", "000000.000-gone", model.Run{Outcome: model.OutcomeSuccess})
 	writeTestRun(t, r.Root, "2020-01-01", "000001.000-live", model.Run{Outcome: model.OutcomeRunning})
 
@@ -275,5 +292,276 @@ func TestSweepLogsASummaryLineAndNamesEachPinnedRun(t *testing.T) {
 	}
 	if !strings.Contains(out, "000001.000-live") {
 		t.Errorf("pinned run not named individually: %s", out)
+	}
+}
+
+func TestStorageAdmissionPausesOnlyModelWorkAtHighWatermark(t *testing.T) {
+	cfg, r := boardFor(t)
+	cfg.Sources[0].Scripts["work"] = config.ScriptSpec{Agent: "fake"}
+	cfg.Storage.MaxBytes = 100
+	cfg.Storage.HighWatermark = 80
+	cfg.Storage.CriticalWatermark = 95
+	s := New(cfg, r)
+	if err := os.WriteFile(filepath.Join(cfg.DataDir(), "used"), make([]byte, 85), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s.reserveModelStorage("s1:direct") {
+		t.Fatal("model work allowed above the high watermark")
+	}
+	if got := s.claim(model.Item{ID: "s1:1", Source: "s1", Stage: "backlog"}, "working", false); got != claimStorageHigh {
+		t.Fatalf("model claim = %v, want claimStorageHigh", got)
+	}
+}
+
+func TestRunClassUsesFailureBeforeModelAndSeparatesPollingStatus(t *testing.T) {
+	cfg, _ := boardFor(t)
+	cfg.Sources[0].Scripts["work"] = config.ScriptSpec{Agent: "fake"}
+	tests := []struct {
+		run  model.Run
+		want string
+	}{
+		{model.Run{Kind: "stage", Source: "s1", To: "working", Outcome: model.OutcomeFailure}, "failure"},
+		{model.Run{Kind: "stage", Source: "s1", To: "working", Outcome: model.OutcomeSuccess}, "model"},
+		{model.Run{Kind: "list", Outcome: model.OutcomeSuccess}, "polling"},
+		{model.Run{Kind: "status", Outcome: model.OutcomeSuccess}, "status"},
+	}
+	for _, tt := range tests {
+		if got := runClass(cfg, tt.run); got != tt.want {
+			t.Errorf("class = %q, want %q", got, tt.want)
+		}
+	}
+}
+
+func TestRetentionClassesExpireIndependently(t *testing.T) {
+	cfg, r := boardFor(t)
+	cfg.Storage.Retention.Polling = config.Duration(2 * 24 * time.Hour)
+	cfg.Storage.Retention.Status = config.Duration(7 * 24 * time.Hour)
+	cfg.Storage.Retention.Model = config.Duration(30 * 24 * time.Hour)
+	cfg.Storage.Retention.Failure = config.Duration(90 * 24 * time.Hour)
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	poll := writeTestRun(t, r.Root, "2026-09-21", "000000.000-poll", model.Run{Kind: "list", StartedAt: now.Add(-5 * 24 * time.Hour), Outcome: model.OutcomeSuccess})
+	status := writeTestRun(t, r.Root, "2026-09-21", "000001.000-status", model.Run{Kind: "status", StartedAt: now.Add(-5 * 24 * time.Hour), Outcome: model.OutcomeSuccess})
+	modelRun := writeTestRun(t, r.Root, "2026-08-17", "000002.000-model", model.Run{Kind: "stage", RetentionClass: "model", StartedAt: now.Add(-40 * 24 * time.Hour), Outcome: model.OutcomeSuccess})
+	failure := writeTestRun(t, r.Root, "2026-08-17", "000003.000-fail", model.Run{Kind: "stage", RetentionClass: "model", StartedAt: now.Add(-40 * 24 * time.Hour), Outcome: model.OutcomeFailure})
+	if _, err := sweepClasses(r.Root, cfg, now, neverPinned); err != nil {
+		t.Fatal(err)
+	}
+	for path, exists := range map[string]bool{poll: false, status: true, modelRun: false, failure: true} {
+		_, err := os.Stat(path)
+		if got := err == nil; got != exists {
+			t.Errorf("%s exists = %v, want %v (err %v)", filepath.Base(path), got, exists, err)
+		}
+	}
+}
+
+func TestPartialListingNeverReplacesLastGoodSourceState(t *testing.T) {
+	cfg, r := boardFor(t)
+	list := cfg.Sources[0].List
+	writeScript(t, list, `#!/bin/sh
+printf '%s' '[{"id":"s1:1","ref":"1","stage":"backlog","title":"last good"}]' >"$CONVEYOR_RESULT"
+`)
+	s := New(cfg, r)
+	s.refresh(t.Context())
+	writeScript(t, list, `#!/bin/sh
+printf '%s' '[{"id":"s1:1","ref":"1","stage":"backlog","title":"partial replacement"},{"id":"s1:2","stage":"backlog","title":"missing ref"}]' >"$CONVEYOR_RESULT"
+`)
+	s.refresh(t.Context())
+	if len(s.state.Items) != 1 || s.state.Items[0].Title != "last good" {
+		t.Fatalf("items after partial listing = %+v, want untouched last-good state", s.state.Items)
+	}
+	if s.state.Sources[0].ListError == "" {
+		t.Fatal("partial listing was not reported as a failed listing")
+	}
+}
+
+func TestEmptyOrTruncatedListingNeverReplacesLastGoodSourceState(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "empty", body: `: >"$CONVEYOR_RESULT"`},
+		{name: "truncated", body: `printf '%s' '[{"id":"s1:1"' >"$CONVEYOR_RESULT"`},
+		{name: "null", body: `printf '%s' 'null' >"$CONVEYOR_RESULT"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, r := boardFor(t)
+			writeScript(t, cfg.Sources[0].List, `#!/bin/sh
+printf '%s' '[{"id":"s1:1","ref":"1","stage":"backlog","title":"last good"}]' >"$CONVEYOR_RESULT"
+`)
+			s := New(cfg, r)
+			s.refresh(t.Context())
+			writeScript(t, cfg.Sources[0].List, "#!/bin/sh\n"+tc.body+"\n")
+			s.refresh(t.Context())
+			if len(s.state.Items) != 1 || s.state.Items[0].Title != "last good" {
+				t.Fatalf("items after invalid listing = %+v, want untouched last-good state", s.state.Items)
+			}
+			if s.state.Sources[0].ListError == "" {
+				t.Fatal("invalid listing was not reported as failed")
+			}
+		})
+	}
+}
+
+func TestStartupSweepWaitsForInitialListingEvidence(t *testing.T) {
+	cfg, r := boardFor(t)
+	release := filepath.Join(t.TempDir(), "release")
+	writeScript(t, cfg.Sources[0].List, `#!/bin/sh
+while [ ! -e "`+release+`" ]; do sleep 0.01; done
+printf '%s' '[{"id":"s1:1","ref":"1","stage":"working","title":"blocked","blocked":true}]' >"$CONVEYOR_RESULT"
+`)
+	dir := writeTestRun(t, r.Root, "2020-01-01", "120000.000-mark", model.Run{
+		Source: "s1", ItemID: "s1:1", Kind: "stage", To: "working",
+		StartedAt: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), Outcome: model.OutcomeBlocked,
+	})
+	if err := os.WriteFile(filepath.Join(dir, "result.json"), []byte(`{"blocked":true,"reason":"keep me"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := New(cfg, r)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go s.sweep(ctx)
+	go s.refresh(ctx)
+	time.Sleep(100 * time.Millisecond)
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("startup sweep ran before initial listing: %v", err)
+	}
+	if err := os.WriteFile(release, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "startup retention sweep", func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return !s.lastCleanup.IsZero()
+	})
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("marking evidence was deleted after startup recall pinned it: %v", err)
+	}
+}
+
+func TestModelStorageReservationsAreAtomicAndIncludeProjectedGrowth(t *testing.T) {
+	cfg, r := boardFor(t)
+	cfg.Sources[0].Scripts["work"] = config.ScriptSpec{Agent: "fake"}
+	cfg.Concurrency.Global, cfg.Concurrency.PerSource, cfg.Concurrency.PerStage = 2, 2, 2
+	s := New(cfg, r)
+	v := s.storageUse()
+	if v.ProjectedGrowth == 0 {
+		t.Fatal("test setup has no projected growth")
+	}
+	highBytes := v.Bytes + v.ProjectedGrowth + v.ProjectedGrowth/2
+	cfg.Storage.MaxBytes = config.ByteSize(highBytes * 100 / int64(cfg.Storage.HighWatermark))
+	cfg.Storage.TempMaxBytes = config.ByteSize(1 << 30)
+
+	items := []model.Item{
+		{ID: "s1:1", Source: "s1", Stage: "backlog"},
+		{ID: "s1:2", Source: "s1", Stage: "backlog"},
+	}
+	results := make(chan claimRefusal, len(items))
+	var wg sync.WaitGroup
+	for _, item := range items {
+		wg.Add(1)
+		go func(item model.Item) {
+			defer wg.Done()
+			results <- s.claim(item, "working", false)
+		}(item)
+	}
+	wg.Wait()
+	close(results)
+	accepted, refused := 0, 0
+	for got := range results {
+		switch got {
+		case claimAccepted:
+			accepted++
+		case claimStorageHigh:
+			refused++
+		default:
+			t.Fatalf("claim refusal = %v, want accepted or storage high", got)
+		}
+	}
+	if accepted != 1 || refused != 1 {
+		t.Fatalf("accepted=%d storage-refused=%d, want one each", accepted, refused)
+	}
+	for _, item := range items {
+		if _, ok := s.working.Load(item.ID); ok {
+			s.releaseModelStorage(item.ID)
+			s.working.Delete(item.ID)
+			s.eng.Locks().Release(item.Source, "working", s.cfg.ResourcesFor(item.Source, "working")...)
+		}
+	}
+}
+
+func TestProjectedGrowthIncludesStorePayloadAndScratch(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	files := map[string]int{
+		filepath.Join(cfg.DataDir(), "ledger.json"):                        11,
+		filepath.Join(filepath.Dir(r.Root), "payloads", "payload.json.gz"): 13,
+		filepath.Join(r.TempRoot, ".run-test", "artifact"):                 17,
+	}
+	var want int64
+	for path, size := range files {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, make([]byte, size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		want += int64(size)
+	}
+	v := s.storageUse()
+	if v.ProjectedGrowth < want {
+		t.Fatalf("ProjectedGrowth = %d, want at least store+payload+scratch bytes %d", v.ProjectedGrowth, want)
+	}
+	if v.ByClass["payloads"] < 13 || v.ByClass["scratch"] < 17 || v.ByClass["store"] < 11 {
+		t.Fatalf("ByClass = %v, want payload, scratch and store accounted", v.ByClass)
+	}
+}
+
+func TestCriticalPressureBeforeRetentionReadyCleansIndependentStorageButRetainsRuns(t *testing.T) {
+	cfg, r := boardFor(t)
+	cfg.Sources[0].Scripts["work"] = config.ScriptSpec{Agent: "fake"}
+	cfg.Storage.MaxBytes = 100
+	cfg.Storage.TempMaxBytes = 100
+	cfg.Storage.HighWatermark = 80
+	cfg.Storage.CriticalWatermark = 90
+	cfg.Storage.Retention.Polling = config.Duration(time.Hour)
+	s := New(cfg, r)
+	runDir := writeTestRun(t, r.Root, "2020-01-01", "000000.000-old", model.Run{Kind: "list", StartedAt: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), Outcome: model.OutcomeSuccess})
+	scratch := filepath.Join(r.TempRoot, "120000.000-old")
+	if err := os.MkdirAll(scratch, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(scratch, ".conveyor-owned")
+	if err := os.WriteFile(marker, []byte(`{"v":1,"runId":"120000.000-old","ended":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(marker, old, old); err != nil {
+		t.Fatal(err)
+	}
+	payloadRoot := filepath.Join(filepath.Dir(r.Root), "payloads")
+	if err := os.MkdirAll(payloadRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(payloadRoot, strings.Repeat("a", 64)+".json.gz")
+	if err := os.WriteFile(payload, []byte("unused"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(payload, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.DataDir(), "pressure"), make([]byte, 100), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s.reserveModelStorage("s1:1") {
+		t.Fatal("model work admitted before retention was safe under critical pressure")
+	}
+	if _, err := os.Stat(runDir); err != nil {
+		t.Fatalf("run swept before initial evidence reconstruction: %v", err)
+	}
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("owned expired scratch remains: %v", err)
+	}
+	if _, err := os.Stat(payload); !os.IsNotExist(err) {
+		t.Fatalf("unreferenced expired payload remains: %v", err)
 	}
 }

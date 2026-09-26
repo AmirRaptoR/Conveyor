@@ -301,6 +301,9 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	case claimBudgetExhausted:
 		http.Error(w, s.whyBudgetExhausted(item.ID, target), http.StatusConflict)
 		return
+	case claimStorageHigh:
+		http.Error(w, "storage cannot safely accept model work; usage is above its high watermark or run persistence is faulted", http.StatusInsufficientStorage)
+		return
 	}
 	w.WriteHeader(http.StatusAccepted)
 }
