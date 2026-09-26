@@ -345,7 +345,7 @@ stage that wrote it. No script is required to write one, and none does today.
 
 ### 2c. Agent result envelopes
 
-Every shipped Claude/OpenCode model invocation ends with one version-1 JSON
+Every shipped Claude/Codex/OpenCode model invocation ends with one version-1 JSON
 object. It may be bare or wrapped in one `json`/untagged code fence, with only
 whitespace outside it. The persisted envelope stays flat so existing engine,
 provider and board readers keep consuming the same top-level fields:
@@ -472,14 +472,28 @@ tokens or money is the interesting number — all of that differs per agent and
 belongs to the script, which is why the engine holds no struct for it. An agent
 with no `status` script simply says nothing, which is not an error.
 
-The shipped OpenCode adapter is still only a script implementation of this
-contract. A source selects it with `agent: opencode` and passes `MODEL`
+The shipped Codex and OpenCode adapters are still only script implementations
+of this contract. A source selects Codex with `agent: codex` and may pass
+`MODEL`, `PROFILE`, and `CODEX_SANDBOX` (default `danger-full-access`) in that
+script entry's `params:`. Refine, implement, review and approve share the same
+deterministic worktree, dependency, pull-request and postcondition policy as
+the Claude adapters; only the model runner beneath that policy changes.
+
+Codex CLI `0.150.1` is the supported event contract. The adapter consumes
+`codex exec --json`, requires one stable `thread.started`, one turn and one
+`turn.completed`, and accepts only the last completed agent message from that
+turn as the final response. Command output and reasoning are never logged;
+command names and statuses are. Completed `todo_list` items publish to the plan
+channel. Stops retain the thread with a `codex:` prefix, so another backend
+treats it as foreign and falls back to the answered cold prompt. Codex exposes
+no turn-count ceiling, so the engine deadline remains its hard bound. The
+adapter does not advertise steering: the event stream has no tested boundary
+at which the adapter can stop a live turn without racing active work.
+
+A source selects OpenCode with `agent: opencode` and passes `MODEL`
 (`provider/model`), optional `VARIANT`, and optional primary `AGENT` in that
 script entry's `params:`. Those names never enter the engine's schema: they are
 environment for one script, exactly like a Claude model or a deployment host.
-Refine, implement, review and approve share the same deterministic worktree,
-dependency, pull-request and postcondition policy as the Claude adapters; only
-the model runner beneath that policy changes.
 
 OpenCode `1.18.32` is the one supported event contract. The adapter disables
 auto-update, validates the exact version, selected model and primary agent

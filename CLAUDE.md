@@ -566,8 +566,9 @@ sources. The engine reads one field of it, `state`, and knows three words: `ok`,
 `limited`, `unknown`. Everything else is passed through and drawn as given.
 What a usage window is, what counts against it, whether tokens or money is the
 interesting number — that differs per agent and belongs to the script, which is
-why there is no struct for it here. `agents/codex/status` reads the rate limits
-Codex records in its own rollouts; `agents/claude/status` sums the last five
+why there is no struct for it here. `agents/codex/` runs the four shared model
+stage policies through native Codex JSON events and reads the rate limits Codex
+records in its own rollouts; `agents/claude/status` sums the last five
 hours from `~/.claude/projects` and reports the refusal Claude Code files when
 the account is over its limit. Neither is the account's ledger and both say so.
 

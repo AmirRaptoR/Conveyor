@@ -567,6 +567,10 @@ resume_prompt '{"answer":"continue","session":"foreign-session","controlCarryove
 chk "an ordinary unprefixed session remains foreign" "${RESUME_SESSION:-}" ""
 
 RESUME_SESSION=""
+resume_prompt '{"answer":"continue","session":"codex:thread-old","controlCarryover":false}' 'original' >/dev/null 2>&1
+chk "a Codex session remains foreign to OpenCode" "${RESUME_SESSION:-}" ""
+
+RESUME_SESSION=""
 export API_SECRET=ses-good
 resume_log=$(resume_prompt '{"answer":"continue","session":"opencode:ses-good"}' 'original' 2>&1)
 chk "a secret-colliding resume session is ignored" "${RESUME_SESSION:-}" ""

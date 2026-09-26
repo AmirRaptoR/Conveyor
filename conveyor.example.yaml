@@ -293,7 +293,8 @@ sources:
         # it wants the git half too.
         agent: git
 
-  # A real source, for comparison — swap `agent: claude` for `agent: codex` and
+  # A real source, for comparison — swap `agent: claude` for `agent: codex`, set
+  # MODEL to a Codex model (or remove it to use Codex's configured default), and
   # only this repository changes:
   #
   # - name: midgame
