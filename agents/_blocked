@@ -9,21 +9,31 @@
 # in $CONVEYOR_RESULT, so the issue ended up wearing a mark with no comment
 # beside it and the board could say nothing about why it stopped.
 
-# _write_stop <jq args...> <filter> — the merge blocked and asks share: apply
-# filter to whatever is already in $CONVEYOR_RESULT (an empty object if there
-# is nothing, or nothing readable), so a field a caller wrote before stopping
-# survives being blocked.
+declare -f result_write_json >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/_result"
+
+# _write_stop <jq args...> <filter> — apply an adapter-authored outcome, retain
+# transport state such as the session, and discard fields owned by the previous
+# outcome so the persisted v1 envelope cannot contradict itself.
 _write_stop() {
 	[[ -z "${CONVEYOR_RESULT:-}" ]] && return 0
-	local tmp base
-	tmp=$(mktemp)
+	local base merged outcome
 	base='{}'
 	[[ -s "$CONVEYOR_RESULT" ]] && jq -e . "$CONVEYOR_RESULT" >/dev/null 2>&1 && base=$(cat "$CONVEYOR_RESULT")
-	if jq "$@" <<<"$base" >"$tmp" 2>/dev/null; then
-		mv "$tmp" "$CONVEYOR_RESULT"
-	else
-		rm -f "$tmp"
-	fi
+	merged=$(jq -c "$@" <<<"$base" 2>/dev/null) || return 0
+	outcome=$(jq -r '.outcome // "success"' <<<"$merged")
+	merged=$(jq -c --arg outcome "$outcome" '
+		def session: if has("session") then {session:.session} else {} end;
+		if $outcome == "blocked" then
+			{v:1,outcome:"blocked",blocked:true,kind:.kind,reason:.reason} +
+			(if has("questions") then {questions:.questions} else {} end) +
+			(if has("asked") then {asked:.asked} else {} end) + session
+		elif $outcome == "noop" then
+			{v:1,outcome:"noop",noop:true,reason:.reason} + session
+		elif $outcome == "waiting" then
+			{v:1,outcome:"waiting",waiting:.waiting} + session
+		else {v:1,outcome:"success"} + session
+		end' <<<"$merged") || return 0
+	result_write_json "$merged" || return 0
 }
 
 # blocked <kind> "<reason>" — record why a human is needed, then stop.
@@ -48,6 +58,8 @@ _write_stop() {
 #   dependency  the item names an issue that is still open; clears once it is
 #   unfinished  the run stopped itself at its deadline with work pushed and a
 #               conversation to resume into (agents/_deadline)
+#   invalid-result a completed model response failed the result contract twice;
+#               a fresh run may produce a valid response without human input
 #   draft       the item's pull request is still a draft when it needs to be
 #               ready; marking it ready is what clears this
 #
@@ -63,30 +75,9 @@ _write_stop() {
 # except that one caller, so this changes no existing behaviour.
 blocked() {
 	local kind=$1 reason=$2
-	_write_stop --arg kind "$kind" --arg reason "$reason" '. + {blocked: true, kind: $kind, reason: $reason}'
+	_write_stop --arg kind "$kind" --arg reason "$reason" '. + {outcome:"blocked", blocked:true, kind:$kind, reason:$reason}'
 	echo "blocked ($kind): $reason" >&2
 	exit 20
-}
-
-# CONDITION_KINDS — the self-clearing subset of the vocabulary above: a stop
-# that may have passed by the time anyone looks, so bulk-clearing it costs at
-# most one run wrongly retried, never a question answered twice. Not the
-# whole vocabulary — decision, no-output, input, draft and error are
-# deliberately not on it. The five words are already written down in
-# CLAUDE.md's three-tone bullet and in board.js's WAITING set; this is what
-# gives them one place a script can read instead of a third copy of the list
-# (a check in ./check keeps this and board.js's WAITING in agreement).
-CONDITION_KINDS=(limit turns unfinished dependency worktree)
-
-# is_condition_kind <word> — true when word names a condition rather than a
-# question. Used by agent_asked (agents/claude/_stream) to derive `asked`
-# from the kind the model actually wrote, instead of a call site guessing.
-is_condition_kind() {
-	local word=$1 k
-	for k in "${CONDITION_KINDS[@]}"; do
-		[[ "$word" == "$k" ]] && return 0
-	done
-	return 1
 }
 
 # asks <kind> "<question>" — stop because a person has to answer something.
@@ -114,19 +105,15 @@ is_condition_kind() {
 decision_brief() {
 	cat <<-BRIEF
 	If this cannot be done because it needs a decision only a human can make,
-	change nothing and write this to the file at ${CONVEYOR_RESULT}:
+	change nothing and return this as your final structured response:
 
-	  {"blocked": true, "kind": "decision",
-	   "reason": "<the decision needed, in one sentence>",
-	   "questions": [{"header": "<label, under 12 chars>",
-	                  "question": "<the full question, self-contained>",
-	                  "options": [{"label": "<1-5 words>", "description": "<what choosing it means>"}],
-	                  "multiSelect": false}]}
+	  {"v":1,"outcome":"blocked","kind":"decision","reason":"<the decision needed, in one sentence>","questions":[{"header":"<label, under 12 chars>","question":"<the full question, self-contained>","options":[{"label":"<recommended choice>","description":"<what choosing it means>"},{"label":"<alternative choice>","description":"<what choosing it means>"}],"multiSelect":false}]}
 
 	One entry per question, two to four options each, the one you would pick
 	listed first. This is the AskUserQuestion shape; that tool is not available
-	here, so the file is how you ask. A person answers on the board and the
-	reply reaches this same conversation. Do not stop for something you can
+	here, so the final response is how you ask. A person answers on the board and the
+	reply reaches this same conversation. Do not write an engine result file.
+	Do not stop for something you can
 	verify yourself, and do not stop because a dependency is open — say so in
 	one line and continue with what does not depend on it. Nothing wakes this
 	conversation when a background command finishes, so run long commands in
@@ -137,7 +124,7 @@ decision_brief() {
 asks() {
 	local kind=$1 question=$2
 	_write_stop --arg kind "$kind" --arg reason "$question" \
-		'. + {blocked: true, kind: $kind, reason: $reason, asked: true}'
+		'. + {outcome:"blocked", blocked:true, kind:$kind, reason:$reason, asked:true}'
 	echo "asks ($kind): $question" >&2
 	exit 20
 }
@@ -161,7 +148,7 @@ waits() {
 	local until=""
 	[[ -n "$until_epoch" ]] && until=$(date -u -d "@$until_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
 	_write_stop --arg why "$why" --arg until "$until" \
-		'. + {waiting: ({why: $why} + (if $until == "" then {} else {until: $until} end))}'
+		'. + {outcome:"waiting", waiting:({why:$why} + (if $until == "" then {} else {until:$until} end))}'
 	echo "waiting: $why" >&2
 	exit 10
 }

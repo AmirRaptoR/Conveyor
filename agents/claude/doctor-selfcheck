@@ -21,17 +21,18 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/scene"
 export PATH="$tmp/bin:$PATH"
 
-# The claude stub: writes whatever verdict the scene staged into
-# $CONVEYOR_RESULT (standing in for the model doing its own investigation and
-# writing that file itself) and prints one clean stream-json result line.
+# The claude stub returns whatever verdict the scene staged as one structured
+# final event. It never sees or writes the engine-owned result path.
 # CLAUDE_EXIT lets a scene force a non-zero exit.
 cat >"$tmp/bin/claude" <<'STUB'
 #!/usr/bin/env bash
 scene="$SCENE"
+result='{"v":1,"outcome":"success"}'
 if [[ -f "$scene/claude_result" ]]; then
-	cp "$scene/claude_result" "$CONVEYOR_RESULT"
+	result=$(jq -c '. + {v:1,outcome:"success"}' "$scene/claude_result")
 fi
-echo '{"type":"result","is_error":false,"subtype":"success","num_turns":1}'
+jq -nc '{type:"system",subtype:"init",session_id:"doctor-session",model:"stub"}'
+jq -nc --argjson result "$result" '{type:"result",is_error:false,subtype:"success",num_turns:1,session_id:"doctor-session",structured_output:$result}'
 exit "${CLAUDE_EXIT:-0}"
 STUB
 chmod +x "$tmp/bin/claude"

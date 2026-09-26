@@ -593,7 +593,7 @@ chk "     leaving the resolution where it was"            "$(cat "$wt/f.txt")" "
 # threads got a reply-and-resolve mutation, and that is only visible against
 # a real commit. claude is restubbed here, last in the file, to actually
 # "address" the threads a scene names rather than refuse outright — it makes
-# one file edit and writes whatever $CONVEYOR_RESULT a scene asks for, which
+# one file edit and returns whatever structured result a scene asks for, which
 # is this harness standing in for the model reporting its own dispositions.
 reset_wt_clean() {
 	g -C "$src" worktree remove --force "$wt" >/dev/null 2>&1
@@ -609,8 +609,12 @@ cat >"$tmp/bin/claude" <<STUB
 #!/usr/bin/env bash
 touch "$tmp/claude-ran"
 [[ -f "\$SCENE/claude_edit" ]] && cat "\$SCENE/claude_edit" >>f.txt
-[[ -f "\$SCENE/claude_result" ]] && cat "\$SCENE/claude_result" >"\$CONVEYOR_RESULT"
-echo "stub claude: addressed threads"
+result='{\"v\":1,\"outcome\":\"success\"}'
+if [[ -f "\$SCENE/claude_result" ]]; then
+	result=\$(jq -c '. + {v:1,outcome:"success"}' "\$SCENE/claude_result")
+fi
+jq -nc '{type:"system",subtype:"init",session_id:"approve-session",model:"stub"}'
+jq -nc --argjson result "\$result" '{type:"result",subtype:"success",is_error:false,session_id:"approve-session",structured_output:\$result}'
 exit 0
 STUB
 chmod +x "$tmp/bin/claude"

@@ -547,10 +547,10 @@ function why(it) {
 }
 
 // Three tones, from the two facts the engine carries: a question is `asked`,
-// and these kinds are conditions that pass on their own (agents/_blocked's
+// and these kinds are conditions that pass on their own (agents/_result's
 // vocabulary — presentation only, the engine never reads the word). Anything
 // else stopped because something went wrong.
-const WAITING = new Set(["limit", "turns", "unfinished", "dependency", "worktree"]);
+const WAITING = new Set(["limit", "turns", "unfinished", "dependency", "worktree", "invalid-result"]);
 export function tone(b) {
   b = b || {};
   return b.asked ? "asks" : WAITING.has(b.kind) ? "waiting" : "fault";

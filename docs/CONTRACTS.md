@@ -185,6 +185,13 @@ script that publishes no plan or capability produces no corresponding board
 entry, never a warning: both are adapter promises, never requirements of the
 engine or the config (CLAUDE.md's extension-seam invariant).
 
+For a shipped AI adapter, "the script writes" is literal: the adapter process,
+not the model child, owns `$CONVEYOR_RESULT`. The child does not receive that
+environment variable and is never prompted with an engine path. It returns the
+versioned final response in §2c; the adapter extracts, validates, redacts and
+atomically persists it. The engine still reads only the file and never learns a
+backend event protocol.
+
 ### 2a. The plan channel
 
 `$CONVEYOR_PLAN` (pre-created `0600` in the run directory, named `plan.jsonl`
@@ -334,6 +341,55 @@ Any stage script may also write `{"summary": "…"}` — one line of narrative,
 unrelated to whether it blocked. The engine does not read it; the final report
 (the panel's per-item write-up, built from run history) quotes it under the
 stage that wrote it. No script is required to write one, and none does today.
+
+### 2c. Agent result envelopes
+
+Every shipped Claude/OpenCode model invocation ends with one version-1 JSON
+object. It may be bare or wrapped in one `json`/untagged code fence, with only
+whitespace outside it. The persisted envelope stays flat so existing engine,
+provider and board readers keep consuming the same top-level fields:
+
+```json
+{"v":1,"outcome":"success"}
+{"v":1,"outcome":"noop","noop":true,"reason":"nothing needed doing"}
+{"v":1,"outcome":"waiting","waiting":{"why":"checks are running","until":"2026-09-25T18:00:00Z"}}
+{"v":1,"outcome":"blocked","blocked":true,"kind":"decision","reason":"choose an API","asked":true,"questions":[{"header":"API","question":"Which API?","options":[{"label":"A","description":"use A"},{"label":"B","description":"use B"}],"multiSelect":false}],"session":"..."}
+```
+
+`outcome` is exactly `success`, `blocked`, `noop` or `waiting`. `blocked`
+requires `kind` and `reason`; `noop` requires `reason`; `waiting` requires
+`waiting.why` and permits a UTC `waiting.until`. The adapter returns exit 10 so
+a stage that permits waiting takes the ordinary deferral path before its
+postconditions. `prioritise` is deliberately best-effort and treats that exit
+like any other missing decision: it writes its default and advances. A block may carry
+`questions` in the AskUserQuestion shape. A successful task may carry the
+task-specific fields the adapter requested: `dispositions`, `priority`,
+`after`, `part`, `of`, `verdict` or `summary`. Unknown fields, unknown
+versions, wrong types and contradictory outcome fields are invalid.
+
+The model supplies none of `blocked`, `noop`, `asked` or `session`. The adapter
+derives the compatibility booleans, classifies a real question from its kind
+and questions, and adds the backend-owned resumable session. Adapter-authored
+stops (quota, turns, pause, preflight, waiting and no-output) use the same flat
+v1 envelope and atomic writer.
+
+A backend response is eligible only after its own completion boundary: one
+non-error Claude `result` event, or OpenCode's terminal `step_finish` after all
+observed tools are terminal. Partial streams are backend failures even when a
+partial text fragment happens to contain JSON. Multiple terminal candidates
+are ambiguous rather than "last one wins". For a completed response that is
+missing, malformed, ambiguous or schema-invalid, the adapter makes exactly one
+formatting-only correction in the same session. A valid correction is handled
+normally; a second failure exits 20 with kind `invalid-result`, `asked:false`,
+the precise failure class and the resumable session. It never corrects twice.
+
+Before logs or envelopes leave the adapter, exact non-empty values from
+environment names containing `token`, `secret`, `password`, `key` or
+`credential` (case-insensitive) are replaced with `[REDACTED]`, including
+JSON-escaped forms, object keys and model-child stderr. Persistence is
+a mode-`0600` temporary file in the result directory followed by rename, so an
+interruption exposes either the prior complete envelope or the new complete
+one, never a partial write.
 
 ## 3. The script kinds
 

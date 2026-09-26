@@ -531,6 +531,8 @@ func TestEveryMarkHasAKind(t *testing.T) {
 		{"a timeout says so", model.Run{Outcome: model.OutcomeTimeout}, "", "timeout"},
 		{"the script's own word wins", model.Run{Outcome: model.OutcomeBlocked, ExitCode: 20},
 			`{"blocked":true,"kind":"Limit","reason":"out of quota"}`, "limit"},
+		{"a v1 envelope keeps compatible top-level fields", model.Run{Outcome: model.OutcomeBlocked, ExitCode: 20},
+			`{"v":1,"outcome":"blocked","blocked":true,"kind":"invalid-result","reason":"malformed final","asked":false}`, "invalid-result"},
 		{"a kind that would not fit a label is dropped", model.Run{Outcome: model.OutcomeBlocked, ExitCode: 20},
 			`{"blocked":true,"kind":"the agent decided that it could not proceed here","reason":"x"}`, "decision"},
 		{"and so is one with punctuation in it", model.Run{Outcome: model.OutcomeFailure, ExitCode: 1},

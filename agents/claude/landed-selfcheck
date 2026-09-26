@@ -92,8 +92,7 @@ git_called() { [[ -f "$tmp/scene/git_called" ]] && echo yes || echo no; }
 # The real `claude`, for the scenes below that legitimately need the model to
 # run: a clean, uneventful pass that still makes one local commit — enough to
 # move `refs/heads/<branch>`, which is what clears #82's no-output guard ahead
-# of implement's postcondition — and writes nothing to $CONVEYOR_RESULT, same
-# as a model that looked and found nothing else to do. Distinct content each
+# of implement's postcondition — and returns a plain success envelope. Distinct content each
 # call so nothing collides across scenes sharing one throwaway repo. Runs in
 # whatever the adapter has already `cd`-ed into, and relies on no identity but
 # the one already configured on that repo (never a global git config).
@@ -104,7 +103,8 @@ stub_claude_clean() {
 date +%s%N >>stub-claude-commit.txt
 git add -A
 git commit --quiet -m "stub: clean run"
-echo '{"type":"result","is_error":false,"subtype":"success","num_turns":1,"result":"nothing to implement"}'
+jq -nc '{type:"system",subtype:"init",session_id:"landed-session",model:"stub"}'
+jq -nc '{type:"result",is_error:false,subtype:"success",num_turns:1,session_id:"landed-session",structured_output:{v:1,outcome:"success"}}'
 exit 0
 STUB
 	chmod +x "$tmp/bin/claude"
@@ -285,7 +285,7 @@ graphql "$open_issue"
 rc=0
 (cd "$tmp/srcrepo" && payload 27 | "$here/implement" >"$tmp/out" 2>"$tmp/err") || rc=$?
 chk "implement still reports a non-draft PR" "$rc" "0"
-chk "  and never touches the mark file" "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+chk "  and persists only model success" "$(jq -r .outcome "$CONVEYOR_RESULT")" "success"
 chk "  and prints the PR it opened" "$(grep -c 'opened PR #51' "$tmp/out")" "1"
 
 # --- review: an OPEN, non-draft PR advances all the way to approving -------
@@ -297,7 +297,7 @@ prlist "$(pr_entry 60 30 OPEN false)"
 rc=0
 (cd "$tmp/srcrepo" && payload 30 | "$here/review" >"$tmp/out" 2>"$tmp/err") || rc=$?
 chk "review advances a non-draft PR exactly as before" "$rc" "0"
-chk "  and never touches the mark file" "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+chk "  and persists only model success" "$(jq -r .outcome "$CONVEYOR_RESULT")" "success"
 chk "  and hands it to approving" "$(grep -c 'PR #60 is OPEN; handing it to the approving stage' "$tmp/out")" "1"
 
 # --- review's postcondition: a person returned the PR to draft mid-review --

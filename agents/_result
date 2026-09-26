@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# Shared structured-result boundary for agent backends. Models return one JSON
+# object in their final response; only this adapter code may write the
+# engine-owned result file.
+
+result_brief() {
+	cat <<'BRIEF'
+End your final response with exactly one JSON object and no prose outside it.
+Use this versioned result contract:
+
+  {"v":1,"outcome":"success"}
+
+`outcome` is one of `success`, `blocked`, `noop`, or `waiting`.
+- blocked requires `kind` and `reason`, and may include `questions` in the
+  AskUserQuestion shape.
+- noop requires `reason`.
+- waiting requires `waiting` with `why` and optional UTC `until`.
+- success may include task-specific `dispositions`, `priority`, `after`,
+  `part`, `of`, `verdict`, or `summary` fields when requested above.
+Do not include file paths, `session`, `asked`, `blocked`, or `noop`; the adapter
+adds trusted transport fields. One optional ```json code fence is accepted.
+BRIEF
+}
+
+result_correction_brief() {
+	cat <<'BRIEF'
+Your previous final response could not be accepted as structured output. Do not
+continue the task and do not use tools. Return only one JSON object matching the
+version-1 result contract from the prior request. Do not wrap it in explanation.
+BRIEF
+}
+
+# Stops that may clear without a person's answer. This is the one script-owned
+# list used by result normalization, backend adapters, and the board parity test.
+CONDITION_KINDS=(limit turns unfinished dependency worktree invalid-result)
+
+is_condition_kind() {
+	local word=$1 k
+	for k in "${CONDITION_KINDS[@]}"; do
+		[[ "$word" == "$k" ]] && return 0
+	done
+	return 1
+}
+
+# Broad enough for each shipped stage's task-specific payload while still
+# forcing the transport discriminator and rejecting model-owned trusted fields.
+result_json_schema() {
+	jq -nc '{
+		type:"object", additionalProperties:false,
+		properties:{
+			v:{const:1}, outcome:{enum:["success","blocked","noop","waiting"]},
+			kind:{type:"string"}, reason:{type:"string"},
+			questions:{type:"array",items:{type:"object"}},
+			waiting:{type:"object"}, dispositions:{type:"object"},
+			priority:{type:"integer"}, after:{type:"integer"}, part:{type:"integer"}, of:{type:"integer"},
+			verdict:{type:"string"}, summary:{type:"string"}
+		}, required:["v","outcome"]
+	}'
+}
+
+_secret_pattern() {
+	jq -nr --arg value "$1" '
+		def re: gsub("\\\\";"\\\\") | gsub("\\.";"\\.") | gsub("\\^";"\\^") |
+			gsub("\\$";"\\$") | gsub("\\|";"\\|") | gsub("\\?";"\\?") |
+			gsub("\\*";"\\*") | gsub("\\+";"\\+") | gsub("\\(";"\\(") |
+			gsub("\\)";"\\)") | gsub("\\[";"\\[") | gsub("\\]";"\\]") |
+			gsub("\\{";"\\{") | gsub("\\}";"\\}");
+		def hd: if . < 10 then tostring else
+			(["a","b","c","d","e","f"][.-10] as $x | "["+$x+($x|ascii_upcase)+"]") end;
+		def u4($n): "\\\\u" + (($n/4096|floor)%16|hd) + (($n/256|floor)%16|hd) +
+			(($n/16|floor)%16|hd) + ($n%16|hd);
+		def unicode($cp): if $cp <= 65535 then u4($cp) else
+			(($cp-65536) as $n | u4(55296+($n/1024|floor)) + u4(56320+($n%1024))) end;
+		[$value | explode[] | . as $cp |
+			([([.]|implode), (([.]|implode)|tojson|.[1:-1])] +
+			 (if $cp == 47 then ["\\/"] else [] end) | unique | map(re) | join("|")) as $ordinary |
+			"(?:"+$ordinary+"|"+unicode($cp)+")"] | join("")'
+}
+
+# Exact-value redaction for values carried by conventionally sensitive
+# environment names. The pattern accepts literal text and any equivalent JSON
+# string escaping, including escaped solidus, Unicode, and surrogate pairs.
+redact_text() {
+	local text=$1 name value fragment pattern
+	for name in $(compgen -e); do
+		[[ "$name" =~ ([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Kk][Ee][Yy]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]) ]] || continue
+		value=${!name-}
+		[[ -n "$value" ]] || continue
+		pattern=$(_secret_pattern "$value") || return 1
+		text=$(jq -nr --arg text "$text" --arg pattern "$pattern" '$text | gsub($pattern;"[REDACTED]")') || return 1
+		# redact_stream receives one line at a time. Redact every non-empty
+		# component of a multiline secret so joining those lines cannot recover it.
+		if [[ "$value" == *$'\n'* ]]; then
+			while IFS= read -r fragment || [[ -n "$fragment" ]]; do
+				[[ -n "$fragment" ]] || continue
+				pattern=$(_secret_pattern "$fragment") || return 1
+				text=$(jq -nr --arg text "$text" --arg pattern "$pattern" '$text | gsub($pattern;"[REDACTED]")') || return 1
+			done <<<"$value"
+		fi
+	done
+	printf '%s' "$text"
+}
+
+secret_values_json() {
+	local values='[]' name value
+	for name in $(compgen -e); do
+		[[ "$name" =~ ([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Kk][Ee][Yy]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]) ]] || continue
+		value=${!name-}
+		[[ -n "$value" ]] || continue
+		values=$(jq -c --arg value "$value" '. + [$value]' <<<"$values") || return 1
+	done
+	printf '%s' "$values"
+}
+
+contains_sensitive_value() {
+	local text=$1 secrets
+	secrets=$(secret_values_json) || return 1
+	jq -e --arg text "$text" 'any(.[]; . as $secret | $text | contains($secret))' <<<"$secrets" >/dev/null 2>&1
+}
+
+redact_stream() {
+	local line
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		redact_text "$line"
+		printf '\n'
+	done
+}
+
+# result_parse <text> prints one canonical model object. The response may be a
+# bare object or exactly one fenced object; anything around it is ambiguous.
+result_parse() {
+	local text=$1
+	printf '%s' "$text" | jq -Rrs '
+		def trim: sub("^[[:space:]]+"; "") | sub("[[:space:]]+$"; "");
+		trim as $s |
+		(if ($s | test("^```(?:json)?[[:space:]]*\\n[\\s\\S]*\\n```$"; "i"))
+		 then ($s | sub("^```(?:json)?[[:space:]]*\\n"; ""; "i") | sub("\\n```$"; ""))
+		 else $s end) as $candidate |
+		try ($candidate | fromjson) catch empty |
+		select(type == "object")' 2>/dev/null
+}
+
+# result_validate_model <json> validates the untrusted model-owned portion.
+# Trusted compatibility fields are added only after this succeeds.
+result_validate_model() {
+	local json=$1 until normalized_until
+	jq -e '
+		type == "object" and
+		((keys - ["v","outcome","kind","reason","questions","waiting",
+		          "dispositions","priority","after","part","of","verdict","summary"]) | length == 0) and
+		.v == 1 and
+		(.outcome == "success" or .outcome == "blocked" or .outcome == "noop" or .outcome == "waiting") and
+		((has("kind") | not) or (.kind | type == "string" and test("^[a-z0-9][a-z0-9 -]{0,23}$"))) and
+		((has("reason") | not) or (.reason | type == "string" and length > 0)) and
+		((has("summary") | not) or (.summary | type == "string")) and
+		((has("verdict") | not) or (.verdict | type == "string")) and
+		((has("priority") | not) or (.priority | type == "number" and floor == . and . >= 0 and . <= 3)) and
+		((has("after") | not) or (.after | type == "number" and floor == . and . > 0)) and
+		((has("part") | not) or (.part | type == "number" and floor == . and . > 0)) and
+		((has("of") | not) or (.of | type == "number" and floor == . and . > 0)) and
+		((has("dispositions") | not) or (.dispositions | type == "object" and all(to_entries[]; (.key | length > 0) and (.value | type == "string" and length > 0)))) and
+		((has("questions") | not) or (.questions | type == "array" and length > 0 and all(.[];
+			type == "object" and
+			((keys - ["header","question","options","multiSelect"]) | length == 0) and
+			(.header | type == "string" and length > 0) and
+			(.question | type == "string" and length > 0) and
+			((has("multiSelect") | not) or (.multiSelect | type == "boolean")) and
+			(.options | type == "array" and length >= 2 and length <= 4 and all(.[];
+				type == "object" and ((keys - ["label","description"]) | length == 0) and
+				(.label | type == "string" and length > 0) and
+				(.description | type == "string" and length > 0)))))) and
+		((has("waiting") | not) or (.waiting | type == "object" and
+			((keys - ["why","until"]) | length == 0) and
+			(.why | type == "string" and length > 0) and
+			((has("until") | not) or (.until | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))))) and
+		(if .outcome == "blocked" then (.kind | type == "string") and (.reason | type == "string") and
+			.waiting == null and .dispositions == null and .priority == null and .after == null and .part == null and .of == null and .verdict == null and .summary == null
+		 elif .outcome == "noop" then (.reason | type == "string") and .kind == null and .questions == null and .waiting == null and
+			.dispositions == null and .priority == null and .after == null and .part == null and .of == null and .verdict == null and .summary == null
+		 elif .outcome == "waiting" then .waiting != null and .kind == null and .reason == null and .questions == null and
+			.dispositions == null and .priority == null and .after == null and .part == null and .of == null and .verdict == null and .summary == null
+		 else .kind == null and .reason == null and .questions == null and .waiting == null end)
+	' >/dev/null 2>&1 <<<"$json" || return 1
+	until=$(jq -r '.waiting.until // empty' <<<"$json") || return 1
+	[[ -z "$until" ]] && return 0
+	normalized_until=$(date -u -d "$until" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || return 1
+	[[ "$normalized_until" == "$until" ]]
+}
+
+result_normalize() {
+	local json=$1 session=${2:-} conditions
+	conditions=$(printf '%s\n' "${CONDITION_KINDS[@]}" | jq -Rsc 'split("\n")[:-1]') || return 1
+	jq -c --arg session "$session" --argjson conditions "$conditions" '
+		if .outcome == "blocked" then
+			.kind as $kind |
+			. + {blocked:true, asked: (((.questions // []) | length) > 0 or ($conditions | index($kind)) == null)}
+		elif .outcome == "noop" then . + {noop:true}
+		else . end |
+		if $session == "" then . else . + {session:$session} end
+	' <<<"$json"
+}
+
+# result_write_json <trusted-json> atomically replaces the engine-owned file.
+# The caller supplies a complete v1 envelope (including adapter-owned fields).
+result_write_json() {
+	local json=$1 dir tmp redacted secrets
+	[[ -n "${CONVEYOR_RESULT:-}" ]] || return 1
+	secrets=$(secret_values_json) || return 1
+	redacted=$(jq -c --argjson secrets "$secrets" '
+		def redact_string: reduce $secrets[] as $secret (.; split($secret) | join("[REDACTED]"));
+		def contains_secret: . as $value | reduce $secrets[] as $secret (false; . or ($value | contains($secret)));
+		def available_key($object; $base; $n):
+			($base + if $n == 1 then "" else "-" + ($n | tostring) end) as $key |
+			if ($object | has($key)) then available_key($object; $base; $n + 1) else $key end;
+		def protected_value($path):
+			$path == ["outcome"] or $path == ["kind"] or $path == ["waiting","until"];
+		def redact($path):
+			if type == "object" then reduce to_entries[] as $entry ({};
+				($entry.key | if $path == ["dispositions"] then redact_string else . end) as $base |
+				available_key(.; $base; 1) as $key |
+				. + {($key): ($entry.value | redact($path + [$entry.key]))})
+			elif type == "array" then to_entries | map(. as $entry | $entry.value | redact($path + [$entry.key]))
+			elif type == "string" then if protected_value($path) then . else redact_string end
+			else . end;
+		(if (.kind | type == "string" and contains_secret) then .kind = "redacted" else . end) |
+		(if (.waiting.until | type == "string" and contains_secret) then del(.waiting.until) else . end) |
+		(if (.session | type == "string" and contains_secret) then del(.session) else . end) |
+		redact([])' <<<"$json" 2>/dev/null) || return 1
+	jq -e 'type == "object" and .v == 1 and (.outcome | type == "string")' >/dev/null 2>&1 <<<"$redacted" || return 1
+	dir=$(dirname "$CONVEYOR_RESULT")
+	tmp=$(mktemp "$dir/.result.XXXXXX") || return 1
+	chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+	if ! jq -c . <<<"$redacted" >"$tmp" || ! mv -f "$tmp" "$CONVEYOR_RESULT"; then
+		rm -f "$tmp"
+		return 1
+	fi
+}
+
+result_accept() {
+	local text=$1 session=${2:-} parsed normalized
+	parsed=$(result_parse "$text") || return 1
+	[[ -n "$parsed" ]] || return 1
+	result_validate_model "$parsed" || return 1
+	normalized=$(result_normalize "$parsed" "$session") || return 1
+	result_write_json "$normalized"
+}
+
+result_is_waiting() {
+	[[ -s "${CONVEYOR_RESULT:-}" ]] &&
+		[[ "$(jq -r '.outcome // empty' "$CONVEYOR_RESULT" 2>/dev/null)" == waiting ]]
+}
+
+result_quarantine() {
+	local reason=$1 session=${2:-} json
+	reason=$(redact_text "$reason")
+	json=$(jq -nc --arg reason "$reason" --arg session "$session" '
+		{v:1,outcome:"blocked",blocked:true,kind:"invalid-result",reason:$reason,asked:false}
+		+ (if $session == "" then {} else {session:$session} end)')
+	result_write_json "$json"
+}

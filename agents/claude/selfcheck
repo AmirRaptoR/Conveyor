@@ -68,7 +68,7 @@ chk "and it is still a question"       "$(jq -r .asked "$CONVEYOR_RESULT")" "tru
 # condition — the bug this issue fixes — and still gets a session, since
 # `turns` and `unfinished` are the resumable kinds.
 printf '%s\n' '{"type":"system","session_id":"sess-cond"}' '{"type":"result","session_id":"sess-cond"}' > "$CLAUDE_RAW"
-for k in limit turns unfinished dependency worktree; do
+for k in limit turns unfinished dependency worktree invalid-result; do
 	echo "{\"blocked\":true,\"kind\":\"$k\",\"reason\":\"r\"}" > "$CONVEYOR_RESULT"
 	agent_asked
 	chk "a model-written kind $k stays a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
@@ -168,6 +168,9 @@ printf '%s\n' \
 MODEL="claude-opus-5"  # what was asked for; the stream says what actually ran
 chk "the model is read from the stream" "$(claude_model)" "claude-sonnet-5[1m]"
 chk "and recorded on one line"          "$(record_model)" "model: claude-sonnet-5[1m]"
+export API_SECRET='sonnet-5'
+chk "model metadata is redacted" "$(record_model)" "model: claude-[REDACTED][1m]"
+unset API_SECRET
 
 # 8. no events — STREAM=0, or a run that died before the first one. Nothing is
 #    printed rather than an empty model: line, and the exit status is untouched,
@@ -221,13 +224,13 @@ chk "a max-turns stop is named in the log" "$out" $'\n[claude stopped: error_max
 out=$(printf '%s\n' '{"type":"result","is_error":true,"subtype":"error_during_execution","result":"API overloaded"}' | render_stream)
 chk "an error with a message shows both" "$out" $'\n[claude stopped: error_during_execution] API overloaded'
 
-# 13. hit_max_turns reads what render_stream just wrote to $CLAUDE_SAID — a
-#     clean finish is not a turns stop, and neither is a quota refusal.
-printf '%s\n' '{"type":"result","is_error":true,"subtype":"error_max_turns","num_turns":40}' | render_stream >"$CLAUDE_SAID"
+# 13. hit_max_turns reads the private raw result — a clean finish is not a
+#     turns stop, and neither is a quota refusal.
+printf '%s\n' '{"type":"result","is_error":true,"subtype":"error_max_turns","num_turns":40}' >"$CLAUDE_RAW"
 chk "a max-turns result is recognised" "$(hit_max_turns && echo yes)" "yes"
-printf '%s\n' '{"type":"result","is_error":false,"subtype":"success"}' | render_stream >"$CLAUDE_SAID"
+printf '%s\n' '{"type":"result","is_error":false,"subtype":"success"}' >"$CLAUDE_RAW"
 chk "a clean finish is not a turns stop" "$(hit_max_turns && echo yes)" ""
-echo "Claude hit your usage limit" >"$CLAUDE_SAID"
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Claude hit your usage limit"}]}}' >"$CLAUDE_RAW"
 chk "a quota refusal is not a turns stop either" "$(hit_max_turns && echo yes)" ""
 
 # 14. record_session merges into an empty/missing $CONVEYOR_RESULT — the case
@@ -293,29 +296,28 @@ record_session
 chk "record_session gets a session out of it" "$(jq -r .session "$CONVEYOR_RESULT")" "sess-long"
 
 # 18. hit_limit tells the CLI refusing to run from the model talking about a
-#     refusal. Both are in $CLAUDE_SAID and only the first one is ours: the
+#     refusal. Both are in the raw stream and only the first one is ours: the
 #     mark it produces pauses every claude stage on the board, so reading the
 #     second as the first stops the whole line over someone else's quota.
-printf '%s\n' "You've hit your session limit · resets 8:30pm (UTC)" >"$CLAUDE_SAID"
+jq -nc --arg text "You've hit your session limit · resets 8:30pm (UTC)" '{type:"assistant",message:{content:[{type:"text",text:$text}]}}' >"$CLAUDE_RAW"
 chk "the CLI's own refusal is recognised" "$(hit_limit && echo yes)" "yes"
 
 # The same line where it really appears: last, after a run's worth of output.
-printf '%s\n' 'Analyzer clean. Now the real gate:' '  · Bash: dart test test/feed/' \
-	"You've hit your weekly limit · resets Sep 8th (UTC)" >"$CLAUDE_SAID"
+jq -nc --arg text $'Analyzer clean. Now the real gate:\n  · Bash: dart test test/feed/\nYou\x27ve hit your weekly limit · resets Sep 8th (UTC)' \
+	'{type:"assistant",message:{content:[{type:"text",text:$text}]}}' >"$CLAUDE_RAW"
 chk "recognised at the end of a real transcript" "$(hit_limit && echo yes)" "yes"
 
 # The regression: a refine that finished its work and then explained why Codex
 # could not run. Quoting a quota error is not hitting one.
-printf '%s\n' '**Codex did not run.** Same block as before — the account is over its limit' \
-	'until 2026-09-08 (`ERROR: You'"'"'ve hit your usage limit... try again at Sep 8th`).' \
-	'Per the skill'"'"'s one-round rule the spec ships without it.' >"$CLAUDE_SAID"
+jq -nc --arg text $'**Codex did not run.** Same block as before — the account is over its limit\nuntil 2026-09-08 (`ERROR: You\x27ve hit your usage limit... try again at Sep 8th`).\nPer the skill\x27s one-round rule the spec ships without it.' \
+	'{type:"assistant",message:{content:[{type:"text",text:$text}]}}' >"$CLAUDE_RAW"
 chk "the model quoting a quota error is not one" "$(hit_limit && echo yes)" ""
 
 # The typographic apostrophe the CLI may render instead of the plain one.
-printf '%s\n' "You’ve hit your usage limit · resets 1:30am (UTC)" >"$CLAUDE_SAID"
+jq -nc --arg text "You’ve hit your usage limit · resets 1:30am (UTC)" '{type:"assistant",message:{content:[{type:"text",text:$text}]}}' >"$CLAUDE_RAW"
 chk "a curly apostrophe is still recognised" "$(hit_limit && echo yes)" "yes"
 
-: > "$CLAUDE_SAID"
+: > "$CLAUDE_RAW"
 chk "an empty transcript is not a quota stop" "$(hit_limit && echo yes)" ""
 
 # 14. A TodoWrite tool call maps into the plan protocol (#110): content ->
@@ -334,7 +336,156 @@ chk "status passes through"           "$(jq -r '.todos[0].status' "$CONVEYOR_PLA
 chk "activeForm maps to active"       "$(jq -r '.todos[1].active' "$CONVEYOR_PLAN")" "Writing the fix"
 chk "the sentinel never reaches the human log" "$(grep -c CONVEYOR_PLAN_TODOS <<<"$out")" "0"
 chk "a human summary is printed instead" "$(grep -c 'plan updated (1/2 done)' <<<"$out")" "1"
+export API_TOKEN='plan/é😀' PRIVATE_KEY=$'multi-plan-top\nmulti-plan-bottom'
+secret_event=$(jq -nc --arg literal "$API_TOKEN" --arg escaped 'plan\/\u00E9\uD83D\uDE00' --arg multiline "$PRIVATE_KEY" \
+	'{type:"assistant",message:{content:[{type:"tool_use",name:"TodoWrite",input:{todos:[{content:$literal,status:"pending",activeForm:$escaped},{content:$multiline,status:"pending"}]}}]}}')
+printf '%s\n' "$secret_event" | render_stream | _plan_route_claude_stream >/dev/null
+chk "Claude plan text redacts literal secrets" "$(jq -r '.todos[0].text' "$CONVEYOR_PLAN" | tail -1)" "[REDACTED]"
+chk "Claude plan active text is redacted too" "$(jq -r '.todos[0].active' "$CONVEYOR_PLAN" | tail -1)" "[REDACTED]"
+chk "Claude plan text redacts multiline secrets" "$(jq -r '.todos[1].text' "$CONVEYOR_PLAN" | tail -1)" "[REDACTED]"
+unset API_TOKEN PRIVATE_KEY
 rm -rf "$tmp_plan"
 unset CONVEYOR_PLAN
+
+# 15. The backend owns final-result extraction and one bounded correction.
+tmp_result=$(mktemp -d)
+old_path=$PATH
+mkdir -p "$tmp_result/bin"
+cat >"$tmp_result/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+calls=1
+[[ -s "$RESULT_CALLS" ]] && calls=$(($(<"$RESULT_CALLS") + 1))
+printf '%s' "$calls" >"$RESULT_CALLS"
+printf '%s\n' "$*" >"$RESULT_ARGS.$calls"
+printf '%s\n' "${CONVEYOR_RESULT+exposed}" >>"$RESULT_ENV"
+if [[ "$RESULT_SCENE" != invalid-no-session ]]; then
+	jq -nc '{type:"system",subtype:"init",session_id:"result-session",model:"stub"}'
+fi
+case "$RESULT_SCENE" in
+fenced)
+	jq -nc --arg result $'```json\n{"v":1,"outcome":"success","summary":"fenced"}\n```' \
+		'{type:"result",subtype:"success",is_error:false,session_id:"result-session",result:$result}'
+	;;
+corrected)
+	if ((calls == 1)); then result='not json'; else result='{"v":1,"outcome":"success","summary":"corrected"}'; fi
+	jq -nc --arg result "$result" '{type:"result",subtype:"success",is_error:false,session_id:"result-session",result:$result}'
+	;;
+duplicate)
+	if ((calls == 1)); then
+		jq -nc '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"success"}}'
+	fi
+	jq -nc '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"success",summary:"corrected duplicate"}}'
+	;;
+secret)
+	jq -nc --arg text "$RESULT_SECRET" '{type:"assistant",session_id:"result-session",message:{content:[{type:"text",text:$text}]}}'
+	jq -nc --arg text "$RESULT_SECRET" '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"success",summary:$text}}'
+	;;
+stderr-secret)
+	printf 'provider stderr: %s / %s / %s\n' "$RESULT_SECRET" "$RESULT_ESCAPED" "${RESULT_ALTERNATE:-}" >&2
+	jq -nc '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"success"}}'
+	;;
+waiting)
+	jq -nc '{type:"result",subtype:"success",is_error:false,session_id:"result-session",structured_output:{v:1,outcome:"waiting",waiting:{why:"checks are running"}}}'
+	;;
+invalid)
+	jq -nc --arg result 'still not json' '{type:"result",subtype:"success",is_error:false,session_id:"result-session",result:$result}'
+	;;
+invalid-no-session)
+	jq -nc --arg result 'still not json' '{type:"result",subtype:"success",is_error:false,result:$result}'
+	;;
+incomplete)
+	jq -nc '{type:"assistant",session_id:"result-session",message:{content:[{type:"text",text:"partial"}]}}'
+	;;
+esac
+STUB
+chmod +x "$tmp_result/bin/claude"
+PATH="$tmp_result/bin:$PATH"
+export RESULT_CALLS="$tmp_result/calls" RESULT_ARGS="$tmp_result/args" RESULT_ENV="$tmp_result/env"
+export CONVEYOR_RESULT="$tmp_result/result.json"
+
+run_result_scene() {
+	export RESULT_SCENE=$1
+	rm -f "$RESULT_CALLS" "$RESULT_ENV" "$RESULT_ARGS".*
+	: >"$CONVEYOR_RESULT"
+	set +e
+	run_claude 'do the task' >/dev/null 2>&1
+	local rc=$?
+	set -e
+	printf '%s' "$rc"
+}
+
+chk "a fenced final is accepted" "$(run_result_scene fenced)" "0"
+chk "the fenced payload is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "fenced"
+export API_KEY=result
+chk "a secret-colliding Claude session still completes" "$(run_result_scene fenced)" "0"
+chk "a secret-colliding Claude session is omitted" "$(jq -r 'has("session")' "$CONVEYOR_RESULT")" "false"
+unset API_KEY
+chk "the model child cannot see CONVEYOR_RESULT" "$(grep -c exposed "$RESULT_ENV" || true)" "0"
+chk "the result schema is passed to Claude" "$(grep -c -- '--json-schema' "$RESULT_ARGS.1")" "1"
+
+chk "a malformed final receives one correction" "$(run_result_scene corrected):$(cat "$RESULT_CALLS")" "0:2"
+chk "the correction is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "corrected"
+chk "the correction resumes the same session" "$(grep -c -- '--resume result-session' "$RESULT_ARGS.2")" "1"
+chk "the correction exposes no tools" "$(grep -c -- '--allowedTools  ' "$RESULT_ARGS.2")" "1"
+chk "the correction removes tools from availability" "$(grep -c -- '--tools  ' "$RESULT_ARGS.2")" "1"
+
+chk "duplicate finals receive one correction" "$(run_result_scene duplicate):$(cat "$RESULT_CALLS")" "0:2"
+chk "the duplicate correction wins" "$(jq -r .summary "$CONVEYOR_RESULT")" "corrected duplicate"
+
+chk "a second invalid result quarantines" "$(run_result_scene invalid):$(cat "$RESULT_CALLS")" "20:2"
+chk "the invalid result has a precise kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "invalid-result"
+chk "the invalid result is not a question" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
+chk "an invalid result without a session is not retried" "$(run_result_scene invalid-no-session):$(cat "$RESULT_CALLS")" "20:1"
+chk "a sessionless invalid result is quarantined" "$(jq -r .kind "$CONVEYOR_RESULT")" "invalid-result"
+
+chk "a waiting final returns the deferral exit" "$(run_result_scene waiting)" "10"
+chk "the waiting reason is persisted" "$(jq -r .waiting.why "$CONVEYOR_RESULT")" "checks are running"
+
+export API_TOKEN='result-secret-112' RESULT_SECRET='result-secret-112'
+export RESULT_SCENE=secret
+rm -f "$RESULT_CALLS" "$RESULT_ENV" "$RESULT_ARGS".*
+: >"$CONVEYOR_RESULT"
+secret_log=$(run_claude 'do the task' 2>&1)
+chk "secret values are absent from rendered logs" "$(grep -c 'result-secret-112' <<<"$secret_log" || true)" "0"
+chk "secret values are redacted in persisted results" "$(jq -r .summary "$CONVEYOR_RESULT")" "[REDACTED]"
+unset API_TOKEN RESULT_SECRET
+
+export API_SECRET='quoted"secret\value'
+export RESULT_SECRET="$API_SECRET"
+RESULT_ESCAPED=$(jq -nr --arg value "$API_SECRET" '$value | @json')
+RESULT_ESCAPED=${RESULT_ESCAPED:1:${#RESULT_ESCAPED}-2}
+export RESULT_ESCAPED RESULT_SCENE=stderr-secret
+rm -f "$RESULT_CALLS" "$RESULT_ENV" "$RESULT_ARGS".*
+: >"$CONVEYOR_RESULT"
+secret_log=$(run_claude 'do the task' 2>&1)
+chk "literal secrets are absent from Claude stderr" "$(grep -Fc -- "$API_SECRET" <<<"$secret_log" || true)" "0"
+chk "JSON-escaped secrets are absent from Claude stderr" "$(grep -Fc -- "$RESULT_ESCAPED" <<<"$secret_log" || true)" "0"
+unset API_SECRET RESULT_SECRET RESULT_ESCAPED
+
+export API_SECRET='abc/é😀' RESULT_SECRET=safe RESULT_ESCAPED=safe RESULT_ALTERNATE='abc\/\u00E9\uD83D\uDE00' RESULT_SCENE=stderr-secret
+secret_log=$(run_claude 'do the task' 2>&1)
+chk "alternate JSON escapes are absent from Claude stderr" "$(grep -Fic 'abc\/\u00E9\uD83D\uDE00' <<<"$secret_log" || true)" "0"
+unset API_SECRET RESULT_SECRET RESULT_ESCAPED RESULT_ALTERNATE
+
+export PRIVATE_KEY=$'multi-secret-top\nmulti-secret-bottom'
+export RESULT_SECRET="$PRIVATE_KEY" RESULT_SCENE=secret
+rm -f "$RESULT_CALLS" "$RESULT_ENV" "$RESULT_ARGS".*
+: >"$CONVEYOR_RESULT"
+secret_log=$(run_claude 'do the task' 2>&1)
+chk "multiline secret lines are absent from assistant output" "$(grep -Ec 'multi-secret-(top|bottom)' <<<"$secret_log" || true)" "0"
+chk "multiline secrets are redacted in persisted results" "$(jq -r .summary "$CONVEYOR_RESULT")" "[REDACTED]"
+export RESULT_ESCAPED='multi-secret-top\nmulti-secret-bottom' RESULT_SCENE=stderr-secret
+rm -f "$RESULT_CALLS" "$RESULT_ENV" "$RESULT_ARGS".*
+: >"$CONVEYOR_RESULT"
+secret_log=$(run_claude 'do the task' 2>&1)
+chk "multiline secret lines are absent from Claude stderr" "$(grep -Ec 'multi-secret-(top|bottom)' <<<"$secret_log" || true)" "0"
+unset PRIVATE_KEY RESULT_SECRET RESULT_ESCAPED
+
+chk "an incomplete stream fails without correction" "$(run_result_scene incomplete):$(cat "$RESULT_CALLS")" "2:1"
+chk "an incomplete stream persists nothing" "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+
+PATH=$old_path
+rm -rf "$tmp_result"
 
 exit $fail

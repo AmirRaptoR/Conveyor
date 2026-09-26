@@ -490,6 +490,23 @@ chk "and adds its own"                      "$(jq -r .kind "$CONVEYOR_RESULT")" 
 echo '{"session": "sess-2"}' > "$CONVEYOR_RESULT"
 rc=0; (asks decision "ship or not?" >/dev/null 2>&1) || rc=$?
 chk "asks merges the same way" "$(jq -r '[.session,.kind,.asked] | join(",")' "$CONVEYOR_RESULT")" "sess-2,decision,true"
+# A postcondition replaces the model's outcome rather than layering mutually
+# exclusive payloads and compatibility flags over it.
+echo '{"v":1,"outcome":"success","summary":"done","dispositions":{"T1":"fixed"},"session":"sess-3"}' > "$CONVEYOR_RESULT"
+rc=0; (blocked turns "hit the wall" >/dev/null 2>&1) || rc=$?
+chk "blocked removes stale success fields" "$(jq -c '[has("summary"),has("dispositions"),.outcome,.blocked,.session]' "$CONVEYOR_RESULT")" '[false,false,"blocked",true,"sess-3"]'
+model_result=$(jq -c 'del(.blocked,.asked,.noop,.session)' "$CONVEYOR_RESULT")
+chk "adapter-authored blocked remains contract-valid" "$(result_validate_model "$model_result" && echo valid)" "valid"
+echo '{"v":1,"outcome":"noop","noop":true,"reason":"old noop","session":"sess-4"}' > "$CONVEYOR_RESULT"
+rc=0; (asks decision "ship or not?" >/dev/null 2>&1) || rc=$?
+chk "asks removes stale noop fields" "$(jq -c '[has("noop"),.outcome,.blocked,.asked,.reason,.session]' "$CONVEYOR_RESULT")" '[false,"blocked",true,true,"ship or not?","sess-4"]'
+model_result=$(jq -c 'del(.blocked,.asked,.noop,.session)' "$CONVEYOR_RESULT")
+chk "adapter-authored question remains contract-valid" "$(result_validate_model "$model_result" && echo valid)" "valid"
+echo '{"v":1,"outcome":"success","summary":"done","session":"sess-5"}' > "$CONVEYOR_RESULT"
+rc=0; (waits "checks pending" >/dev/null 2>&1) || rc=$?
+chk "waits removes stale success fields" "$(jq -c '[has("summary"),has("blocked"),has("noop"),.outcome,.waiting.why,.session]' "$CONVEYOR_RESULT")" '[false,false,false,"waiting","checks pending","sess-5"]'
+model_result=$(jq -c 'del(.blocked,.asked,.noop,.session)' "$CONVEYOR_RESULT")
+chk "adapter-authored wait remains contract-valid" "$(result_validate_model "$model_result" && echo valid)" "valid"
 # and it still works from nothing, same as before either helper existed.
 rm -f "$CONVEYOR_RESULT"
 rc=0; (blocked worktree "dirty" >/dev/null 2>&1) || rc=$?
@@ -526,7 +543,7 @@ want_hard=$(date -u -d "@$at" +'%H:%M UTC')
 chk "the brief names the engine's kill time" "$(grep -c "killed at" <<<"$brief")" "1"
 chk "and the hard deadline itself"           "$(grep -c "$want_hard" <<<"$brief")" "1"
 chk "and a wrap-up one grace earlier"        "$(grep -c "$want_soft" <<<"$brief")" "1"
-chk "and where to write an unfinished stop"  "$(grep -c "$CONVEYOR_RESULT" <<<"$brief")" "1"
+chk "and how to return an unfinished stop"   "$(grep -c 'final structured response' <<<"$brief")" "1"
 
 # No timeout is a real configuration. An adapter must be able to tell it apart
 # from a deadline in the past — a stage with no limit that told its agent it was
@@ -542,15 +559,15 @@ chk "a grace wider than the stage still reads" \
 
 # 13. is_condition_kind (#68): the predicate agent_asked derives `asked`
 # from, checked directly rather than through a model-written result.
-for k in limit turns unfinished dependency worktree; do
+for k in limit turns unfinished dependency worktree invalid-result; do
 	chk "is_condition_kind recognises $k" "$(is_condition_kind "$k" && echo yes)" "yes"
 done
 for k in decision no-output input draft error flabbergasted; do
 	chk "is_condition_kind rejects $k" "$(is_condition_kind "$k" && echo yes)" ""
 done
 
-# 14. board.js's WAITING set and agents/_blocked's CONDITION_KINDS are one
-# list, not two that can drift apart. agents/_blocked is authoritative, so
+# 14. board.js's WAITING set and agents/_result's CONDITION_KINDS are one
+# list, not two that can drift apart. agents/_result is authoritative, so
 # this fails on a word added to or removed from either side — verified by
 # making each of those four edits and watching this line fail.
 board_waiting=$(grep -o 'WAITING = new Set(\[[^]]*\])' "$here/../internal/server/web/board.js" |

@@ -37,8 +37,10 @@ if [[ -s "$OC_CALLS" ]]; then run_no=$(($(cat "$OC_CALLS") + 1)); fi
 printf '%s\n' "$run_no" >"$OC_CALLS"
 cp "$OC_ARGS" "$OC_ARGS.$run_no"
 cp "$OC_PROMPT" "$OC_PROMPT.$run_no"
+printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" >"$OC_CONFIG.$run_no"
 printf '%s\n' "$run_no" >>"$OC_STARTS"
 printf '%s\n' "$$" >>"$OC_PIDS"
+printf '%s\n' "${CONVEYOR_RESULT+exposed}" >>"$OC_RESULT_ENV"
 if [[ -n "${CONVEYOR_CONTROL_ACK:-}" && -s "${CONVEYOR_CONTROL_ACK:-}" ]] &&
 	jq -e 'select(.type == "hello")' "$CONVEYOR_CONTROL_ACK" >/dev/null 2>&1; then
 	printf 'yes\n' >>"$OC_HELLO_BEFORE_RUN"
@@ -49,13 +51,77 @@ case "${OC_SCENE:-success}" in
 success)
 	printf '%s\n' \
 		'{"type":"step_start","timestamp":1,"sessionID":"ses-good","part":{"id":"p1","type":"step-start"}}' \
-		'{"type":"text","timestamp":2,"sessionID":"ses-good","part":{"id":"p2","type":"text","text":"work complete"}}' \
-		'{"type":"text","timestamp":2,"sessionID":"ses-good","part":{"id":"p2","type":"text","text":"work complete"}}' \
+		'{"type":"text","timestamp":2,"sessionID":"ses-good","part":{"id":"p2","type":"text","text":"{\"v\":1,\"outcome\":\"success\",\"summary\":\"work complete\"}"}}' \
+		'{"type":"text","timestamp":2,"sessionID":"ses-good","part":{"id":"p2","type":"text","text":"{\"v\":1,\"outcome\":\"success\",\"summary\":\"work complete\"}"}}' \
 		'{"type":"tool_use","timestamp":3,"sessionID":"ses-good","part":{"id":"p3","type":"tool","tool":"bash","state":{"status":"completed","title":"run tests","output":"SECRET TOOL OUTPUT"}}}' \
 		'{"type":"step_finish","timestamp":4,"sessionID":"ses-good","part":{"id":"p4","type":"step-finish","reason":"stop","tokens":{"input":10,"output":2}}}'
 	;;
+secrets)
+	text=$(jq -nc --arg summary "saw $SHORT_KEY and $API_SECRET" '{v:1,outcome:"success",summary:$summary}')
+	printf 'provider stderr: %s / %s / %s\n' "$API_SECRET" "$ESCAPED_SECRET" "${ALT_ESCAPED_SECRET:-}" >&2
+	jq -nc '{type:"step_start",timestamp:1,sessionID:"ses-secrets",part:{id:"start",type:"step-start"}}'
+	jq -nc --arg text "$text" '{type:"text",timestamp:2,sessionID:"ses-secrets",part:{id:"text",type:"text",text:$text}}'
+	jq -nc '{type:"step_finish",timestamp:3,sessionID:"ses-secrets",part:{id:"finish",type:"step-finish",reason:"stop"}}'
+	;;
+waiting)
+	printf '%s\n' \
+		'{"type":"step_start","timestamp":1,"sessionID":"ses-waiting","part":{"id":"start","type":"step-start"}}' \
+		'{"type":"text","timestamp":2,"sessionID":"ses-waiting","part":{"id":"text","type":"text","text":"{\"v\":1,\"outcome\":\"waiting\",\"waiting\":{\"why\":\"checks are running\"}}"}}' \
+		'{"type":"step_finish","timestamp":3,"sessionID":"ses-waiting","part":{"id":"finish","type":"step-finish","reason":"stop"}}'
+	;;
+split-fenced)
+	jq -nc --arg text $'```json\n' '{type:"step_start",timestamp:1,sessionID:"ses-fenced",part:{id:"start",type:"step-start"}}, {type:"text",timestamp:2,sessionID:"ses-fenced",part:{id:"one",type:"text",text:$text}}'
+	jq -nc --arg text $'{"v":1,"outcome":"success","summary":"split fenced"}\n' '{type:"text",timestamp:3,sessionID:"ses-fenced",part:{id:"two",type:"text",text:$text}}'
+	jq -nc --arg text '```' '{type:"text",timestamp:4,sessionID:"ses-fenced",part:{id:"three",type:"text",text:$text}}'
+	jq -nc '{type:"step_finish",timestamp:5,sessionID:"ses-fenced",part:{id:"finish",type:"step-finish",reason:"stop"}}'
+	;;
+split-secret)
+	jq -nc --arg text '{"v":1,"outcome":"success","summary":"sword' '{type:"step_start",timestamp:1,sessionID:"ses-split-secret",part:{id:"start",type:"step-start"}}, {type:"text",timestamp:2,sessionID:"ses-split-secret",part:{id:"one",type:"text",text:$text}}'
+	jq -nc --arg text 'fish and abc\' '{type:"text",timestamp:3,sessionID:"ses-split-secret",part:{id:"two",type:"text",text:$text}}'
+	jq -nc --arg text '/def"}' '{type:"text",timestamp:4,sessionID:"ses-split-secret",part:{id:"three",type:"text",text:$text}}'
+	jq -nc '{type:"step_finish",timestamp:5,sessionID:"ses-split-secret",part:{id:"finish",type:"step-finish",reason:"stop"}}'
+	;;
+terminal-truncated)
+	printf '%s\n' \
+		'{"type":"step_start","timestamp":1,"sessionID":"ses-truncated","part":{"id":"start-one","type":"step-start"}}' \
+		'{"type":"text","timestamp":2,"sessionID":"ses-truncated","part":{"id":"text-one","type":"text","text":"{\"v\":1,\"outcome\":\"success\"}"}}' \
+		'{"type":"step_finish","timestamp":3,"sessionID":"ses-truncated","part":{"id":"finish-one","type":"step-finish","reason":"stop"}}' \
+		'{"type":"step_start","timestamp":4,"sessionID":"ses-truncated","part":{"id":"start-two","type":"step-start"}}' \
+		'{"type":"text","timestamp":5,"sessionID":"ses-truncated","part":{"id":"text-two","type":"text","text":"partial"}}'
+	;;
+terminal-running-tool)
+	printf '%s\n' \
+		'{"type":"step_start","timestamp":1,"sessionID":"ses-tool-after","part":{"id":"start","type":"step-start"}}' \
+		'{"type":"text","timestamp":2,"sessionID":"ses-tool-after","part":{"id":"text","type":"text","text":"{\"v\":1,\"outcome\":\"success\"}"}}' \
+		'{"type":"step_finish","timestamp":3,"sessionID":"ses-tool-after","part":{"id":"finish","type":"step-finish","reason":"stop"}}' \
+		'{"type":"tool_use","timestamp":4,"sessionID":"ses-tool-after","part":{"id":"late-tool","type":"tool","tool":"bash","state":{"status":"running","title":"still running"}}}'
+	;;
+invalid-once|invalid-always)
+	text='not json'
+	if [[ "$OC_SCENE" == invalid-once && "$run_no" -gt 1 ]]; then
+		text='{"v":1,"outcome":"success","summary":"corrected"}'
+	fi
+	jq -nc --arg text "$text" '{type:"step_start",timestamp:1,sessionID:"ses-invalid",part:{id:"start",type:"step-start"}}'
+	jq -nc --arg text "$text" '{type:"text",timestamp:2,sessionID:"ses-invalid",part:{id:"text",type:"text",text:$text}}'
+	jq -nc '{type:"step_finish",timestamp:3,sessionID:"ses-invalid",part:{id:"finish",type:"step-finish",reason:"stop"}}'
+	;;
+duplicate-once|duplicate-always)
+	if [[ "$OC_SCENE" == duplicate-once && "$run_no" -gt 1 ]]; then
+		printf '%s\n' \
+			'{"type":"step_start","timestamp":1,"sessionID":"ses-duplicate","part":{"id":"correct-start","type":"step-start"}}' \
+			'{"type":"text","timestamp":2,"sessionID":"ses-duplicate","part":{"id":"correct-text","type":"text","text":"{\"v\":1,\"outcome\":\"success\",\"summary\":\"corrected duplicate\"}"}}' \
+			'{"type":"step_finish","timestamp":3,"sessionID":"ses-duplicate","part":{"id":"correct-finish","type":"step-finish","reason":"stop"}}'
+	else
+		printf '%s\n' \
+			'{"type":"step_start","timestamp":1,"sessionID":"ses-duplicate","part":{"id":"duplicate-start","type":"step-start"}}' \
+			'{"type":"text","timestamp":2,"sessionID":"ses-duplicate","part":{"id":"duplicate-text","type":"text","text":"{\"v\":1,\"outcome\":\"success\",\"summary\":\"ambiguous\"}"}}' \
+			'{"type":"step_finish","timestamp":3,"sessionID":"ses-duplicate","part":{"id":"finish-one","type":"step-finish","reason":"stop"}}' \
+			'{"type":"step_finish","timestamp":4,"sessionID":"ses-duplicate","part":{"id":"finish-two","type":"step-finish","reason":"stop"}}'
+	fi
+	;;
 limit)
-	printf '%s\n' '{"type":"error","timestamp":1,"sessionID":"ses-limit","error":{"name":"FreeUsageLimitError","data":{"message":"free usage limit reached","responseBody":"SECRET PROVIDER BODY"}}}'
+	jq -nc --arg message "${LIMIT_MESSAGE:-free usage limit reached}" \
+		'{type:"error",timestamp:1,sessionID:"ses-limit",error:{name:"FreeUsageLimitError",data:{message:$message,responseBody:"SECRET PROVIDER BODY"}}}'
 	;;
 generic429)
 	printf '%s\n' '{"type":"error","timestamp":1,"sessionID":"ses-rate","error":{"name":"APIError","data":{"message":"too many requests","statusCode":429}}}'
@@ -92,7 +158,7 @@ steering|delivery-fail|pause)
 		if [[ "$OC_SCENE" == delivery-fail ]]; then exit 73; fi
 		printf '%s\n' \
 			'{"type":"step_start","timestamp":6,"sessionID":"ses-steer","part":{"id":"continued-start","type":"step-start"}}' \
-			'{"type":"text","timestamp":7,"sessionID":"ses-steer","part":{"id":"continued-text","type":"text","text":"continued"}}' \
+			'{"type":"text","timestamp":7,"sessionID":"ses-steer","part":{"id":"continued-text","type":"text","text":"{\"v\":1,\"outcome\":\"success\",\"summary\":\"continued\"}"}}' \
 			'{"type":"step_finish","timestamp":8,"sessionID":"ses-steer","part":{"id":"continued-finish","type":"step-finish"}}'
 		exit 0
 	fi
@@ -124,9 +190,12 @@ export OC_ARGS="$tmp/args" OC_PROMPT="$tmp/prompt" OC_CALLS="$tmp/calls" OC_STAR
 export OC_HELLO_BEFORE_RUN="$tmp/hello-before-run" OC_SIGNALS="$tmp/signals"
 export OC_EARLY_ACK="$tmp/early-ack" OC_UNSAFE_ACK="$tmp/unsafe-ack"
 export OC_ABORTED="$tmp/aborted"
+export OC_RESULT_ENV="$tmp/result-env"
+export OC_CONFIG="$tmp/config"
 export OC_BOUNDARY_FIXTURE="$here/fixtures/steering-boundaries-synthetic.jsonl"
 export MODEL=openai/gpt-test VARIANT=high AGENT=build
 export CONVEYOR_SOURCE=test CONVEYOR_STAGE=working CONVEYOR_ITEM_REF=7
+export CONVEYOR_RESULT="$tmp/result.json"
 
 source "$here/_stream"
 trap 'rm -rf "$tmp" "$_OPENCODE_TMP"' EXIT
@@ -136,7 +205,7 @@ chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2]
 
 reset_invocations() {
 	rm -f "$OC_CALLS" "$OC_STARTS" "$OC_PIDS" "$OC_HELLO_BEFORE_RUN" "$OC_SIGNALS" \
-		"$OC_EARLY_ACK" "$OC_UNSAFE_ACK" "$OC_ABORTED" "$OC_ARGS".* "$OC_PROMPT".*
+		"$OC_EARLY_ACK" "$OC_UNSAFE_ACK" "$OC_ABORTED" "$OC_RESULT_ENV" "$OC_ARGS".* "$OC_PROMPT".* "$OC_CONFIG".*
 }
 
 reset_control() {
@@ -166,11 +235,147 @@ chk "a valid event stream succeeds" "$rc" "0"
 chk "text events become logs" "$(grep -c 'work complete' <<<"$out")" "1"
 chk "tool output is not logged" "$(grep -c 'SECRET TOOL OUTPUT' <<<"$out" || true)" "0"
 chk "the session is captured" "$(claude_session)" "ses-good"
+reset_invocations
+export API_KEY=good OC_SCENE=success
+run_claude 'do the work' >/dev/null 2>&1
+chk "a secret-colliding OpenCode session is omitted" "$(jq -r 'has("session")' "$CONVEYOR_RESULT")" "false"
+unset API_KEY
 chk "the selected model is recorded" "$(record_model)" "model: openai/gpt-test variant: high agent: build"
-chk "the prompt is sent on stdin" "$(cat "$OC_PROMPT")" "do the work"
+export API_SECRET=gpt-test
+chk "OpenCode model metadata is redacted" "$(record_model)" "model: openai/[REDACTED] variant: high agent: build"
+unset API_SECRET
+chk "the task leads the prompt" "$(sed -n '1p' "$OC_PROMPT")" "do the work"
+chk "the result contract is appended" "$(grep -c 'versioned result contract' "$OC_PROMPT")" "1"
+chk "the model child cannot see CONVEYOR_RESULT" "$(grep -c exposed "$OC_RESULT_ENV" || true)" "0"
 for arg in '--format' 'json' '--model' 'openai/gpt-test' '--variant' 'high' '--agent' 'build'; do
 	chk "run receives $arg" "$(grep -Fx -- "$arg" "$OC_ARGS" || true)" "$arg"
 done
+
+reset_invocations
+export OC_SCENE=secrets SHORT_KEY=abc API_SECRET='quoted"secret\value'
+ESCAPED_SECRET=$(jq -nr --arg value "$API_SECRET" '$value | @json')
+ESCAPED_SECRET=${ESCAPED_SECRET:1:${#ESCAPED_SECRET}-2}
+export ESCAPED_SECRET
+set +e
+out=$(run_claude 'return secrets for the fixture' 2>&1)
+rc=$?
+set -e
+escaped_secret=$(jq -nr --arg value "$API_SECRET" '$value | @json')
+escaped_secret=${escaped_secret:1:${#escaped_secret}-2}
+chk "a secret-bearing result succeeds after redaction" "$rc" "0"
+chk "a short secret is absent from backend logs" "$(grep -Fc -- "$SHORT_KEY" <<<"$out" || true)" "0"
+chk "a literal complex secret is absent from backend logs" "$(grep -Fc -- "$API_SECRET" <<<"$out" || true)" "0"
+chk "a JSON-escaped secret is absent from backend logs" "$(grep -Fc -- "$escaped_secret" <<<"$out" || true)" "0"
+chk "secret values are absent from the persisted result" "$(jq -r .summary "$CONVEYOR_RESULT")" "saw [REDACTED] and [REDACTED]"
+unset SHORT_KEY API_SECRET ESCAPED_SECRET
+
+reset_invocations
+export OC_SCENE=secrets SHORT_KEY=safe API_SECRET='abc/é😀' ESCAPED_SECRET=safe ALT_ESCAPED_SECRET='abc\/\u00E9\uD83D\uDE00'
+out=$(run_claude 'return escaped secrets for the fixture' 2>&1)
+chk "alternate JSON escapes are absent from OpenCode logs" "$(grep -Fic 'abc\/\u00E9\uD83D\uDE00' <<<"$out" || true)" "0"
+unset SHORT_KEY API_SECRET ESCAPED_SECRET ALT_ESCAPED_SECRET
+
+reset_invocations
+export OC_SCENE=waiting
+set +e
+run_claude 'wait for checks' >/dev/null 2>&1
+rc=$?
+set -e
+chk "an OpenCode waiting final returns the deferral exit" "$rc" "10"
+chk "the OpenCode waiting reason is persisted" "$(jq -r .waiting.why "$CONVEYOR_RESULT")" "checks are running"
+
+for collision in 1 v waiting; do
+	reset_invocations
+	export API_KEY=$collision
+	if [[ "$collision" == waiting ]]; then export OC_SCENE=waiting; expected=10; else export OC_SCENE=success; expected=0; fi
+	set +e
+	run_claude 'return a result despite schema-shaped secrets' >/dev/null 2>&1
+	rc=$?
+	set -e
+	chk "secret value '$collision' cannot corrupt raw result parsing" "$rc" "$expected"
+	chk "secret value '$collision' preserves the result discriminator" "$(jq -r .outcome "$CONVEYOR_RESULT")" "$([[ "$collision" == waiting ]] && echo waiting || echo success)"
+	unset API_KEY
+done
+
+reset_invocations
+export OC_SCENE=split-fenced
+set +e
+run_claude 'return a split fence' >/dev/null 2>&1
+rc=$?
+set -e
+chk "split fenced text preserves boundary newlines" "$rc:$(cat "$OC_CALLS")" "0:1"
+chk "the split fenced payload is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "split fenced"
+
+reset_invocations
+export OC_SCENE=split-secret API_TOKEN=swordfish API_SECRET=abc/def
+out=$(run_claude 'redact across text parts' 2>&1)
+chk "a split literal secret is absent from OpenCode logs" "$(grep -Fc swordfish <<<"$out" || true)" "0"
+chk "a split JSON-escaped secret is absent from OpenCode logs" "$(grep -Fc 'abc\/def' <<<"$out" || true)" "0"
+chk "split secrets are redacted after joining" "$(jq -r .summary "$CONVEYOR_RESULT")" "[REDACTED] and [REDACTED]"
+unset API_TOKEN API_SECRET
+
+reset_invocations
+export OC_SCENE=terminal-truncated
+before=$(cat "$CONVEYOR_RESULT")
+set +e
+run_claude 'do not accept an earlier terminal' >/dev/null 2>&1
+rc=$?
+set -e
+chk "a step truncated after an earlier terminal fails closed" "$rc:$(cat "$OC_CALLS")" "2:1"
+chk "the truncated later step preserves the prior complete result" "$(cat "$CONVEYOR_RESULT")" "$before"
+
+reset_invocations
+export OC_SCENE=terminal-running-tool
+before=$(cat "$CONVEYOR_RESULT")
+set +e
+run_claude 'do not accept post-terminal tools' >/dev/null 2>&1
+rc=$?
+set -e
+chk "a running tool after a terminal result fails closed" "$rc:$(cat "$OC_CALLS")" "2:1"
+chk "the post-terminal tool preserves the prior result" "$(cat "$CONVEYOR_RESULT")" "$before"
+
+reset_invocations
+export OC_SCENE=invalid-once
+set +e
+run_claude 'return a result' >/dev/null 2>&1
+rc=$?
+set -e
+chk "one malformed final gets one correction" "$rc:$(cat "$OC_CALLS")" "0:2"
+chk "the valid correction is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "corrected"
+chk "the correction reuses the session" "$(grep -A1 -Fx -- '--session' "$OC_ARGS.2" | tail -1)" "ses-invalid"
+chk "the correction uses the no-tool agent" "$(grep -A1 -Fx -- '--agent' "$OC_ARGS.2" | tail -1)" "conveyor-result"
+chk "the correction denies every tool" "$(jq -r '.agent["conveyor-result"].permission["*"]' "$OC_CONFIG.2")" "deny"
+
+reset_invocations
+export OC_SCENE=invalid-always
+set +e
+run_claude 'return a result' >/dev/null 2>&1
+rc=$?
+set -e
+chk "an invalid correction is quarantined after two calls" "$rc:$(cat "$OC_CALLS")" "20:2"
+chk "the quarantine names invalid-result" "$(jq -r .kind "$CONVEYOR_RESULT")" "invalid-result"
+chk "the quarantine is a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
+
+reset_invocations
+export OC_SCENE=duplicate-once
+set +e
+run_claude 'return one result' >/dev/null 2>&1
+rc=$?
+set -e
+chk "duplicate terminal results get one correction" "$rc:$(cat "$OC_CALLS")" "0:2"
+chk "the duplicate correction is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "corrected duplicate"
+chk "the duplicate correction reuses the session" "$(grep -A1 -Fx -- '--session' "$OC_ARGS.2" | tail -1)" "ses-duplicate"
+chk "the duplicate correction denies every tool" "$(jq -r '.agent["conveyor-result"].permission["*"]' "$OC_CONFIG.2")" "deny"
+
+reset_invocations
+export OC_SCENE=duplicate-always
+set +e
+run_claude 'return one result' >/dev/null 2>&1
+rc=$?
+set -e
+chk "a second ambiguous correction is quarantined" "$rc:$(cat "$OC_CALLS")" "20:2"
+chk "the ambiguous quarantine names invalid-result" "$(jq -r .kind "$CONVEYOR_RESULT")" "invalid-result"
+chk "the ambiguous quarantine is a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
 
 set +e
 fixture=$(render_stream <"$here/fixtures/tool-run-1.18.32.jsonl" 2>&1)
@@ -306,6 +511,14 @@ chk "its ids are used verbatim"     "$(jq -r '.todos[0].id' "$CONVEYOR_PLAN")" "
 chk "content maps to text"          "$(jq -r '.todos[1].text' "$CONVEYOR_PLAN")" "write the fix"
 chk "status passes through"         "$(jq -r '.todos[2].status' "$CONVEYOR_PLAN")" "pending"
 chk "no active equivalent is set"   "$(jq -r '.todos[1].active // "absent"' "$CONVEYOR_PLAN")" "absent"
+export API_TOKEN='plan/é😀' PRIVATE_KEY=$'multi-plan-top\nmulti-plan-bottom'
+secret_plan=$(jq -nc --arg literal "$API_TOKEN" --arg escaped 'plan\/\u00E9\uD83D\uDE00' --arg multiline "$PRIVATE_KEY" \
+	'{type:"tool_use",part:{type:"tool",tool:"todowrite",state:{status:"completed",input:{todos:[{id:"secret-id",content:$literal,status:"pending"},{id:"escaped-id",content:$escaped,status:"pending"},{id:"multiline-id",content:$multiline,status:"pending"}]}}}}')
+_plan_publish_opencode_todos "$secret_plan"
+chk "OpenCode plan text redacts literal secrets" "$(jq -r '.todos[0].text' "$CONVEYOR_PLAN" | tail -1)" "[REDACTED]"
+chk "OpenCode plan text redacts alternate JSON escapes" "$(jq -r '.todos[1].text' "$CONVEYOR_PLAN" | tail -1)" "[REDACTED]"
+chk "OpenCode plan text redacts multiline secrets" "$(jq -r '.todos[2].text' "$CONVEYOR_PLAN" | tail -1)" "[REDACTED]"
+unset API_TOKEN PRIVATE_KEY
 unset CONVEYOR_PLAN
 
 incremental=$(printf '%s\n' \
@@ -315,6 +528,15 @@ incremental=$(printf '%s\n' \
 	'{"type":"step_finish","timestamp":4,"sessionID":"ses-progress","part":{"id":"f","type":"step-finish"}}' |
 	render_stream)
 chk "a progressively growing text part keeps the new suffix" "$(tr '\n' ' ' <<<"$incremental" | tr -s ' ')" "work complete "
+
+printf '%s\n' \
+	'{"type":"step_start","timestamp":1,"sessionID":"ses-split","part":{"id":"s","type":"step-start"}}' \
+	'{"type":"text","timestamp":2,"sessionID":"ses-split","part":{"id":"a","type":"text","text":"{\"v\":1,\"outcome\":"}}' \
+	'{"type":"text","timestamp":3,"sessionID":"ses-split","part":{"id":"b","type":"text","text":"\"success\",\"summary\":\"split\"}"}}' \
+	'{"type":"step_finish","timestamp":4,"sessionID":"ses-split","part":{"id":"f","type":"step-finish","reason":"stop"}}' |
+	render_stream >/dev/null
+result_accept "$(<"$CLAUDE_FINAL")" "opencode:ses-split"
+chk "separate final text parts are joined deterministically" "$(jq -r .summary "$CONVEYOR_RESULT")" "split"
 
 tool_progress=$(printf '%s\n' \
 	'{"type":"step_start","timestamp":1,"sessionID":"ses-tool","part":{"id":"s","type":"step-start"}}' \
@@ -344,6 +566,18 @@ RESUME_SESSION=""
 resume_prompt '{"answer":"continue","session":"foreign-session","controlCarryover":false}' 'original' >/dev/null 2>&1
 chk "an ordinary unprefixed session remains foreign" "${RESUME_SESSION:-}" ""
 
+RESUME_SESSION=""
+export API_SECRET=ses-good
+resume_log=$(resume_prompt '{"answer":"continue","session":"opencode:ses-good"}' 'original' 2>&1)
+chk "a secret-colliding resume session is ignored" "${RESUME_SESSION:-}" ""
+chk "a secret-colliding resume session is not logged" "$(grep -Fc ses-good <<<"$resume_log" || true)" "0"
+reset_invocations
+reset_control
+export OC_SCENE=success
+run_claude 'do not persist the colliding session' >/dev/null
+chk "a secret-colliding session is absent from control ack" "$(jq -rs '[.[] | select(.type=="session")] | length' "$CONVEYOR_CONTROL_ACK")" "0"
+unset API_SECRET
+
 export CONVEYOR_RESULT="$tmp/result"
 printf '%s\n' '{"type":"text","timestamp":1,"sessionID":"ses-question","part":{"id":"p","type":"text","text":"x"}}' >"$CLAUDE_RAW"
 echo '{"blocked":true,"kind":"decision","reason":"choose","questions":[{"header":"Mode","question":"Which?","options":[{"label":"Safe","description":"Use safe mode"}]}]}' >"$CONVEYOR_RESULT"
@@ -351,8 +585,12 @@ agent_asked
 chk "questions remain questions" "$(jq -r .asked "$CONVEYOR_RESULT")" "true"
 chk "questions retain their session" "$(jq -r .session "$CONVEYOR_RESULT")" "opencode:ses-question"
 
+export API_TOKEN='quota-secret-112' API_SECRET='quoted"quota\value'
+escaped_quota=$(jq -nr --arg value "$API_SECRET" '$value | @json')
+escaped_quota=${escaped_quota:1:${#escaped_quota}-2}
+LIMIT_MESSAGE="quota exceeded for $API_TOKEN and $escaped_quota"
 OC_SCENE=limit
-export OC_SCENE
+export OC_SCENE LIMIT_MESSAGE
 set +e
 run_claude 'hit the quota' >/dev/null 2>&1
 rc=$?
@@ -361,9 +599,27 @@ chk "an error event fails the run" "$rc" "1"
 chk "an explicit quota event is recognised" "$(hit_limit && echo yes)" "yes"
 chk "the quota refusal is cached for status" "$([[ -s "$XDG_STATE_HOME/conveyor/opencode/openai.json" ]] && echo yes)" "yes"
 chk "provider response bodies are not cached" "$(grep -c 'SECRET PROVIDER BODY' "$XDG_STATE_HOME/conveyor/opencode/openai.json" || true)" "0"
+chk "literal secrets are absent from the quota cache" "$(grep -Fc -- "$API_TOKEN" "$XDG_STATE_HOME/conveyor/opencode/openai.json" || true)" "0"
+chk "JSON-escaped secrets are absent from the quota cache" "$(grep -Fc -- "$escaped_quota" "$XDG_STATE_HOME/conveyor/opencode/openai.json" || true)" "0"
+status_out=$("$here/status" 2>&1)
+chk "literal quota secrets are absent from status output" "$(grep -Fc -- "$API_TOKEN" <<<"$status_out" || true)" "0"
+chk "JSON-escaped quota secrets are absent from status output" "$(grep -Fc -- "$escaped_quota" <<<"$status_out" || true)" "0"
+unset API_TOKEN API_SECRET LIMIT_MESSAGE
 
 OC_SCENE=success run_claude 'quota recovered' >/dev/null
 chk "a successful provider run clears its quota cache" "$([[ -e "$XDG_STATE_HOME/conveyor/opencode/openai.json" ]] && echo present || echo absent)" "absent"
+
+export TEST_SECRET=openai LIMIT_MESSAGE='quota exceeded'
+OC_SCENE=limit
+run_claude 'hit provider quota' >/dev/null 2>&1 || true
+hit_limit
+chk "a secret-colliding provider is redacted in quota cache" "$(jq -r .provider "$XDG_STATE_HOME/conveyor/opencode/redacted.json")" "redacted"
+status_out=$("$here/status" 2>&1)
+chk "a secret-colliding provider is absent from status output" "$(grep -Fc openai <<<"$status_out" || true)" "0"
+
+OC_SCENE=success run_claude 'quota recovered' >/dev/null
+chk "a successful provider run clears a redacted quota cache" "$([[ -e "$XDG_STATE_HOME/conveyor/opencode/redacted.json" ]] && echo present || echo absent)" "absent"
+unset TEST_SECRET LIMIT_MESSAGE
 
 export OC_SCENE=generic429
 set +e

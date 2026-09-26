@@ -53,7 +53,7 @@ chmod +x "$tmp/bin/gh"
 
 # The stub `claude`: captures the prompt it was handed (for the prompt-shape
 # assertion), then plays out whatever the scene asked for — a commit, a push,
-# a result file, a nonzero exit — around a real stream-json system/result pair
+# a structured result, a nonzero exit — around a real stream-json system/result pair
 # so record_session has a session id to find, exactly like a real run.
 cat >"$tmp/bin/claude" <<'STUB'
 #!/usr/bin/env bash
@@ -75,12 +75,20 @@ if [[ -f "$scene/do_commit" ]]; then
 	git commit --quiet -m "the agent committed"
 fi
 [[ -f "$scene/do_push" ]] && git push --quiet origin HEAD 2>/dev/null
-[[ -f "$scene/write_result" ]] && cat "$scene/write_result" >"$CONVEYOR_RESULT"
+result='{"v":1,"outcome":"success"}'
+if [[ -f "$scene/write_result" ]]; then
+	result=$(jq -c '
+		if .blocked == true then {v:1,outcome:"blocked",kind:(.kind // "decision"),reason:(.reason // "stopped"),questions:.questions}
+		elif .noop == true then {v:1,outcome:"noop",reason:.reason}
+		elif .outcome == "waiting" then .
+		else . + {v:1,outcome:"success"} end |
+		with_entries(select(.value != null))' "$scene/write_result")
+fi
 
 if [[ -n "$session" ]]; then
-	printf '{"type":"result","subtype":"success","is_error":false,"num_turns":3,"session_id":"%s"}\n' "$session"
+	jq -nc --arg session "$session" --argjson result "$result" '{type:"result",subtype:"success",is_error:false,num_turns:3,session_id:$session,structured_output:$result}'
 else
-	printf '{"type":"result","subtype":"success","is_error":false,"num_turns":3}\n'
+	jq -nc --argjson result "$result" '{type:"result",subtype:"success",is_error:false,num_turns:3,structured_output:$result}'
 fi
 [[ -f "$scene/exit_nonzero" ]] && exit 7
 exit 0
@@ -202,11 +210,19 @@ rc=$(run_implement 107)
 chk "(h) a nonzero claude exit keeps its own status" "$rc" "7"
 chk "    and writes no no-output mark"               "$(result_written)" "empty"
 
+# --- (i) a valid model wait defers before provider postconditions ------------
+scene; pr_fixture 111
+printf '{"v":1,"outcome":"waiting","waiting":{"why":"checks are running"}}' >"$tmp/scene/write_result"
+rc=$(run_implement 111)
+chk "(i) a model-written wait exits 10" "$rc" "10"
+chk "    its waiting reason survives" "$(jq -r .waiting.why "$CONVEYOR_RESULT")" "checks are running"
+chk "    provider postconditions are not consulted" "$(grep -c '^pr list' "$tmp/scene/gh_calls" || true)" "1"
+
 # --- the prompt: the escape hatch has a shape, distinct from decision_brief --
 scene; pr_fixture 108
 run_implement 108 >/dev/null
 chk "the prompt tells the agent how to declare a deliberate no-op" \
-	"$(grep -c '"noop": true' "$tmp/scene/claude_prompt")" "1"
+	"$(grep -c '"outcome": "noop"' "$tmp/scene/claude_prompt")" "1"
 chk "and names the shape distinctly from a decision" \
 	"$(grep -c 'nobody has to choose anything' "$tmp/scene/claude_prompt")" "1"
 

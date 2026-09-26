@@ -118,6 +118,9 @@ investigate() {
 		echo "the doctor itself stopped: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
 		exit 20
 	fi
+	if [[ $rc -eq 10 ]] && result_is_waiting; then
+		exit 10
+	fi
 	if [[ $rc -ne 0 ]]; then
 		echo "the doctor's own invocation exited $rc" >&2
 		exit 1
@@ -144,7 +147,7 @@ dependency)
 turns | unfinished)
 	# A resumable condition: starting cold can hit the identical wall again.
 	echo "resumable; handing back a fresh turn budget" >&2
-	jq -n '{answer: "continue"}' >"$CONVEYOR_RESULT"
+	result_write_json '{"v":1,"outcome":"success","answer":"continue"}'
 	exit 0
 	;;
 
@@ -167,10 +170,9 @@ test, a tool that timed out for no reason tied to this change) or would
 OBVIOUSLY REPRODUCE on an identical retry (a real code defect, a missing
 tool, a config problem, a test that is deterministically wrong).
 
-Write your verdict to \$CONVEYOR_RESULT as JSON:
-{\"verdict\": \"transient\"} or
-{\"verdict\": \"reproducible\", \"summary\": \"<one paragraph: what needs fixing>\"}
-Write nothing else to that file."
+Return your verdict as the final structured response:
+{\"v\":1,\"outcome\":\"success\",\"verdict\":\"transient\"} or
+{\"v\":1,\"outcome\":\"success\",\"verdict\":\"reproducible\",\"summary\":\"<one paragraph: what needs fixing>\"}."
 
 	: >"${CONVEYOR_RESULT:-/dev/null}"
 	investigate "$prompt"
@@ -180,7 +182,7 @@ Write nothing else to that file."
 		echo "looks transient; clearing it" >&2
 		# A clean, minimal record — never the item's own answer, which this
 		# branch has none of.
-		jq -n '{summary: "looked transient; retried"}' >"$CONVEYOR_RESULT"
+		result_write_json '{"v":1,"outcome":"success","summary":"looked transient; retried"}'
 		exit 0
 	fi
 
@@ -190,7 +192,7 @@ Write nothing else to that file."
 	summary=$(jq -r '.summary // ""' "${CONVEYOR_RESULT:-/dev/null}" 2>/dev/null || echo "")
 	[[ -z "$summary" ]] && summary="could not determine whether this would reproduce; leaving it for a person to judge (original reason: ${reason})"
 	comment "**Doctor:** $summary"
-	jq -n --arg s "$summary" '{summary: $s}' >"$CONVEYOR_RESULT"
+	result_write_json "$(jq -nc --arg s "$summary" '{v:1,outcome:"success",summary:$s}')"
 	exit 10
 	;;
 
@@ -204,9 +206,9 @@ related issues, and this item's own run history to understand the question.
 Item #${ref} in ${REPO}: ${title}
 It stopped asking: ${reason}
 
-Write your recommendation to \$CONVEYOR_RESULT as JSON:
-{\"summary\": \"<one paragraph: what you found, and what you recommend>\"}
-Write nothing else to that file. You are not deciding — a person still has
+Return your recommendation as the final structured response:
+{\"v\":1,\"outcome\":\"success\",\"summary\":\"<one paragraph: what you found, and what you recommend>\"}.
+You are not deciding — a person still has
 to confirm or reject this before anything happens."
 
 	: >"${CONVEYOR_RESULT:-/dev/null}"
@@ -215,7 +217,7 @@ to confirm or reject this before anything happens."
 	summary=$(jq -r '.summary // ""' "${CONVEYOR_RESULT:-/dev/null}" 2>/dev/null || echo "")
 	[[ -z "$summary" ]] && summary="the doctor could not form a recommendation; a person still needs to decide (original reason: ${reason})"
 	comment "**Doctor:** $summary"
-	jq -n --arg s "$summary" '{summary: $s}' >"$CONVEYOR_RESULT"
+	result_write_json "$(jq -nc --arg s "$summary" '{v:1,outcome:"success",summary:$s}')"
 	exit 10
 	;;
 

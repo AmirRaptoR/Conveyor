@@ -25,7 +25,7 @@
 #
 # WRAP_UP_GRACE — seconds between the agent's deadline and the engine's,
 # default 300. It has to cover a wrap-up and nothing more: committing, pushing,
-# and writing the result file.
+# and returning the structured result.
 
 # deadline_brief — the block to append to an agent's prompt.
 #
@@ -71,9 +71,9 @@ deadline_brief() {
 
 		  1. commit and push everything you have verified — pushed work is what the
 		     next run starts from,
-		  2. write {"blocked": true, "kind": "unfinished", "reason": "<what you
-		     finished, what is left, and what you would do next>"} to the file at
-		     ${CONVEYOR_RESULT}.
+		  2. return {"v": 1, "outcome": "blocked", "kind": "unfinished",
+		     "reason": "<what you finished, what is left, and what you would do next>"}
+		     as your final structured response.
 
 		That stop is not a failure of the run. Your conversation and your worktree
 		are both handed to the next one, so it continues from where you left off

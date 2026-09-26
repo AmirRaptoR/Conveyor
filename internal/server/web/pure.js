@@ -94,7 +94,7 @@ export function sourceDegraded(s, updatedAtMs, pollNs, nowMsVal) {
 // read — never a second vocabulary for the same mark. `dependency` and
 // `limit` get their own category because the issue asks readers to tell a
 // sequencing wait from a quota wait at a glance; every other WAITING kind
-// (turns, unfinished, worktree) folds into the generic "waiting". A `pending`
+// (turns, unfinished, worktree, invalid-result) folds into generic "waiting". A `pending`
 // item is not blocked at all — it is a resting item (exit 10, e.g. approve's
 // quiet-PR wait for CI to finish) with an entry in state.waiting, which is
 // the one case worth surfacing here even though the engine never marked it.
@@ -105,7 +105,7 @@ export function attentionCategory(it, block, pendingWait) {
     if (b.asked) return "question";
     if (b.kind === "dependency") return "dependency";
     if (b.kind === "limit") return "limit";
-    if (b.kind === "turns" || b.kind === "unfinished" || b.kind === "worktree") return "waiting";
+    if (b.kind === "turns" || b.kind === "unfinished" || b.kind === "worktree" || b.kind === "invalid-result") return "waiting";
     return "failure";
   }
   return pendingWait ? "pending" : null;
