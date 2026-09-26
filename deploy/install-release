@@ -10,9 +10,14 @@ service=${CONVEYOR_SERVICE:-conveyor}
 systemctl_bin=${CONVEYOR_SYSTEMCTL:-systemctl}
 gate_hook=${CONVEYOR_GATE:-}
 gate_timeout=${CONVEYOR_GATE_TIMEOUT:-60s}
+local_scripts=${CONVEYOR_LOCAL_SCRIPTS:-}
 
 if [[ ! -f "$config" ]]; then
   echo "install-release: config does not exist: $config" >&2
+  exit 1
+fi
+if [[ -n "$local_scripts" && ! -d "$local_scripts" ]]; then
+  echo "install-release: local scripts directory does not exist: $local_scripts" >&2
   exit 1
 fi
 config_dir=$(cd "$(dirname "$config")" && pwd)
@@ -91,6 +96,19 @@ if [[ ! -e "$target" ]]; then
       -ldflags "-X github.com/AmirRaptoR/Conveyor/internal/release.BuildRevision=$revision" \
       -o "$stage/conveyor" ./cmd/conveyor
     cp -a agents providers "$stage/"
+    if [[ -n "$local_scripts" ]]; then
+      [[ -f "$local_scripts/_sync" ]] && cp -a "$local_scripts/_sync" "$stage/agents/_sync"
+      for source_dir in "$local_scripts"/*; do
+        [[ -d "$source_dir" ]] || continue
+        name=$(basename "$source_dir")
+        target_dir="$stage/agents/local-$name"
+        if [[ -e "$target_dir" ]]; then
+          echo "install-release: local agent name collides with shipped agent: local-$name" >&2
+          exit 1
+        fi
+        cp -a "$source_dir" "$target_dir"
+      done
+    fi
   )
 
   # Record the final, read-only permission bits as well as content hashes.

@@ -22,6 +22,12 @@ calls="$tmp/systemctl.log"
 health_state="$tmp/health-state"
 health_calls="$tmp/health-calls"
 systemctl_state="$tmp/systemctl-state"
+local_scripts="$tmp/local-scripts"
+
+mkdir -p "$local_scripts/source-one"
+printf '#!/bin/sh\nexit 0\n' >"$local_scripts/_sync"
+printf '#!/bin/sh\nexit 0\n' >"$local_scripts/source-one/deploy"
+chmod +x "$local_scripts/_sync" "$local_scripts/source-one/deploy"
 
 cat >"$tmp/systemctl" <<'SH'
 #!/usr/bin/env bash
@@ -66,6 +72,7 @@ deploy() {
   CONVEYOR_CONFIG="$repo/conveyor.example.yaml" \
   CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
   CONVEYOR_GATE="$tmp/health" \
+  CONVEYOR_LOCAL_SCRIPTS="$local_scripts" \
   CONVEYOR_REVISION="$revision" \
   CONVEYOR_ALLOW_DIRTY=1 \
   CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" SYSTEMCTL_STATE="$systemctl_state" \
@@ -80,6 +87,10 @@ echo pass >"$health_state"
 deploy "$prefix" selfcheck-one >/dev/null
 [[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-one" ]]
 CONVEYOR_RELEASE_DIR="$prefix/current" "$prefix/current/conveyor" version | grep -q 'selfcheck-one'
+[[ -x "$prefix/current/agents/_sync" ]]
+[[ -x "$prefix/current/agents/local-source-one/deploy" ]]
+jq -e '.files["agents/_sync"] and .files["agents/local-source-one/deploy"]' \
+  "$prefix/current/release.json" >/dev/null
 
 echo pass >"$health_state"
 deploy "$prefix" selfcheck-two >/dev/null
