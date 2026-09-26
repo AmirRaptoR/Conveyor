@@ -75,6 +75,12 @@ split-fenced)
 	jq -nc --arg text '```' '{type:"text",timestamp:4,sessionID:"ses-fenced",part:{id:"three",type:"text",text:$text}}'
 	jq -nc '{type:"step_finish",timestamp:5,sessionID:"ses-fenced",part:{id:"finish",type:"step-finish",reason:"stop"}}'
 	;;
+split-secret)
+	jq -nc --arg text '{"v":1,"outcome":"success","summary":"sword' '{type:"step_start",timestamp:1,sessionID:"ses-split-secret",part:{id:"start",type:"step-start"}}, {type:"text",timestamp:2,sessionID:"ses-split-secret",part:{id:"one",type:"text",text:$text}}'
+	jq -nc --arg text 'fish and abc\' '{type:"text",timestamp:3,sessionID:"ses-split-secret",part:{id:"two",type:"text",text:$text}}'
+	jq -nc --arg text '/def"}' '{type:"text",timestamp:4,sessionID:"ses-split-secret",part:{id:"three",type:"text",text:$text}}'
+	jq -nc '{type:"step_finish",timestamp:5,sessionID:"ses-split-secret",part:{id:"finish",type:"step-finish",reason:"stop"}}'
+	;;
 terminal-truncated)
 	printf '%s\n' \
 		'{"type":"step_start","timestamp":1,"sessionID":"ses-truncated","part":{"id":"start-one","type":"step-start"}}' \
@@ -299,6 +305,14 @@ rc=$?
 set -e
 chk "split fenced text preserves boundary newlines" "$rc:$(cat "$OC_CALLS")" "0:1"
 chk "the split fenced payload is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "split fenced"
+
+reset_invocations
+export OC_SCENE=split-secret API_TOKEN=swordfish API_SECRET=abc/def
+out=$(run_claude 'redact across text parts' 2>&1)
+chk "a split literal secret is absent from OpenCode logs" "$(grep -Fc swordfish <<<"$out" || true)" "0"
+chk "a split JSON-escaped secret is absent from OpenCode logs" "$(grep -Fc 'abc\/def' <<<"$out" || true)" "0"
+chk "split secrets are redacted after joining" "$(jq -r .summary "$CONVEYOR_RESULT")" "[REDACTED] and [REDACTED]"
+unset API_TOKEN API_SECRET
 
 reset_invocations
 export OC_SCENE=terminal-truncated

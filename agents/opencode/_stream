@@ -228,12 +228,11 @@ _opencode_pause() {
 }
 
 render_stream() {
-	local line type session="" event_session="" final_text="" seen=0 finished=0 post_terminal_active=0 errors=0 detail id text previous previous_rendered status key command kind rendered reason tid
+	local line type session="" event_session="" final_text="" seen=0 finished=0 post_terminal_active=0 errors=0 detail id text previous status key command kind rendered reason tid
 	_OPENCODE_STREAM_ABORTED=0
 	_OPENCODE_RESULT_AMBIGUOUS=0
 	declare -A parts=()
 	declare -A texts=()
-	declare -A rendered_texts=()
 	declare -A tool_states=()
 	declare -A tool_status=()
 	local -a text_ids=()
@@ -284,18 +283,10 @@ render_stream() {
 			[[ $finished -eq 1 ]] && post_terminal_active=1
 			# NUL-delimited reads preserve trailing newlines in each text fragment.
 			IFS= read -r -d '' text < <(jq -jr '.part.text, "\u0000"' <<<"$line")
-			IFS= read -r -d '' rendered < <(redact_text "$text"; printf '\0')
 			[[ -n "${texts[$id]+seen}" ]] || text_ids+=("$id")
 			previous=${texts[$id]-}
 			[[ "$text" == "$previous" ]] && continue
-			previous_rendered=${rendered_texts[$id]-}
-			if [[ -n "$previous" && "$text" == "$previous"* && "$rendered" == "$previous_rendered"* ]]; then
-				_opencode_emit "${rendered:${#previous_rendered}}"
-			else
-				_opencode_emit "$rendered"
-			fi
 			texts[$id]=$text
-			rendered_texts[$id]=$rendered
 			final_text=""
 			for tid in "${text_ids[@]}"; do final_text+="${texts[$tid]}"; done
 			seen=1
@@ -341,6 +332,7 @@ render_stream() {
 					continue
 				fi
 				finished=1
+				[[ -z "$final_text" ]] || _opencode_emit "$(redact_text "$final_text")"
 				printf '%s' "$final_text" >"$CLAUDE_FINAL"
 			fi
 			seen=1
