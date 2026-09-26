@@ -474,10 +474,13 @@ with no `status` script simply says nothing, which is not an error.
 
 The shipped Codex and OpenCode adapters are still only script implementations
 of this contract. A source selects Codex with `agent: codex` and may pass
-`MODEL`, `PROFILE`, and `CODEX_SANDBOX` (default `danger-full-access`) in that
-script entry's `params:`. Refine, implement, review and approve share the same
-deterministic worktree, dependency, pull-request and postcondition policy as
-the Claude adapters; only the model runner beneath that policy changes.
+`MODEL`, `REASONING_EFFORT`, `PROFILE`, and `CODEX_SANDBOX` (default
+`danger-full-access`) in that script entry's `params:`. `REASONING_EFFORT`
+becomes the per-invocation Codex `model_reasoning_effort` override, so one
+stage does not have to inherit the operator's global default. Refine,
+implement, review and approve share the same deterministic worktree,
+dependency, pull-request and postcondition policy as the Claude adapters; only
+the model runner beneath that policy changes.
 
 The shipped `reviewer` adapter is a Codex-only review alias. It delegates both
 review execution and status directly to the Codex adapter and uses

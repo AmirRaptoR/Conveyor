@@ -133,7 +133,7 @@ fail=0
 chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
 reset_run() { rm -f "$CODEX_CALLS" "$CODEX_ARGS".* "$CODEX_PROMPT".* "$CODEX_RESULT_ENV" "$CONVEYOR_RESULT"; : >"$CONVEYOR_PLAN"; unset RESUME_SESSION; }
 
-export CODEX_SCENE=success MODEL=gpt-test PROFILE=test-profile CODEX_SANDBOX=workspace-write
+export CODEX_SCENE=success MODEL=gpt-test REASONING_EFFORT=medium PROFILE=test-profile CODEX_SANDBOX=workspace-write
 set +e
 out=$(run_claude 'do the work' 2>&1)
 rc=$?
@@ -149,10 +149,10 @@ chk "the result contract is appended" "$(grep -c 'versioned result contract' "$C
 chk "todo_list publishes a plan" "$(wc -l <"$CONVEYOR_PLAN" | tr -d ' ')" "1"
 chk "completed todos map to completed" "$(jq -r '.todos[0].status' "$CONVEYOR_PLAN")" "completed"
 chk "incomplete todos map to pending" "$(jq -r '.todos[1].status' "$CONVEYOR_PLAN")" "pending"
-for arg in --json --color never --sandbox workspace-write --model gpt-test --profile test-profile; do
+for arg in --json --color never --sandbox workspace-write --model gpt-test --config model_reasoning_effort=medium --profile test-profile; do
 	chk "exec receives $arg" "$(grep -Fx -- "$arg" "$CODEX_ARGS" || true)" "$arg"
 done
-chk "model metadata is recorded" "$(record_model)" "model: gpt-test sandbox: workspace-write profile: test-profile"
+chk "model metadata is recorded" "$(record_model)" "model: gpt-test effort: medium sandbox: workspace-write profile: test-profile"
 
 reset_run
 export CODEX_SCENE=waiting
