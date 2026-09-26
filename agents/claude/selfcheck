@@ -44,6 +44,14 @@ case "$out" in
 esac
 chk "a foreign session is not passed to Claude" "${RESUME_SESSION:-}" ""
 
+RESUME_SESSION=""
+out=$(resume_prompt '{"answer":"continue","session":"codex:thread-abc"}' "do the work")
+case "$out" in
+  "The question you stopped on has been answered: continue"*"do the work") echo "ok   a Codex session falls back to the answered prompt";;
+  *) echo "FAIL Codex session fallback: got [$out]"; fail=1;;
+esac
+chk "a Codex session is not passed to Claude" "${RESUME_SESSION:-}" ""
+
 # 4. the session id is read out of the raw stream, first one wins.
 printf '%s\n' '{"type":"system","session_id":"sess-xyz"}' '{"type":"assistant"}' '{"type":"result","session_id":"sess-xyz"}' > "$CLAUDE_RAW"
 chk "the session id is read from the stream" "$(claude_session)" "sess-xyz"

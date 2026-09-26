@@ -34,7 +34,7 @@ depends on all of them at once.
 
 | Prerequisite | Needed for | Prove it |
 | --- | --- | --- |
-| `codex` CLI | `agents/codex/review`, `agents/codex/status` | `codex --version` |
+| Codex CLI **0.150.1** | `agents/codex/{refine,implement,review,approve,status}` | `codex --version` |
 | OpenCode CLI **1.18.32** | `agents/opencode/{refine,implement,review,approve}` | `opencode --version` |
 | Node.js | the UI test suite (`*.test.mjs`), run by `./check` | `node --version` |
 | systemd | running the engine as a service (`deploy/conveyor.service.example`) | `systemctl --version` |

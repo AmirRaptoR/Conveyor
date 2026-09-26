@@ -21,10 +21,19 @@ SESSIONS = pathlib.Path(os.environ.get("CODEX_HOME", pathlib.Path.home() / ".cod
 def newest_limits():
     """The most recent rate_limits Codex recorded, or None."""
     files = sorted(SESSIONS.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for path in files[:20]:  # newest first; the limits are account-wide
-        latest = None
+    newest = None
+    for file_index, path in enumerate(files):  # newest first; the limits are account-wide
         try:
-            for line in path.open(errors="replace"):
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        # An older file cannot contain an event newer than the timestamp
+        # already observed. This still walks past any number of newer active
+        # rollouts that have not recorded rate limits themselves.
+        if newest is not None and modified < newest[0][0]:
+            break
+        try:
+            for line_index, line in enumerate(path.open(errors="replace")):
                 # Cheap gate: parsing 40MB of rollouts to find one field is the
                 # difference between a probe and a stage.
                 if '"rate_limits"' not in line:
@@ -35,12 +44,17 @@ def newest_limits():
                     continue
                 lim = (ev.get("payload") or {}).get("rate_limits")
                 if lim:
-                    latest = (ev.get("timestamp"), lim)
+                    seen = ev.get("timestamp")
+                    try:
+                        stamp = dt.datetime.fromisoformat(seen.replace("Z", "+00:00")).timestamp()
+                    except (AttributeError, TypeError, ValueError):
+                        stamp = modified
+                    key = (stamp, -file_index, line_index)
+                    if newest is None or key > newest[0]:
+                        newest = (key, seen, lim)
         except OSError:
             continue
-        if latest:
-            return latest
-    return None
+    return (newest[1], newest[2]) if newest else None
 
 
 def window(lim, key, name):

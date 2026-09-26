@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export CONVEYOR_AGENT_BACKEND=codex
-exec "$(dirname "$0")/../claude/review"
+exec "$(dirname "$0")/../claude/refine"

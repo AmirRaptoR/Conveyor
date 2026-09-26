@@ -9,6 +9,7 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 install_skills="$here/install-skills"
 repo_root=$(cd "$here/../.." && pwd)
+initial_status=$(cd "$repo_root" && git status --porcelain 2>/dev/null || true)
 
 fail=0
 chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
@@ -176,7 +177,7 @@ chk "nothing else was created under the temporary \$HOME" "${stray:-none}" "none
 
 ### 10. The checkout itself is never touched ##################################
 status=$(cd "$repo_root" && git status --porcelain 2>/dev/null || true)
-chk "the checkout is unmodified after every scenario above" "$status" ""
+chk "the checkout is unmodified after every scenario above" "$status" "$initial_status"
 
 if [[ $fail -eq 0 ]]; then
 	echo "install-skills-selfcheck: all checks passed"

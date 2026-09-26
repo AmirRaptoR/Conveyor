@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# Codex's JSON-event backend for the shared stage policies. Pinned because the
+# exec --json projection is a CLI contract, not a stable service API.
+
+CODEX_SUPPORTED_VERSION=0.150.1
+_CODEX_TMP=$(mktemp -d)
+CLAUDE_SAID="$_CODEX_TMP/said"
+CLAUDE_RAW="$_CODEX_TMP/raw"
+CLAUDE_FINAL="$_CODEX_TMP/final"
+_CODEX_STDERR="$_CODEX_TMP/stderr"
+_CODEX_RESUME="$_CODEX_TMP/resume"
+trap 'rm -rf "$_CODEX_TMP"' EXIT
+trap '_codex_stop_child; exit 143' TERM
+
+declare -f result_accept >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_result"
+declare -f is_condition_kind >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_blocked"
+declare -f plan_publish >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../_plan"
+
+codex_bin() { printf '%s' "${CODEX_BIN:-codex}"; }
+
+claude_session() {
+	[[ -s "$CLAUDE_RAW" ]] || return 0
+	jq -r 'select(.type == "thread.started") | .thread_id' "$CLAUDE_RAW" 2>/dev/null | head -1 || true
+}
+
+claude_model() { printf '%s' "${MODEL:-configured default}"; }
+
+record_model() {
+	local line
+	line=$(redact_text "model: $(claude_model) sandbox: ${CODEX_SANDBOX:-danger-full-access}${PROFILE:+ profile: $PROFILE}") || line="model: [REDACTED]"
+	printf '%s\n' "$line" || true
+	return 0
+}
+
+resume_prompt() {
+	local payload=$1 default=$2 answer session
+	: >"$_CODEX_RESUME"
+	answer=$(jq -r '.answer // ""' <<<"$payload")
+	session=$(jq -r '.session // ""' <<<"$payload")
+	contains_sensitive_value "$session" && session=""
+	if [[ -z "$answer" ]]; then
+		printf '%s' "$default"
+		return 0
+	fi
+	if [[ "$session" == codex:* ]]; then
+		RESUME_SESSION=${session#codex:}
+		printf '%s' "$RESUME_SESSION" >"$_CODEX_RESUME"
+		echo "resuming the conversation that asked (session ${RESUME_SESSION:0:8})" >&2
+		printf '%s' "$answer"
+		return 0
+	fi
+	printf '%s' "The question you stopped on has been answered: ${answer}
+
+Carry on from there.
+
+--- what you were asked to do originally ---
+${default}"
+}
+
+hit_limit() {
+	local messages
+	messages=$(jq -rs '[.[] |
+		if .type == "error" then (.message // .error.message // "")
+		elif .type == "turn.failed" then (.error.message // "")
+		else empty end] | join("\n")' "$CLAUDE_RAW" 2>/dev/null || true)
+	messages+=$'\n'$(<"$_CODEX_STDERR")
+	grep -qiE 'usage limit|quota (is )?(exceeded|exhausted)|insufficient[_ -]?quota|spend(ing)? (control|limit).*(reached|exceeded)' <<<"$messages"
+}
+
+# Codex has no turn-count flag. Conveyor's deadline remains the hard bound and
+# the shared deadline brief asks the model to land work before it.
+hit_max_turns() { return 1; }
+
+record_session() {
+	local sess base merged
+	[[ -z "${CONVEYOR_RESULT:-}" ]] && return 0
+	sess=$(claude_session)
+	[[ -z "$sess" ]] && return 0
+	contains_sensitive_value "$sess" && return 0
+	base='{}'
+	[[ -s "$CONVEYOR_RESULT" ]] && jq -e . "$CONVEYOR_RESULT" >/dev/null 2>&1 && base=$(<"$CONVEYOR_RESULT")
+	merged=$(jq -c --arg s "codex:$sess" '. + {v:1,outcome:(.outcome // "success"),session:$s}' <<<"$base" 2>/dev/null) || return 0
+	result_write_json "$merged" || true
+}
+
+agent_asked() {
+	local sess kind asked merged
+	[[ -z "${CONVEYOR_RESULT:-}" || ! -s "$CONVEYOR_RESULT" ]] && return 0
+	jq -e 'type == "object"' "$CONVEYOR_RESULT" >/dev/null 2>&1 || return 0
+	kind=$(jq -r '.kind // "decision"' "$CONVEYOR_RESULT" 2>/dev/null) || return 0
+	sess=$(claude_session)
+	contains_sensitive_value "$sess" && sess=""
+	asked=true
+	is_condition_kind "$kind" && asked=false
+	if jq -e '(.questions // []) | type == "array" and length > 0 and all(.[]; type == "object")' \
+		"$CONVEYOR_RESULT" >/dev/null 2>&1; then
+		asked=true
+	fi
+	[[ -n "$sess" ]] && sess="codex:$sess"
+	merged=$(jq -c --arg s "$sess" --arg kind "$kind" --argjson asked "$asked" \
+		'. + {v:1,outcome:"blocked",blocked:true,kind:$kind,asked:$asked} + (if $s == "" then {} else {session:$s} end)' \
+		"$CONVEYOR_RESULT" 2>/dev/null) || return 0
+	result_write_json "$merged" || true
+}
+
+last_said() {
+	[[ -s "$CLAUDE_SAID" ]] || return 0
+	grep -v '^\s*$' "$CLAUDE_SAID" | tail -n 3 | tr -s '[:space:]' ' ' | cut -c1-300
+}
+
+_codex_publish_todos() {
+	local line=$1 mapped
+	mapped=$(jq -c '[.item.items[]? | {text:(.text // ""), status:(if .completed == true then "completed" else "pending" end)}]' \
+		<<<"$line" 2>/dev/null) || return 0
+	plan_publish "$mapped"
+}
+
+render_stream() {
+	local line type item_type thread="" event_thread="" final="" phase=0 failed=0 detail rendered
+	: >"$CLAUDE_RAW"
+	: >"$CLAUDE_FINAL"
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		[[ -z "$line" ]] && continue
+		printf '%s\n' "$line" >>"$CLAUDE_RAW" || true
+		if ! jq -e 'type == "object" and (.type | type == "string" and length > 0)' >/dev/null 2>&1 <<<"$line"; then
+			echo "codex emitted a malformed JSON event" >&2
+			return 2
+		fi
+		type=$(jq -r .type <<<"$line")
+		case "$type" in
+		thread.started)
+			[[ $phase -eq 0 ]] || {
+				echo "codex emitted thread.started out of order" >&2; return 2; }
+			jq -e '(.thread_id | type == "string" and length > 0)' >/dev/null 2>&1 <<<"$line" || {
+				echo "codex emitted a malformed thread.started event" >&2; return 2; }
+			event_thread=$(jq -r .thread_id <<<"$line")
+			if [[ -n "${RESUME_SESSION:-}" && "$event_thread" != "$RESUME_SESSION" ]]; then
+				echo "codex resumed an unexpected thread" >&2
+				return 2
+			fi
+			thread=$event_thread
+			phase=1
+			;;
+		turn.started)
+			[[ $phase -eq 1 ]] || {
+				echo "codex emitted turn.started out of order" >&2; return 2; }
+			phase=2
+			;;
+		item.started | item.updated | item.completed)
+			[[ $phase -eq 2 ]] || {
+				echo "codex emitted $type outside the active turn" >&2; return 2; }
+			jq -e '.item | type == "object" and (.id | type == "string" and length > 0) and (.type | type == "string" and length > 0)' \
+				>/dev/null 2>&1 <<<"$line" || {
+				echo "codex emitted a malformed $type event" >&2; return 2; }
+			item_type=$(jq -r .item.type <<<"$line")
+			case "$item_type" in
+			agent_message)
+				jq -e '(.item.text | type == "string")' >/dev/null 2>&1 <<<"$line" || {
+					echo "codex emitted a malformed agent message" >&2; return 2; }
+				if [[ "$type" == item.completed ]]; then
+					IFS= read -r -d '' final < <(jq -jr '.item.text, "\u0000"' <<<"$line")
+					redact_text "$final"; printf '\n'
+				fi
+				;;
+			command_execution)
+				rendered=$(jq -r '"  · command: " + ((.item.command // "") | gsub("[[:space:]]+"; " ") | .[0:160]) +
+					(if .item.status then " [" + .item.status + "]" else "" end)' <<<"$line")
+				redact_text "$rendered"; printf '\n'
+				;;
+			todo_list)
+				jq -e '(.item.items | type == "array" and all(.[]; type == "object" and (.text | type == "string") and (.completed | type == "boolean")))' \
+					>/dev/null 2>&1 <<<"$line" || {
+					echo "codex emitted a malformed todo list" >&2; return 2; }
+				if [[ "$type" == item.completed ]]; then
+					_codex_publish_todos "$line"
+					echo "  · plan updated"
+				fi
+				;;
+			reasoning) ;; # Never expose chain-of-thought or summaries as run logs.
+			*) echo "codex item ignored: $item_type" >&2 ;;
+			esac
+			;;
+		turn.completed)
+			[[ $phase -eq 2 ]] || {
+				echo "codex emitted turn.completed out of order" >&2; return 2; }
+			printf '%s' "$final" >"$CLAUDE_FINAL"
+			phase=3
+			;;
+		turn.failed)
+			[[ $phase -eq 2 ]] || {
+				echo "codex emitted turn.failed outside the active turn" >&2; return 2; }
+			jq -e '(.error.message | type == "string" and length > 0)' >/dev/null 2>&1 <<<"$line" || {
+				echo "codex emitted a malformed turn.failed event" >&2; return 2; }
+			detail=$(jq -r .error.message <<<"$line")
+			echo "[codex stopped] $(redact_text "$detail")"
+			failed=1
+			;;
+		error)
+			jq -e '((.message // .error.message) | type == "string" and length > 0)' >/dev/null 2>&1 <<<"$line" || {
+				echo "codex emitted a malformed error event" >&2; return 2; }
+			detail=$(jq -r '.message // .error.message' <<<"$line")
+			echo "[codex stopped] $(redact_text "$detail")"
+			failed=1
+			;;
+		*) echo "codex event ignored: $type" >&2 ;;
+		esac
+	done
+	[[ $failed -eq 0 ]] || return 1
+	[[ $phase -eq 3 ]] || {
+		echo "codex stream ended without exactly one turn.completed event" >&2; return 2; }
+	[[ -n "$final" ]] || {
+		echo "codex completed without a final agent message" >&2; return 2; }
+}
+
+_codex_child_done() {
+	local pid=${_CODEX_CHILD_PID:-} stat state
+	[[ -n "$pid" ]] || return 0
+	if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
+	if [[ -r "/proc/$pid/stat" ]]; then
+		stat=$(<"/proc/$pid/stat")
+		stat=${stat#*) }
+		state=${stat%% *}
+		[[ "$state" == Z ]] && return 0
+	fi
+	return 1
+}
+
+_codex_stop_child() {
+	local pid=${_CODEX_CHILD_PID:-} grace=${CODEX_STOP_GRACE:-2} deadline status
+	[[ -n "$pid" ]] || return 0
+	[[ "$grace" =~ ^[0-9]+$ ]] || grace=2
+	if kill -0 "$pid" 2>/dev/null; then
+		kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+		deadline=$((SECONDS + grace))
+		while kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.05; done
+		if kill -0 "$pid" 2>/dev/null; then
+			kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+		fi
+	fi
+	if wait "$pid" 2>/dev/null; then status=0; else status=$?; fi
+	_CODEX_CHILD_STATUS=$status
+	_CODEX_CHILD_WAITED=1
+}
+
+validate_codex() {
+	local bin version
+	bin=$(codex_bin)
+	if ! version=$("$bin" --version 2>/dev/null); then
+		echo "codex is not installed or did not report its version" >&2
+		return 2
+	fi
+	if [[ "$version" != "codex-cli $CODEX_SUPPORTED_VERSION" ]]; then
+		echo "$version is unsupported; install codex-cli $CODEX_SUPPORTED_VERSION" >&2
+		return 2
+	fi
+}
+
+_codex_invoke() {
+	local prompt=$1 correction=${2:-0} bin sandbox render_status child_status forced_stop=0 fifo stderr_fifo stderr_pid
+	local -a flags
+	bin=$(codex_bin)
+	if [[ -z "${RESUME_SESSION:-}" && -s "$_CODEX_RESUME" ]]; then
+		RESUME_SESSION=$(<"$_CODEX_RESUME")
+	fi
+	sandbox=${CODEX_SANDBOX:-danger-full-access}
+	[[ "$correction" == 1 ]] && sandbox=read-only
+	flags=(exec --json --color never --sandbox "$sandbox")
+	[[ -n "${MODEL:-}" ]] && flags+=(--model "$MODEL")
+	[[ -n "${PROFILE:-}" ]] && flags+=(--profile "$PROFILE")
+	if [[ -n "${RESUME_SESSION:-}" ]]; then
+		flags+=(resume "$RESUME_SESSION" -)
+	else
+		flags+=(--cd "$PWD" --skip-git-repo-check -)
+	fi
+	: >"$CLAUDE_SAID"
+	: >"$_CODEX_STDERR"
+	fifo="$_CODEX_TMP/events"
+	stderr_fifo="$_CODEX_TMP/stderr-events"
+	rm -f "$fifo" "$stderr_fifo"
+	mkfifo "$fifo" "$stderr_fifo" || return 1
+	tee "$_CODEX_STDERR" <"$stderr_fifo" | redact_stream >&2 &
+	stderr_pid=$!
+	_CODEX_CHILD_WAITED=0
+	setsid env -u CONVEYOR_RESULT "$bin" "${flags[@]}" <<<"$prompt" >"$fifo" 2>"$stderr_fifo" &
+	_CODEX_CHILD_PID=$!
+	render_stream <"$fifo" | redact_stream | tee "$CLAUDE_SAID"
+	local -a statuses=("${PIPESTATUS[@]}")
+	render_status=${statuses[0]}
+	if [[ $render_status -ne 0 ]] && ! _codex_child_done; then
+		forced_stop=1
+		_codex_stop_child
+	fi
+	if [[ "$_CODEX_CHILD_WAITED" == 1 ]]; then
+		child_status=$_CODEX_CHILD_STATUS
+	elif wait "$_CODEX_CHILD_PID"; then child_status=0; else child_status=$?; fi
+	_CODEX_CHILD_PID=""
+	wait "$stderr_pid" || true
+	rm -f "$fifo" "$stderr_fifo"
+	[[ $forced_stop -eq 0 ]] || return "$render_status"
+	[[ $child_status -eq 0 ]] || return "$child_status"
+	return "$render_status"
+}
+
+# Compatibility name used by the shared stage policies.
+run_claude() {
+	local prompt=$1 rc final session failure
+	validate_codex || return $?
+	prompt="${prompt}
+
+$(result_brief)"
+	if _codex_invoke "$prompt"; then rc=0; else rc=$?; fi
+	[[ $rc -eq 0 ]] || return "$rc"
+	session=$(claude_session)
+	final=$(<"$CLAUDE_FINAL")
+	if [[ -n "$final" ]] && result_accept "$final" "${session:+codex:$session}"; then
+		result_is_waiting && return 10
+		return 0
+	fi
+	failure="the agent completed without one valid version-1 final result"
+	if [[ -z "$session" ]]; then
+		result_quarantine "$failure; no session was available for a same-session correction"
+		return 20
+	fi
+	RESUME_SESSION=$session
+	if _codex_invoke "$(result_correction_brief)" 1; then rc=0; else rc=$?; fi
+	if [[ $rc -eq 0 ]]; then
+		final=$(<"$CLAUDE_FINAL")
+		if [[ -n "$final" ]] && result_accept "$final" "codex:$session"; then
+			result_is_waiting && return 10
+			return 0
+		fi
+		failure="the agent's single result correction was still missing, ambiguous, or invalid"
+	else
+		failure="the agent's single result correction failed (exit $rc)"
+	fi
+	result_quarantine "$failure" "codex:$session" || {
+		echo "could not persist the invalid-result quarantine" >&2
+		return 1
+	}
+	echo "blocked (invalid-result): $failure" >&2
+	return 20
+}

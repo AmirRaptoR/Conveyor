@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export CODEX_HOME="$tmp/codex" CONVEYOR_RESULT="$tmp/result.json"
+mkdir -p "$CODEX_HOME/sessions/2026/09/26"
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+run_status() { "$here/status" >/dev/null 2>&1; }
+
+run_status
+chk "no rollout reports unknown" "$(jq -r .state "$CONVEYOR_RESULT")" "unknown"
+
+old="$CODEX_HOME/sessions/2026/09/26/old.jsonl"
+new="$CODEX_HOME/sessions/2026/09/26/new.jsonl"
+printf '%s\n' \
+	'not json' \
+	'{"timestamp":"old","payload":{"rate_limits":{"primary":{"used_percent":90,"resets_at":1790424000},"secondary":{"used_percent":20},"plan_type":"pro"}}}' \
+	'{"timestamp":"latest-in-file","payload":{"rate_limits":{"primary":{"used_percent":34,"resets_at":1790424000},"secondary":{"used_percent":12},"plan_type":"pro"}}}' >"$old"
+run_status
+chk "the newest event in a rollout wins" "$(jq -r .summary "$CONVEYOR_RESULT")" "34% of the 5-hour window, 12% of the week"
+chk "the status includes both windows" "$(jq '.detail | map(select(.label == "5-hour window" or .label == "weekly")) | length' "$CONVEYOR_RESULT")" "2"
+chk "the primary reset is reported" "$(jq -r .resetsAt "$CONVEYOR_RESULT")" "2026-09-26T12:00:00+00:00"
+
+sleep 0.01
+printf '%s\n' '{"timestamp":"new","payload":{"rate_limits":{"primary":{"used_percent":100,"resets_at":1790424000},"secondary":{"used_percent":1}}}}' >"$new"
+run_status
+chk "a newer rollout wins" "$(jq -r .state "$CONVEYOR_RESULT")" "limited"
+chk "a full primary window is limited" "$(jq -r .summary "$CONVEYOR_RESULT")" "out of quota"
+
+printf '%s\n' '{"timestamp":"2026-09-26T12:01:00Z","payload":{"rate_limits":{"primary":{"used_percent":23},"secondary":{"used_percent":4}}}}' >"$new"
+printf '%s\n' '{"timestamp":"2026-09-26T12:00:00Z","payload":{"rate_limits":{"primary":{"used_percent":91},"secondary":{"used_percent":8}}}}' >"$old"
+touch "$old"
+run_status
+chk "event time wins over a later write to another rollout" "$(jq -r .summary "$CONVEYOR_RESULT")" "23% of the 5-hour window, 4% of the week"
+
+for i in {1..21}; do
+	printf '%s\n' '{"timestamp":"2026-09-26T12:01:30Z","payload":{"note":"active without rate limits"}}' \
+		>"$CODEX_HOME/sessions/2026/09/26/no-limits-$i.jsonl"
+done
+run_status
+chk "more than twenty newer rollouts cannot hide quota data" "$(jq -r .summary "$CONVEYOR_RESULT")" "23% of the 5-hour window, 4% of the week"
+
+printf '%s\n' '{"timestamp":"2026-09-26T12:02:00Z","payload":{"rate_limits":{"primary":{"used_percent":1},"secondary":{"used_percent":100}}}}' >"$new"
+run_status
+chk "a full secondary window is limited" "$(jq -r .state "$CONVEYOR_RESULT")" "limited"
+
+printf '%s\n' '{"timestamp":"2026-09-26T12:03:00Z","payload":{"rate_limits":{"primary":{"used_percent":1},"secondary":{"used_percent":2},"spend_control_reached":true}}}' >"$new"
+run_status
+chk "spend control is limited" "$(jq -r .state "$CONVEYOR_RESULT")" "limited"
+
+exit "$fail"

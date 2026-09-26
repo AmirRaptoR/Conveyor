@@ -48,7 +48,7 @@ result_json_schema() {
 	jq -nc '{
 		type:"object", additionalProperties:false,
 		properties:{
-			v:{const:1}, outcome:{enum:["success","blocked","noop","waiting"]},
+			v:{type:"integer",const:1}, outcome:{type:"string",enum:["success","blocked","noop","waiting"]},
 			kind:{type:"string"}, reason:{type:"string"},
 			questions:{type:"array",items:{type:"object"}},
 			waiting:{type:"object"}, dispositions:{type:"object"},

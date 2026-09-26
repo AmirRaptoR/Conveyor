@@ -99,7 +99,7 @@ resume_prompt() {
 		printf '%s' "$default"
 		return 0
 	fi
-	if [[ -n "$session" && "$session" != opencode:* ]]; then
+	if [[ -n "$session" && "$session" != opencode:* && "$session" != codex:* ]]; then
 		RESUME_SESSION=$session
 		echo "resuming the conversation that asked (session ${session:0:8})" >&2
 		printf '%s' "$answer"

@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# Exercise the Codex event adapter without making a model call.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/bin"
+
+cat >"$tmp/bin/codex" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == --version ]]; then
+	echo "codex-cli ${CODEX_VERSION:-0.150.1}"
+	exit 0
+fi
+printf '%s\n' "$@" >"$CODEX_ARGS"
+cat >"$CODEX_PROMPT"
+run_no=1
+if [[ -s "$CODEX_CALLS" ]]; then run_no=$(($(<"$CODEX_CALLS") + 1)); fi
+printf '%s\n' "$run_no" >"$CODEX_CALLS"
+cp "$CODEX_ARGS" "$CODEX_ARGS.$run_no"
+cp "$CODEX_PROMPT" "$CODEX_PROMPT.$run_no"
+printf '%s\n' "${CONVEYOR_RESULT+exposed}" >>"$CODEX_RESULT_ENV"
+scene=${CODEX_SCENE:-success}
+case "$scene" in
+success)
+	printf '%s\n' \
+		'{"type":"thread.started","thread_id":"thread-good"}' \
+		'{"type":"turn.started"}' \
+		'{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"working"}}' \
+		'{"type":"item.started","item":{"id":"c1","type":"command_execution","command":"go test ./...","aggregated_output":"","exit_code":null,"status":"in_progress"}}' \
+		'{"type":"item.completed","item":{"id":"c1","type":"command_execution","command":"go test ./...","aggregated_output":"SECRET TOOL OUTPUT","exit_code":0,"status":"completed"}}' \
+		'{"type":"item.completed","item":{"id":"p1","type":"todo_list","items":[{"text":"inspect","completed":true},{"text":"report","completed":false}]}}' \
+		'{"type":"item.completed","item":{"id":"m2","type":"agent_message","text":"{\"v\":1,\"outcome\":\"success\",\"summary\":\"work complete\"}"}}' \
+		'{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}'
+	;;
+waiting)
+	printf '%s\n' \
+		'{"type":"thread.started","thread_id":"thread-wait"}' \
+		'{"type":"turn.started"}' \
+		'{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"{\"v\":1,\"outcome\":\"waiting\",\"waiting\":{\"why\":\"checks are running\"}}"}}' \
+		'{"type":"turn.completed"}'
+	;;
+invalid-once|invalid-always)
+	text='not json'
+	if [[ "$scene" == invalid-once && $run_no -gt 1 ]]; then
+		text='{"v":1,"outcome":"success","summary":"corrected"}'
+	fi
+	jq -nc '{type:"thread.started",thread_id:"thread-invalid"}'
+	jq -nc '{type:"turn.started"}'
+	jq -nc --arg text "$text" '{type:"item.completed",item:{id:"m",type:"agent_message",text:$text}}'
+	jq -nc '{type:"turn.completed"}'
+	;;
+duplicate)
+	printf '%s\n' \
+		'{"type":"thread.started","thread_id":"thread-duplicate"}' \
+		'{"type":"turn.started"}' \
+		'{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"{\"v\":1,\"outcome\":\"success\"}"}}' \
+		'{"type":"turn.completed"}' \
+		'{"type":"turn.completed"}'
+	;;
+incomplete)
+	printf '%s\n' \
+		'{"type":"thread.started","thread_id":"thread-incomplete"}' \
+		'{"type":"turn.started"}' \
+		'{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"{\"v\":1,\"outcome\":\"success\"}"}}'
+	;;
+mismatch)
+	printf '%s\n' \
+		'{"type":"thread.started","thread_id":"thread-one"}' \
+		'{"type":"thread.started","thread_id":"thread-two"}'
+	;;
+out-of-order)
+	printf '%s\n' \
+		'{"type":"thread.started","thread_id":"thread-order"}' \
+		'{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"{\"v\":1,\"outcome\":\"success\"}"}}' \
+		'{"type":"turn.started"}' \
+		'{"type":"turn.completed"}'
+	;;
+resume-mismatch)
+	printf '%s\n' \
+		'{"type":"thread.started","thread_id":"thread-other"}' \
+		'{"type":"turn.started"}' \
+		'{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"{\"v\":1,\"outcome\":\"success\"}"}}' \
+		'{"type":"turn.completed"}'
+	;;
+malformed-hang)
+	trap 'touch "$CODEX_ABORTED"; exit 143' TERM
+	printf '%s\n' 'not json'
+	sleep 300
+	;;
+limit)
+	printf '%s\n' \
+		'{"type":"thread.started","thread_id":"thread-limit"}' \
+		'{"type":"turn.started"}' \
+		'{"type":"error","message":"usage limit reached; reset later"}'
+	;;
+generic429)
+	printf '%s\n' \
+		'{"type":"thread.started","thread_id":"thread-rate"}' \
+		'{"type":"turn.started"}' \
+		'{"type":"error","message":"HTTP 429 too many requests"}'
+	;;
+secrets)
+	text=$(jq -nc --arg summary "saw $SHORT_KEY and $API_SECRET" '{v:1,outcome:"success",summary:$summary}')
+	printf 'provider stderr: %s\n' "$API_SECRET" >&2
+	jq -nc '{type:"thread.started",thread_id:"thread-secrets"}'
+	jq -nc '{type:"turn.started"}'
+	jq -nc --arg text "$text" '{type:"item.completed",item:{id:"m",type:"agent_message",text:$text}}'
+	jq -nc '{type:"turn.completed"}'
+	;;
+sleep)
+	sleep 300 &
+	echo "$!" >"$CODEX_CHILD"
+	wait
+	;;
+esac
+STUB
+chmod +x "$tmp/bin/codex"
+
+export PATH="$tmp/bin:$PATH"
+export CODEX_ARGS="$tmp/args" CODEX_PROMPT="$tmp/prompt" CODEX_CALLS="$tmp/calls"
+export CODEX_RESULT_ENV="$tmp/result-env" CONVEYOR_RESULT="$tmp/result.json"
+export CONVEYOR_SOURCE=test CONVEYOR_STAGE=working CONVEYOR_ITEM_REF=7
+export CONVEYOR_PLAN="$tmp/plan.jsonl"
+: >"$CONVEYOR_PLAN"
+
+source "$here/_stream"
+trap 'rm -rf "$tmp" "$_CODEX_TMP"' EXIT
+
+fail=0
+chk() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
+reset_run() { rm -f "$CODEX_CALLS" "$CODEX_ARGS".* "$CODEX_PROMPT".* "$CODEX_RESULT_ENV" "$CONVEYOR_RESULT"; : >"$CONVEYOR_PLAN"; unset RESUME_SESSION; }
+
+export CODEX_SCENE=success MODEL=gpt-test PROFILE=test-profile CODEX_SANDBOX=workspace-write
+set +e
+out=$(run_claude 'do the work' 2>&1)
+rc=$?
+set -e
+chk "a valid event stream succeeds" "$rc" "0"
+chk "agent messages become logs" "$(grep -c 'work complete' <<<"$out")" "1"
+chk "commands become bounded logs" "$(grep -c 'command: go test' <<<"$out")" "2"
+chk "command output is hidden" "$(grep -c 'SECRET TOOL OUTPUT' <<<"$out" || true)" "0"
+chk "the final result is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "work complete"
+chk "the session is backend-qualified" "$(jq -r .session "$CONVEYOR_RESULT")" "codex:thread-good"
+chk "the model child cannot see CONVEYOR_RESULT" "$(grep -c exposed "$CODEX_RESULT_ENV" || true)" "0"
+chk "the result contract is appended" "$(grep -c 'versioned result contract' "$CODEX_PROMPT")" "1"
+chk "todo_list publishes a plan" "$(wc -l <"$CONVEYOR_PLAN" | tr -d ' ')" "1"
+chk "completed todos map to completed" "$(jq -r '.todos[0].status' "$CONVEYOR_PLAN")" "completed"
+chk "incomplete todos map to pending" "$(jq -r '.todos[1].status' "$CONVEYOR_PLAN")" "pending"
+for arg in --json --color never --sandbox workspace-write --model gpt-test --profile test-profile; do
+	chk "exec receives $arg" "$(grep -Fx -- "$arg" "$CODEX_ARGS" || true)" "$arg"
+done
+chk "model metadata is recorded" "$(record_model)" "model: gpt-test sandbox: workspace-write profile: test-profile"
+
+reset_run
+export CODEX_SCENE=waiting
+set +e; run_claude wait >/dev/null 2>&1; rc=$?; set -e
+chk "a waiting result defers" "$rc" "10"
+chk "the waiting reason is persisted" "$(jq -r .waiting.why "$CONVEYOR_RESULT")" "checks are running"
+
+reset_run
+export CODEX_SCENE=invalid-once
+set +e; run_claude correct >/dev/null 2>&1; rc=$?; set -e
+chk "one invalid result gets one correction" "$rc:$(<"$CODEX_CALLS")" "0:2"
+chk "the correction is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "corrected"
+chk "the correction resumes the same thread" "$(grep -A1 -Fx resume "$CODEX_ARGS.2" | tail -1)" "thread-invalid"
+chk "the correction is read-only" "$(grep -A1 -Fx -- --sandbox "$CODEX_ARGS.2" | head -2 | tail -1)" "read-only"
+chk "the correction prompt forbids tools" "$(grep -c 'do not use tools' "$CODEX_PROMPT.2")" "1"
+
+reset_run
+export CODEX_SCENE=invalid-always
+set +e; run_claude correct >/dev/null 2>&1; rc=$?; set -e
+chk "a second invalid result quarantines" "$rc:$(<"$CODEX_CALLS")" "20:2"
+chk "the quarantine is invalid-result" "$(jq -r .kind "$CONVEYOR_RESULT")" "invalid-result"
+chk "the quarantine is a condition" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
+
+for scene in duplicate incomplete mismatch out-of-order; do
+	reset_run
+	export CODEX_SCENE=$scene
+	set +e; run_claude bad >/dev/null 2>&1; rc=$?; set -e
+	chk "$scene streams fail without correction" "$rc:$(<"$CODEX_CALLS")" "2:1"
+done
+
+reset_run
+export CODEX_SCENE=resume-mismatch RESUME_SESSION=thread-wanted
+set +e; run_claude resume >/dev/null 2>&1; rc=$?; set -e
+chk "a resume must return the requested thread" "$rc" "2"
+
+reset_run
+export CODEX_SCENE=malformed-hang CODEX_ABORTED="$tmp/aborted" CODEX_STOP_GRACE=1
+started=$SECONDS
+set +e; run_claude bad >/dev/null 2>&1; rc=$?; set -e
+chk "a malformed stream keeps its parser failure" "$rc" "2"
+chk "a malformed stream stops its producer" "$([[ -e "$CODEX_ABORTED" ]] && echo stopped || echo alive)" "stopped"
+chk "a malformed stream does not wait for producer exit" "$((SECONDS - started < 3 && 1 || 0))" "1"
+unset CODEX_STOP_GRACE CODEX_ABORTED
+
+reset_run
+export CODEX_SCENE=limit
+set +e; run_claude limited >/dev/null 2>&1; rc=$?; set -e
+chk "an error event fails the run" "$rc" "1"
+chk "an explicit usage limit is recognized" "$(hit_limit && echo yes)" "yes"
+
+reset_run
+export CODEX_SCENE=generic429
+run_claude rate >/dev/null 2>&1 || true
+chk "a generic 429 is not account quota" "$(hit_limit && echo limited || echo transient)" "transient"
+
+reset_run
+export CODEX_SCENE=secrets SHORT_KEY=abc API_SECRET='quoted"secret\value'
+set +e; out=$(run_claude secrets 2>&1); rc=$?; set -e
+chk "secret-bearing results still succeed" "$rc" "0"
+chk "short secrets are absent from logs" "$(grep -Fc "$SHORT_KEY" <<<"$out" || true)" "0"
+chk "complex secrets are absent from logs" "$(grep -Fc "$API_SECRET" <<<"$out" || true)" "0"
+chk "secrets are absent from results" "$(jq -r .summary "$CONVEYOR_RESULT")" "saw [REDACTED] and [REDACTED]"
+unset SHORT_KEY API_SECRET
+
+RESUME_SESSION=""
+prompt=$(resume_prompt '{"answer":"continue","session":"codex:thread-old"}' original 2>/dev/null)
+resume_prompt '{"answer":"continue","session":"codex:thread-old"}' original >/dev/null 2>&1
+chk "Codex answers resume with only the answer" "$prompt" "continue"
+chk "Codex strips its session prefix" "$RESUME_SESSION" "thread-old"
+for session in thread-raw opencode:thread-old claude:thread-old; do
+	RESUME_SESSION=""
+	resume_prompt "{\"answer\":\"continue\",\"session\":\"$session\"}" original >/dev/null 2>&1
+	chk "foreign session $session starts cold" "${RESUME_SESSION:-}" ""
+done
+
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-question"}' >"$CLAUDE_RAW"
+echo '{"blocked":true,"kind":"unfinished","reason":"more work"}' >"$CONVEYOR_RESULT"
+agent_asked
+chk "conditions remain conditions" "$(jq -r .asked "$CONVEYOR_RESULT")" "false"
+chk "conditions retain the Codex session" "$(jq -r .session "$CONVEYOR_RESULT")" "codex:thread-question"
+
+for stage in refine implement review approve; do
+	chk "$stage wrapper is executable" "$([[ -x "$here/$stage" ]] && echo yes || echo no)" "yes"
+	chk "$stage wrapper selects Codex" "$(grep -c 'CONVEYOR_AGENT_BACKEND=codex' "$here/$stage")" "1"
+	chk "$stage wrapper delegates to shared policy" "$(grep -c "claude/$stage" "$here/$stage")" "1"
+done
+
+reset_run
+export CODEX_SCENE=success PROMPT='Refine this item.' CONVEYOR_RESULT="$tmp/wrapper-result"
+printf '%s\n' '{"item":{"ref":"7","title":"Wrapper test","description":"Body","url":"https://example.test/7"}}' |
+	"$here/refine" >/dev/null
+chk "agent: codex selects the native backend" "$(grep -c 'Refine this item.' "$CODEX_PROMPT")" "1"
+
+reset_run
+export CODEX_SCENE=success PROMPT='Refine this item.' CONVEYOR_RESULT="$tmp/wrapper-result"
+printf '%s\n' '{"item":{"ref":"7","title":"Wrapper test","description":"Body","url":"https://example.test/7"},"answer":"continue","session":"codex:thread-good"}' |
+	"$here/refine" >/dev/null
+chk "a shared stage resumes an answered Codex session" "$(grep -A1 -Fx resume "$CODEX_ARGS" | tail -1)" "thread-good"
+
+export CODEX_VERSION=0.149.0
+set +e; run_claude old >/dev/null 2>&1; rc=$?; set -e
+chk "an unpinned Codex version is refused" "$rc" "2"
+unset CODEX_VERSION
+
+export CODEX_SCENE=sleep CODEX_CHILD="$tmp/child"
+cat >"$tmp/cancel-driver" <<DRIVER
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH='$tmp/bin':"\$PATH" CODEX_SCENE=sleep CODEX_ARGS='$tmp/args' CODEX_PROMPT='$tmp/prompt' CODEX_CALLS='$tmp/calls' CODEX_RESULT_ENV='$tmp/result-env' CODEX_CHILD='$tmp/child'
+source '$here/_stream'
+run_claude wait
+DRIVER
+chmod +x "$tmp/cancel-driver"
+setsid "$tmp/cancel-driver" >/dev/null 2>&1 &
+driver=$!
+for _ in {1..100}; do [[ -s "$CODEX_CHILD" ]] && break; sleep 0.02; done
+child=$(<"$CODEX_CHILD")
+kill -TERM -- "-$driver"
+wait "$driver" 2>/dev/null || true
+for _ in {1..100}; do kill -0 "$child" 2>/dev/null || break; sleep 0.02; done
+chk "process-group cancellation removes the CLI child" "$(kill -0 "$child" 2>/dev/null && echo alive || echo gone)" "gone"
+
+exit "$fail"
