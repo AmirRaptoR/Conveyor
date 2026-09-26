@@ -216,6 +216,25 @@ func TestRunDirectoryIsSelfContained(t *testing.T) {
 	}
 }
 
+func TestPreExecFailureAfterDirectoryCreationReturnsStructuredRun(t *testing.T) {
+	r := New(t.TempDir())
+	res, err := r.Run(context.Background(), Spec{Kind: "stage", Source: "s1", Item: &model.Item{ID: "s1:1"}, Stdin: func() {}})
+	if err == nil {
+		t.Fatal("unmarshalable stdin did not fail")
+	}
+	if res == nil || res.Run.ID == "" || res.Run.Dir == "" || res.Run.Outcome != model.OutcomeFailure || res.Run.Error == "" {
+		t.Fatalf("result = %+v, want identified structured failure", res)
+	}
+	var persisted model.Run
+	b, readErr := os.ReadFile(filepath.Join(res.Run.Dir, "meta.json"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if json.Unmarshal(b, &persisted) != nil || persisted.ID != res.Run.ID || persisted.Error == "" {
+		t.Fatalf("persisted pre-exec run = %+v", persisted)
+	}
+}
+
 // The script itself still sees the real value — cmd.Env is never touched by
 // redaction — but what reaches meta.json (and so GET /api/runs) replaces it,
 // keeping only the key: a source's env:/params: is exactly where a token

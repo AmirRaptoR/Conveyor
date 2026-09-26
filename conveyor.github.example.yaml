@@ -28,6 +28,11 @@ concurrency:
 resources:
   claude: 1
 
+budgets:
+  maxRunsPerItem: 20
+  maxRunsPerDay: 200
+  quarantineAfter: 2
+
 poll: 5m
 timeout: 90m          # default per-script timeout; a source may override per
                       # script — a slower repository's suite needs more room
@@ -64,7 +69,6 @@ stages:
     script: implement
     onSuccess: review
     resources: [claude]
-    maxAttempts: 2
     # An item enters here only once everything it declares "Depends on" has
     # reached `done` — in this pipeline `approving` merges, and the merge
     # closes the issue, so `done` is the first stage at which the dependency's

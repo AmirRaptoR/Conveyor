@@ -208,13 +208,31 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	if spec.Item != nil {
 		run.ItemID = spec.Item.ID
 	}
+	failSetup := func(cause error) (*Result, error) {
+		run.Error = cause.Error()
+		run.Outcome = model.OutcomeFailure
+		run.ExitCode = -1
+		run.FinishedAt = time.Now()
+		run.Duration = run.FinishedAt.Sub(started)
+		persistErr := ""
+		if !spec.Transient {
+			if err := writeMeta(&run, dir); err != nil {
+				persistErr = err.Error()
+			}
+		}
+		res := &Result{Run: run, PersistErr: persistErr}
+		if !spec.Transient && r.OnResult != nil {
+			r.OnResult(res)
+		}
+		return res, cause
+	}
 
 	logPath := filepath.Join(dir, "log.txt")
 	// 0o600: this file holds a script's stdout/stderr, meant for the operator
 	// who runs conveyor and nobody else, same as the rest of the run directory.
 	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		return nil, err
+		return failSetup(fmt.Errorf("create log: %w", err))
 	}
 	defer logFile.Close()
 
@@ -290,7 +308,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	if spec.Inline != "" {
 		script = filepath.Join(dir, "script")
 		if err := os.WriteFile(script, []byte(spec.Inline), 0o755); err != nil {
-			return nil, fmt.Errorf("write inline script: %w", err)
+			return failSetup(fmt.Errorf("write inline script: %w", err))
 		}
 		run.Script = script
 	}
@@ -299,12 +317,12 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	if spec.Stdin != nil {
 		b, err := json.MarshalIndent(spec.Stdin, "", "  ")
 		if err != nil {
-			return nil, fmt.Errorf("marshal stdin: %w", err)
+			return failSetup(fmt.Errorf("marshal stdin: %w", err))
 		}
 		stdinJSON = b
 	}
 	if err := os.WriteFile(filepath.Join(dir, "stdin.json"), stdinJSON, 0o600); err != nil {
-		return nil, err
+		return failSetup(fmt.Errorf("write stdin: %w", err))
 	}
 
 	// A timeout must kill the whole process group: an AI stage script spawns
@@ -329,14 +347,14 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	// whatever the script decided was worth structuring — as restricted as
 	// everything else in the run directory once the script writes it.
 	if err := os.WriteFile(resultPath, nil, 0o600); err != nil {
-		return nil, err
+		return failSetup(fmt.Errorf("create result channel: %w", err))
 	}
 	// planPath is pre-created the same way and for the same reason: the
 	// script's own append (`>>`) must open a file already at 0600, not one
 	// its own redirection created at the process's default mode.
 	planPath := filepath.Join(dir, "plan.jsonl")
 	if err := os.WriteFile(planPath, nil, 0o600); err != nil {
-		return nil, err
+		return failSetup(fmt.Errorf("create plan channel: %w", err))
 	}
 	// controlPath/controlAckPath are pre-created the same way and for the
 	// same reason as planPath: a script's own append must open a file
@@ -344,11 +362,11 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	// either channel elsewhere (see buildEnv).
 	controlPath := filepath.Join(dir, "control.jsonl")
 	if err := os.WriteFile(controlPath, nil, 0o600); err != nil {
-		return nil, err
+		return failSetup(fmt.Errorf("create control channel: %w", err))
 	}
 	controlAckPath := filepath.Join(dir, "control-ack.jsonl")
 	if err := os.WriteFile(controlAckPath, nil, 0o600); err != nil {
-		return nil, err
+		return failSetup(fmt.Errorf("create control acknowledgement channel: %w", err))
 	}
 	env, envMap := buildEnv(spec, resultPath, planPath, controlPath, controlAckPath, deadline)
 	run.Env = envMap
@@ -360,11 +378,11 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return failSetup(fmt.Errorf("open stdout pipe: %w", err))
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, err
+		return failSetup(fmt.Errorf("open stderr pipe: %w", err))
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -866,6 +884,20 @@ func WriteMeta(run *model.Run) error {
 // person re-queued it) mean recovery has moved past this one, so the walk
 // stops at the first stage run for this item and stage, pending or not.
 func PendingMove(root, itemID, stage string) (model.Run, bool) {
+	run, ok := LatestStageRun(root, itemID, stage)
+	if !ok {
+		return model.Run{}, false
+	}
+	if !run.MoveConfirmed && ((run.Outcome == model.OutcomeSuccess && run.NextStage != "") ||
+		(run.Outcome == model.OutcomeBlocked && run.PendingMark)) {
+		return run, true
+	}
+	return model.Run{}, false
+}
+
+// LatestStageRun returns the newest persisted stage run for one item at one
+// stage. Callers use the same ordering as pending-move recovery.
+func LatestStageRun(root, itemID, stage string) (model.Run, bool) {
 	days, err := os.ReadDir(root)
 	if err != nil {
 		return model.Run{}, false
@@ -903,11 +935,7 @@ func PendingMove(root, itemID, stage string) (model.Run, bool) {
 				continue
 			}
 			run.Dir = dir
-			if !run.MoveConfirmed && ((run.Outcome == model.OutcomeSuccess && run.NextStage != "") ||
-				(run.Outcome == model.OutcomeBlocked && run.PendingMark)) {
-				return run, true
-			}
-			return model.Run{}, false
+			return run, true
 		}
 	}
 	return model.Run{}, false

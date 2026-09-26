@@ -53,6 +53,35 @@ test("draw: #warnings is empty (innerHTML === \"\") when warnings is empty or ab
   assert.equal(p2.el("#warnings").innerHTML, "");
 });
 
+test("draw: budget chips never render NaN when an older state omits daily remaining", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:1", source: "s1", stage: "backlog", title: "budgeted" }],
+    budgetMaxRunsPerItem: 3,
+    budgets: { "s1:1": { runs: 1, remaining: 2, modelRun: true } },
+  }));
+  assert.doesNotMatch(p.el("#rail").innerHTML, /NaN/);
+  assert.match(p.el("#rail").innerHTML, />2 runs left</);
+});
+
+test("draw: an exact zero daily budget is rendered as zero", async () => {
+  const p = await page();
+  await withState(p, baseState({ budgetMaxRunsPerDay: 5, budgetDayRemaining: 0 }));
+  assert.match(p.el("#line1").innerHTML, />0 model runs left today</);
+  assert.doesNotMatch(p.el("#line1").innerHTML, /reset at/);
+});
+
+test("draw: an unlimited daily ceiling does not reduce an item's remaining runs to zero", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:1", source: "s1", stage: "backlog", title: "budgeted" }],
+    budgetMaxRunsPerItem: 3, budgetMaxRunsPerDay: 0, budgetDayRemaining: 0,
+    budgets: { "s1:1": { runs: 1, remaining: 2, modelRun: true } },
+  }));
+  assert.match(p.el("#rail").innerHTML, />2 runs left</);
+  assert.doesNotMatch(p.el("#line1").innerHTML, /left today/);
+});
+
 test("draw: #warnings is its own block, distinct from .faults", async () => {
   const p = await page();
   await withState(p, baseState({ warnings: ["s1: boom"] }));

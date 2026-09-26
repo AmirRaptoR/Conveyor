@@ -17,6 +17,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
+	"github.com/AmirRaptoR/Conveyor/internal/store"
 )
 
 // cancellableTwoSourcesFor lays down two sources whose "working" stage spawns
@@ -165,6 +166,36 @@ func TestCancelReapsOnlyTheSelectedRunsChildren(t *testing.T) {
 
 	waitFor(t, "s1's transition to finish", func() bool { _, running := s.working.Load("s1:1"); return !running })
 	waitFor(t, "s1's grandchild to die", func() bool { return !alive(pid1) })
+	if entry, ok := s.recovery.Get("item", "s1:1"); !ok || entry.Class != recoveryOperator {
+		t.Fatalf("cancel rest = %+v ok=%v, want durable operator hold", entry, ok)
+	}
+	if n := s.launch(s.ctx); n != 0 {
+		t.Fatalf("auto mode relaunched %d transition(s) after explicit cancel", n)
+	}
+	restarted := New(cfg, runner.New(r.Root))
+	restarted.ctx = context.Background()
+	restarted.state.Items = []model.Item{{ID: "s1:1", Ref: "1", Source: "s1", Stage: "working"}}
+	if !restarted.resting["s1:1"] || restarted.launch(restarted.ctx) != 0 {
+		t.Fatal("explicit cancellation did not remain held across restart")
+	}
+	resumeReq := httptest.NewRequest(http.MethodPost, "/api/items/s1:1/resume", strings.NewReader(`{"reason":"worktree inspected"}`))
+	resumeReq.SetPathValue("id", "s1:1")
+	resumeReq.SetBasicAuth("reviewer", "whatever")
+	resumeW := httptest.NewRecorder()
+	restarted.handleItemResume(resumeW, resumeReq)
+	if resumeW.Code != http.StatusNoContent {
+		t.Fatalf("resume = %d: %s", resumeW.Code, resumeW.Body)
+	}
+	if restarted.resting["s1:1"] {
+		t.Fatal("resume left the item resting")
+	}
+	if _, ok := restarted.recovery.Get("item", "s1:1"); ok {
+		t.Fatal("resume left the operator recovery active")
+	}
+	resumeAudit, ok := restarted.recovery.Get("operator-audit", "s1:1")
+	if !ok || resumeAudit.ResumedBy != "reviewer" || resumeAudit.ResumeReason != "worktree inspected" || resumeAudit.ResumedAt.IsZero() {
+		t.Fatalf("resume audit = %+v ok=%v", resumeAudit, ok)
+	}
 
 	// s2 was never asked to stop and is still running, children and all.
 	if !alive(pid2) {
@@ -191,4 +222,23 @@ func TestCancelReapsOnlyTheSelectedRunsChildren(t *testing.T) {
 	// t.TempDir's cleanup against that write and intermittently fails it with
 	// "directory not empty" rather than anything this test means to assert.
 	waitFor(t, "s2's transition to finish", func() bool { _, running := s.working.Load("s2:1"); return !running })
+}
+
+func TestItemResumeCannotClearAnotherRecoveryClass(t *testing.T) {
+	cfg, r, _ := twoSourcesFor(t)
+	s := New(cfg, r)
+	entry := store.RecoveryEntry{Scope: "item", ID: "s1:1", Source: "s1", Stage: "working", Class: recoveryPoll, Key: "checks"}
+	if err := s.recovery.Put(entry); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/items/s1:1/resume", strings.NewReader(`{"reason":"try again"}`))
+	req.SetPathValue("id", "s1:1")
+	w := httptest.NewRecorder()
+	s.handleItemResume(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("resume typed recovery = %d, want 409", w.Code)
+	}
+	if got, ok := s.recovery.Get("item", "s1:1"); !ok || got != entry {
+		t.Fatalf("typed recovery changed: %+v ok=%v", got, ok)
+	}
 }

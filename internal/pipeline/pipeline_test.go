@@ -87,6 +87,24 @@ func TestOneAttemptByDefault(t *testing.T) {
 	}
 }
 
+func TestModelFailureReturnsStructuredSignatureWithoutProviderMark(t *testing.T) {
+	e := &Engine{attempts: NewAttempts()}
+	st := &config.Stage{Name: "review", MaxAttempts: 1}
+	tr := &Transition{ModelRun: true}
+	_, mark := e.route(st, ran(model.OutcomeFailure, 7), "s:1", tr)
+	if mark.Blocked {
+		t.Fatal("model failure was provider-marked before the execution gate could quarantine it")
+	}
+	if tr.FailureSignature == "" || tr.FailureReason == "" {
+		t.Fatalf("failure evidence = signature %q reason %q", tr.FailureSignature, tr.FailureReason)
+	}
+	tr2 := &Transition{ModelRun: true}
+	e.route(st, ran(model.OutcomeFailure, 7), "s:1", tr2)
+	if tr2.FailureSignature != tr.FailureSignature {
+		t.Fatalf("identical structured failures produced %q and %q", tr.FailureSignature, tr2.FailureSignature)
+	}
+}
+
 // Exit 20 is a decision, not a fault: no retry could change the answer, so it
 // marks immediately however much budget the stage has.
 func TestBlockedMarksImmediately(t *testing.T) {

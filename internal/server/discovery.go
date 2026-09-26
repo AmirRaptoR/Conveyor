@@ -278,11 +278,30 @@ func (s *Server) refresh(ctx context.Context) {
 		items = append(items, s.mergeSourceListing(src.Name, o.genStart, o.res.Items, false)...)
 	}
 	items = dedupeCrossSource(items, func(msg string) { warnings = append(warnings, msg) })
+	warnings = append(warnings, s.reconcileModelFailures(items, failedNow)...)
+	// A model failure may receive one automatic extra attempt only after a
+	// listing that began after the failure proves the provider's item version
+	// changed. The first such listing establishes the post-transition baseline;
+	// it never releases by itself.
+	for _, it := range items {
+		if failedNow[it.Source] != "" {
+			continue
+		}
+		s.mu.RLock()
+		observedAt := s.sourceGen[it.Source]
+		s.mu.RUnlock()
+		if released, err := s.budgets.ObserveExternal(it.ID, it.Stage, it.UpdatedAt, observedAt); err != nil {
+			warnings = append(warnings, it.Source+": reconcile model failure gate: "+err.Error())
+		} else if released {
+			s.wakeUp()
+		}
+	}
 
 	s.askAgents(ctx)
 	s.recallBlocks(items)
 	storage := s.storageUse()
 	recoveringItems := map[string]bool{}
+	failureHeld := map[string]bool{}
 	var staleRecoveries []store.RecoveryEntry
 	listedItems := make(map[string]model.Item, len(items))
 	for _, it := range items {
@@ -293,12 +312,21 @@ func (s *Server) refresh(ctx context.Context) {
 			continue
 		}
 		it, ok := listedItems[entry.ID]
-		if ok && !it.Blocked && it.Source == entry.Source && it.Stage == entry.Stage &&
-			(engineManagedRecovery(entry) || s.targetScriptBinding(it.Source, it.Stage) == entry.Script) {
+		matchesOperatorHold := entry.Class == recoveryOperator && ok &&
+			it.Source == entry.Source && it.Stage == entry.Stage
+		matchesTypedWait := entry.Class != recoveryOperator && ok && !it.Blocked &&
+			it.Source == entry.Source && it.Stage == entry.Stage &&
+			(engineManagedRecovery(entry) || s.targetScriptBinding(it.Source, it.Stage) == entry.Script)
+		if matchesOperatorHold || matchesTypedWait {
 			recoveringItems[entry.ID] = true
 			continue
 		}
 		staleRecoveries = append(staleRecoveries, entry)
+	}
+	for _, it := range items {
+		if f, ok := s.budgets.Failure(it.ID); ok && f.Held && f.Stage == it.Stage {
+			failureHeld[it.ID] = true
+		}
 	}
 
 	s.mu.Lock()
@@ -333,7 +361,7 @@ func (s *Server) refresh(ctx context.Context) {
 		srcOf[it.ID] = it.Source
 	}
 	for id := range s.resting {
-		if recoveringItems[id] {
+		if recoveringItems[id] || failureHeld[id] {
 			continue
 		}
 		src, onBoard := srcOf[id]

@@ -1030,6 +1030,12 @@ The engine reads the flag and never the word beside it. `Unblock all` is an
 explicit person's action and skips questions. Automatic recovery never clears
 a question or re-runs its stage: only answering it on its own card takes it off.
 
+An operator cancellation is also never retried automatically. `POST
+/api/items/{id}/resume` requires a reason, compare-and-clears only the matching
+operator recovery, and durably records requester, reason and time before waking
+the scheduler. It cannot clear typed waits, failure holds or provider marks;
+observe mode remains read-only.
+
 **`Unblock all` also leaves standing whatever the sequencing rule (§4a rung 1)
 would hold anyway.** A marked item whose dependency has not yet reached the
 stage it is marked in gets no provider write from this button — clearing the
@@ -1125,3 +1131,50 @@ what any action means, exactly as it never learns what a `kind` means.
 
 Pairs with the waiting report in §6: one says what the script is waiting for,
 the other lets a person say "not any more".
+
+## 5c. Model-run budgets and deterministic failure quarantine
+
+Autonomous mode requires positive `budgets.maxRunsPerItem` and
+`budgets.maxRunsPerDay`; manual and observe modes remain available during
+migration. A model run is exactly a stage whose source script declares
+`agent:`. Inline and `script:` stages, list/status/provider calls and transient
+recovery probes spend no model-run budget. Reservation happens atomically after
+all other claim gates pass and before launch. The daily window resets at 00:00
+UTC; the per-item count is lifetime.
+
+A failed model run is held in its current stage. Its signature hashes structured
+run metadata and result data with resumable session identity removed; logs are
+never parsed. The first fresh listing begun after the failure records the
+provider item's `updatedAt` as a baseline. Exactly one automatic extra attempt
+becomes eligible only after a later fresh listing reports a different value. A
+provider that supplies no `updatedAt` cannot prove release. Reaching
+`budgets.quarantineAfter` identical signatures makes the durable hold a
+quarantine; it preserves stage, reason, run id, signature count and exact
+release condition while unrelated items continue.
+
+Run IDs already reconciled are persisted as durable retirement tombstones too.
+Unlike bounded display audit, these tombstones are not evicted: eviction could
+make an old run authoritative again if an item later returned to its stage. If Conveyor
+crashes after a failure is archived but before the failure ledger is updated,
+a fresh listing that shows the item in another stage retires that run; moving
+away and later returning can never resurrect the historical failure.
+
+`POST /api/items/{id}/budget-override` requires a reason and records requester,
+time and target stage. It grants exactly one model run and is consumed
+atomically with that reservation; the spent record remains for audit. It never
+changes routing, provider state or another item. `/api/state` and the board show
+item/day remaining counts, the next UTC reset, quarantine evidence and release
+condition. Daily remaining is absent when `maxRunsPerDay` is unset: zero is an
+unlimited ceiling, not zero runs left.
+
+Cancelling an in-flight run creates a durable operator hold scoped to that item,
+source and stage. Refresh, restart, a replacement script binding, and a temporary
+provider-side blocked mark do not release it. Only the audited item resume
+endpoint does; a listing that moves the item to another source or stage retires
+the stale hold.
+
+The old unversioned `budgets.json` counted every transition and cannot be
+truthfully converted into model-only usage. Startup fails closed. After
+preserving the data directory, run `conveyor budget-reset -c <config> -reason
+'<why>'`; Conveyor archives the old file and writes a versioned empty model-run
+ledger carrying the reset audit.

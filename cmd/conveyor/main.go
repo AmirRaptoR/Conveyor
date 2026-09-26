@@ -17,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
@@ -47,6 +48,8 @@ func main() {
 		err = cmdTick(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "budget-reset":
+		err = cmdBudgetReset(os.Args[2:])
 	case "probe":
 		err = cmdProbe(os.Args[2:])
 	case "passwd":
@@ -90,6 +93,9 @@ func usage() {
                                         manual (tick button only) or observe
                                         (nothing ever advances). -watch is an
                                         alias for -mode=observe
+  budget-reset -reason TEXT             archive an incompatible/old execution
+                                        ledger and start a versioned model-run
+                                        ledger. Requires exclusive ownership.
   probe     [-addr ADDR] [-wait D]      post-deploy check: request the board
             [-origin URL]... [-notify] through every auth.origins entry (and
                                         any -origin), retrying up to -wait;
@@ -454,6 +460,7 @@ func cmdRun(args []string) error {
 	if !ok {
 		return fmt.Errorf("no source named %q", *srcName)
 	}
+	listedAt := time.Now()
 	res, err := client.List(ctx)
 	if err != nil {
 		return err
@@ -482,7 +489,11 @@ func cmdRun(args []string) error {
 		return explainRun(cfg, *srcName, item, stage, os.Stdout)
 	}
 
-	tr, err := eng.Advance(ctx, *srcName, item, stage, model.Resume{})
+	budgets := store.OpenBudgets(filepath.Join(cfg.DataDir(), "budgets.json"))
+	if err := reconcileCLIListing(budgets, []model.Item{*item}, listedAt); err != nil {
+		return err
+	}
+	tr, err := advanceCLI(ctx, cfg, eng, r.Root, budgets, *srcName, item, stage)
 	report(tr)
 	printChecklist(ctx, cfg, r, *srcName, tr)
 	if err != nil {
@@ -508,6 +519,10 @@ func cmdTick(args []string) error {
 
 	eng := pipeline.New(cfg, r)
 	order := store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json"))
+	budgets := store.OpenBudgets(filepath.Join(cfg.DataDir(), "budgets.json"))
+	if err := budgets.Err(); err != nil {
+		return err
+	}
 	advanced := 0
 	for _, s := range cfg.Sources {
 		if *only != "" && s.Name != *only {
@@ -519,6 +534,7 @@ func cmdTick(args []string) error {
 		}
 		for advanced < *max {
 			client, _ := eng.Client(s.Name)
+			listedAt := time.Now()
 			res, err := client.List(ctx)
 			if err != nil {
 				return err
@@ -526,13 +542,17 @@ func cmdTick(args []string) error {
 			for _, w := range res.Warnings {
 				fmt.Fprintf(os.Stderr, "warn: %s: %s\n", s.Name, w)
 			}
+			if err := reconcileCLIListing(budgets, res.Items, listedAt); err != nil {
+				return err
+			}
 			// The same order the board writes, so a tick from the terminal and
 			// a tick from the button choose the same item.
 			// The graph comes from the full listing, never from a subset:
 			// the dependency that must hold a follower is often the very
 			// item a filter has already dropped.
 			deps := pipeline.NewDeps(cfg, res.Items)
-			item, target := pipeline.Pick(cfg, res.Items, order.IDs(), deps)
+			available := availableCLIItems(cfg, budgets, res.Items, deps, time.Now())
+			item, target := pipeline.Pick(cfg, available, order.IDs(), deps)
 			if item == nil {
 				fmt.Printf("%s: nothing to do\n", s.Name)
 				break
@@ -541,7 +561,7 @@ func cmdTick(args []string) error {
 			if !eng.Locks().TryAcquire(s.Name, target) {
 				break // something else holds this source or stage
 			}
-			tr, err := eng.Advance(ctx, s.Name, item, target, model.Resume{})
+			tr, err := advanceCLI(ctx, cfg, eng, r.Root, budgets, s.Name, item, target)
 			eng.Locks().Release(s.Name, target)
 			report(tr)
 			advanced++
@@ -558,6 +578,84 @@ func cmdTick(args []string) error {
 	}
 	fmt.Printf("\nadvanced %d item(s)\n", advanced)
 	return nil
+}
+
+func reconcileCLIListing(budgets *store.Budgets, items []model.Item, listedAt time.Time) error {
+	for _, item := range items {
+		if err := budgets.ReconcileStage(item.ID, item.Stage); err != nil {
+			return err
+		}
+		if _, err := budgets.ObserveExternal(item.ID, item.Stage, item.UpdatedAt, listedAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func availableCLIItems(cfg *config.Config, budgets *store.Budgets, items []model.Item, deps pipeline.Deps, now time.Time) []model.Item {
+	available := make([]model.Item, 0, len(items))
+	for _, item := range items {
+		target, ok := pipeline.Target(cfg, &item, deps)
+		if !ok {
+			continue
+		}
+		if cfg.AgentFor(item.Source, target) == "" {
+			available = append(available, item)
+			continue
+		}
+		if ok, _ := budgets.PeekModel(item.ID, target, now.UTC().Format("2006-01-02"), cfg.Budgets.MaxRunsPerItem, cfg.Budgets.MaxRunsPerDay); ok {
+			available = append(available, item)
+		}
+	}
+	return available
+}
+
+func advanceCLI(ctx context.Context, cfg *config.Config, eng *pipeline.Engine, runsRoot string, budgets *store.Budgets, sourceName string, item *model.Item, stage string) (*pipeline.Transition, error) {
+	modelRun := cfg.AgentFor(sourceName, stage) != ""
+	if modelRun {
+		if run, ok := runner.LatestStageRun(runsRoot, item.ID, stage); ok {
+			switch run.Outcome {
+			case model.OutcomeFailure, model.OutcomeTimeout:
+				if budgets.HasFailureRun(item.ID, run.ID) {
+					break
+				}
+				data, _ := os.ReadFile(filepath.Join(run.Dir, "result.json"))
+				timeout := time.Duration(0)
+				if st, ok := cfg.Stage(stage); ok {
+					timeout = st.Timeout.D()
+				}
+				sig, reason := pipeline.FailureEvidence(run, data, timeout)
+				if _, err := budgets.RecordFailure(item.ID, stage, sig, reason, run.ID, max(2, cfg.Budgets.QuarantineAfter), run.FinishedAt); err != nil {
+					return nil, err
+				}
+			case model.OutcomeSuccess, model.OutcomeNoop, model.OutcomeBlocked:
+				if err := budgets.ClearFailure(item.ID, stage); err != nil {
+					return nil, err
+				}
+			}
+		}
+		ok, reason, err := budgets.ReserveModel(item.ID, stage, time.Now().UTC().Format("2006-01-02"), cfg.Budgets.MaxRunsPerItem, cfg.Budgets.MaxRunsPerDay)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("model run refused by execution budget (%s)", reason)
+		}
+	}
+	tr, err := eng.Advance(ctx, sourceName, item, stage, model.Resume{})
+	if tr == nil || !tr.ModelRun {
+		return tr, err
+	}
+	switch tr.Outcome {
+	case model.OutcomeFailure, model.OutcomeTimeout:
+		_, ledgerErr := budgets.RecordFailure(item.ID, stage, tr.FailureSignature, tr.FailureReason, tr.RunID,
+			max(2, cfg.Budgets.QuarantineAfter), time.Now())
+		return tr, errors.Join(err, ledgerErr)
+	case model.OutcomeInterrupted:
+		return tr, err
+	default:
+		return tr, errors.Join(err, budgets.ClearFailure(item.ID, stage))
+	}
 }
 
 func report(tr *pipeline.Transition) {
@@ -619,6 +717,34 @@ func cmdServe(args []string) error {
 		return err
 	}
 	return srv.Run(ctx, server.Addr(*addr), mode)
+}
+
+func cmdBudgetReset(args []string) error {
+	c := newFlags("budget-reset")
+	reason := c.fs.String("reason", "", "why the existing model-run ledger is being reset (required)")
+	cfg, r, _, stop, err := c.load(args)
+	if err != nil {
+		return err
+	}
+	defer stop()
+	if strings.TrimSpace(*reason) == "" {
+		return errors.New("-reason is required; a budget reset must be auditable")
+	}
+	release, err := own(cfg, r, false)
+	if err != nil {
+		return err
+	}
+	defer release()
+	archive, err := store.ResetBudgets(filepath.Join(cfg.DataDir(), "budgets.json"), *reason, time.Now())
+	if err != nil {
+		return err
+	}
+	if archive == "" {
+		fmt.Println("model-run budget ledger initialized")
+	} else {
+		fmt.Printf("model-run budget ledger reset; previous ledger archived at %s\n", archive)
+	}
+	return nil
 }
 
 func carryOverForServe(s *server.Server, mode server.Mode) error {

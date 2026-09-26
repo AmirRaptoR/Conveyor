@@ -346,6 +346,8 @@ func TestDrainWaitsForAdvanceInWatchMode(t *testing.T) {
 // still running.
 func TestServerRunDoesNotReturnUntilDrained(t *testing.T) {
 	cfg, r, dir := resistantPipelineFor(t)
+	cfg.Budgets.MaxRunsPerItem = 20
+	cfg.Budgets.MaxRunsPerDay = 200
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := New(cfg, r)

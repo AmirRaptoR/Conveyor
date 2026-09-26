@@ -11,7 +11,7 @@ import { dragging, justDragged, refusals, stageBy, wireDrag, wireQueue } from ".
 import { renderInbox } from "./inbox.js";
 import { cardPlan } from "./plans.js";
 import { applySteeringState } from "./steering.js";
-
+import { budgetChip, failureChip, renderPanelExecutionHold } from "./execution.js";
 // A draw() that lands mid-drag defers instead of touching #rail (see draw()
 // and shouldDeferDraw above); the drag's own dragend runs the one redraw that
 // was owed once it is safe to rebuild again.
@@ -19,13 +19,11 @@ let pendingRedraw = false;
 // Why each marked item is marked, keyed by item id — the engine's note, not the
 // provider's. See State.Blocks.
 export let blocks = {};
-// Why each held item is not moving, keyed by item id — the sequencing rule's
-// own note, and deliberately not a mark: nobody clears this, and it is gone
+// Why held items are not moving; deliberately not a mark, and gone
 // the moment the dependency moves on. See State.Held.
 export let heldBy = {};
 
-// Buckets every item into the stage it is actually in right now, folding in
-// the active-stage override so a card mid-transition shows in the stage it is
+// Buckets items by current stage, folding in the active-stage override so a card
 // being worked in rather than the one it left (see draw()'s own comment on
 // this, below). Exported because the source filter (#93) needs each stage's
 // full, unfiltered order in more than one place: draw() itself (rank, tally),
@@ -43,8 +41,7 @@ export function bucketByStage(stages, items, active) {
 }
 
 let firstDraw = true;
-// Every item by id, and the names of the terminal stages, as the last draw
-// saw them — what a card's dependency chip reads to say where each
+// Every item by id, and terminal stages, for dependency chips.
 // dependency stands. Rebuilt on every draw, never accumulated.
 let byId = new Map();
 let terminal = new Set();
@@ -242,12 +239,15 @@ export function draw() {
   const degradedNote = degradedSources.length
     ? ` &nbsp;·&nbsp; <span class="degraded">${degradedSources.length} source${degradedSources.length === 1 ? "" : "s"} not listing</span>`
     : "";
+  const budgetNote = state.budgetMaxRunsPerDay
+    ? ` &nbsp;·&nbsp; <span class="budget-day"${state.budgetNextEligibleAt ? ` title="model runs reset at ${esc(new Date(state.budgetNextEligibleAt).toLocaleString())}"` : ""}>${state.budgetDayRemaining} model run${state.budgetDayRemaining === 1 ? "" : "s"} left today</span>`
+    : "";
   $("#line1").innerHTML = (active.length === 1
     ? `<b>${esc(active[0].stage)}</b> running &middot; ${esc(active[0].itemId)}`
     : active.length
       ? `<b>${active.length}</b> running &middot; ${active.map(a => esc(a.stage)).join(", ")}`
       : `<b>${items.length}</b> items${asking.length ? `, <b>${asking.length}</b> need${asking.length === 1 ? "s" : ""} you`
-          : held ? `, <b>${held}</b> stopped` : ""} &nbsp;·&nbsp; updated ${when}`) + degradedNote;
+          : held ? `, <b>${held}</b> stopped` : ""} &nbsp;·&nbsp; updated ${when}`) + budgetNote + degradedNote;
 
   // Rebuilt from the same `state`/`blocks` the rail just drew from, so the
   // inbox is never a step behind it — and before the wiring loop below, so
@@ -294,6 +294,7 @@ export function draw() {
   // rather than only when the panel first opens.
   if (openItemId) {
     renderPanelActions(openItemId);
+    renderPanelExecutionHold(openItemId);
     renderPanelRelationships(openItemId);
     refreshOpenStop(openItemId, false);
   }
@@ -466,6 +467,8 @@ function card(it, active, place) {
       ${ranked && !working && !it.blocked ? `<span class="rank">${place + 1}</span>` : ""}
       ${hasPrio ? `<span class="prio">p${it.priority}</span>` : ""}
       ${working ? "" : waitChip(it)}
+      ${failureChip(it)}
+      ${budgetChip(it)}
       ${ageChip(it)}
       <span class="src">${esc(it.id)}</span>
       ${it.url ? (isHttpUrl(it.url)

@@ -299,6 +299,20 @@ config schema and canonical release directory. In production the badge must say
 
 ### Migrating an existing checkout-based service
 
+Before starting autonomous mode after upgrading from the all-transition budget
+ledger, add positive `budgets.maxRunsPerItem` and `budgets.maxRunsPerDay` values.
+If `data/budgets.json` predates the model-only ledger, startup names the reset
+command. Stop the service and run it as the service account:
+
+```bash
+conveyor budget-reset -c /var/lib/conveyor/conveyor.yaml \
+  -reason 'migrate dispatch counts to model-only execution budgets'
+```
+
+The old file remains beside the new one as `budgets.json.reset-<UTC>`; the new
+ledger records the reason and time. There is no automatic numerical migration
+because old counts do not say which transitions invoked a model.
+
 The data directory is not independently configurable: it is always `data/`
 beside `conveyor.yaml`. Moving only the config would silently discard run
 history, ordering, saved answers, pauses, budgets, push subscriptions and the
