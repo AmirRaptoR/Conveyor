@@ -261,7 +261,8 @@ that must not live in the Conveyor repository. The installer snapshots its
 `agents/local-<source>/`, before the release manifest is generated. Configure
 those entries with `agent: local-<source>` rather than an external `script:`
 path; the running release then executes the hashed snapshot, never the mutable
-source directory.
+source directory. Editor backups ending in `.bak` or `~` are excluded so they
+cannot become a second ambiguous match for an adapter.
 
 The installer performs these operations in order:
 
