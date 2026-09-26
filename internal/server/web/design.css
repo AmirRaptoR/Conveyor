@@ -109,9 +109,7 @@ aside { width:min(760px, 96vw); }
 .report h1 { font-size:15px; font-weight:600; }
 .report h2 { font-size:13px; font-weight:600; letter-spacing:0; text-transform:none; margin-top:16px; }
 .report th { letter-spacing:0; text-transform:none; }
-.drow .dstatus { font-size:11.5px; letter-spacing:0; text-transform:none; }
 .askhdr { font-size:12.5px; letter-spacing:0; text-transform:none; }
-.doctor-sweep { margin:0 22px 10px; }
 @media (max-width: 640px) {
   body { height:auto; min-height:100vh; }
   .line { height:auto; }

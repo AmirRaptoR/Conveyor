@@ -227,14 +227,42 @@ chk "and names the shape distinctly from a decision" \
 	"$(grep -c 'nobody has to choose anything' "$tmp/scene/claude_prompt")" "1"
 
 # The old provider-side guard remains for configurations without the engine
-# gate, but must stand down when dependenciesAt already authorised this run.
+# gate, but is a typed poll rather than a mark. It must stand down when
+# dependenciesAt already authorised this run.
 scene; pr_fixture 109
 echo open >"$tmp/scene/depstate"
 rc=$(run_implement 109 "Depends on #12")
-chk "a legacy configuration still blocks an open dependency" "$rc" "20"
-chk "    with the dependency kind" "$(kind)" "dependency"
+chk "a legacy configuration waits on an open dependency" "$rc" "10"
+chk "    with a typed polling recovery" \
+	"$(jq -r '[.waiting.class,.waiting.key] | join(" ")' "$CONVEYOR_RESULT")" \
+	"poll dependency:#12"
 chk "    after checking the provider" \
 	"$(grep -c 'repos/owner/repo/issues/12' "$tmp/scene/gh_calls")" "1"
+
+scene; pr_fixture 109; touch "$tmp/scene/fail_depstate"
+rc=$(run_implement 109 "Depends on #12")
+chk "an unreadable dependency uses network recovery" "$rc" "10"
+chk "    and never dispatches the model" \
+	"$([[ -f "$tmp/scene/claude_prompt" ]] && echo ran || echo no)" "no"
+chk "    with the unavailable dependency in its stable key" \
+	"$(jq -r '.waiting.class + " " + .waiting.key' "$CONVEYOR_RESULT")" \
+	"network dependencies:#12"
+
+scene; pr_fixture 109
+echo open >"$tmp/scene/depstate"
+rc=$(CONVEYOR_RECOVERY_PROBE=1 CONVEYOR_RECOVERY_CLASS=poll \
+	CONVEYOR_RECOVERY_KEY=dependency:#12 run_implement 109 "Depends on #12")
+chk "an unchanged dependency probe stays out of the stage" "$rc" "10"
+chk "    and never dispatches the model" \
+	"$([[ -f "$tmp/scene/claude_prompt" ]] && echo ran || echo no)" "no"
+
+scene; pr_fixture 109
+echo closed >"$tmp/scene/depstate"
+rc=$(CONVEYOR_RECOVERY_PROBE=1 CONVEYOR_RECOVERY_CLASS=poll \
+	CONVEYOR_RECOVERY_KEY=dependency:#12 run_implement 109 "Depends on #12")
+chk "a dependency state change wakes one ordinary run" "$rc" "0"
+chk "    before model dispatch" \
+	"$([[ -f "$tmp/scene/claude_prompt" ]] && echo ran || echo no)" "no"
 
 scene; pr_fixture 110
 echo open >"$tmp/scene/depstate"

@@ -6,8 +6,8 @@
 # Nine of the seventeen "needs a decision" stops in one week were an agent
 # reading "Depends on #353" in the body and stopping because #353 was open.
 # That is not a decision; it is a condition with a known end, so it is a
-# `dependency` mark, and the doctor clears it once every number named is
-# closed (agents/claude/doctor).
+# typed poll on legacy configurations. With dependenciesAt, pipeline.Deps owns
+# the hold directly and wakes it from fresh listing state.
 
 # dependency_refs <body> — the issue numbers named in a sentence that declares
 # a dependency: "Depends on #12", "Blocked by: #12, #13", "- depends on #12",
@@ -114,14 +114,21 @@ dependency_refs() {
 }
 
 # open_dependencies <body> — "#12 #13" for every named dependency that is
-# still open, or nothing. An issue that cannot be read is not counted: a
-# number from another repository or a typo must not hold an item forever.
+# still open, or nothing. Also sets DEPENDENCIES_UNAVAILABLE for reads GitHub
+# could not answer: absence is not evidence that a prerequisite is complete.
 open_dependencies() {
-	local n out=""
+	local n out="" state
+	OPEN_DEPENDENCIES=""
+	DEPENDENCIES_UNAVAILABLE=""
 	for n in $(dependency_refs "$1"); do
-		if [[ "$(gh api "repos/$REPO/issues/$n" --jq .state 2>/dev/null)" == "open" ]]; then
+		if ! state=$(gh api "repos/$REPO/issues/$n" --jq .state 2>/dev/null); then
+			DEPENDENCIES_UNAVAILABLE="${DEPENDENCIES_UNAVAILABLE:+$DEPENDENCIES_UNAVAILABLE }#$n"
+			continue
+		fi
+		if [[ "$state" == "open" ]]; then
 			out="${out:+$out }#$n"
 		fi
 	done
+	OPEN_DEPENDENCIES=$out
 	printf '%s' "$out"
 }

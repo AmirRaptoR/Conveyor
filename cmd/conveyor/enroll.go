@@ -260,19 +260,6 @@ func enrollFlow(cfg *config.Config, asker *enroll.Asker) (name, block string, er
 		choices = append(choices, c)
 	}
 
-	wantDoctor, err := asker.AskBool("DOCTOR_ENABLED",
-		"add an optional doctor: script too? (used by the board's Diagnose sweep)", false)
-	if err != nil {
-		return "", "", err
-	}
-	if wantDoctor {
-		c, err := askScriptChoice(asker, "doctor", agentNames)
-		if err != nil {
-			return "", "", err
-		}
-		choices = append(choices, c)
-	}
-
 	scripts := enroll.BuildScripts(choices)
 	block, err = enroll.Fill(tmpl, name, workdir, scripts, promptAnswers)
 	if err != nil {

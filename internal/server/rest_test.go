@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
+	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 )
 
@@ -62,6 +64,39 @@ sources:
 	return cfg, runner.New(filepath.Join(dir, "runs")), dir
 }
 
+func TestTypedWaitPersistsOnFirstEntryAndRestoresAfterRestart(t *testing.T) {
+	cfg, r, dir := deferringPipeline(t)
+	runDir := filepath.Join(dir, "first-entry")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "result.json"), []byte(
+		`{"waiting":{"class":"poll","key":"draft:7","why":"PR #7 is still a draft"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(cfg, r)
+	item := model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "working", Title: "first entry"}
+	s.state.Items = []model.Item{item}
+	s.applyTransition(&pipeline.Transition{
+		Item: item, From: "backlog", Stage: "working",
+		Outcome: model.OutcomeNoop, RunDir: runDir,
+	})
+	entry, ok := s.recovery.Get("item", item.ID)
+	if !ok || entry.Class != recoveryPoll || entry.Key != "draft:7" {
+		t.Fatalf("first-entry recovery = %+v, present=%v", entry, ok)
+	}
+
+	s2 := New(cfg, r)
+	s2.mu.RLock()
+	resting := s2.resting[item.ID]
+	wait := s2.waiting[item.ID]
+	s2.mu.RUnlock()
+	if !resting || wait.Class != recoveryPoll || wait.Key != "draft:7" {
+		t.Fatalf("restart restored resting=%v wait=%+v", resting, wait)
+	}
+}
+
 // Exit 10 says "leave it, try again next poll" (CONTRACTS §2), and the engine
 // answered "try again now": a finished transition wakes the scheduler, the item
 // is still workable in the stage it never left, and nothing else can outrank a
@@ -93,6 +128,90 @@ func TestANoOpWaitsForTheNextListing(t *testing.T) {
 	// It must still be retried — deferring is not giving up.
 	if got < 2 {
 		t.Errorf("stage ran %d time(s) across %d listings; it should retry once per listing", got, listings)
+	}
+}
+
+func TestTypedWaitUsesTransientProbesUntilDiagnosisChanges(t *testing.T) {
+	cfg, r, dir := deferringPipeline(t)
+	stageRuns := filepath.Join(dir, "stageruns")
+	probes := filepath.Join(dir, "probes")
+	changed := filepath.Join(dir, "changed")
+	rediagnosed := filepath.Join(dir, "rediagnosed")
+	writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), `#!/bin/sh
+echo x >> `+filepath.Join(dir, "lists")+`
+stage=working
+if [ -e `+changed+` ]; then stage=done; fi
+printf '[{"id":"s1:1","ref":"1","source":"s1","stage":"%s","title":"waiting on the outside world"}]\n' "$stage" > "$CONVEYOR_RESULT"
+`)
+	writeScript(t, filepath.Join(dir, "work.sh"), `#!/bin/sh
+if [ "${CONVEYOR_RECOVERY_PROBE:-}" = 1 ]; then
+  echo x >> `+probes+`
+  if [ -e `+changed+` ]; then exit 0; fi
+  if [ -e `+rediagnosed+` ]; then
+    printf '%s\n' '{"waiting":{"class":"poll","key":"checks:7:PENDING","why":"checks are pending"}}' > "$CONVEYOR_RESULT"
+    exit 10
+  fi
+  printf '%s\n' '{"waiting":{"class":"poll","key":"draft:7","why":"PR #7 is still a draft"}}' > "$CONVEYOR_RESULT"
+  exit 10
+fi
+echo x >> `+stageRuns+`
+if [ -e `+changed+` ]; then exit 0; fi
+if [ -e `+rediagnosed+` ]; then
+  printf '%s\n' '{"waiting":{"class":"poll","key":"checks:7:PENDING","why":"checks are pending"}}' > "$CONVEYOR_RESULT"
+  exit 10
+fi
+printf '%s\n' '{"waiting":{"class":"poll","key":"draft:7","why":"PR #7 is still a draft"}}' > "$CONVEYOR_RESULT"
+exit 10
+`)
+
+	oldSweep, oldBase, oldCap := recoverySweepInterval, recoveryPollBase, recoveryPollCap
+	recoverySweepInterval, recoveryPollBase, recoveryPollCap = 10*time.Millisecond, 20*time.Millisecond, 40*time.Millisecond
+	defer func() { recoverySweepInterval, recoveryPollBase, recoveryPollCap = oldSweep, oldBase, oldCap }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(cfg, r)
+	s.ctx = ctx
+	defer drain(t, s, cancel)
+	go s.poll(ctx)
+	go s.schedule(ctx)
+	go s.recover(ctx)
+	go s.button(ctx, ModeAuto)
+
+	waitFor(t, "the stage to diagnose its deterministic wait", func() bool { return countLines(stageRuns) == 1 })
+	waitFor(t, "a transient recovery probe", func() bool { return countLines(probes) >= 1 })
+	time.Sleep(150 * time.Millisecond)
+	if got := countLines(stageRuns); got != 1 {
+		t.Fatalf("unchanged diagnosis created %d stage runs, want exactly the first", got)
+	}
+	beforeProbes := countLines(probes)
+	s.tick <- struct{}{}
+	waitFor(t, "the tick to expedite a transient probe", func() bool { return countLines(probes) > beforeProbes })
+	if got := countLines(stageRuns); got != 1 {
+		t.Fatalf("tick bypassed recovery and created %d stage runs, want exactly the first", got)
+	}
+
+	if err := os.WriteFile(rediagnosed, []byte("checks"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "one real stage run after the typed diagnosis changed", func() bool { return countLines(stageRuns) == 2 })
+	time.Sleep(100 * time.Millisecond)
+	if got := countLines(stageRuns); got != 2 {
+		t.Fatalf("changed typed diagnosis created %d stage runs, want exactly two total", got)
+	}
+	if err := os.Remove(rediagnosed); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(changed, []byte("ready"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "one real stage run after the probe observed readiness", func() bool { return countLines(stageRuns) == 3 })
+	time.Sleep(100 * time.Millisecond)
+	if got := countLines(stageRuns); got != 3 {
+		t.Fatalf("two changed diagnoses created %d stage runs, want exactly three total", got)
+	}
+	if _, ok := s.recovery.Get("item", "s1:1"); ok {
+		t.Fatal("settled item retained its recovery ledger entry")
 	}
 }
 

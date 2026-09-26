@@ -39,7 +39,7 @@ func New() *Registry { return &Registry{byItem: map[string]*liveEntry{}} }
 
 // Open records a live run for itemID. Only a "stage" run with a non-empty
 // item id and target stage should ever be passed here — a list, move,
-// doctor or status run is never steerable, and that filtering is the
+// list, move or status run is never steerable, and that filtering is the
 // caller's (Runner.OnStart's) job, not this package's.
 func (r *Registry) Open(itemID string, e Entry) {
 	next := &liveEntry{entry: e}

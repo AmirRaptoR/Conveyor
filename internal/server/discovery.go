@@ -16,6 +16,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 	"github.com/AmirRaptoR/Conveyor/internal/source"
 	"github.com/AmirRaptoR/Conveyor/internal/steering"
+	"github.com/AmirRaptoR/Conveyor/internal/store"
 )
 
 // discoveryWorkers bounds how many sources are listed at once. Listing is I/O
@@ -47,79 +48,6 @@ func (s *Server) poll(ctx context.Context) {
 	}
 }
 
-// stalled watches for the board stopping altogether and, on an interval, hands
-// it back. Only when *everything* is marked: while one item can still move, a
-// mark is a decision a person has to answer, and clearing it spends an agent
-// run to be told the same thing.
-//
-// A total stall is a different animal. It is almost always the outside world —
-// every agent over its usage limit, a credential that expired overnight, a
-// worktree one dead run left dirty — and those come back on their own, hours
-// after the board gave up. Without this the line stays stopped until somebody
-// looks at it, which on a Sunday is the whole weekend.
-//
-// It reports what it did. An automatic recovery nobody can see is how a board
-// starts lying about why work restarted.
-func (s *Server) stalled(ctx context.Context, every time.Duration) {
-	t := time.NewTicker(every)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		if s.inFlight.Load() != 0 {
-			continue // something is running; by definition not stalled
-		}
-		// The one stall this must not touch. Its whole premise is that the
-		// cause may have passed — but an agent out of quota is a cause with a
-		// known end, and handing every item back before that end spends one
-		// refused run per item to learn what the pause already knows. That was
-		// this timer's own worst hour: eight or nine items, every hour, all
-		// night, against a weekly limit thirty hours from resetting.
-		if s.anyPaused() {
-			continue
-		}
-		s.mu.RLock()
-		deps := pipeline.NewDeps(s.cfg, s.state.Items)
-		var held []model.Item
-		moving := 0
-		for _, it := range s.state.Items {
-			switch {
-			case it.Blocked:
-				// A tracking mark is derived from this listing, not a transient
-				// script failure. Only a later fresh listing proving the topology
-				// repaired may clear it; retrying cannot discover anything new.
-				if it.Tracking && s.blocks[it.ID].Kind == trackingKind {
-					continue
-				}
-				// A question is not part of a stall. It is not waiting for the
-				// world to come back, it is waiting for a person, and clearing
-				// it on a timer spends a run to be asked the same thing again.
-				// It is not counted as movable either: a board holding nothing
-				// but questions is genuinely stopped, and retrying it would be
-				// re-asking every one of them every hour.
-				if !s.blocks[it.ID].Asked {
-					held = append(held, it)
-				}
-			default:
-				if _, ok := pipeline.Target(s.cfg, &it, deps); ok {
-					moving++
-				}
-			}
-		}
-		s.mu.RUnlock()
-		if moving > 0 || len(held) == 0 {
-			continue
-		}
-		fmt.Fprintf(os.Stderr, "conveyor: every item is marked and nothing can move; clearing %d mark(s) to try again\n", len(held))
-		n := s.unblockAll(ctx, held)
-		fmt.Fprintf(os.Stderr, "conveyor: handed %d item(s) back to the pipeline\n", n)
-		s.wakeUp()
-	}
-}
-
 // button serves the tick control. In a running pipeline it means "look now", so
 // it wakes the scheduler; when watching, it is the only thing that ever moves
 // an item, so it performs the transition itself.
@@ -142,10 +70,33 @@ func (s *Server) button(ctx context.Context, mode Mode) {
 				s.advance(ctx)
 				s.refresh(ctx)
 			default: // auto
-				// "Look again now", so nothing gets to say "not yet".
+				// "Look again now" still goes through typed recovery. Clearing
+				// one of these deferrals would bypass its read-only probe and
+				// dispatch the stage (and possibly its model) directly. Pollable
+				// conditions are made due now; authoritative quota/clock waits
+				// retain the instant their adapter reported.
+				recovering := map[string]bool{}
+				now := time.Now()
+				for _, entry := range s.recovery.All() {
+					if entry.Scope != "item" {
+						continue
+					}
+					recovering[entry.ID] = true
+					if entry.Class == recoveryNetwork || entry.Class == recoveryPoll || entry.Class == recoveryWorktree {
+						expedited := entry
+						expedited.NotBefore = now
+						if _, err := s.recovery.ReplaceIf(entry, expedited); err != nil {
+							fmt.Fprintf(os.Stderr, "conveyor: %s: expedite recovery probe: %v\n", entry.ID, err)
+						}
+					}
+				}
 				s.mu.Lock()
-				clear(s.resting)
-				clear(s.restingAt)
+				for id := range s.resting {
+					if !recovering[id] {
+						delete(s.resting, id)
+						delete(s.restingAt, id)
+					}
+				}
 				s.mu.Unlock()
 				s.wakeUp()
 			}
@@ -234,11 +185,20 @@ func (s *Server) refresh(ctx context.Context) {
 	s.hub.publish(event{Kind: "polling"})
 
 	var active []config.Source
+	now := time.Now()
 	for _, src := range s.cfg.Sources {
 		if !src.OK() { // its problems are already on the board
 			continue
 		}
 		if _, ok := s.eng.Client(src.Name); ok {
+			if retry, held := s.recovery.Get("source", src.Name); held && now.Before(retry.NotBefore) {
+				// Preserve this source's last-good board while its own API backoff
+				// is active. Every unrelated source still enters active below.
+				items = append(items, s.mergeSourceListing(src.Name, time.Time{}, nil, true)...)
+				failedNow[src.Name] = retry.Why
+				warnings = append(warnings, fmt.Sprintf("%s: %s (retry after %s)", src.Name, retry.Why, retry.NotBefore.UTC().Format(time.RFC3339)))
+				continue
+			}
 			active = append(active, src)
 		}
 	}
@@ -290,6 +250,14 @@ func (s *Server) refresh(ctx context.Context) {
 		if o.err != nil {
 			warnings = append(warnings, src.Name+": "+o.err.Error())
 			failedNow[src.Name] = o.err.Error()
+			old, _ := s.recovery.Get("source", src.Name)
+			next := nextRecovery(old, store.RecoveryEntry{
+				Scope: "source", ID: src.Name, Source: src.Name,
+				Class: recoveryNetwork, Key: "list", Why: o.err.Error(),
+			}, time.Now())
+			if err := s.recovery.Put(next); err != nil {
+				warnings = append(warnings, src.Name+": persist listing recovery: "+err.Error())
+			}
 			// A failed listing is no information about this source, not a
 			// signal that its work vanished: keep what was already known
 			// about it rather than have the wholesale assignment below wipe
@@ -297,6 +265,11 @@ func (s *Server) refresh(ctx context.Context) {
 			// an item still removes it — tombstones remain out of scope.
 			items = append(items, s.mergeSourceListing(src.Name, o.genStart, nil, true)...)
 			continue
+		}
+		if _, recovering := s.recovery.Get("source", src.Name); recovering {
+			if err := s.recovery.Delete("source", src.Name); err != nil {
+				warnings = append(warnings, src.Name+": clear listing recovery: "+err.Error())
+			}
 		}
 		listedNow[src.Name] = time.Now()
 		for _, w := range o.res.Warnings {
@@ -309,6 +282,24 @@ func (s *Server) refresh(ctx context.Context) {
 	s.askAgents(ctx)
 	s.recallBlocks(items)
 	storage := s.storageUse()
+	recoveringItems := map[string]bool{}
+	var staleRecoveries []store.RecoveryEntry
+	listedItems := make(map[string]model.Item, len(items))
+	for _, it := range items {
+		listedItems[it.ID] = it
+	}
+	for _, entry := range s.recovery.All() {
+		if entry.Scope != "item" {
+			continue
+		}
+		it, ok := listedItems[entry.ID]
+		if ok && !it.Blocked && it.Source == entry.Source && it.Stage == entry.Stage &&
+			(engineManagedRecovery(entry) || s.targetScriptBinding(it.Source, it.Stage) == entry.Script) {
+			recoveringItems[entry.ID] = true
+			continue
+		}
+		staleRecoveries = append(staleRecoveries, entry)
+	}
 
 	s.mu.Lock()
 	// Both fields describe the latest attempt, not a high-water mark: a
@@ -342,6 +333,9 @@ func (s *Server) refresh(ctx context.Context) {
 		srcOf[it.ID] = it.Source
 	}
 	for id := range s.resting {
+		if recoveringItems[id] {
+			continue
+		}
 		src, onBoard := srcOf[id]
 		gen, knownGen := s.sourceGen[src]
 		since, haveSince := s.restingAt[id]
@@ -418,6 +412,11 @@ func (s *Server) refresh(ctx context.Context) {
 		}
 	}
 	s.mu.Unlock()
+	for _, entry := range staleRecoveries {
+		if _, err := s.recovery.DeleteIf(entry); err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: %s: clear stale recovery: %v\n", entry.ID, err)
+		}
+	}
 	// Unlike cancels and the other caches above, an item's execution-budget
 	// ledger is deliberately never pruned by board visibility: MaxRunsPerItem
 	// is a lifetime ceiling that must survive an item scrolling off the

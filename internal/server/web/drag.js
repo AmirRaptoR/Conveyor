@@ -1,6 +1,6 @@
 import { $ } from "./dom.js";
 import { startableRule, controlsForMode, applyVisibleOrder } from "./pure.js";
-import { state, fault, startDoctor } from "./shared.js";
+import { state, fault } from "./shared.js";
 import { draw, blocks, flushPendingRedraw, bucketByStage } from "./board.js";
 
 // Dragging ends in a click; without this, dropping a card also opens it.
@@ -242,16 +242,6 @@ $("#unblock-all").onclick = async e => {
       + `${body.heldByDependencies} left marked — still sequenced behind something that has not caught up yet.`);
   }
   setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 2000);
-};
-
-$("#diagnose").onclick = () => {
-  // Dry run is the only thing a click starts — apply is a second, explicit
-  // press on the Apply button the result itself offers, never implied by this
-  // one. The blast radius is comments and clears across every marked item at
-  // once, and that is not a decision to make with one gesture.
-  const marked = (state?.items || []).filter(it => it.blocked).length;
-  if (!marked) { alert("Nothing is marked."); return; }
-  startDoctor(false);
 };
 
 $("#refresh").onclick = async () => {

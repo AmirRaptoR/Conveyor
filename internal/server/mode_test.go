@@ -119,7 +119,7 @@ func newModeServer(t *testing.T, cfg *config.Config, r *runner.Runner, mode Mode
 }
 
 // Every mutation route observe refuses, and none of them so much as started a
-// stage, a move or a doctor script.
+// stage or move script.
 func TestObserveModeRefusesEveryMutationRoute(t *testing.T) {
 	cfg, r, stageRuns, moveRuns, _, _ := modePipeline(t)
 	s, h := newModeServer(t, cfg, r, ModeObserve)
@@ -133,7 +133,6 @@ func TestObserveModeRefusesEveryMutationRoute(t *testing.T) {
 		{"POST", "/api/items/s1:1/start", nil},
 		{"POST", "/api/items/s1:2/unblock", []byte(`{}`)},
 		{"POST", "/api/unblock", nil},
-		{"POST", "/api/doctor", nil},
 	}
 	for _, rt := range routes {
 		code, _ := doReq(t, h, rt.method, rt.path, rt.body)
@@ -155,6 +154,16 @@ func TestObserveModeRefusesEveryMutationRoute(t *testing.T) {
 	}
 	if n := countLines(moveRuns); n != 0 {
 		t.Errorf("%d move(s) happened in observe mode, want 0", n)
+	}
+}
+
+func TestDoctorRoutesAreRemoved(t *testing.T) {
+	cfg, r, _, _, _, _ := modePipeline(t)
+	_, h := newModeServer(t, cfg, r, ModeAuto)
+	for _, method := range []string{"GET", "POST"} {
+		if code, _ := doReq(t, h, method, "/api/doctor", nil); code != http.StatusNotFound {
+			t.Errorf("%s /api/doctor = %d, want 404", method, code)
+		}
 	}
 }
 
@@ -184,44 +193,6 @@ func TestObserveModeStillServesReadsAndOrder(t *testing.T) {
 	}
 	if got := s.order.IDs(); len(got) != 2 || got[0] != "s1:2" {
 		t.Errorf("order = %v, want [s1:2 s1:1] persisted", got)
-	}
-}
-
-// retryStalled never runs under observe: every item stays marked across
-// several of its intervals and nothing moves. Mirrors exactly what Run does
-// — stalled only ever starts when mode.Runs() — rather than a real listener.
-func TestObserveModeNeverRunsRetryStalled(t *testing.T) {
-	cfg, r, _, moveRuns, _, _ := modePipeline(t)
-	cfg.RetryStalled = config.Duration(30 * time.Millisecond)
-	s := New(cfg, r)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	s.ctx = ctx
-	s.refresh(ctx)
-	s.mu.Lock()
-	for i := range s.state.Items {
-		s.state.Items[i].Blocked = true // the guard stalled itself requires
-	}
-	s.mu.Unlock()
-
-	if ModeObserve.Runs() {
-		t.Fatal("ModeObserve.Runs() = true; Run would launch retryStalled under it")
-	}
-	// What Run actually does: `if mode.Runs() { go s.stalled(...) }`. Since it
-	// does not here, nothing below should be able to move.
-	time.Sleep(150 * time.Millisecond) // several retryStalled intervals
-
-	s.mu.RLock()
-	stillMarked := true
-	for _, it := range s.state.Items {
-		stillMarked = stillMarked && it.Blocked
-	}
-	s.mu.RUnlock()
-	if !stillMarked {
-		t.Error("an item was unmarked; retryStalled must not run under observe")
-	}
-	if n := countLines(moveRuns); n != 0 {
-		t.Errorf("%d move(s) happened; retryStalled must not run under observe", n)
 	}
 }
 

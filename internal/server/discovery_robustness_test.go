@@ -225,6 +225,7 @@ func TestHungSourceRetainsLastGoodItemsFlaggedStale(t *testing.T) {
 	if err := os.Remove(hangFlag); err != nil {
 		t.Fatal(err)
 	}
+	expireSourceRecovery(t, s, "s1")
 	time.Sleep(1100 * time.Millisecond)
 	s.refresh(context.Background())
 	s1 = sourceView(t, s, "s1")

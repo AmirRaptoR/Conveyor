@@ -12,7 +12,9 @@ import (
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
+	"github.com/AmirRaptoR/Conveyor/internal/store"
 )
 
 // boardWithAction is boardFor with one stage that declares a manual action.
@@ -76,6 +78,12 @@ func TestAnActionIsArmedForTheNextRunAndEndsTheWait(t *testing.T) {
 	s.resting["s1:1"] = true
 	s.restingAt["s1:1"] = time.Now()
 	s.waiting["s1:1"] = model.Waiting{Why: "quiet period"}
+	if err := s.recovery.Put(store.RecoveryEntry{
+		Scope: "item", ID: "s1:1", Source: "s1", Stage: "working",
+		Class: recoveryUntil, Key: "quiet:7", NotBefore: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	if w := postAction(t, s, "s1:1", "merge-now"); w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d (%s), want 204", w.Code, w.Body.String())
@@ -88,6 +96,40 @@ func TestAnActionIsArmedForTheNextRunAndEndsTheWait(t *testing.T) {
 	}
 	if _, ok := s.waiting["s1:1"]; ok {
 		t.Error("the countdown outlived the wait it was counting down to")
+	}
+	if _, ok := s.recovery.Get("item", "s1:1"); ok {
+		t.Error("the persisted recovery outlived the manual action")
+	}
+}
+
+func TestActionWinsAgainstAnAlreadyFinishingWait(t *testing.T) {
+	cfg, r := boardWithAction(t)
+	s := New(cfg, r)
+	item := model.Item{ID: "s1:1", Source: "s1", Stage: "working"}
+	s.state.Items = []model.Item{item}
+	runDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(runDir, "result.json"), []byte(
+		`{"waiting":{"class":"until","key":"quiet:7","why":"quiet period","until":"2099-01-01T00:00:00Z"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The run has produced its wait, but its completion has not yet reached
+	// applyTransition. The person's action must remain newer than that result.
+	if w := postAction(t, s, item.ID, "merge-now"); w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d (%s), want 204", w.Code, w.Body.String())
+	}
+	s.applyTransition(&pipeline.Transition{
+		Item: item, From: "working", Stage: "working", Outcome: model.OutcomeNoop, RunDir: runDir,
+	})
+
+	if _, ok := s.recovery.Get("item", item.ID); ok {
+		t.Error("the finishing run recreated recovery after the manual action")
+	}
+	if s.resting[item.ID] {
+		t.Error("the finishing run restored the deferral after the manual action")
+	}
+	if got := s.answers.Get(item.ID).Manual; got != "merge-now" {
+		t.Fatalf("armed action = %q, want merge-now", got)
 	}
 }
 

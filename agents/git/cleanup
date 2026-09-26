@@ -50,10 +50,24 @@ no)
 	blocked no-output "#$ref reached cleanup but GitHub has no merged pull request closing it (issue is ${ISSUE_STATE:-unknown}). Its branch still holds the only copy of the work, so nothing here was deleted."
 	;;
 unavailable)
-	waits "cannot reach GitHub to confirm #$ref actually merged; not deleting anything until it can"
+	recovers network landed "cannot reach GitHub to confirm #$ref actually merged; not deleting anything until it can"
 	;;
 esac
 echo "#$ref landed as PR #$LANDED_PR" >&2
+
+# A remote-cleanup recovery probes connectivity only. It must not delete a
+# branch from a transient run: once the read succeeds, one ordinary stage run
+# performs the idempotent local and remote cleanup and records the outcome.
+if [[ "${CONVEYOR_RECOVERY_PROBE:-}" == "1" && "${CONVEYOR_RECOVERY_CLASS:-}" == "network" &&
+	"${CONVEYOR_RECOVERY_KEY:-}" == git-* ]]; then
+	remote_probe_rc=0
+	git ls-remote --heads "$remote" "$branch" >/dev/null 2>&1 || remote_probe_rc=$?
+	if [[ "$remote_probe_rc" -ne 0 && "$remote_probe_rc" -ne 2 ]]; then
+		recovers network "$CONVEYOR_RECOVERY_KEY" "cannot reach $remote while reconciling branch $branch"
+	fi
+	probe_changed
+fi
+probe_changed
 
 # The worktree, by the same ownership proof approve uses: a path is only ever
 # touched when it is provably this pipeline's (agents/_worktree).
@@ -71,14 +85,18 @@ fi
 
 # And on the remote. `gh pr merge --delete-branch` usually got here first, so
 # "already gone" is the expected answer and not a failure.
-if git ls-remote --exit-code --heads "$remote" "$branch" >/dev/null 2>&1; then
+remote_rc=0
+git ls-remote --exit-code --heads "$remote" "$branch" >/dev/null 2>&1 || remote_rc=$?
+if [[ "$remote_rc" -eq 0 ]]; then
 	if git push "$remote" --delete "$branch" >&2; then
 		echo "deleted $remote/$branch" >&2
 	else
-		echo "could not delete $remote/$branch; it can be removed by hand" >&2
+		recovers network "git-push:$remote:$branch" "could not delete $remote/$branch; waiting before retrying the remote"
 	fi
-else
+elif [[ "$remote_rc" -eq 2 ]]; then
 	echo "no $remote/$branch" >&2
+else
+	recovers network "git-remote:$remote:$branch" "cannot reach $remote to inspect branch $branch"
 fi
 
 git worktree prune 2>/dev/null || true

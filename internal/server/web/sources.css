@@ -61,25 +61,6 @@
 .agent .facts { display:flex; gap:14px; flex-wrap:wrap; padding-top:6px; color:var(--faint); }
 .agent .facts b { color:var(--dim); font-weight:400; }
 
-/* A doctor sweep: one row per marked item, updating in place as each one
-   settles. Never a count — a count cannot say which item was left, only
-   that some were. */
-.doctor-sweep { border:1px solid var(--rule); border-radius:6px; padding:10px 12px;
-  margin:0 16px 10px; font-size:12px; }
-.doctor-sweep .dhead { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
-.doctor-sweep .dhead b { color:var(--ink); font-weight:400; letter-spacing:.02em; }
-.doctor-sweep .dstate { color:var(--dim); }
-.doctor-sweep .dapply { color:var(--run); }
-.drow { display:flex; gap:10px; align-items:baseline; padding:2px 0; }
-.drow .ditem { color:var(--dim); min-width:120px; }
-.drow .dstatus { text-transform:uppercase; letter-spacing:.04em; font-size:10px; min-width:64px; }
-.drow.pending .dstatus { color:var(--faint); }
-.drow.skipped .dstatus { color:var(--faint); }
-.drow.cleared .dstatus { color:var(--ok); }
-.drow.left .dstatus { color:var(--run); }
-.drow.failed .dstatus { color:var(--stop); }
-.drow .dwhy { color:var(--dim); }
-
 /* What kind of stop it was, on the card. One word: the paragraph is in the
    panel, because a column of paragraphs cannot be read across. */
 .item .why {

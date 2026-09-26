@@ -474,8 +474,7 @@ func TestWorkableItemOutranksAFinishedTerminalItem(t *testing.T) {
 
 // The other unworkable items — marked, and resting in a queue with no exit —
 // are untouched by this change: they keep the rungs they have today, and sort
-// after every terminal item, which is what keeps the doctor sweep's order
-// (a second consumer of Order, over marked items only) exactly as it is now.
+// after every terminal item.
 func TestOtherUnworkableItemsSortAfterTerminalOnes(t *testing.T) {
 	cfg := &config.Config{Stages: []config.Stage{
 		{Name: "backlog", OnSuccess: "refining"},

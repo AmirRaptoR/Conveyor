@@ -83,7 +83,6 @@ func mutationRoutes() []struct{ method, path string } {
 		{"POST", "/api/items/s1:1/start"},
 		{"POST", "/api/items/s1:2/unblock"},
 		{"POST", "/api/unblock"},
-		{"POST", "/api/doctor"},
 		{"POST", "/api/refresh"},
 		{"PUT", "/api/order"},
 	}

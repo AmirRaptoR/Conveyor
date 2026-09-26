@@ -5,7 +5,7 @@ import "fmt"
 // Mode is what this process is willing to do to the pipeline. It replaces the
 // boolean -watch used to carry: auto drives the pipeline itself, manual only
 // ever moves an item when the tick button is pressed, and observe never runs a
-// stage script, a move or a doctor script at all — CONTRACTS' "watching only".
+// stage script or a move at all — CONTRACTS' "watching only".
 type Mode string
 
 const (
@@ -15,7 +15,7 @@ const (
 )
 
 // Runs reports whether this mode ever launches a transition on its own, absent
-// the tick button — the scheduler and the retryStalled sweep both gate on it.
+// the tick button — the scheduler gates on it.
 func (m Mode) Runs() bool { return m == ModeAuto }
 
 // Mutates reports whether this mode allows any mutation route to do anything

@@ -4,7 +4,8 @@ A `prioritising` stage records the order of a sequenced family of issues, and
 the scheduler enforces it: an item may never get further along the line than
 what it depends on.
 
-Status: design, approved 2026-09-06. Not yet planned or implemented.
+Status: historical design, implemented. Recovery references below describe the
+system as it existed at approval time; `docs/CONTRACTS.md` is authoritative.
 
 ## The problem
 

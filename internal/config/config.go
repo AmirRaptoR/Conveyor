@@ -65,15 +65,11 @@ type Config struct {
 	// shorter than Timeout, so an existing config needs no change to get the
 	// guard.
 	Discovery Duration `yaml:"discovery"`
-	// RetryStalled is how often to clear every mark when *every* item is
-	// marked and the line cannot move at all. A total stall usually means the
-	// outside world broke — an agent over its usage limit, an expired
-	// credential — and those fix themselves; a board that stays stopped until
-	// someone looks at it does not. Unset means never, and the guard is
-	// deliberately "everything": while any item can still move, a mark is a
-	// decision and clearing it would just spend an agent to be told again.
-	RetryStalled Duration `yaml:"retryStalled"`
-	Logs         Logs     `yaml:"logs"`
+	// Kept only so old files receive an actionable migration error instead of
+	// a generic unknown-field message. Automatic recovery is blocker-specific;
+	// it never clears every mark because a timer elapsed.
+	RetryStalled removedRetryStalled `yaml:"retryStalled"`
+	Logs         Logs                `yaml:"logs"`
 	// Auth is who may open the board. Empty is allowed only on loopback; see
 	// internal/config/auth.go and Server.Run.
 	Auth    Auth     `yaml:"auth"`
@@ -133,6 +129,12 @@ type Logs struct {
 	// Duration, but they mean different things — one wants the default, the
 	// other is a load error — and only the raw node tells them apart.
 	retentionSet bool
+}
+
+type removedRetryStalled struct{}
+
+func (*removedRetryStalled) UnmarshalYAML(*yaml.Node) error {
+	return fmt.Errorf("retryStalled has been removed; delete it because blocker-specific recovery replaces bulk clearing")
 }
 
 // UnmarshalYAML decodes into an unexported-field-preserving alias so
@@ -650,7 +652,7 @@ func (c *Config) AgentsInUse() []Agent {
 }
 
 // AgentStatusScript resolves agents/<name>/status, or "" when that agent has
-// none — the same optional-script convention `doctor` and `preflight` use.
+// none — the same optional-script convention provider preflight uses.
 func (c *Config) AgentStatusScript(agent string) string {
 	if path, err := findScript(filepath.Join(c.AgentsDir(), agent), "status"); err == nil {
 		return path
@@ -834,21 +836,6 @@ func (c *Config) resolveSources() {
 			s.Paths[st.Script] = path
 		}
 
-		// doctor is a reserved script key: no stage names it, and it is
-		// resolved here on its own account rather than by the loop above,
-		// which only resolves what a stage asks for. A source that declares
-		// none is not a problem — its marked items are simply skipped by a
-		// sweep — so only a declared-and-broken doctor: becomes a problem.
-		if spec, ok := s.Scripts["doctor"]; ok {
-			path, err := c.resolveScriptSpec("doctor", spec)
-			if err != nil {
-				note(`script "doctor": %v`, err)
-			} else if errs := checkScript(path, `script "doctor"`); len(errs) > 0 {
-				note("%s", strings.Join(errs, "; "))
-			} else {
-				s.Paths["doctor"] = path
-			}
-		}
 	}
 }
 
@@ -939,6 +926,9 @@ func (c *Config) Validate() []string {
 	}
 	for _, src := range c.Sources {
 		for name, spec := range src.Scripts {
+			if name == "doctor" {
+				add("source %q scripts.doctor has been removed; delete it because blocker-specific recovery replaces Doctor sweeps", src.Name)
+			}
 			declared(fmt.Sprintf("source %q script %q", src.Name, name), spec.Resources)
 		}
 	}

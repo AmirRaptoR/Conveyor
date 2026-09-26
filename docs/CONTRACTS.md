@@ -123,8 +123,8 @@ marked `no-output` are cleared by the same reconciliation so they can migrate
 without inventing a pull request. Questions and unrelated marks are left alone;
 stale source state and observe/manual modes never perform this reconciliation,
 while their read-only state still carries the computed lifecycle and reason.
-Tracking items are also excluded from doctor sweeps: their child graph is the
-diagnosis, and no stage or doctor script may turn non-work into agent work.
+Their child graph is the diagnosis, and no stage or recovery probe may turn
+non-work into agent work.
 
 For GitHub, native sub-issue data is authoritative. A child body may carry the
 strict fallback marker `Parent: #123` as its complete first metadata line;
@@ -358,7 +358,8 @@ provider and board readers keep consuming the same top-level fields:
 
 `outcome` is exactly `success`, `blocked`, `noop` or `waiting`. `blocked`
 requires `kind` and `reason`; `noop` requires `reason`; `waiting` requires
-`waiting.why` and permits a UTC `waiting.until`. The adapter returns exit 10 so
+`waiting.why` and permits a UTC `waiting.until`; adapters may also add the
+closed recovery `class` and a stable `key` described in §5. The adapter returns exit 10 so
 a stage that permits waiting takes the ordinary deferral path before its
 postconditions. `prioritise` is deliberately best-effort and treats that exit
 like any other missing decision: it writes its default and advances. A block may carry
@@ -549,54 +550,9 @@ promise, not the engine's redaction, which only ever covers what the *engine
 itself* prints (env values in `conveyor run -explain`, `conveyor enroll`'s
 stdout) and never rewrites a script's own prose.
 
-**`doctor`** (optional, `scripts.doctor:` — a reserved source-script key no
-stage names) — triage one marked item, on demand, as part of a *sweep* the
-board starts across every marked item at once (`POST /api/doctor`). Not a
-stage in an item's lifecycle: it runs across items, and a source that declares
-none simply has its marked items skipped by a sweep. Receives
-
-```json
-{"item": …, "stage": "review", "blocked": true,
- "block": {"kind": "turns", "reason": "…", "stage": "review",
-           "runId": "…", "at": "…", "asked": false},
- "runs": [ {"id": "…", "kind": "stage", "stage": "review", "outcome": "blocked",
-            "exitCode": 20, "timedOut": false,
-            "startedAt": "…", "finishedAt": "…", "dir": "…"} ]}
-```
-
-`runs` is that item's own history, newest first and capped at 20, including
-earlier doctor runs — trimmed, deliberately not the shape a run is stored in:
-it never carries `env` or `item`, which would hand a model every source
-parameter, tokens included. `block` never carries the block's `session`. A
-`decision` mark is never something a doctor may clear — see below.
-
-| Exit | Means | The sweep does |
-| --- | --- | --- |
-| `0` | hand it back | clears the mark; if `$CONVEYOR_RESULT` has a non-empty string `answer`, records it first (with the block's own session) so the next run resumes into it |
-| `10` | leave it | nothing |
-| `20` | the doctor itself needs a person | nothing to the item |
-| other, or a timeout | the doctor failed on this item | nothing to the item; the sweep continues |
-
-Every invocation is recorded with `kind: "doctor"`, never `"stage"` —
-§6's run history reader for a mark's reason reads only `kind: "stage"`, so a
-doctor run that exits 20 is never mistaken for the run that marked the item.
-
-A block with `asked: true` is skipped before the script runs — the same
-`asked` guard every bulk clear already applies. Immediately before a `0` is
-applied, the item is re-checked against the live board, not the snapshot the
-sweep began with: unblocked, or re-marked under a new run id, since it was
-diagnosed, and the row is skipped rather than acted on twice.
-
-`CONVEYOR_DRY_RUN=1` reaches the script when the sweep is a dry run — the
-default invocation, given the blast radius of a script that can act across
-every onboarded repository at once. A dry run clears no mark and records no
-answer, whatever the script exits; what a doctor writes to the *provider*
-under it (a comment, say) is the script's own promise, exactly as it already
-is for `move`.
-
 **`source.template.yaml`** (optional, `providers/<name>/source.template.yaml`)
 — not a script; never resolved by `findScript`, so it can never be mistaken
-for `list`, `move`, `status`, `doctor` or `preflight`, the way `onboard.sh`
+for `list`, `move`, `status` or `preflight`, the way `onboard.sh`
 and `selfcheck.sh` already avoid a name `provider:` could resolve. It is the
 one thing `conveyor enroll` reads to ask a provider's own questions without
 understanding what a param means:
@@ -1018,11 +974,45 @@ but only while the two are describing the same stop.
 **A script may say what it is waiting for.** Exiting 10 with
 `{"waiting": {"until": "<RFC 3339>", "why": "…"}}` in `$CONVEYOR_RESULT` says
 "nothing to do yet, and here is what would change that". The engine stores it
-against the item and hands it to the board, which draws a live countdown; it
-reads neither field and acts on neither. `until` is optional — plenty of waits
-have no deadline — and a wait without one says what it is for and draws no
-clock. It exists because a resting item and a stuck one look identical
-otherwise: both sit still, and only the script that stopped knows which.
+against the item and hands it to the board, which draws a live countdown.
+`until` is optional — plenty of waits have no deadline — and a wait without one
+says what it is for and draws no clock. An untyped wait remains presentation:
+the next successful listing permits the stage to be considered again.
+
+A deterministic wait adds `class` and `key`:
+
+```json
+{"waiting": {"class": "poll", "key": "draft:127",
+             "why": "pull request #127 is a draft"}}
+```
+
+The closed classes are `network`, `poll`, `until`, `quota` and `worktree`.
+`key` is the adapter's stable identity for the observed condition; changing it
+means the diagnosis changed. `network` uses bounded exponential backoff with
+stable hash-derived jitter (30 seconds through 30 minutes), `poll` uses one
+through five minutes, and `worktree` one through fifteen. `until` and `quota`
+use the exact reported instant. Source-list failures use the same network
+policy per source while preserving that source's last-good listing; one broken
+repository never delays another. Provider transition failures use the item
+ledger too. An outgoing move resumes from the successful run's pending-move
+record, so backoff never repeats the stage or turns an outage into a human mark.
+
+The ledger is persisted in the data directory, so restarts preserve the
+diagnosis, attempt and deadline. When due, the scheduler invokes the same
+adapter with `CONVEYOR_RECOVERY_PROBE=1` and the class/key in adjacent env
+variables. This invocation is transient: no run directory, run-history entry,
+live log/plan/steering event or notification. A shipped adapter must stop before
+model dispatch or provider mutation; a `worktree` probe may perform only its
+deterministic local reconciliation. Returning the same class/key reschedules
+the probe without creating a stage run. A changed result removes the ledger
+entry and permits exactly one ordinary stage run to record and route the new
+state. `until` and `quota` simply wake at their authoritative instant; the
+ordinary gate still has to pass.
+
+Dependencies do not need probes. Their state comes from the fresh listing used
+to build `pipeline.Deps`; a dependency moving clears its computed hold on that
+same refresh. Invalid, stale and still-behind dependencies remain held without
+a stage run.
 
 **A stop is either a question or a condition**, and the script says which. A
 condition — out of quota, a dirty checkout, a network that was down — may have
@@ -1036,11 +1026,9 @@ A question may also carry `"questions": [...]` — the AskUserQuestion shape
 engine passes it through on the block untouched, like `session`; the board
 turns it into a modal and sends the choices back as the `answer`.
 
-The engine reads the flag and never the word beside it. Conditions are cleared
-in bulk — `Unblock all`, `retryStalled`, an agent's quota returning. **A question
-is never cleared in bulk**, and is not counted towards a stall either: a board
-holding nothing but questions is stopped on purpose. Only answering it on its
-own card takes it off.
+The engine reads the flag and never the word beside it. `Unblock all` is an
+explicit person's action and skips questions. Automatic recovery never clears
+a question or re-runs its stage: only answering it on its own card takes it off.
 
 **`Unblock all` also leaves standing whatever the sequencing rule (§4a rung 1)
 would hold anyway.** A marked item whose dependency has not yet reached the
@@ -1057,21 +1045,13 @@ standing (`waitingOnYou`); an item that is both is counted once, under
 `waitingOnYou`. The one gap this accepts: a dependency the listing cannot see
 at all (an un-onboarded issue, another repository) is not something the engine
 can compute a hold for, so that item is still cleared here — `agents/_deps`
-remains the backstop that re-marks it at `implement` time, before the worktree
+remains the backstop that waits on it at `implement` time, before the worktree
 and before any model run.
 
-**Only a person clears a mark**, with four narrow exceptions. The first two are
-the outside world coming back rather than a decision being made; the third is
-the only one that reads the reason first; the fourth owns a lifecycle mark the
-engine itself derived rather than a script's decision.
+**Only a person clears a mark**, with three narrow exceptions owned by state
+the engine can verify rather than by a periodic guess.
 
-When *every* item is marked and the line cannot move at all, `retryStalled:`
-clears them on an interval and lets it try again. The guard is "everything" on
-purpose: while one item can still move, a mark is a decision waiting on a human,
-and clearing it spends an agent run to be told the same thing. A total stall is
-a different animal — it is almost always the outside world.
-
-And when an agent's `status` script goes from `limited` back to `ok`, the
+When an agent's `status` script goes from `limited` back to `ok`, the
 conditions of kind `limit` are cleared — those and no others. A `limit` says, in the
 script's own words, that nothing was wrong with the item and the agent had no
 quota left; the quota returning is the whole of the answer, and it arrives on a
@@ -1080,17 +1060,11 @@ a night of the line standing still for a reason that expired at 3am. A
 `decision` mark is untouched, because no amount of waiting produces an answer
 only a person has.
 
-The third is a **doctor** script (§3) clearing a mark it examined itself, one
-item at a time, as part of a sweep a person started (`POST /api/doctor`). It
-differs from the first two in kind, not just in trigger: `retryStalled` and a
-quota's return clear a mark blind, on the strength of "the outside world may
-have changed"; a doctor reads the mark's kind and reason, and that item's own
-run history, before deciding. The one invariant that does not move for it
-either: a `decision` mark is never something a doctor may clear — the adapter
-holds that rule, checked by a selfcheck rather than by trust, because the
-engine itself still never reads the word beside the flag.
+The second is one-time migration of a legacy script-authored `dependency` mark
+when the configuration enables `dependenciesAt`. The computed dependency hold
+then owns the condition; questions and every other mark remain untouched.
 
-The fourth is tracking lifecycle reconciliation described in §1. Only marks of
+The third is tracking lifecycle reconciliation described in §1. Only marks of
 kind `tracking`, plus legacy `no-output` marks on an explicitly tracking item,
 are cleared when the full fresh listing says the tracker is repaired. A
 question and every unrelated kind remain untouched. This runs only in automatic

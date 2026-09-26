@@ -1,5 +1,8 @@
 # Dependency-Aware Scheduling Implementation Plan
 
+> Historical implementation plan. Recovery references describe the system at
+> the time; `docs/CONTRACTS.md` is authoritative.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** An item may enter a stage its dependency has already entered, and no further — it may share that stage, never pass it, and never walk into a stage its dependency is marked in.

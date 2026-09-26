@@ -154,6 +154,7 @@ run() {
 		SCENE="$tmp/scene" REPO=o/n PROMPT="fix it" CONVEYOR_SOURCE=s1 \
 			QUIET_SECONDS="${QUIET:-0}" CONFLICT_RESOLVE="${CONFLICT_RESOLVE:-}" \
 			CONVEYOR_MANUAL="${CONVEYOR_MANUAL:-}" \
+			CONVEYOR_RECOVERY_PROBE="${CONVEYOR_RECOVERY_PROBE:-}" \
 			"$here/approve" >/dev/null 2>&1
 	rc=$?
 	echo "$rc"
@@ -275,6 +276,24 @@ scene; pr 9 OPEN; labels; details true MERGEABLE SUCCESS
 chk "(7) a draft waits"                       "$(run)" "10"
 chk "     and names the PR in what it's waiting for" \
 	"$(jq -r '.waiting.why // ""' "$CONVEYOR_RESULT" | grep -c '#9')" "1"
+chk "     and records a typed polling recovery" \
+	"$(jq -r '[.waiting.class,.waiting.key] | join(" ")' "$CONVEYOR_RESULT")" \
+	"poll draft:9"
+
+# A recovery probe repeats only deterministic reads. An unchanged diagnosis
+# remains a wait; a changed one returns before a provider write or model call.
+CONVEYOR_RECOVERY_PROBE=1
+chk "a probe preserves an unchanged draft diagnosis" "$(run)" "10"
+chk "     and keeps the same recovery key" \
+	"$(jq -r '.waiting.key' "$CONVEYOR_RESULT")" "draft:9"
+
+scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS \
+	'[{"id":"T1","isResolved":false,"comments":{"nodes":[{"body":"please change this","author":{"login":"reviewer"}}]}}]'
+rm -f "$tmp/claude-ran"
+chk "a changed probe returns before model dispatch" "$(run)" "0"
+chk "     and no model ran during the probe" \
+	"$([[ -f "$tmp/claude-ran" ]] && echo ran || echo no)" "no"
+unset CONVEYOR_RECOVERY_PROBE
 
 # (1/2) try_rebase always fails here (no worktree in this sandbox), whatever
 # CONFLICT_RESOLVE is set to — so with it at "0" this is exactly today's old
@@ -414,10 +433,9 @@ chk "     and gh pr merge actually ran"       "$([[ -f "$tmp/scene/merged" ]] &&
 
 # A confirmation read that itself fails is not the same as "not merged yet":
 # the merge was already issued, and only the read that would say what happened
-# to it is what broke. It defers (10) rather than marking, and stderr — the
-# one place this is visible, since stdout/stderr are logs and never parsed —
-# names both that the merge was already issued and the SHA it was issued at,
-# so this is never mistaken for the ordinary "still quiet" case in the log.
+# to it is what broke. It records a typed network wait rather than marking, and
+# stderr names both that the merge was already issued and the SHA it was issued
+# at, so this is never mistaken for the ordinary "still quiet" case in the log.
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS; touch "$tmp/scene/fail_confirm"
 : >"$CONVEYOR_RESULT"
 echo '{"item":{"ref":"7","title":"an item"}}' |
@@ -426,9 +444,11 @@ echo '{"item":{"ref":"7","title":"an item"}}' |
 		"$here/approve" >/dev/null 2>"$tmp/confirm_stderr"
 confirm_rc=$?
 chk "a failed confirmation read defers"           "$confirm_rc" "10"
-chk "     and it is not marked"                   "$([[ -s "$CONVEYOR_RESULT" ]] && echo written || echo empty)" "empty"
+chk "     as a typed network wait, not a mark" \
+	"$(jq -r '[.outcome,.waiting.class,.waiting.key] | join(" ")' "$CONVEYOR_RESULT")" \
+	"waiting network github-api"
 chk "     and stderr names the merge as already issued" \
-	"$(grep -c 'already issued' "$tmp/confirm_stderr")" "1"
+	"$(grep -q 'already issued' "$tmp/confirm_stderr" && echo yes)" "yes"
 chk "     naming the head it was issued at" \
 	"$(grep -o 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "$tmp/confirm_stderr" | sort -u | wc -l | tr -d ' ')" "1"
 

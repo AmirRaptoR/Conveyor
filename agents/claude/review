@@ -37,8 +37,7 @@ if [[ -n "${REPO:-}" ]]; then
 	pr_lookup "$ref" open
 	case "$PR_STATUS" in
 	unavailable)
-		echo "could not tell whether an open pull request closes #$ref; deferring rather than reporting nothing landed" >&2
-		exit 10
+		recovers network pr-identity "could not tell whether an open pull request closes issue #$ref; waiting before checking GitHub again"
 		;;
 	conflict)
 		asks decision "$PR_CONFLICT_REASON Repair the PR marker, closing reference, or branch before this item can proceed."
@@ -54,8 +53,7 @@ if [[ -n "${REPO:-}" ]]; then
 		item_landed "$ref"
 		case "$LANDED" in
 		unavailable)
-			echo "could not confirm whether #$ref already landed before reporting nothing to review; deferring" >&2
-			exit 10
+			recovers network landed "could not confirm whether issue #$ref already landed; waiting before checking GitHub again"
 			;;
 		yes)
 			echo "issue #$ref is already closed by merged pull request #$LANDED_PR; nothing to review"
@@ -77,11 +75,10 @@ by hand."
 	# this before spending a worktree or a model run finding it out. Checked
 	# before either.
 	if [[ "$PR_DRAFT" == "true" ]]; then
-		blocked draft "pull request #$PR_NUMBER, which closes issue #$ref, is \
-still a draft. A pull request must be marked ready before this item can \
-advance to approving; an implement run that did not reach \`gh pr ready\` is \
-the usual cause."
+		recovers poll "draft:$PR_NUMBER" "pull request #$PR_NUMBER, which closes issue #$ref, is \
+still a draft; waiting for it to be marked ready"
 	fi
+	probe_changed_unless worktree
 	pr=$PR_NUMBER
 	head=$PR_HEAD
 	echo "reviewing PR #$pr for $CONVEYOR_SOURCE #$ref — $title"
@@ -89,6 +86,7 @@ the usual cause."
 	# fixes and merges, both of which are writes: doing them in the repository a
 	# person works in is how a review lands on top of somebody's evening.
 	wt=$(item_worktree "$CONVEYOR_SOURCE" "$ref" "$head")
+	probe_changed
 	cd "$wt"
 	echo "  worktree: $wt  (branch $(git branch --show-current))"
 
@@ -216,8 +214,7 @@ fi
 if [[ $rc -eq 0 && -n "${REPO:-}" ]]; then
 	pr_lookup "$ref" all
 	if [[ "$PR_STATUS" == "unavailable" ]]; then
-		echo "could not confirm the pull request for #$ref still exists after the review; deferring" >&2
-		exit 10
+		recovers network pr-postcondition "could not confirm the pull request for issue #$ref still exists after review; waiting before checking GitHub again"
 	fi
 	if [[ "$PR_STATUS" == "conflict" ]]; then
 		asks decision "$PR_CONFLICT_REASON Repair the PR marker, closing reference, or branch before this item can proceed."
@@ -239,10 +236,8 @@ references #$ref any more. A run cut short by a usage limit looks exactly like t
 	# person can return a ready PR to draft while review is running. Never
 	# fires on MERGED: a merged PR is never a draft.
 	if [[ "$state" == "OPEN" && "$(jq -r '.[0].isDraft' <<<"$active")" == "true" ]]; then
-		blocked draft "pull request #$number, which closes issue #$ref, is \
-still a draft. A pull request must be marked ready before this item can \
-advance to approving; an implement run that did not reach \`gh pr ready\` is \
-the usual cause."
+		recovers poll "draft:$number" "pull request #$number, which closes issue #$ref, is \
+still a draft; waiting for it to be marked ready"
 	fi
 	echo "PR #$number is $state; handing it to the approving stage"
 fi

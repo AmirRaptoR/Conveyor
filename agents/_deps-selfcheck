@@ -151,5 +151,8 @@ STUB
 chmod +x "$tmp/bin/gh"
 chk "open_dependencies: one open, one closed, one unreadable -> only the open one" \
 	"$(open_dependencies 'Depends on #10, #12 and #14')" "#10"
+open_dependencies 'Depends on #10, #12 and #14' >/dev/null
+chk "open_dependencies reports unreadable dependencies separately" \
+	"$DEPENDENCIES_UNAVAILABLE" "#14"
 
 exit $fail

@@ -159,38 +159,6 @@ func TestALimitMarkPausesTheAgentAtOnce(t *testing.T) {
 	}
 }
 
-// The hourly grind this cost most. retryStalled's premise is that the cause of
-// a total stall may have passed — but an agent out of quota is a cause with a
-// known end, and handing every item back before it spends one refused run per
-// item. Nine items, every hour, all night, against a weekly limit thirty hours
-// from resetting.
-func TestTheStallTimerDoesNotClearMarksIntoAClosedDoor(t *testing.T) {
-	cfg, r, _ := pausableFor(t)
-	s := New(cfg, r)
-	s.ctx = context.Background()
-	s.state.Items = []model.Item{
-		{ID: "s1:1", Ref: "1", Source: "s1", Stage: "working", Blocked: true},
-		{ID: "s1:2", Ref: "2", Source: "s1", Stage: "working", Blocked: true},
-	}
-	s.blocks = map[string]Block{
-		"s1:1": {Kind: "limit", Reason: "out of quota"},
-		"s1:2": {Kind: "limit", Reason: "out of quota"},
-	}
-	s.pauseFor("fake", time.Now().Add(time.Hour), "out of quota until the reset", false)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go s.stalled(ctx, 20*time.Millisecond)
-	time.Sleep(150 * time.Millisecond) // several ticks
-	cancel()
-
-	s.mu.RLock()
-	held := len(s.blocks)
-	s.mu.RUnlock()
-	if held != 2 {
-		t.Errorf("%d mark(s) left after the stall timer ran; it cleared marks while the agent was paused", held)
-	}
-}
-
 // A pause has to end on its own. The agent names the reset in its own status
 // report, and that is the moment the quota comes back — checked when the
 // scheduler looks for work rather than on a timer of its own.

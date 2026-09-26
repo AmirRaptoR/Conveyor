@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
@@ -66,12 +67,10 @@ sources:
 	return cfg, runner.New(filepath.Join(dir, "runs")), dir
 }
 
-// F04: an initial provider move that fails must preserve the answer it read
-// (nothing ran to spend it), and must not be retried on every scheduler wake
-// — the item is deferred until the next listing, the same mechanism a
-// deferring stage already uses, so a failing provider is not hammered once
-// per poll interval instead of once per listing.
-func TestInitialMoveFailurePreservesTheAnswerAndDefersToTheNextListing(t *testing.T) {
+// An initial provider move that fails preserves the answer it read and enters
+// source-specific network backoff. Listings do not bypass the deadline; when it
+// expires only the provider transition is retried, since no stage ran yet.
+func TestInitialMoveFailurePreservesTheAnswerAndUsesNetworkBackoff(t *testing.T) {
 	cfg, r, dir := failsToEnterWorking(t)
 	attempts := filepath.Join(dir, "move-attempts")
 	s := New(cfg, r)
@@ -104,6 +103,13 @@ func TestInitialMoveFailurePreservesTheAnswerAndDefersToTheNextListing(t *testin
 	if !hasErr || terr.Reason == "" {
 		t.Error("no transition error was recorded for the board")
 	}
+	recovery, ok := s.recovery.Get("item", "s1:1")
+	if !ok || recovery.Class != recoveryNetwork || !strings.HasPrefix(recovery.Key, recoveryTransitionPrefix) {
+		t.Fatalf("provider move recovery = %+v, present=%v", recovery, ok)
+	}
+	if delay := time.Until(recovery.NotBefore); delay < 20*time.Second || delay > 40*time.Second {
+		t.Errorf("provider move retry delay = %s, want bounded first network backoff", delay)
+	}
 
 	// A second scheduler wake, with no listing in between, must not retry it.
 	if got := countLines(attempts); got != 1 {
@@ -116,10 +122,8 @@ func TestInitialMoveFailurePreservesTheAnswerAndDefersToTheNextListing(t *testin
 		t.Errorf("move was attempted %d time(s) across two wakes with no listing, want 1", got)
 	}
 
-	// The next listing clears the deferral (and, since the fixture always
-	// reports the item in backlog, restates the same state) and survives:
-	// the transition error must still be visible even though refresh
-	// replaces State.Warnings wholesale on every poll.
+	// A listing restates the item but does not bypass its backoff. The
+	// transition error remains visible even though refresh replaces warnings.
 	s.refresh(s.ctx)
 	s.mu.RLock()
 	_, stillThere := s.transitionErrs["s1:1"]
@@ -127,8 +131,16 @@ func TestInitialMoveFailurePreservesTheAnswerAndDefersToTheNextListing(t *testin
 	if !stillThere {
 		t.Error("the transition error did not survive a listing that did not touch this item")
 	}
+	if n := s.launch(s.ctx); n != 0 {
+		t.Fatalf("listing bypassed provider backoff and launched %d transition(s)", n)
+	}
+	recovery.NotBefore = time.Now().Add(-time.Second)
+	if err := s.recovery.Put(recovery); err != nil {
+		t.Fatal(err)
+	}
+	s.recoverDue(s.ctx, time.Now())
 	if n := s.launch(s.ctx); n != 1 {
-		t.Fatalf("after the next listing, launch dispatched %d transition(s), want 1 (one retry per listing)", n)
+		t.Fatalf("expired provider backoff dispatched %d transition(s), want 1", n)
 	}
 	waitFor(t, "the retried transition to finish", func() bool { return s.inFlight.Load() == 0 })
 	if got := countLines(attempts); got != 2 {

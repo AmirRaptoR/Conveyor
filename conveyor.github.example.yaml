@@ -29,9 +29,6 @@ resources:
   claude: 1
 
 poll: 5m
-retryStalled: 1h      # a total stall is almost always the outside world — a
-                      # usage limit, an expired credential — and both come back
-                      # on their own; see CLAUDE.md, "Only a person clears a mark"
 timeout: 90m          # default per-script timeout; a source may override per
                       # script — a slower repository's suite needs more room
                       # than a faster one's, and one number for both is either
@@ -147,12 +144,6 @@ sources:
         agent: claude
         params:
           QUIET_SECONDS: "600"
-      doctor:
-        # A reserved key — no stage names it. `POST /api/doctor` sweeps every
-        # item this repository has marked through it. A source declaring none
-        # simply has its marked items skipped by a sweep.
-        agent: claude
-
   # Leaving MODEL unset above is a choice, and the one this file ships: every
   # adapter then inherits whatever the operator's CLI is configured with. That
   # opinion belongs in a working config, where it can differ per repository —
