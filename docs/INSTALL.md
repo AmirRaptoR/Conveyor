@@ -369,23 +369,41 @@ identity explicitly; for example, to migrate PR #172 from the legacy
 `issue-128` branch to item #143:
 
 ```bash
+set -euo pipefail
 repo=OWNER/REPO
 pr=172
+old_item=128
 item=143
-old_branch=issue-128
 new_branch=issue-143
-base=$(gh pr view "$pr" --repo "$repo" --json baseRefName --jq .baseRefName)
-title=$(gh pr view "$pr" --repo "$repo" --json title --jq .title)
+meta=$(gh pr view "$pr" --repo "$repo" \
+  --json title,body,baseRefName,headRefOid,isDraft)
+base=$(jq -r .baseRefName <<<"$meta")
+title=$(jq -r .title <<<"$meta")
+head_oid=$(jq -r .headRefOid <<<"$meta")
 
-git fetch origin "$old_branch"
-git push origin "refs/remotes/origin/$old_branch:refs/heads/$new_branch"
+# Create the replacement branch in $repo itself, independent of this shell's
+# current checkout and its origin remote.
+gh api -X POST "repos/$repo/git/refs" \
+  -f ref="refs/heads/$new_branch" -f sha="$head_oid" >/dev/null
 body=$(mktemp)
-gh pr view "$pr" --repo "$repo" --json body --jq .body >"$body"
-# Edit $body so its closing reference names only #143 and remove any old
-# conveyor:item marker, then add the replacement marker.
+jq -r .body <<<"$meta" >"$body"
+sed -i -E \
+  -e "s/([Cc]lose[sd]?|[Ff]ix(e[sd])?|[Rr]esolve[sd]?)[:]?[[:space:]]*#$old_item/Closes #$item/g" \
+  -e 's/<!--[[:space:]]*conveyor:item[[:space:]][0-9]+[[:space:]]*-->//g' \
+  "$body"
 printf '\n<!-- conveyor:item %s -->\n' "$item" >>"$body"
+
+# Refuse to create a replacement that still names the old item or does not
+# carry both required identities for the child.
+! grep -Eiq "(close[sd]?|fix(e[sd])?|resolve[sd]?)[:]?[[:space:]]*#$old_item\\b|conveyor:item[[:space:]]+$old_item\\b" "$body"
+grep -Eiq "(close[sd]?|fix(e[sd])?|resolve[sd]?)[:]?[[:space:]]*#$item\\b" "$body"
+grep -Fq "<!-- conveyor:item $item -->" "$body"
+
+draft_args=()
+if jq -e .isDraft >/dev/null <<<"$meta"; then draft_args+=(--draft); fi
 replacement=$(gh pr create --repo "$repo" --head "$new_branch" --base "$base" \
-  --title "$title" --body-file "$body")
+  --title "$title" --body-file "$body" "${draft_args[@]}")
+[[ -n "$replacement" ]]
 gh pr close "$pr" --repo "$repo" --comment "Replaced by $replacement for item #$item."
 rm -f "$body"
 ```
