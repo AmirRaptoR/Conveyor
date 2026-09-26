@@ -103,8 +103,14 @@ type State struct {
 	// and guessing at a constant of its own is exactly what PollNs exists to
 	// avoid. Zero means that ceiling is unset (unlimited), the same meaning
 	// it has in config.
-	BudgetMaxRunsPerItem int `json:"budgetMaxRunsPerItem,omitempty"`
-	BudgetMaxRunsPerDay  int `json:"budgetMaxRunsPerDay,omitempty"`
+	BudgetMaxRunsPerItem int        `json:"budgetMaxRunsPerItem,omitempty"`
+	BudgetMaxRunsPerDay  int        `json:"budgetMaxRunsPerDay,omitempty"`
+	BudgetDayRemaining   *int       `json:"budgetDayRemaining,omitempty"`
+	BudgetNextEligibleAt *time.Time `json:"budgetNextEligibleAt,omitempty"`
+	// Failures are model failures held until a fresh provider version changes.
+	// Quarantined distinguishes a repeated identical signature from its first
+	// guarded failure; both preserve the item in its current stage.
+	Failures map[string]FailureView `json:"failures,omitempty"`
 	// Slots is what the concurrency locks are holding, against their limits. It
 	// is here rather than behind a debug flag because "nothing is starting" is
 	// the question this board gets asked most, and a held slot is the one cause
@@ -398,9 +404,14 @@ type CancelView struct {
 // BudgetOverrideView is the audit record of an operator letting one item keep
 // spending past its configured execution ceiling — who asked, why, and when.
 type BudgetOverrideView struct {
-	By     string    `json:"by,omitempty"`
-	Reason string    `json:"reason"`
-	At     time.Time `json:"at"`
+	By        string    `json:"by,omitempty"`
+	Reason    string    `json:"reason"`
+	At        time.Time `json:"at"`
+	Stage     string    `json:"stage"`
+	Remaining int       `json:"remaining"`
+	UsedAt    time.Time `json:"usedAt,omitempty"`
+	RevokedAt time.Time `json:"revokedAt,omitempty"`
+	RevokedBy string    `json:"revokedBy,omitempty"`
 }
 
 // BudgetView is one item's own execution-budget ledger: how many runs it has
@@ -410,8 +421,22 @@ type BudgetOverrideView struct {
 // items that have actually run at least once or carry an override; an item
 // that has never been dispatched has nothing here worth showing.
 type BudgetView struct {
-	Runs     int                 `json:"runs"`
-	Override *BudgetOverrideView `json:"override,omitempty"`
+	Runs            int                  `json:"runs"`
+	Remaining       int                  `json:"remaining"`
+	ModelRun        bool                 `json:"modelRun"`
+	Override        *BudgetOverrideView  `json:"override,omitempty"`
+	OverrideHistory []BudgetOverrideView `json:"overrideHistory,omitempty"`
+}
+
+type FailureView struct {
+	Stage            string    `json:"stage"`
+	Signature        string    `json:"signature"`
+	Reason           string    `json:"reason"`
+	RunID            string    `json:"runId"`
+	Count            int       `json:"count"`
+	Quarantined      bool      `json:"quarantined"`
+	At               time.Time `json:"at"`
+	ReleaseCondition string    `json:"releaseCondition"`
 }
 
 type SourceView struct {

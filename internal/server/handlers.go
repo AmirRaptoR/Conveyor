@@ -118,18 +118,29 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 			st.Cancels[id] = c
 		}
 	}
-	ids := make([]string, len(st.Items))
-	for i, it := range st.Items {
-		ids[i] = it.ID
-	}
 	s.mu.RUnlock()
 	st.ManualPauses = s.manualPauseList()
-	if budgets := s.budgetViews(ids); len(budgets) > 0 {
+	if budgets := s.budgetViews(st.Items); len(budgets) > 0 {
 		st.Budgets = budgets
+	}
+	if failures := s.failureViews(st.Items); len(failures) > 0 {
+		st.Failures = failures
 	}
 	st.BudgetDayUsage = s.budgets.DayUsage(budgetDay(time.Now()))
 	st.BudgetMaxRunsPerItem = s.cfg.Budgets.MaxRunsPerItem
 	st.BudgetMaxRunsPerDay = s.cfg.Budgets.MaxRunsPerDay
+	if st.BudgetMaxRunsPerDay > 0 {
+		remaining := st.BudgetMaxRunsPerDay - st.BudgetDayUsage
+		if remaining < 0 {
+			remaining = 0
+		}
+		st.BudgetDayRemaining = &remaining
+	}
+	if st.BudgetDayRemaining != nil && *st.BudgetDayRemaining == 0 {
+		now := time.Now().UTC()
+		next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+		st.BudgetNextEligibleAt = &next
+	}
 	writeJSON(w, st)
 }
 
@@ -288,7 +299,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, s.whyManuallyPaused(item.Source), http.StatusConflict)
 		return
 	case claimBudgetExhausted:
-		http.Error(w, s.whyBudgetExhausted(item.ID), http.StatusConflict)
+		http.Error(w, s.whyBudgetExhausted(item.ID, target), http.StatusConflict)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -10,8 +11,10 @@ import (
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 	"github.com/AmirRaptoR/Conveyor/internal/server"
+	"github.com/AmirRaptoR/Conveyor/internal/store"
 )
 
 // -watch selects observe and says so; an explicit, conflicting -mode is a
@@ -53,6 +56,70 @@ func TestResolveMode(t *testing.T) {
 				t.Errorf("note = %q, want it to contain %q", note, tc.wantNoteContains)
 			}
 		})
+	}
+}
+
+func TestCLIModelDispatchUsedByRunAndTickEnforcesBudgetAndFailureGate(t *testing.T) {
+	cfg := explainCfg(t)
+	cfg.Budgets = config.Budgets{MaxRunsPerItem: 1, MaxRunsPerDay: 10, QuarantineAfter: 2}
+	spec := cfg.Sources[0].Scripts["work"]
+	spec.Agent = "test-agent"
+	cfg.Sources[0].Scripts["work"] = spec
+	r := runner.New(filepath.Join(cfg.DataDir(), "runs"))
+	eng := pipeline.New(cfg, r)
+	budgets := store.OpenBudgets(filepath.Join(cfg.DataDir(), "budgets.json"))
+	item := &model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"}
+
+	if ok, _, err := budgets.ReserveModel(item.ID, "working", time.Now().UTC().Format("2006-01-02"), 1, 10); err != nil || !ok {
+		t.Fatalf("seed item budget: ok=%v err=%v", ok, err)
+	}
+	if tr, err := advanceCLI(context.Background(), cfg, eng, r.Root, budgets, "s1", item, "working"); err == nil || tr != nil || item.Stage != "backlog" {
+		t.Fatalf("budgeted CLI dispatch = tr=%+v err=%v stage=%s, want refusal before provider move", tr, err, item.Stage)
+	}
+
+	item2 := &model.Item{ID: "s1:2", Ref: "2", Source: "s1", Stage: "working"}
+	if _, err := budgets.RecordFailure(item2.ID, "working", "sig", "same failure", "run-1", 2, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if tr, err := advanceCLI(context.Background(), cfg, eng, r.Root, budgets, "s1", item2, "working"); err == nil || tr != nil {
+		t.Fatalf("failure-held CLI dispatch = tr=%+v err=%v, want refusal", tr, err)
+	}
+}
+
+func TestCLIListingReleasesChangedEvidenceAndFiltersHeldCandidatesBeforePick(t *testing.T) {
+	cfg := explainCfg(t)
+	cfg.Budgets = config.Budgets{MaxRunsPerItem: 10, MaxRunsPerDay: 20}
+	spec := cfg.Sources[0].Scripts["work"]
+	spec.Agent = "test-agent"
+	cfg.Sources[0].Scripts["work"] = spec
+	budgets := store.OpenBudgets(filepath.Join(cfg.DataDir(), "budgets.json"))
+	at := time.Now().Add(-time.Minute)
+	if _, err := budgets.RecordFailure("s1:1", "working", "sig", "failed", "run-1", 2, at); err != nil {
+		t.Fatal(err)
+	}
+	items := []model.Item{
+		{ID: "s1:1", Ref: "1", Source: "s1", Stage: "working", UpdatedAt: "v1"},
+		{ID: "s1:2", Ref: "2", Source: "s1", Stage: "backlog"},
+	}
+	if err := reconcileCLIListing(budgets, items, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileCLIListing(budgets, []model.Item{{ID: "s1:1", Source: "s1", Stage: "working", UpdatedAt: "v2"}}, time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	deps := pipeline.NewDeps(cfg, items)
+	available := availableCLIItems(cfg, budgets, items, deps, time.Now())
+	picked, _ := pipeline.Pick(cfg, available, nil, deps)
+	if picked == nil || picked.ID != "s1:1" {
+		t.Fatalf("changed evidence picked %+v, want released s1:1", picked)
+	}
+	if _, err := budgets.RecordFailure("s1:1", "working", "sig", "failed", "run-2", 2, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	available = availableCLIItems(cfg, budgets, items, deps, time.Now())
+	picked, _ = pipeline.Pick(cfg, available, nil, deps)
+	if picked == nil || picked.ID != "s1:2" {
+		t.Fatalf("held top candidate blocked unrelated work; picked %+v", picked)
 	}
 }
 

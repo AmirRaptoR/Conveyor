@@ -80,7 +80,7 @@ func (s *Server) claim(item model.Item, target string, overridePause bool) claim
 	// itself is what claim() returns claimAccepted for. On refusal, unwind
 	// everything already reserved — the same "changed nothing" guarantee
 	// claimSlotBusy above keeps.
-	if ok, _ := s.reserveBudget(item.ID); !ok {
+	if ok, _ := s.reserveBudget(item.ID, item.Source, target); !ok {
 		s.working.Delete(item.ID)
 		s.eng.Locks().Release(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...)
 		return claimBudgetExhausted
@@ -196,7 +196,7 @@ func (s *Server) launch(ctx context.Context) int {
 			// reason a paused agent and a manual pause are: claim spends the
 			// reservation atomically and is the authority, this only saves
 			// Pick from ranking a candidate that cannot actually launch.
-			if !s.budgetAvailable(it.ID) {
+			if !s.budgetAvailable(it.ID, it.Source, target) {
 				continue
 			}
 			if _, running := s.working.Load(it.ID); running {
@@ -377,6 +377,25 @@ func (s *Server) runOne(ctx context.Context, item model.Item, target string) {
 // interrupted job — running an agent over it a second time. The provider is
 // still the authority; this only stops the cache lying in the gap.
 func (s *Server) applyTransition(tr *pipeline.Transition) {
+	failureHeld := false
+	if tr.ModelRun {
+		switch tr.Outcome {
+		case model.OutcomeFailure, model.OutcomeTimeout:
+			threshold := s.cfg.Budgets.QuarantineAfter
+			if threshold < 2 {
+				threshold = 2
+			}
+			if _, err := s.budgets.RecordFailure(tr.Item.ID, tr.Stage, tr.FailureSignature, tr.FailureReason, tr.RunID, threshold, time.Now()); err != nil {
+				fmt.Fprintf(os.Stderr, "conveyor: %s: persist model failure gate: %v\n", tr.Item.ID, err)
+			} else {
+				failureHeld = true
+			}
+		default:
+			if err := s.budgets.ClearFailure(tr.Item.ID, tr.Stage); err != nil {
+				fmt.Fprintf(os.Stderr, "conveyor: %s: clear model failure gate: %v\n", tr.Item.ID, err)
+			}
+		}
+	}
 	wait, hasWait := waitingAt(tr.RunDir)
 	var recovery *store.RecoveryEntry
 	typedWaitRecovery := false
@@ -421,6 +440,17 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 
 	s.mu.Lock()
 	manualOverride := false
+	if tr.Outcome == model.OutcomeInterrupted {
+		if cancelled, ok := s.cancels[tr.Item.ID]; ok {
+			recovery = &store.RecoveryEntry{
+				Scope: "item", ID: tr.Item.ID, Source: tr.Item.Source, Stage: tr.Stage,
+				Script: s.targetScriptBinding(tr.Item.Source, tr.Stage), Class: recoveryOperator,
+				Key: cancelled.By, Why: "cancelled by operator: " + cancelled.Reason,
+			}
+			wait = model.Waiting{Class: recoveryOperator, Why: recovery.Why}
+			hasWait = true
+		}
+	}
 	if typedWaitRecovery {
 		armed := s.answers.Get(tr.Item.ID)
 		manualOverride = armed.Manual != "" && armed.Stage == tr.Stage &&
@@ -517,13 +547,19 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 	// same reason: nothing ran, nothing changed, and retrying it on every
 	// scheduler wake instead of waiting for the next listing would hammer a
 	// provider that is already failing.
-	if !manualOverride && ((tr.Outcome == model.OutcomeNoop && tr.From == tr.Stage) || tr.ProviderWritePending || (tr.Outcome == "" && tr.Err != nil)) {
+	operatorRest := recovery != nil && recovery.Class == recoveryOperator
+	if !manualOverride && (operatorRest || failureHeld || (tr.Outcome == model.OutcomeNoop && tr.From == tr.Stage) || tr.ProviderWritePending || (tr.Outcome == "" && tr.Err != nil)) {
 		s.resting[tr.Item.ID] = true
 		s.restingAt[tr.Item.ID] = now
 		// What it said it is waiting for, if it said anything. Set and
 		// cleared together with the deferral, so a countdown can never
 		// outlive the wait it was counting down to.
-		if hasWait {
+		if operatorRest {
+			s.waiting[tr.Item.ID] = wait
+		} else if failureHeld {
+			f, _ := s.budgets.Failure(tr.Item.ID)
+			s.waiting[tr.Item.ID] = model.Waiting{Why: f.ReleaseCondition}
+		} else if hasWait {
 			s.waiting[tr.Item.ID] = wait
 		} else {
 			delete(s.waiting, tr.Item.ID)

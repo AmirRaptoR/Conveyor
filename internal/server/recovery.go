@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ const (
 	recoveryUntil    = "until"
 	recoveryQuota    = "quota"
 	recoveryWorktree = "worktree"
+	recoveryOperator = "operator"
 
 	recoveryTransitionPrefix = "transition:"
 	recoveryMovePrefix       = "provider-move:"
@@ -93,6 +95,9 @@ func (s *Server) recover(ctx context.Context) {
 func (s *Server) recoverDue(ctx context.Context, now time.Time) {
 	for _, entry := range s.recovery.All() {
 		if entry.Scope != "item" || now.Before(entry.NotBefore) {
+			continue
+		}
+		if entry.Class == recoveryOperator {
 			continue
 		}
 		if entry.Class == recoveryUntil || entry.Class == recoveryQuota || engineManagedRecovery(entry) {
@@ -250,6 +255,44 @@ func (s *Server) finishRecoveryState(itemID string) {
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
 	s.wakeUp()
+}
+
+const itemResumeBodyLimit = 4 << 10
+
+// handleItemResume is the only automatic-work escape from an operator
+// cancellation. It compare-and-clears that exact durable hold and records who
+// resumed it and why; other recovery classes are never affected.
+func (s *Server) handleItemResume(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, itemResumeBodyLimit)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `expected {"reason": "..."}`, http.StatusBadRequest)
+		return
+	}
+	reason := strings.TrimSpace(body.Reason)
+	if reason == "" {
+		http.Error(w, "reason is required: resuming cancelled work must be auditable", http.StatusBadRequest)
+		return
+	}
+	entry, ok := s.recovery.Get("item", id)
+	if !ok || entry.Class != recoveryOperator {
+		http.Error(w, id+" has no operator cancellation to resume", http.StatusConflict)
+		return
+	}
+	resolved, err := s.recovery.ResolveOperator(entry, requestedBy(r), reason, time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !resolved {
+		http.Error(w, id+" recovery changed before it could be resumed", http.StatusConflict)
+		return
+	}
+	s.finishRecoveryState(id)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func waitingData(data json.RawMessage) (model.Waiting, bool) {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +67,8 @@ sources:
 	if err != nil {
 		t.Fatal(err)
 	}
+	loaded.Budgets.MaxRunsPerItem = 20
+	loaded.Budgets.MaxRunsPerDay = 200
 	return loaded, runner.New(filepath.Join(dir, "runs")), stageRuns, moveRuns, lists, dir
 }
 
@@ -116,6 +119,17 @@ func newModeServer(t *testing.T, cfg *config.Config, r *runner.Runner, mode Mode
 		t.Fatal(err)
 	}
 	return s, h
+}
+
+func TestAutonomousModeRequiresExplicitModelRunCeilings(t *testing.T) {
+	cfg, r, _, _, _, _ := modePipeline(t)
+	cfg.Budgets.MaxRunsPerItem = 0
+	cfg.Budgets.MaxRunsPerDay = 0
+	s := New(cfg, r)
+	err := s.Run(t.Context(), "127.0.0.1:0", ModeAuto)
+	if err == nil || !strings.Contains(err.Error(), "budgets.maxRunsPerItem") || !strings.Contains(err.Error(), "budgets.maxRunsPerDay") {
+		t.Fatalf("Run(auto) error = %v, want both required model-run ceilings", err)
+	}
 }
 
 // Every mutation route observe refuses, and none of them so much as started a

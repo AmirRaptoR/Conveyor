@@ -44,15 +44,9 @@ type Config struct {
 	// the cheap ones. A name with no entry here is a load error, because a
 	// silently unlimited resource is the failure this exists to prevent.
 	Resources map[string]int `yaml:"resources"`
-	// Budgets bounds how many times work may actually be dispatched — an
-	// operator-defined execution ceiling, and deliberately not the same
-	// knob as a stage's own MaxAttempts. MaxAttempts counts one stage's
-	// consecutive failures and marks the item where it stopped; a budget
-	// counts every dispatch of any outcome, across the item's whole life or
-	// the whole board's day, and stops new dispatch rather than marking
-	// anything — exhausting a budget is not itself a failure, and the item
-	// is left exactly where it is for the next window or an operator's
-	// override to free it.
+	// Budgets bounds model dispatch. Only source scripts declared with agent:
+	// spend it; deterministic scripts and recovery probes do not. Autonomous
+	// serving requires both ceilings to be positive.
 	Budgets Budgets  `yaml:"budgets"`
 	Poll    Duration `yaml:"poll"`
 	Timeout Duration `yaml:"timeout"`
@@ -103,22 +97,21 @@ type Concurrency struct {
 	Global int `yaml:"global"`
 }
 
-// Budgets is the two execution ceilings an operator may declare — see
-// Config.Budgets. Both are counted at claim time, the moment a transition is
-// actually about to be dispatched, never merely attempted: a claim refused
-// for a busy slot or a paused source spends nothing, because nothing ran.
+// Budgets is the model-run policy. Ceilings are counted atomically at claim
+// time; QuarantineAfter counts repeated structured failure signatures.
 type Budgets struct {
-	// MaxRunsPerItem is how many times one item may ever be dispatched,
+	// MaxRunsPerItem is how many model runs one item may ever dispatch,
 	// across every stage, every attempt and every restart — a lifetime
-	// ceiling, unlike MaxAttempts which counts one stage's own consecutive
-	// failures and resets the moment the item moves. Zero means unlimited.
+	// ceiling across stages and restarts. Zero is accepted only outside auto.
 	MaxRunsPerItem int `yaml:"maxRunsPerItem"`
-	// MaxRunsPerDay is how many times the whole board — every source,
-	// every stage — may be dispatched in one UTC day. Zero means
-	// unlimited. The day is UTC for the same reason CONVEYOR_DEADLINE is:
+	// MaxRunsPerDay is how many model runs the whole board may dispatch in one
+	// UTC day. Zero is accepted only outside autonomous mode. The day is UTC:
 	// one definition of "today" that does not depend on where the process
 	// happens to run.
 	MaxRunsPerDay int `yaml:"maxRunsPerDay"`
+	// QuarantineAfter is how many failures with the same structured signature
+	// establish that the failure is deterministic. Unset defaults to 2.
+	QuarantineAfter int `yaml:"quarantineAfter"`
 }
 
 type Logs struct {
@@ -418,6 +411,9 @@ func LoadFromRoots(path, providers, agents string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	if c.Budgets.QuarantineAfter == 0 {
+		c.Budgets.QuarantineAfter = 2
+	}
 	if c.Concurrency.PerSource == 0 {
 		c.Concurrency.PerSource = 1
 	}
@@ -958,6 +954,9 @@ func (c *Config) Validate() []string {
 	}
 	if c.Budgets.MaxRunsPerDay < 0 {
 		add("budgets.maxRunsPerDay cannot be negative")
+	}
+	if c.Budgets.QuarantineAfter < 2 {
+		add("budgets.quarantineAfter must be at least 2, got %d", c.Budgets.QuarantineAfter)
 	}
 	if c.Logs.Retention <= 0 {
 		add("logs.retention must be greater than zero, got %s", time.Duration(c.Logs.Retention))

@@ -35,6 +35,14 @@ var netListen = net.Listen
 // here and cancels it before it returns, rather than only reacting to the
 // caller's.
 func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
+	if mode == ModeAuto && (s.cfg.Budgets.MaxRunsPerItem < 1 || s.cfg.Budgets.MaxRunsPerDay < 1) {
+		return fmt.Errorf("autonomous mode requires explicit positive model-run ceilings: set budgets.maxRunsPerItem and budgets.maxRunsPerDay (manual and observe modes remain available for migration)")
+	}
+	if mode == ModeAuto {
+		if err := s.budgets.Err(); err != nil {
+			return err
+		}
+	}
 	// The board is a control plane: it starts agent runs, reorders work and
 	// hands marked items back. Reaching it is enough to drive every repository
 	// the config enrols, so an open one on a public interface is not a
@@ -225,6 +233,7 @@ func (s *Server) handler() (tcp, socket http.Handler, err error) {
 	mux.HandleFunc("POST /api/pause", s.mutationGuard(s.handlePause))
 	mux.HandleFunc("POST /api/resume", s.mutationGuard(s.handleResume))
 	mux.HandleFunc("POST /api/items/{id}/cancel", s.mutationGuard(s.handleCancel))
+	mux.HandleFunc("POST /api/items/{id}/resume", s.mutationGuard(s.handleItemResume))
 	mux.HandleFunc("POST /api/items/{id}/steer", s.mutationGuard(s.handleSteer))
 	mux.HandleFunc("POST /api/items/{id}/budget-override", s.mutationGuard(s.handleBudgetOverride))
 	mux.HandleFunc("POST /api/items/{id}/budget-restore", s.mutationGuard(s.handleBudgetRestore))

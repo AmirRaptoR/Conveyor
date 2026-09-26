@@ -7,6 +7,7 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -267,6 +268,11 @@ type Transition struct {
 	RunID    string `json:"runId,omitempty"`
 	RunDir   string `json:"runDir,omitempty"`
 	Attempts int    `json:"attempts,omitempty"`
+	// ModelRun is true only when the source selected an agent-backed script.
+	// FailureSignature is derived from structured run metadata, never logs.
+	ModelRun         bool   `json:"modelRun,omitempty"`
+	FailureSignature string `json:"failureSignature,omitempty"`
+	FailureReason    string `json:"failureReason,omitempty"`
 	// ProviderWritePending means the script (if any) has finished but its
 	// provider move or mark did not. The server backs this transition off and
 	// must not cache/notify the desired mark before the provider confirms it.
@@ -384,6 +390,7 @@ func (e *Engine) Advance(ctx context.Context, srcName string, item *model.Item, 
 	}
 
 	src := mustSource(e.cfg, srcName)
+	tr.ModelRun = stage.Run == "" && src.Scripts[stage.Script].Agent != ""
 	script, ok := src.Paths[stage.Script]
 	timeout := timeoutFor(src, stage)
 	// A stage's params reach only its own script, layered over what the source
@@ -603,6 +610,15 @@ func (e *Engine) route(s *config.Stage, res *runner.Result, itemID string, tr *T
 		e.attempts.Clear(key)
 		return "", Marked(s.Name, res.Run, res.Data, s.Timeout.D(), 0)
 	default: // failure, timeout
+		if tr.ModelRun {
+			tr.Attempts = e.attempts.Bump(key)
+			tr.FailureSignature = failureSignature(res)
+			tr.FailureReason = Marked(s.Name, res.Run, res.Data, s.Timeout.D(), tr.Attempts).Reason
+			// The autonomous server's persisted failure gate decides when another
+			// model run is eligible. Marking here would make external-state proof
+			// unable to release it without an unrelated provider mutation.
+			return "", source.Mark{}
+		}
 		n := e.attempts.Bump(key)
 		tr.Attempts = n
 		max := s.MaxAttempts
@@ -617,6 +633,35 @@ func (e *Engine) route(s *config.Stage, res *runner.Result, itemID string, tr *T
 		e.attempts.Clear(key)
 		return "", Marked(s.Name, res.Run, res.Data, s.Timeout.D(), n)
 	}
+}
+
+func failureSignature(res *runner.Result) string {
+	var data any
+	if len(res.Data) > 0 && json.Unmarshal(res.Data, &data) == nil {
+		if m, ok := data.(map[string]any); ok {
+			delete(m, "session")
+		}
+	}
+	errText := res.Run.Error
+	if res.Run.Dir != "" {
+		errText = strings.ReplaceAll(errText, res.Run.Dir, "$RUN_DIR")
+	}
+	canonical, _ := json.Marshal(struct {
+		Outcome model.Outcome `json:"outcome"`
+		Exit    int           `json:"exit"`
+		Timeout bool          `json:"timeout"`
+		Error   string        `json:"error,omitempty"`
+		Data    any           `json:"data,omitempty"`
+	}{res.Run.Outcome, res.Run.ExitCode, res.Run.TimedOut, errText, data})
+	sum := sha256.Sum256(canonical)
+	return fmt.Sprintf("%x", sum[:8])
+}
+
+// FailureEvidence reconstructs the stable failure signature and readable
+// reason from a persisted run, without consulting its log.
+func FailureEvidence(run model.Run, data json.RawMessage, timeout time.Duration) (string, string) {
+	res := &runner.Result{Run: run, Data: data}
+	return failureSignature(res), Marked(run.To, run, data, timeout, 0).Reason
 }
 
 // Marked describes, in one line and one word, why a finished run leaves the

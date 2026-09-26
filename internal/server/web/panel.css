@@ -27,6 +27,12 @@ aside.open { transform:none; }
    nothing. */
 .upper { flex:0 1 auto; max-height:55%; overflow-y:auto; min-height:0; }
 
+.execution-hold { padding:12px 18px; border-bottom:1px solid var(--rule); }
+.execution-hold h3 { margin:0 0 9px; color:var(--stop); font-size:13px; font-weight:600; }
+.execution-hold dl { display:grid; grid-template-columns:62px minmax(0, 1fr); gap:6px 10px; margin:0; }
+.execution-hold dt { color:var(--faint); font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; }
+.execution-hold dd { margin:0; font-size:11.5px; line-height:1.45; overflow-wrap:anywhere; }
+
 .relationships { padding:12px 18px; border-bottom:1px solid var(--rule); }
 .relationships h3 { margin:0 0 12px; font-size:13px; font-weight:600; }
 .relationships h4 {
@@ -68,6 +74,8 @@ aside.open { transform:none; }
 .dependency-hold.invalid b { color:var(--stop); }
 
 @media (max-width: 480px) {
+  .execution-hold { padding:10px 14px; }
+  .execution-hold dl { grid-template-columns:1fr; gap:2px; }
   .relationships { padding:10px 14px; }
   .relation-row { grid-template-columns:58px minmax(0, 1fr); gap:7px; }
   .relation-child, .dependency-row { align-items:flex-start; flex-direction:column; gap:1px; }

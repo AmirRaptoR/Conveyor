@@ -13,16 +13,42 @@ import (
 // listing backoff. Class is engine vocabulary while Key is adapter-owned and
 // compared only for equality.
 type RecoveryEntry struct {
-	Scope     string    `json:"scope"`
-	ID        string    `json:"id"`
-	Source    string    `json:"source,omitempty"`
-	Stage     string    `json:"stage,omitempty"`
-	Script    string    `json:"script,omitempty"`
-	Class     string    `json:"class"`
-	Key       string    `json:"key,omitempty"`
-	Why       string    `json:"why,omitempty"`
-	Attempt   int       `json:"attempt,omitempty"`
-	NotBefore time.Time `json:"notBefore,omitempty"`
+	Scope        string    `json:"scope"`
+	ID           string    `json:"id"`
+	Source       string    `json:"source,omitempty"`
+	Stage        string    `json:"stage,omitempty"`
+	Script       string    `json:"script,omitempty"`
+	Class        string    `json:"class"`
+	Key          string    `json:"key,omitempty"`
+	Why          string    `json:"why,omitempty"`
+	Attempt      int       `json:"attempt,omitempty"`
+	NotBefore    time.Time `json:"notBefore,omitempty"`
+	ResumedBy    string    `json:"resumedBy,omitempty"`
+	ResumeReason string    `json:"resumeReason,omitempty"`
+	ResumedAt    time.Time `json:"resumedAt,omitempty"`
+}
+
+// ResolveOperator removes exactly the operator hold the caller observed and
+// retains its latest resolution as a durable audit record.
+func (r *Recovery) ResolveOperator(old RecoveryEntry, by, reason string, at time.Time) (bool, error) {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	next := r.snapshot()
+	key := recoveryKey(old.Scope, old.ID)
+	if current, ok := next[key]; !ok || current != old {
+		return false, nil
+	}
+	delete(next, key)
+	old.Scope = "operator-audit"
+	old.ResumedBy, old.ResumeReason, old.ResumedAt = by, reason, at.UTC()
+	next[recoveryKey(old.Scope, old.ID)] = old
+	if err := r.persist(next); err != nil {
+		return false, err
+	}
+	r.dataMu.Lock()
+	r.m = next
+	r.dataMu.Unlock()
+	return true, nil
 }
 
 type Recovery struct {

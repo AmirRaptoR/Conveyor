@@ -16,6 +16,7 @@ import (
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 )
 
@@ -62,12 +63,25 @@ sources:
 	return cfg, runner.New(filepath.Join(dir, "runs"))
 }
 
+// modelBudgeted marks the already-resolved test scripts as agent-backed. The
+// executable path stays unchanged; only the budget boundary cares about this
+// source declaration.
+func modelBudgeted(cfg *config.Config) {
+	for i := range cfg.Sources {
+		for name, spec := range cfg.Sources[i].Scripts {
+			spec.Agent = "test-agent"
+			cfg.Sources[i].Scripts[name] = spec
+		}
+	}
+}
+
 // F02-shaped: a claim refused for a spent execution budget must roll back
 // exactly what it already took — the item claim and the (source, stage)
 // slot — the same "changed nothing" guarantee a slot or item refusal keeps.
 func TestClaimBudgetExhaustedRollsBackTheSlotAndTheClaim(t *testing.T) {
 	cfg, r := manyItemsOneSourceFor(t, 4)
 	cfg.Budgets = config.Budgets{MaxRunsPerItem: 1}
+	modelBudgeted(cfg)
 	s := New(cfg, r)
 	s.ctx = context.Background()
 	item := model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"}
@@ -92,12 +106,34 @@ func TestClaimBudgetExhaustedRollsBackTheSlotAndTheClaim(t *testing.T) {
 	}
 }
 
+func TestDeterministicStageDispatchDoesNotSpendModelRunBudget(t *testing.T) {
+	cfg, r := manyItemsOneSourceFor(t, 2) // script:, deliberately not agent:
+	cfg.Budgets = config.Budgets{MaxRunsPerItem: 1, MaxRunsPerDay: 1}
+	s := New(cfg, r)
+	s.ctx = context.Background()
+	item := model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"}
+	for i := 0; i < 2; i++ {
+		if got := s.claim(item, "working", false); got != claimAccepted {
+			t.Fatalf("deterministic claim %d = %v, want accepted", i+1, got)
+		}
+		s.working.Delete(item.ID)
+		s.eng.Locks().Release(item.Source, "working")
+	}
+	if runs, _ := s.budgets.Usage(item.ID); runs != 0 {
+		t.Fatalf("deterministic stage spent %d model run(s), want 0", runs)
+	}
+	if got := s.budgets.DayUsage(budgetDay(time.Now())); got != 0 {
+		t.Fatalf("deterministic stage spent daily model budget: %d", got)
+	}
+}
+
 // Unlike a paused agent's quota, the tick button's overridePause must not
 // reach past a spent execution budget: it is an operator-defined ceiling,
 // not a fact the outside world reports back on its own.
 func TestClaimBudgetExhaustedIsNeverOverriddenByOverridePause(t *testing.T) {
 	cfg, r := manyItemsOneSourceFor(t, 4)
 	cfg.Budgets = config.Budgets{MaxRunsPerItem: 1}
+	modelBudgeted(cfg)
 	s := New(cfg, r)
 	s.ctx = context.Background()
 	item := model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"}
@@ -116,6 +152,7 @@ func TestClaimBudgetExhaustedIsNeverOverriddenByOverridePause(t *testing.T) {
 func TestLaunchSkipsAnItemPastItsBudgetButStartsOthers(t *testing.T) {
 	cfg, r, dir := twoSourcesFor(t)
 	cfg.Budgets = config.Budgets{MaxRunsPerItem: 1}
+	modelBudgeted(cfg)
 	s := New(cfg, r)
 	s.ctx = context.Background()
 	s.state.Items = []model.Item{
@@ -146,6 +183,7 @@ func TestLaunchSkipsAnItemPastItsBudgetButStartsOthers(t *testing.T) {
 func TestBudgetDailyCeilingIsSharedAcrossSources(t *testing.T) {
 	cfg, r, _ := twoSourcesFor(t)
 	cfg.Budgets = config.Budgets{MaxRunsPerDay: 1}
+	modelBudgeted(cfg)
 	s := New(cfg, r)
 	s.ctx = context.Background()
 
@@ -168,6 +206,7 @@ func TestConcurrentClaimsCannotOverspendTheDailyBudget(t *testing.T) {
 	const attempts = 30
 	cfg, r := manyItemsOneSourceFor(t, attempts)
 	cfg.Budgets = config.Budgets{MaxRunsPerDay: ceiling}
+	modelBudgeted(cfg)
 	s := New(cfg, r)
 	s.ctx = context.Background()
 
@@ -202,11 +241,13 @@ func TestConcurrentClaimsCannotOverspendTheDailyBudget(t *testing.T) {
 func TestBudgetOverrideAndRestoreAPI(t *testing.T) {
 	cfg, r, _ := twoSourcesFor(t)
 	cfg.Budgets = config.Budgets{MaxRunsPerItem: 1}
+	modelBudgeted(cfg)
 	s := New(cfg, r)
 	s.ctx = context.Background()
 	s.mode = ModeAuto
 
 	item := model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"}
+	s.state.Items = []model.Item{item}
 	// releaseClaim mimics transition's own cleanup (schedule.go) — claim only
 	// reserves, so a test reusing one item across several claims must give it
 	// back itself, exactly as a finished run's defers would.
@@ -261,6 +302,10 @@ func TestBudgetOverrideAndRestoreAPI(t *testing.T) {
 	if _, ov := s.budgets.Usage(item.ID); ov != nil {
 		t.Error("override still present after restore")
 	}
+	history := s.budgets.OverrideHistory(item.ID)
+	if len(history) != 1 || history[0].RevokedAt.IsZero() || history[0].RevokedBy != "amir" {
+		t.Fatalf("restore audit = %+v, want revocation by amir", history)
+	}
 	if got := s.claim(item, "working", false); got != claimBudgetExhausted {
 		t.Errorf("claim() after restore = %v, want claimBudgetExhausted (usage already at 2, ceiling is 1)", got)
 	}
@@ -295,6 +340,93 @@ func TestStateReportsTheConfiguredBudgetCeilings(t *testing.T) {
 	if st.BudgetMaxRunsPerDay != 7 {
 		t.Errorf("BudgetMaxRunsPerDay = %d, want 7", st.BudgetMaxRunsPerDay)
 	}
+	var raw map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := raw["budgetDayRemaining"]; !ok || got != float64(7) {
+		t.Fatalf("budgetDayRemaining = %v present=%v, want exact serialized 7", got, ok)
+	}
+	if _, ok := raw["budgetNextEligibleAt"]; ok {
+		t.Fatal("budgetNextEligibleAt was serialized before the daily budget was exhausted")
+	}
+}
+
+func TestStateAlwaysSerializesExactZeroDailyRemaining(t *testing.T) {
+	cfg, r, _ := twoSourcesFor(t)
+	cfg.Budgets = config.Budgets{MaxRunsPerItem: 3, MaxRunsPerDay: 1}
+	s := New(cfg, r)
+	if ok, _, err := s.budgets.ReserveModel("s1:1", "working", budgetDay(time.Now()), 3, 1); err != nil || !ok {
+		t.Fatalf("seed daily use: ok=%v err=%v", ok, err)
+	}
+	w := httptest.NewRecorder()
+	s.handleState(w, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+	var raw map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := raw["budgetDayRemaining"]; !ok || got != float64(0) {
+		t.Fatalf("budgetDayRemaining = %v present=%v, want exact serialized zero", got, ok)
+	}
+	if _, ok := raw["budgetNextEligibleAt"]; !ok {
+		t.Fatal("exhausted daily budget omitted its next eligible time")
+	}
+}
+
+func TestStateOmitsDailyRemainingWhenTheDailyCeilingIsUnlimited(t *testing.T) {
+	cfg, r, _ := twoSourcesFor(t)
+	cfg.Budgets = config.Budgets{MaxRunsPerItem: 3}
+	s := New(cfg, r)
+	w := httptest.NewRecorder()
+	s.handleState(w, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+	var raw map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["budgetDayRemaining"]; ok {
+		t.Fatal("unlimited daily budget serialized a misleading remaining count")
+	}
+}
+
+func TestFailureOverrideClearsItsRestAndOneSchedulerLaunchConsumesIt(t *testing.T) {
+	cfg, r := manyItemsOneSourceFor(t, 2)
+	cfg.Budgets = config.Budgets{MaxRunsPerItem: 1, QuarantineAfter: 2}
+	modelBudgeted(cfg)
+	s := New(cfg, r)
+	s.ctx = context.Background()
+	s.mode = ModeAuto
+	item := model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "working"}
+	s.state.Items = []model.Item{item}
+	if ok, _, err := s.budgets.ReserveModel(item.ID, item.Stage, budgetDay(time.Now()), 1, 0); err != nil || !ok {
+		t.Fatalf("seed run: ok=%v err=%v", ok, err)
+	}
+	f, err := s.budgets.RecordFailure(item.ID, item.Stage, "sig", "failed", "run-1", 2, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.resting[item.ID] = true
+	s.waiting[item.ID] = model.Waiting{Why: f.ReleaseCondition}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/items/s1:1/budget-override", strings.NewReader(`{"reason":"retry once"}`))
+	req.SetPathValue("id", item.ID)
+	w := httptest.NewRecorder()
+	s.handleBudgetOverride(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("override = %d: %s", w.Code, w.Body)
+	}
+	if s.resting[item.ID] {
+		t.Fatal("matching failure rest survived the override")
+	}
+	if n := s.launch(s.ctx); n != 1 {
+		t.Fatalf("launches = %d, want 1", n)
+	}
+	waitFor(t, "override run to finish", func() bool { _, running := s.working.Load(item.ID); return !running })
+	if runs, ov := s.budgets.Usage(item.ID); runs != 2 || ov == nil || ov.Remaining != 0 {
+		t.Fatalf("usage=%d override=%+v, want exactly one consumed grant", runs, ov)
+	}
+	if n := s.launch(s.ctx); n != 0 {
+		t.Fatalf("second scheduler pass launched %d run(s)", n)
+	}
 }
 
 // A manual start refused for a spent budget must say so plainly, the same
@@ -302,6 +434,7 @@ func TestStateReportsTheConfiguredBudgetCeilings(t *testing.T) {
 func TestManualStartRefusesOnASpentBudgetWithAClearMessage(t *testing.T) {
 	cfg, r, _ := twoSourcesFor(t)
 	cfg.Budgets = config.Budgets{MaxRunsPerItem: 1}
+	modelBudgeted(cfg)
 	s := New(cfg, r)
 	s.ctx = context.Background()
 	s.mode = ModeAuto
@@ -328,6 +461,7 @@ func TestManualStartRefusesOnASpentBudgetWithAClearMessage(t *testing.T) {
 func TestBudgetUsageSurvivesARestart(t *testing.T) {
 	cfg, r, _ := twoSourcesFor(t)
 	cfg.Budgets = config.Budgets{MaxRunsPerItem: 2}
+	modelBudgeted(cfg)
 	s1 := New(cfg, r)
 	s1.ctx = context.Background()
 	item := model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog"}
@@ -347,6 +481,114 @@ func TestBudgetUsageSurvivesARestart(t *testing.T) {
 	s2.eng.Locks().Release(item.Source, "working", s2.cfg.ResourcesFor(item.Source, "working")...)
 	if got := s2.claim(item, "working", false); got != claimBudgetExhausted {
 		t.Errorf("third claim() after restart = %v, want claimBudgetExhausted", got)
+	}
+}
+
+func TestRepeatedModelFailureQuarantinesOnlyThatItemAndIsVisibleInState(t *testing.T) {
+	cfg, r, _ := twoSourcesFor(t)
+	cfg.Budgets = config.Budgets{MaxRunsPerItem: 10, MaxRunsPerDay: 20, QuarantineAfter: 2}
+	modelBudgeted(cfg)
+	s := New(cfg, r)
+	s.ctx = context.Background()
+	s.mode = ModeAuto
+	failed := model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "working", Title: "fails the same way"}
+	other := model.Item{ID: "s2:1", Ref: "1", Source: "s2", Stage: "working", Title: "unrelated"}
+	s.state.Items = []model.Item{failed, other}
+
+	firstAt := time.Now()
+	s.applyTransition(&pipeline.Transition{Item: failed, From: "working", Stage: "working", Outcome: model.OutcomeFailure,
+		ModelRun: true, FailureSignature: "same", FailureReason: "tests exited 1", RunID: "run-1"})
+	if s.budgetAvailable(failed.ID, failed.Source, failed.Stage) {
+		t.Fatal("failed item remained eligible without changed external evidence")
+	}
+	if !s.budgetAvailable(other.ID, other.Source, other.Stage) {
+		t.Fatal("unrelated work was stopped by another item's failure hold")
+	}
+	if released, err := s.budgets.ObserveExternal(failed.ID, failed.Stage, "v1", firstAt.Add(time.Minute)); err != nil || released {
+		t.Fatalf("baseline release=%v err=%v", released, err)
+	}
+	if released, err := s.budgets.ObserveExternal(failed.ID, failed.Stage, "v2", firstAt.Add(2*time.Minute)); err != nil || !released {
+		t.Fatalf("changed evidence release=%v err=%v", released, err)
+	}
+	s.applyTransition(&pipeline.Transition{Item: failed, From: "working", Stage: "working", Outcome: model.OutcomeFailure,
+		ModelRun: true, FailureSignature: "same", FailureReason: "tests exited 1", RunID: "run-2"})
+
+	w := httptest.NewRecorder()
+	s.handleState(w, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+	var state State
+	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	f := state.Failures[failed.ID]
+	if !f.Quarantined || f.Stage != "working" || f.RunID != "run-2" || f.Reason != "tests exited 1" || f.ReleaseCondition == "" {
+		t.Fatalf("quarantine view = %+v", f)
+	}
+	if got := state.Budgets[failed.ID].Remaining; got != 10 {
+		t.Fatalf("remaining item budget = %d, want 10 before claim-level reservations", got)
+	}
+}
+
+func TestRestartReconcilesPersistedCurrentStageModelFailureBeforeDispatch(t *testing.T) {
+	cfg, r := manyItemsOneSourceFor(t, 2)
+	cfg.Budgets = config.Budgets{MaxRunsPerItem: 10, MaxRunsPerDay: 20, QuarantineAfter: 2}
+	modelBudgeted(cfg)
+	item := model.Item{ID: "s1:1", Ref: "1", Source: "s1", Stage: "working"}
+	runDir := filepath.Join(r.Root, "2026-09-26", "120000.000-failed")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run := model.Run{ID: "120000.000-failed", Source: "s1", ItemID: item.ID, Kind: "stage", To: item.Stage,
+		Outcome: model.OutcomeFailure, ExitCode: 1, StartedAt: time.Now().Add(-time.Minute), FinishedAt: time.Now(), Dir: runDir}
+	if err := runner.WriteMeta(&run); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := New(cfg, runner.New(r.Root))
+	if warnings := restarted.reconcileModelFailures([]model.Item{item}, nil); len(warnings) != 0 {
+		t.Fatalf("reconciliation warnings = %v", warnings)
+	}
+	if restarted.budgetAvailable(item.ID, item.Source, item.Stage) {
+		t.Fatal("persisted failed model run was eligible after restart reconciliation")
+	}
+	if f, ok := restarted.budgets.Failure(item.ID); !ok || f.RunID != run.ID || !f.Held {
+		t.Fatalf("recovered failure = %+v ok=%v", f, ok)
+	}
+	if warnings := restarted.reconcileModelFailures([]model.Item{{ID: item.ID, Source: item.Source, Stage: "done"}}, nil); len(warnings) != 0 {
+		t.Fatalf("external stage move warnings = %v", warnings)
+	}
+	if _, ok := restarted.budgets.Failure(item.ID); ok {
+		t.Fatal("old-stage failure remained active after external move")
+	}
+	if warnings := restarted.reconcileModelFailures([]model.Item{item}, nil); len(warnings) != 0 {
+		t.Fatalf("return to old stage warnings = %v", warnings)
+	}
+	if !restarted.budgetAvailable(item.ID, item.Source, item.Stage) {
+		t.Fatal("historical failure re-blocked item after it returned to the old stage")
+	}
+}
+
+func TestCrashBeforeFailureLedgerDoesNotResurrectOldStageRunAfterReturn(t *testing.T) {
+	cfg, r := manyItemsOneSourceFor(t, 2)
+	cfg.Budgets = config.Budgets{MaxRunsPerItem: 10, QuarantineAfter: 2}
+	modelBudgeted(cfg)
+	runDir := filepath.Join(r.Root, "2026-09-26", "120000.000-crash")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run := model.Run{ID: "120000.000-crash", Source: "s1", ItemID: "s1:1", Kind: "stage", To: "working",
+		Outcome: model.OutcomeFailure, ExitCode: 1, StartedAt: time.Now().Add(-time.Minute), FinishedAt: time.Now(), Dir: runDir}
+	if err := runner.WriteMeta(&run); err != nil {
+		t.Fatal(err)
+	}
+	s := New(cfg, runner.New(r.Root))
+	if warnings := s.reconcileModelFailures([]model.Item{{ID: "s1:1", Source: "s1", Stage: "done"}}, nil); len(warnings) != 0 {
+		t.Fatalf("move-away warnings = %v", warnings)
+	}
+	if warnings := s.reconcileModelFailures([]model.Item{{ID: "s1:1", Source: "s1", Stage: "working"}}, nil); len(warnings) != 0 {
+		t.Fatalf("return warnings = %v", warnings)
+	}
+	if _, ok := s.budgets.Failure("s1:1"); ok {
+		t.Fatal("historical crash failure became active after return")
 	}
 }
 
@@ -394,6 +636,7 @@ sources:
 	if err != nil {
 		t.Fatal(err)
 	}
+	modelBudgeted(cfg)
 	r := runner.New(filepath.Join(dir, "runs"))
 	s := New(cfg, r)
 	s.ctx = context.Background()

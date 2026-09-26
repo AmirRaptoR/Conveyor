@@ -178,6 +178,48 @@ func TestRefreshCannotDeleteANewerRecoveryObservation(t *testing.T) {
 	}
 }
 
+func TestOperatorCancellationSurvivesScriptReplacementAndBlockedListings(t *testing.T) {
+	cfg, r, dir := deferringPipeline(t)
+	s := New(cfg, r)
+	entry := store.RecoveryEntry{
+		Scope: "item", ID: "s1:1", Source: "s1", Stage: "working",
+		Script: s.targetScriptBinding("s1", "working"), Class: recoveryOperator,
+		Why: "cancelled by operator: inspect the worktree",
+	}
+	if err := s.recovery.Put(entry); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement := filepath.Join(dir, "replacement-work.sh")
+	writeScript(t, replacement, "#!/bin/sh\nexit 0\n")
+	src, _ := cfg.Source("s1")
+	src.Paths["work"] = replacement
+	writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), `#!/bin/sh
+cat > "$CONVEYOR_RESULT" <<'JSON'
+[{"id":"s1:1","ref":"1","source":"s1","stage":"working","title":"cancelled","blocked":true}]
+JSON
+`)
+
+	restarted := New(cfg, r)
+	restarted.refresh(t.Context())
+	if got, ok := restarted.recovery.Get("item", "s1:1"); !ok || got != entry {
+		t.Fatalf("blocked listing or script replacement cleared operator hold: got=%+v ok=%v", got, ok)
+	}
+	if !restarted.resting["s1:1"] {
+		t.Fatal("restart did not restore operator cancellation as a scheduler hold")
+	}
+
+	writeScript(t, filepath.Join(dir, "providers", "fake", "list.sh"), `#!/bin/sh
+cat > "$CONVEYOR_RESULT" <<'JSON'
+[{"id":"s1:1","ref":"1","source":"s1","stage":"working","title":"cancelled","blocked":false}]
+JSON
+`)
+	restarted.refresh(t.Context())
+	if got, ok := restarted.recovery.Get("item", "s1:1"); !ok || got != entry {
+		t.Fatalf("unblocked listing cleared operator hold without audited resume: got=%+v ok=%v", got, ok)
+	}
+}
+
 func TestRecoveryProbeAtomicallyClaimsItemAndResources(t *testing.T) {
 	cfg, r, dir := deferringPipeline(t)
 	started := filepath.Join(dir, "probe-started")

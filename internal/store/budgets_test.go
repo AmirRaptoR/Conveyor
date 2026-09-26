@@ -1,7 +1,10 @@
 package store
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -166,6 +169,10 @@ func TestOverrideLiftsBothCeilingsAndRestoreReimposesThem(t *testing.T) {
 	if _, ov := b.Usage("item-1"); ov != nil {
 		t.Errorf("override still present after Restore: %+v", ov)
 	}
+	history := b.OverrideHistory("item-1")
+	if len(history) != 1 || history[0].Reason != "operator says go" || history[0].RevokedAt.IsZero() || history[0].UsedAt.IsZero() {
+		t.Fatalf("restored override audit = %+v, want durable use and revocation", history)
+	}
 	if ok, reason, err := b.Reserve("item-1", "2026-09-11", 1, 1); err != nil || ok {
 		t.Fatalf("Reserve after Restore = ok=%v reason=%q err=%v, want refused again (usage already at 2, ceiling is 1)", ok, reason, err)
 	}
@@ -220,15 +227,15 @@ func TestBudgetsSurviveAReopen(t *testing.T) {
 	}
 }
 
-func TestOpenBudgetsStartsEmptyOnAMalformedFile(t *testing.T) {
+func TestOpenBudgetsFailsClosedOnAMalformedFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "budgets.json")
 	if err := writeAtomic(path, []byte("not json")); err != nil {
 		t.Fatal(err)
 	}
 	b := OpenBudgets(path)
-	if runs, ov := b.Usage("item-1"); runs != 0 || ov != nil {
-		t.Errorf("Usage from a malformed file = runs=%d override=%v, want zero value", runs, ov)
+	if err := b.Err(); err == nil || !strings.Contains(err.Error(), "budget-reset") {
+		t.Errorf("malformed ledger error = %v, want deliberate reset instructions", err)
 	}
 }
 
@@ -254,5 +261,176 @@ func TestBudgetUsageIsNeverPrunedByBoardMembership(t *testing.T) {
 	reopened := OpenBudgets(path)
 	if runs, _ := reopened.Usage("item-1"); runs != 1 {
 		t.Errorf("item-1 usage after reopen = %d, want 1 (a lifetime ceiling survives, it is never reset)", runs)
+	}
+}
+
+func TestRepeatedFailureIsHeldUntilFreshExternalEvidenceAndThenQuarantined(t *testing.T) {
+	b := OpenBudgets(filepath.Join(t.TempDir(), "budgets.json"))
+	at := time.Date(2026, 9, 26, 10, 0, 0, 0, time.UTC)
+
+	first, err := b.RecordFailure("s:1", "review", "sig-a", "review exited 1", "run-1", 2, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Quarantined || !first.Held || first.Count != 1 {
+		t.Fatalf("first failure = %+v, want held but not quarantined", first)
+	}
+	if released, err := b.ObserveExternal("s:1", "review", "2026-09-26T10:01:00Z", at.Add(time.Minute)); err != nil || released {
+		t.Fatalf("first fresh observation released=%v err=%v, want baseline only", released, err)
+	}
+	if released, err := b.ObserveExternal("s:1", "review", "2026-09-26T10:01:00Z", at.Add(2*time.Minute)); err != nil || released {
+		t.Fatalf("unchanged evidence released=%v err=%v, want held", released, err)
+	}
+	if released, err := b.ObserveExternal("s:1", "review", "2026-09-26T10:03:00Z", at.Add(3*time.Minute)); err != nil || !released {
+		t.Fatalf("changed evidence released=%v err=%v, want one eligible attempt", released, err)
+	}
+	if ok, _, err := b.ReserveModel("s:1", "review", "2026-09-26", 10, 20); err != nil || !ok {
+		t.Fatalf("changed-state permit was not claimable: ok=%v err=%v", ok, err)
+	}
+	if ok, reason, err := b.ReserveModel("s:1", "review", "2026-09-26", 10, 20); err != nil || ok || reason != "evidence" {
+		t.Fatalf("changed-state permit was not bounded: ok=%v reason=%q err=%v", ok, reason, err)
+	}
+
+	second, err := b.RecordFailure("s:1", "review", "sig-a", "review exited 1", "run-2", 2, at.Add(4*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Quarantined || second.Count != 2 || second.Stage != "review" || second.RunID != "run-2" {
+		t.Fatalf("second identical failure = %+v, want quarantined with stage and evidence", second)
+	}
+}
+
+func TestFailureSignatureChangeRestartsTheQuarantineCount(t *testing.T) {
+	b := OpenBudgets(filepath.Join(t.TempDir(), "budgets.json"))
+	now := time.Now()
+	if _, err := b.RecordFailure("s:1", "work", "sig-a", "a", "run-a", 2, now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.RecordFailure("s:1", "work", "sig-b", "b", "run-b", 2, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Count != 1 || got.Quarantined {
+		t.Fatalf("changed signature = %+v, want a fresh count", got)
+	}
+}
+
+func TestScopedOverridePermitsExactlyOneModelRunAndKeepsItsAudit(t *testing.T) {
+	b := OpenBudgets(filepath.Join(t.TempDir(), "budgets.json"))
+	now := time.Now().Truncate(time.Second)
+	if ok, _, err := b.ReserveModel("s:1", "review", "2026-09-26", 1, 0); err != nil || !ok {
+		t.Fatal("could not seed the one normal model run")
+	}
+	if err := b.Grant("s:1", "review", BudgetOverride{Reason: "new evidence is in a private system", By: "amir", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _, err := b.ReserveModel("s:1", "review", "2026-09-26", 1, 0); err != nil || !ok {
+		t.Fatalf("first scoped override reservation = %v, %v", ok, err)
+	}
+	if ok, reason, err := b.ReserveModel("s:1", "review", "2026-09-26", 1, 0); err != nil || ok || reason != "item" {
+		t.Fatalf("second reservation = ok=%v reason=%q err=%v, want bounded refusal", ok, reason, err)
+	}
+	_, ov := b.Usage("s:1")
+	if ov == nil || ov.Remaining != 0 || ov.Stage != "review" || ov.Reason == "" || ov.By != "amir" {
+		t.Fatalf("spent override audit = %+v", ov)
+	}
+}
+
+func TestGrantPreservesPriorOverrideAudit(t *testing.T) {
+	b := OpenBudgets(filepath.Join(t.TempDir(), "budgets.json"))
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	if err := b.Grant("s:1", "review", BudgetOverride{Reason: "first", By: "a", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Grant("s:1", "review", BudgetOverride{Reason: "second", By: "b", At: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	history := b.OverrideHistory("s:1")
+	if len(history) != 2 || history[0].Reason != "first" || history[0].RevokedAt.IsZero() || history[1].Reason != "second" || history[1].Remaining != 1 {
+		t.Fatalf("override history = %+v", history)
+	}
+}
+
+func TestStageMismatchArchivesFailureAndReturnDoesNotReactivateIt(t *testing.T) {
+	b := OpenBudgets(filepath.Join(t.TempDir(), "budgets.json"))
+	if _, err := b.RecordFailure("s:1", "review", "sig", "failed", "run-1", 2, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ReconcileStage("s:1", "deploy"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := b.Failure("s:1"); ok {
+		t.Fatal("old-stage failure remained active after an external move")
+	}
+	if history := b.FailureHistory("s:1"); len(history) != 1 || history[0].RunID != "run-1" {
+		t.Fatalf("failure history = %+v, want preserved run-1", history)
+	}
+	if err := b.ReconcileStage("s:1", "review"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, reason := b.PeekModel("s:1", "review", "2026-09-26", 10, 10); !ok || reason != "" {
+		t.Fatalf("return to old stage was re-blocked: ok=%v reason=%q", ok, reason)
+	}
+}
+
+func TestRetiredFailureRunsAreNotEvictedWhenItemReturnsToStage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "budgets.json")
+	b := OpenBudgets(path)
+	for i := range budgetAuditLimit + 5 {
+		runID := fmt.Sprintf("review-run-%02d", i)
+		if err := b.ProcessFailureRun("s:1", runID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Simulate leaving review and later returning after a restart. The oldest
+	// archived run must remain retired rather than becoming failure evidence.
+	if err := b.ReconcileStage("s:1", "deploy"); err != nil {
+		t.Fatal(err)
+	}
+	reopened := OpenBudgets(path)
+	if err := reopened.ReconcileStage("s:1", "review"); err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.HasFailureRun("s:1", "review-run-00") {
+		t.Fatal("oldest retired failure was evicted and could be resurrected on return to review")
+	}
+}
+
+func TestLegacyBudgetLedgerRequiresDeliberateReset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "budgets.json")
+	if err := writeAtomic(path, []byte(`{"items":{"s:1":{"runs":4}},"day":"2026-09-25","runs":4}`)); err != nil {
+		t.Fatal(err)
+	}
+	b := OpenBudgets(path)
+	if err := b.Err(); err == nil || !strings.Contains(err.Error(), "budget-reset") {
+		t.Fatalf("legacy ledger error = %v, want reset instructions", err)
+	}
+}
+
+func TestBudgetResetArchivesTheOldLedgerAndRecordsItsReason(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "budgets.json")
+	old := []byte(`{"items":{"s:1":{"runs":4}}}`)
+	if err := writeAtomic(path, old); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	archive, err := ResetBudgets(path, "switch to model-only accounting", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(archive); err != nil || string(got) != string(old) {
+		t.Fatalf("archive = %q err=%v body=%q", archive, err, got)
+	}
+	b := OpenBudgets(path)
+	if err := b.Err(); err != nil {
+		t.Fatalf("reset ledger did not reopen: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "switch to model-only accounting") || !strings.Contains(string(raw), filepath.Base(archive)) {
+		t.Fatalf("reset audit missing from %s", raw)
 	}
 }

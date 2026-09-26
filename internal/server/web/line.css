@@ -245,3 +245,11 @@
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+.item .budget {
+  color:var(--faint); font-variant-numeric:tabular-nums; white-space:nowrap;
+}
+.item .quarantine {
+  color:var(--stop); border:1px solid color-mix(in srgb, var(--stop) 45%, transparent);
+  border-radius:999px; padding:0 .4em; white-space:nowrap;
+}
+.budget-day { color:var(--faint); font-variant-numeric:tabular-nums; }

@@ -723,6 +723,35 @@ sources:
 	}
 }
 
+func TestQuarantineThresholdMustBeAtLeastTwo(t *testing.T) {
+	base := `
+version: 1
+budgets:
+  quarantineAfter: %d
+stages:
+  - name: work
+    script: do
+    onSuccess: done
+  - name: done
+    terminal: true
+sources:
+  - name: s1
+    provider: github
+    scripts:
+      do: {agent: claude}
+`
+	if _, err := loadYAML(t, fmt.Sprintf(base, 1)); err == nil || !strings.Contains(err.Error(), "quarantineAfter") {
+		t.Fatalf("quarantineAfter 1: err = %v, want an actionable validation error", err)
+	}
+	cfg, err := loadYAML(t, fmt.Sprintf(base, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Budgets.QuarantineAfter != 3 {
+		t.Fatalf("QuarantineAfter = %d, want 3", cfg.Budgets.QuarantineAfter)
+	}
+}
+
 // A source may say its version of a stage spends something different — the
 // same stage is Claude in one repository and Codex in the next — and `[]` says
 // it spends nothing, which is not the same as saying nothing at all.

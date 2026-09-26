@@ -7,24 +7,20 @@ import { openAsk, openReport } from "./report.js";
 import { renderPanelRelationships } from "./relationships.js";
 import { beginPanelPlan, applyPlanSnapshot } from "./plans.js";
 import { selectPanelRun, applySteeringSnapshot } from "./steering.js";
+import { renderPanelExecutionHold } from "./execution.js";
 
 export { renderPanelRelationships } from "./relationships.js";
-
+export { renderPanelExecutionHold };
 export let openItemId = null, openItemTitle = null, followRun = null;
-
-// The card or `.need` button that opened the panel, as a focus descriptor
-// rather than a node reference — the node itself is routinely replaced by a
-// draw() while the panel sits open (see focusDescriptor/findFocusTarget), so
+// The opener as a focus descriptor: draw() routinely replaces the node, so
 // looking it up again by identity when the panel closes is what makes
 // "restore focus to the opener" mean anything after even one state update.
 let panelOpenerDesc = null;
-// One entry per item ever opened this session, keyed by id: the last block
-// signature `refreshOpenStop` rendered for it, so a draw() that changes
+// Last block signature rendered per item, so a draw() that changes
 // nothing about the mark does not blow away a reply someone is mid-typing —
 // see refreshOpenStop.
 const lastBlockSig = new Map();
 const blockSig = b => b ? `${b.kind}|${b.reason}|${b.at}` : "";
-
 export async function inspect(id, title, stage) {
   panelOpenerDesc = focusDescriptor(document.activeElement);
   openItemId = id; openItemTitle = title;
@@ -44,6 +40,7 @@ export async function inspect(id, title, stage) {
   lastBlockSig.delete(id);
   refreshOpenStop(id, true);
   renderPanelActions(id);
+  renderPanelExecutionHold(id);
   renderPanelRelationships(id);
   // The report is derived from run history, so it exists for every item;
   // on one still moving it is the passage so far.
@@ -52,7 +49,6 @@ export async function inspect(id, title, stage) {
   $("#report .rbtn").onclick = e => openReport(id, title, e.target);
   await loadHistory(id);
 }
-
 // Redraws `#stop` only when the mark actually changed — a poll that finds the
 // same mark still in place must not reset a reply someone is mid-typing in
 // the textarea `stopNotice` renders. `isInitialOpen` skips the "just
@@ -142,10 +138,22 @@ export function renderPanelActions(id) {
   // word to the next run of this stage, which is the whole of the manual
   // override: it cannot move the item, choose a stage or skip a check.
   if (controlsForMode(state?.mode || "auto").handBack) {
+    const wait = state?.waiting?.[id];
+    if (wait?.class === "operator") {
+      parts.push(`<button class="ctl" data-item-resume="1">Resume cancelled work</button>`);
+    }
     for (const a of stageBy(stage)?.actions || []) {
       parts.push(`<button class="ctl act" data-action="${esc(a.name)}"
           ${a.confirm ? `data-confirm="${esc(a.confirm)}"` : ""}
           aria-label="${esc(a.label)} for ${esc(title)}">${esc(a.label)}</button>`);
+    }
+    const budget = state?.budgets?.[id];
+    const failure = state?.failures?.[id];
+    const budgetSpent = budget?.modelRun && budget.remaining <= 0;
+    const daySpent = budget?.modelRun && state?.budgetMaxRunsPerDay > 0 && state?.budgetDayRemaining <= 0;
+    if ((failure || budgetSpent || daySpent) && !(budget?.override?.remaining > 0)) {
+      parts.push(`<button class="ctl budget-override" data-budget-override="1"
+          title="Allows exactly one model run in ${esc(stage)}">Allow one model run</button>`);
     }
   }
   box.innerHTML = parts.join("");
@@ -158,6 +166,54 @@ export function renderPanelActions(id) {
   box.querySelectorAll("[data-action]").forEach(btn => {
     btn.onclick = () => armAction(id, btn);
   });
+  const budgetOverride = box.querySelector("[data-budget-override]");
+  if (budgetOverride) budgetOverride.onclick = () => grantOneModelRun(id, budgetOverride);
+  const itemResume = box.querySelector("[data-item-resume]");
+  if (itemResume) itemResume.onclick = () => resumeCancelledItem(id, itemResume);
+}
+
+async function resumeCancelledItem(id, btn) {
+  const reason = prompt("Reason for resuming this cancelled work:", "");
+  if (reason === null) return;
+  if (!reason.trim()) { announce("A reason is required."); return; }
+  btn.disabled = true;
+  let res;
+  try {
+    res = await fetch(`/api/items/${encodeURIComponent(id)}/resume`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason: reason.trim() }),
+    });
+  } catch { btn.disabled = false; announce("Could not reach the server."); return; }
+  if (!res.ok) {
+    btn.disabled = false;
+    announce((await res.text()).trim() || `Could not resume this item (HTTP ${res.status}).`);
+    return;
+  }
+  announce(`Cancelled work resumed for ${id}.`); load();
+}
+
+async function grantOneModelRun(id, btn) {
+  const reason = prompt("Reason for allowing exactly one additional model run:", "");
+  if (reason === null) return;
+  if (!reason.trim()) { announce("A reason is required."); return; }
+  btn.disabled = true;
+  let res;
+  try {
+    res = await fetch(`/api/items/${encodeURIComponent(id)}/budget-override`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason: reason.trim() }),
+    });
+  } catch {
+    btn.disabled = false; announce("Could not reach the server."); return;
+  }
+  if (!res.ok) {
+    btn.disabled = false;
+    announce((await res.text()).trim() || `Could not grant the run (HTTP ${res.status}).`);
+    return;
+  }
+  btn.textContent = "one run armed";
+  announce(`One model run is armed for ${id} in its current stage.`);
+  load();
 }
 
 // Arm one of the stage's actions for the next run. The button reports its own

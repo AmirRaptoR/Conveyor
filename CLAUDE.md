@@ -221,6 +221,16 @@ peer, and the socket is the only door with no password on it (#94).
   stage is Claude in one repo and Codex in the next, so a source's
   `scripts.<name>.resources` replaces the stage's list; `[]` there means "spends
   nothing", which is not the same as saying nothing.
+- **Autonomous model work has explicit ceilings and deterministic failure
+  proof.** `serve -mode auto` refuses without positive per-item and per-UTC-day
+  model-run budgets. Only source scripts declared with `agent:` spend them;
+  deterministic scripts and transient recovery probes do not. A failed model
+  run stays in its stage and cannot run again merely because time passed: a
+  fresh provider `updatedAt` baseline must later change. Repeated identical
+  structured signatures become a persisted quarantine with run evidence and an
+  exact release condition. One reasoned operator override grants one run in one
+  item/stage and remains audited after use. Old all-transition ledgers require
+  the explicit `budget-reset` archive flow; they are never silently reinterpreted.
 - **A script says what it is waiting for; a person says "not any more".** Exit
   10 with `{"waiting": {"until": …, "why": …}}` draws a live countdown on the
   card — a resting item and a stuck one look identical otherwise. A stage
@@ -262,7 +272,8 @@ peer, and the socket is the only door with no password on it (#94).
   a marked item, and *that* is what stops the stage being re-run on every poll —
   it used to be a terminal `blocked` column, which cost the context of where the
   work stopped. `onSuccess:` is the only route; `onFailure:` and `onBlocked:` are
-  rejected by name. `maxAttempts:` unset means one, so the first failure marks.
+  rejected by name. `maxAttempts:` unset means one for non-agent scripts;
+  agent-backed failures use the execution gate above.
 - **A drag decides when, never where.** The start endpoint runs only the
   transition `pipeline.Target` already chose, and the board offers the gesture
   only out of the first stage. Dropping a card onto a deploy stage would be a

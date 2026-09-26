@@ -114,6 +114,36 @@ test("renderPanelActions: an item absent from state.items entirely clears the ac
   assert.equal(p.el("#pactions").innerHTML, "");
 });
 
+test("renderPanelActions: operator-cancelled work has an explicit resume action", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    mode: "manual",
+    items: [{ id: "s1:1", source: "s1", stage: "working", title: "cancelled" }],
+    waiting: { "s1:1": { class: "operator", why: "cancelled by operator" } },
+  }));
+  p.mod.renderPanelActions("s1:1");
+  assert.match(p.el("#pactions").innerHTML, /Resume cancelled work/);
+});
+
+test("renderPanelExecutionHold: quarantine reason and exact release are visible without hover", async () => {
+  const p = await page();
+  await withState(p, baseState({
+    items: [{ id: "s1:1", source: "s1", stage: "working", title: "failed" }],
+    failures: { "s1:1": {
+      quarantined: true,
+      reason: "tests failed <again>",
+      releaseCondition: "item.updatedAt must change from \"v7\"",
+    } },
+  }));
+  p.mod.renderPanelExecutionHold("s1:1");
+  const html = p.el("#execution-hold").innerHTML;
+  assert.equal(p.el("#execution-hold").hidden, false);
+  assert.match(html, /Quarantined/);
+  assert.match(html, /Reason[\s\S]*tests failed &lt;again&gt;/);
+  assert.match(html, /Release[\s\S]*item\.updatedAt must change from &quot;v7&quot;/);
+  assert.doesNotMatch(html, /title=/);
+});
+
 // ---- relationship detail ---------------------------------------------------
 
 test("renderPanelRelationships: family and execution dependencies are separate, linked safely, and status-labelled", async () => {
