@@ -140,17 +140,16 @@ func TestSocketServesStateWithoutAuth(t *testing.T) {
 	tcpBody, _ := io.ReadAll(tcpResp.Body)
 
 	sockKeys, tcpKeys := topLevelKeys(t, sockBody), topLevelKeys(t, tcpBody)
-	if len(sockKeys) == 0 {
-		t.Fatal("socket response had no top-level keys")
-	}
-	for k := range tcpKeys {
+	// Optional views can legitimately appear between these two live requests
+	// when startup reconciliation finishes. Both transports must expose the
+	// stable state envelope; they share the same handler, so comparing every
+	// omitempty key only tests timing.
+	for _, k := range []string{"release", "stages", "sources", "items", "active", "mode", "storage", "pollNs", "watchdog", "metrics", "soak"} {
 		if !sockKeys[k] {
-			t.Errorf("socket response is missing top-level key %q present over TCP", k)
+			t.Errorf("socket response is missing stable top-level key %q", k)
 		}
-	}
-	for k := range sockKeys {
 		if !tcpKeys[k] {
-			t.Errorf("socket response has extra top-level key %q not present over TCP", k)
+			t.Errorf("TCP response is missing stable top-level key %q", k)
 		}
 	}
 }
