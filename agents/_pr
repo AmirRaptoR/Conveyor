@@ -37,29 +37,31 @@ pr_match_filter() {
 			((.body // "") | gsub("```[\\s\\S]*?```"; "")) as $body
 			| ([$body | match("<!--\\s*conveyor:item\\s+(?<ref>[1-9][0-9]*)\\s*-->"; "gi")
 				| .captures[] | select(.name == "ref") | .string] | unique) as $markers
+			| ([$body | match("<!--\\s*conveyor:item\\s+(?<ref>[1-9][0-9]*)\\b"; "gi")
+				| .captures[] | select(.name == "ref") | .string] | unique) as $looseMarkers
 			| ([$body | scan("<!--\\s*conveyor:item\\b"; "i")] | length) as $markerMentions
 			| ([$body | match("\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\b:?\\s*#(?<ref>[1-9][0-9]*)\\b"; "gi")
 				| .captures[] | select(.name == "ref") | .string] | unique) as $closing
-			| ([.headRefName // "" | match("^issue-(?<ref>[1-9][0-9]*)$")?.captures[]?
+			| ([.headRefName // "" | try match("^issue-(?<ref>[1-9][0-9]*)$") catch empty | .captures[]
 				| select(.name == "ref") | .string] | unique) as $branch
-			| (($markers + $closing + $branch) | unique) as $all
+			| (($looseMarkers + $closing + $branch) | unique) as $all
 			| (($markerMentions != ($markers | length)) or
 				($markers | length) > 1 or ($closing | length) > 1 or ($all | length) > 1) as $conflict
 			| . + {
 				_prIdentity: ($markers[0] // $closing[0] // $branch[0] // ""),
-				_prSignals: {markers: $markers, closing: $closing, branch: $branch},
+				_prSignals: {markers: $markers, looseMarkers: $looseMarkers, closing: $closing, branch: $branch},
 				_prConflict: $conflict,
 				_prMalformedMarker: ($markerMentions != ($markers | length))
 			};
 		def signal_reason:
 			([if ._prMalformedMarker then "body has a malformed conveyor:item marker" else empty end]
-			+ [._prSignals.markers[] | "marker identifies #" + .]
+			+ [._prSignals.looseMarkers[] | "marker identifies #" + .]
 			+ [._prSignals.closing[] | "body closes #" + .]
 			+ [._prSignals.branch[] | "branch issue-" + . + " identifies #" + .])
 			| join("; ");
 		[.[] | classify
 			| . + {_prConflictReason: ("PR #" + (.number | tostring) + " has conflicting item identities: " + signal_reason + ".")}
-			| select((._prConflict and ((._prSignals.markers + ._prSignals.closing + ._prSignals.branch) | index($ref) != null))
+			| select((._prConflict and ((._prSignals.looseMarkers + ._prSignals.closing + ._prSignals.branch) | index($ref) != null))
 				or ((._prConflict | not) and ._prIdentity == $ref))]
 		| sort_by(.state != "OPEN", -.number)'
 }

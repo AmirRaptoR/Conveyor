@@ -105,7 +105,7 @@ name="${REPO##*/}"
 
 # The reply that marks a thread as already addressed. Fixed and invisible on
 # GitHub, durable in the API — the whole of "did the script already answer
-# this?" lives in whether the newest comment in the thread carries it, which
+# this?" lives in whether any comment in the thread carries it, which
 # needs no store of its own (see the issue's technical note 5).
 SENTINEL='<!-- conveyor:approve -->'
 

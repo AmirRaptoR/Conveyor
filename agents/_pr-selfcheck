@@ -112,6 +112,11 @@ scene; list '[{"number":9,"body":"<!-- conveyor:item nope -->\nCloses #7","state
 pr_lookup 7
 chk "a malformed Conveyor marker stops" "$PR_STATUS" "conflict"
 
+scene; list '[{"number":9,"body":"<!-- conveyor:item 7 extra -->","state":"OPEN","headRefName":"feature","url":"u"}]'
+pr_lookup 7
+chk "a malformed numeric marker still stops its named item" "$PR_STATUS" "conflict"
+chk "  rather than disappearing and allowing a duplicate" "$(grep -c '#7' <<<"$PR_CONFLICT_REASON")" "1"
+
 # --- #N in a different repository's issue is never seen, because the list is
 # already scoped to $REPO by `gh pr list --repo` --------------------------
 scene; list '[{"number":9,"body":"Closes other-org/other-repo#7","state":"OPEN","headRefName":"patch-1","url":"u"}]'

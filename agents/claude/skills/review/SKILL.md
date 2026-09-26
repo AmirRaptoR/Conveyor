@@ -160,10 +160,10 @@ open, and stop. Do not merge.
 Requires all of: full local suite green, `gh pr checks` green, review clean,
 every criterion ticked. Then **stop, with the PR open**. Do not merge.
 
-The one thing to check before you finish: the PR body must say `Closes #N`.
-That is the link that ties the work to the item, and the `approving` stage finds
-the pull request by exactly that reference — a PR without it is a PR the gate
-cannot see. Add it if it is missing; never close the issue by hand.
+Before finishing, the PR body must contain matching `Closes #N` and
+`<!-- conveyor:item N -->` lines. The marker is Conveyor's ownership identity;
+the closing reference is GitHub's completion link. Add either if it is missing;
+never close the issue by hand.
 
 What happens next, so you can leave it confidently: `approving` re-checks the
 PR on every poll and merges it once it is not a draft, has no conflict, has
