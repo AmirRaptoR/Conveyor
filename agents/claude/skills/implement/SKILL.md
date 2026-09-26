@@ -72,6 +72,7 @@ After the first commit:
 git push -u origin HEAD
 gh pr create --draft --title "<issue title>" --body "$(cat <<'EOF'
 Closes #42
+<!-- conveyor:item 42 -->
 
 ## Acceptance criteria
 - [ ] criterion one
@@ -111,8 +112,9 @@ gh pr ready
 gh pr view --json number,url
 ```
 
-Leave `Closes #N` in the PR body — the merge that `/review` performs is what
-closes the issue, and the link is what ties the work to the item.
+Leave both `Closes #N` and `<!-- conveyor:item N -->` in the PR body. The marker
+is Conveyor's durable ownership identity; the closing reference is what lets
+GitHub close the issue on merge.
 
 **Do not review your own work here, and do not merge.** A separate reviewer is
 the point: the model that wrote the code is the worst judge of whether it meets

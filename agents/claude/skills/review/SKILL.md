@@ -33,11 +33,11 @@ the end of its own run never had one.
 
 ## Workflow
 
-### 1. Find the PR
+### 1. Use the selected PR
 
 ```bash
 gh issue view <N> --json title,body,state
-gh pr list --search "<N>" --state open --json number,headRefName,url
+gh pr view <PR number supplied by the adapter> --json number,headRefName,url
 ```
 
 No open PR is not a review failure — it means the work has not been delivered
@@ -183,7 +183,7 @@ clock.
 ## Quick reference
 
 ```bash
-gh pr list --search "<N>" --state open      # find it
+gh pr view <PR> --json number,headRefName,url # inspect the adapter-selected PR
 gh pr checks --watch                        # CI must be green
 codex exec review --base main "..."         # round 1: the whole diff
 codex exec review --base "$reviewed" "..."  # rounds 2-3: only what changed since

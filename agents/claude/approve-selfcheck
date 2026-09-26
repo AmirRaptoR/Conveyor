@@ -214,6 +214,16 @@ scene; printf '[{"number":9,"body":"Closes #7","state":"OPEN","url":"u"},{"numbe
 chk "(3) two open PRs stop rather than pick" "$(run)" "20"
 chk "     and the kind is input"             "$(kind)" "input"
 
+scene; printf '[{"number":172,"body":"Part of #128 (tracking). Closes #143.","state":"OPEN","headRefName":"issue-128","url":"u"}]' >"$tmp/scene/prlist"
+: >"$CONVEYOR_RESULT"
+echo '{"item":{"ref":"128","title":"an item"}}' |
+	SCENE="$tmp/scene" REPO=o/n PROMPT="fix it" CONVEYOR_SOURCE=s1 QUIET_SECONDS=0 \
+	"$here/approve" >/dev/null 2>&1
+identity_rc=$?
+chk "a conflicting PR identity asks before approval" "$identity_rc" "20"
+chk "     and the kind is decision"            "$(kind)" "decision"
+chk "     and names both identities"           "$(jq -r .reason "$CONVEYOR_RESULT" | grep -Ec '#128.*#143|#143.*#128')" "1"
+
 # A PR that merely mentions the issue is not a PR that closes it.
 scene; printf '[{"number":9,"body":"related to #7","state":"OPEN","url":"u"}]' >"$tmp/scene/prlist"
 chk "a mention is not a closing reference"   "$(run)" "20"
@@ -353,11 +363,12 @@ scene; pr 9 OPEN; labels; details false MERGEABLE SOMETHING_NEW
 chk "(10) an unknown rollup waits, never merges" "$(run)" "10"
 
 # --- 12. a thread the script already answered is a question, not a retry ----
-answered='[{"id":"t1","isResolved":false,"comments":{"pageInfo":{"hasNextPage":false},"nodes":[{"id":"c1","body":"please change this","createdAt":"2020-01-01T00:00:00Z"},{"id":"c2","body":"Addressed in abc123.\n\n<!-- conveyor:approve -->","createdAt":"2020-01-01T00:00:00Z"}]}}]'
+answered='[{"id":"t1","isResolved":false,"comments":{"pageInfo":{"hasNextPage":false},"nodes":[{"id":"c1","body":"please change this","createdAt":"2020-01-01T00:00:00Z"},{"id":"c2","body":"Addressed in abc123.\n\n<!-- conveyor:approve -->","createdAt":"2020-01-01T00:00:00Z"},{"id":"c3","body":"I still disagree","createdAt":"2020-01-02T00:00:00Z"}]}}]'
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$answered"
-chk "(12) a thread answered but still open stops" "$(run)" "20"
+chk "(12) a later disagreement after an answer stops" "$(run)" "20"
 chk "     and the kind is decision"               "$(kind)" "decision"
 chk "     and it is a question, never bulk-cleared" "$(jq -r '.asked // false' "$CONVEYOR_RESULT")" "true"
+chk "     and no model is dispatched again"       "$([[ -f "$tmp/claude-ran" ]] && echo ran || echo no)" "no"
 
 # --- 13. the quiet clock ----------------------------------------------------
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS
@@ -634,26 +645,27 @@ chk "(11) all threads disposed defers"        "$(run_real)" "10"
 chk "     T1 is replied to and resolved"      "$(touches_for T1)" "2"
 chk "     T2 is replied to and resolved"      "$(touches_for T2)" "2"
 
-# A subset disposed: only the reported thread is replied to and resolved; the
-# other is left for gate 12 on a later poll.
+# A subset disposed: the reported thread is resolved and the omitted one turns
+# into one human decision now, never another automatic model poll.
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
 printf 'edit for subset\n' >"$tmp/scene/claude_edit"
 printf '{"dispositions":{"T1":"fixed X"}}' >"$tmp/scene/claude_result"
 reset_wt_clean
-chk "(11) a subset disposed defers"           "$(run_real)" "10"
+chk "(11) a subset disposed asks once"        "$(run_real)" "20"
 chk "     T1 is replied to and resolved"      "$(touches_for T1)" "2"
 chk "     T2 is left alone"                   "$(touches_for T2)" "0"
+chk "     the omitted thread is a decision"   "$(kind)" "decision"
 
-# None disposed: a commit still landed (the model touched something) but
-# reported no disposition at all — "the commit changed" is no longer enough
-# on its own, so nothing is resolved and nothing is replied to.
+# None disposed: a commit may still land, but missing dispositions become one
+# human decision rather than sending the same threads back to the model.
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
 printf 'edit with no disposition\n' >"$tmp/scene/claude_edit"
 printf '{}' >"$tmp/scene/claude_result"
 reset_wt_clean
-chk "(11) none disposed still defers"         "$(run_real)" "10"
+chk "(11) none disposed asks once"            "$(run_real)" "20"
 chk "     T1 is left alone"                   "$(touches_for T1)" "0"
 chk "     T2 is left alone"                   "$(touches_for T2)" "0"
+chk "     and the kind is decision"           "$(kind)" "decision"
 
 # All threads disposed with no edit at all: the branch already answered them,
 # which the prompt invites the model to say. Nothing to push, but the threads
@@ -666,12 +678,13 @@ chk "(11) disposed with no change defers"     "$(run_real)" "10"
 chk "     T1 is replied to and resolved"      "$(touches_for T1)" "2"
 chk "     T2 is replied to and resolved"      "$(touches_for T2)" "2"
 
-# No edit and no disposition is still a run that did nothing.
+# No edit and no disposition is disagreement, not an automatic retry loop.
 scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
 printf '{}' >"$tmp/scene/claude_result"
 reset_wt_clean
-chk "(11) no change, no disposition marks"    "$(run_real)" "20"
+chk "(11) no change, no disposition asks"     "$(run_real)" "20"
 chk "     T1 is left alone"                   "$(touches_for T1)" "0"
+chk "     and the kind is decision"           "$(kind)" "decision"
 
 # A disposition naming a thread id outside this run's unanswered set is
 # ignored, not acted on — it names a thread this run was never asked about.
@@ -679,8 +692,9 @@ scene; pr 9 OPEN; labels; details false MERGEABLE SUCCESS "$threads" issue-7
 printf 'edit for unknown id\n' >"$tmp/scene/claude_edit"
 printf '{"dispositions":{"T1":"fixed X","T99":"fixed something else"}}' >"$tmp/scene/claude_result"
 reset_wt_clean
-chk "(11) an unknown thread id is ignored"    "$(run_real)" "10"
+chk "(11) an unknown thread id is ignored"    "$(run_real)" "20"
 chk "     T1 is replied to and resolved"      "$(touches_for T1)" "2"
 chk "     the unknown id was never sent"      "$(touches_for T99)" "0"
+chk "     and the real omitted thread asks"    "$(kind)" "decision"
 
 exit $fail

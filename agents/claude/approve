@@ -155,32 +155,26 @@ gh_do() {
 # a hold.
 wearing() { jq -e --arg l "$1" 'any(.[]; . == $l)' >/dev/null 2>&1 <<<"$2"; }
 
-# The PR is found by closing reference, never by `gh pr list --search`, which
-# matches substrings anywhere in the PR and silently takes the first hit.
-# --state all so a PR that has already merged, or one abandoned in an earlier
-# round of rework, is still visible to the checks below. The matching rule
-# itself — pr_match_filter, from agents/_pr — is the one every caller of
-# closing_prs shares too, so this script and _pr can never disagree about
-# what counts as "closes #ref".
+# The PR is found through agents/_pr's marker-first identity classifier, never
+# by search. --state all keeps merged and abandoned history visible to the
+# checks below while sharing the exact conflict and truncation policy used by
+# implement and review.
 discover_pr() {
-	local all matches active n_all n_match n_active
-	all=$(gh_json pr list --repo "$REPO" --state all --limit 100 \
-		--json number,body,state,headRefName,url)
-	matches=$(pr_match_filter "$ref" <<<"$all")
-
-	n_all=$(jq 'length' <<<"$all")
-	n_match=$(jq 'length' <<<"$matches")
-	# gh's own page cap: a full page with no match in it might be hiding one
-	# behind, the same as agents/_pr's closing_prs — unavailable, not none,
-	# because reporting "no PR" here would mark the item for a person to
-	# reconcile work that may well already have a PR.
-	if [[ "$n_all" -ge 100 && "$n_match" -eq 0 ]]; then
-		echo "gh pr list for #$ref returned a full page with no match; it may be truncated" >&2
+	local matches active n_active
+	pr_lookup "$ref" all
+	case "$PR_STATUS" in
+	unavailable)
+		echo "could not identify the pull request for #$ref; deferring" >&2
 		exit 10
-	fi
-	if [[ "$n_match" -eq 0 ]]; then
+		;;
+	conflict)
+		asks decision "$PR_CONFLICT_REASON Repair the PR marker, closing reference, or branch before this item can proceed."
+		;;
+	none)
 		blocked input "no pull request closes issue #$ref, so there is nothing to approve."
-	fi
+		;;
+	esac
+	matches=$PR_MATCHES
 
 	# A closed-and-abandoned PR from an earlier round does not count as an
 	# active candidate — only the one currently open, or already merged, does.
@@ -447,7 +441,7 @@ state of the branch, redoing whatever investigation already happened."
 	# outside the unanswered set this run asked about is dropped here rather
 	# than resolving something never asked. "the commit changed" alone is not
 	# in this set at all, so it can no longer resolve anything by itself.
-	local dispositions known_ids disposed
+	local dispositions known_ids disposed missing
 	known_ids=$(jq -c '[.[].id]' <<<"$threads")
 	if [[ -s "${CONVEYOR_RESULT:-}" ]]; then
 		dispositions=$(jq -c '.dispositions // {}' "$CONVEYOR_RESULT" 2>/dev/null) || dispositions='{}'
@@ -457,16 +451,14 @@ state of the branch, redoing whatever investigation already happened."
 	disposed=$(jq -c --argjson known "$known_ids" '
 		[to_entries[] | select((.value | type) == "string" and (.value | length) > 0)
 			| select(.key as $k | $known | index($k) != null)]' <<<"$dispositions")
+	missing=$(jq -c --argjson disposed "$(jq '[.[].key]' <<<"$disposed")" '
+		[.[] | select(.id as $id | $disposed | index($id) == null)]' <<<"$threads")
 
-	# No commit and no disposition is a run that did nothing. No commit *with*
-	# dispositions is the model saying the branch already answers the threads —
-	# the prompt invites exactly that — so they are replied to and resolved
-	# below with nothing to test or push. Marking it used to make the mark
-	# permanent: every resume said the same true thing and was marked again.
-	if [[ "$after" == "$before" && "$(jq 'length' <<<"$disposed")" -eq 0 ]]; then
-		blocked no-output "the agent finished but made no change to address the review threads on #$pr."
-	fi
-
+	# No commit *with* dispositions is the model saying the branch already
+	# answers the threads — the prompt invites exactly that — so they are
+	# replied to and resolved below with nothing to test or push. Missing
+	# dispositions become one human decision after the reported threads are
+	# handled, never another automatic model poll.
 	if [[ "$after" != "$before" ]]; then
 		run_tests "$wt"
 		if ! git push origin "HEAD:$head_ref" 2>&1; then
@@ -492,6 +484,12 @@ $SENTINEL" >/dev/null
 				resolveReviewThread(input: {threadId: $id}) { thread { id } }
 			}' -F id="$tid" >/dev/null
 	done < <(jq -r '.[] | [.key, .value] | @tsv' <<<"$disposed")
+
+	if [[ "$(jq 'length' <<<"$missing")" -gt 0 ]]; then
+		local unresolved_summary
+		unresolved_summary=$(jq -r '[.[] | .id + ": " + (.comments.nodes[-1].body // "<no comment>")] | join("; ")' <<<"$missing")
+		asks decision "the review agent did not give a disposition for every unresolved conversation on pull request #$pr. It left: $unresolved_summary. Decide whether these need another change or may be resolved as already addressed."
+	fi
 
 	echo "addressed #$pr and resolved $(jq 'length' <<<"$disposed") of $(jq 'length' <<<"$threads") thread(s)" >&2
 	exit 10
@@ -929,17 +927,17 @@ check_gates_once() {
 	local unresolved unanswered answered
 	unresolved=$(jq '[.reviewThreads.nodes[] | select(.isResolved == false)]' <<<"$details")
 	unanswered=$(jq --arg s "$SENTINEL" \
-		'[.[] | select((.comments.nodes[-1].body // "") | contains($s) | not)]' <<<"$unresolved")
+		'[.[] | select(any(.comments.nodes[]; (.body // "") | contains($s)) | not)]' <<<"$unresolved")
 	answered=$(jq --arg s "$SENTINEL" \
-		'[.[] | select((.comments.nodes[-1].body // "") | contains($s))]' <<<"$unresolved")
+		'[.[] | select(any(.comments.nodes[]; (.body // "") | contains($s)))]' <<<"$unresolved")
 
 	if [[ "$(jq 'length' <<<"$unanswered")" -gt 0 ]]; then
 		address_threads "$unanswered" # exits 10 or 20; never returns
 	fi
 	if [[ "$(jq 'length' <<<"$answered")" -gt 0 ]]; then
 		local quoted
-		quoted=$(jq -r '.[0].comments.nodes[0].body' <<<"$answered")
-		asks decision "a reviewer left this unresolved after the fix that addressed it: \"$quoted\""
+		quoted=$(jq -r '[.[] | .id + ": " + (.comments.nodes[-1].body // "<no comment>")] | join("; ")' <<<"$answered")
+		asks decision "a reviewer left or reopened conversations after Conveyor answered them on pull request #$pr: $quoted"
 	fi
 
 	compute_base

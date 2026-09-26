@@ -441,6 +441,15 @@ of a stage. Run an AI agent, run
 tests, deploy, cut a release. This is the extension point; everything else is
 plumbing.
 
+Pull-request ownership is stage-adapter policy, never engine state. The shipped
+GitHub adapters put `<!-- conveyor:item N -->` in each new PR body and treat it
+as the primary identity. An unambiguous GitHub closing reference is the legacy
+fallback; `issue-N` is the final compatibility fallback. Every identity-bearing
+signal that is present must agree. A malformed marker, multiple identities, or
+a marker/body/branch disagreement stops every named item before a worktree or
+model is dispatched and reports the PR plus every conflicting signal. The same
+PR can therefore never be selected independently for two items.
+
 **`status`** (optional, `agents/<name>/status`) — report how an agent is doing.
 Run on the discovery tick, beside the list scripts, and given no stdin. Writes:
 

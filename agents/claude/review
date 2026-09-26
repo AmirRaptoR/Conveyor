@@ -40,6 +40,9 @@ if [[ -n "${REPO:-}" ]]; then
 		echo "could not tell whether an open pull request closes #$ref; deferring rather than reporting nothing landed" >&2
 		exit 10
 		;;
+	conflict)
+		asks decision "$PR_CONFLICT_REASON Repair the PR marker, closing reference, or branch before this item can proceed."
+		;;
 	several)
 		blocked decision "more than one open pull request closes issue #$ref; resolve which one is correct before this can proceed."
 		;;
@@ -215,6 +218,9 @@ if [[ $rc -eq 0 && -n "${REPO:-}" ]]; then
 	if [[ "$PR_STATUS" == "unavailable" ]]; then
 		echo "could not confirm the pull request for #$ref still exists after the review; deferring" >&2
 		exit 10
+	fi
+	if [[ "$PR_STATUS" == "conflict" ]]; then
+		asks decision "$PR_CONFLICT_REASON Repair the PR marker, closing reference, or branch before this item can proceed."
 	fi
 	active=$(jq '[.[] | select(.state != "CLOSED")]' <<<"$PR_MATCHES")
 	if [[ "$(jq 'length' <<<"$active")" -ge 2 ]]; then

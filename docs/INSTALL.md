@@ -360,6 +360,33 @@ Each release is read-only and content-verified, so never edit one in place.
 Deploy a new revision instead. Old release directories may be removed only
 after confirming neither `current` nor `previous` points to them.
 
+### Repairing legacy PR ownership
+
+New pull requests carry `<!-- conveyor:item N -->` in their body. Older PRs
+remain valid when their closing reference and `issue-N` branch agree. If they
+disagree, Conveyor stops every named item rather than guessing. Repair the
+identity explicitly; for example, to migrate PR #172 from the legacy
+`issue-128` branch to item #143:
+
+```bash
+repo=OWNER/REPO
+pr=172
+item=143
+old_branch=issue-128
+new_branch=issue-143
+
+gh api -X POST "repos/$repo/branches/$old_branch/rename" -f new_name="$new_branch"
+body=$(mktemp)
+gh pr view "$pr" --repo "$repo" --json body --jq .body >"$body"
+printf '\n<!-- conveyor:item %s -->\n' "$item" >>"$body"
+gh pr edit "$pr" --repo "$repo" --body-file "$body"
+rm -f "$body"
+```
+
+Verify the PR body closes the same item and then hand that item back. If a
+managed worktree for the old item still exists, let Conveyor's ordinary
+positive-ownership cleanup remove it; do not delete an unmarked path by hand.
+
 ## Everything this does not do
 
 - Does not install Go, git, `gh`, `jq`, `flock`, `claude`, `codex`, Node, systemd or

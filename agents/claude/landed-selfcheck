@@ -135,8 +135,8 @@ payload() { jq -n --arg ref "$1" '{item:{ref:$ref,title:"an item",description:""
 # elsewhere, which is a different scene's business, not this one's.
 pr_entry() {
 	local number=$1 ref=$2 state=$3 draft=$4
-	printf '[{"number":%s,"body":"Closes #%s","state":"%s","headRefName":"pr-branch-%s","url":"u","isDraft":%s}]' \
-		"$number" "$ref" "$state" "$ref" "$draft"
+	printf '[{"number":%s,"body":"Closes #%s\\n<!-- conveyor:item %s -->","state":"%s","headRefName":"pr-branch-%s","url":"u","isDraft":%s}]' \
+		"$number" "$ref" "$ref" "$state" "$ref" "$draft"
 }
 
 run_implement() {
@@ -188,6 +188,26 @@ chk "  as a condition, not a question" "$(jq -r '.asked // false' "$CONVEYOR_RES
 chk "  and names the kind" "$(jq -r .kind "$CONVEYOR_RESULT")" "draft"
 chk "  and names the PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#40')" "1"
 chk "  and says draft" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -ci 'draft')" "1"
+chk "  never starts the model" "$(claude_called)" "no"
+chk "  and never reaches git" "$(git_called)" "no"
+
+# --- identity conflicts stop both adapters before worktree/model dispatch ---
+# The live #172 shape identifies #128 by branch and #143 by closing reference.
+conflict_pr='[{"number":172,"body":"Part of #128 (tracking). Closes #143.","state":"OPEN","headRefName":"issue-128","url":"u","isDraft":false}]'
+
+scene; prlist "$conflict_pr"; graphql "$open_issue"
+rc=$(run_implement 128)
+chk "implement asks on conflicting PR identities" "$rc" "20"
+chk "  as a human decision" "$(jq -r .kind "$CONVEYOR_RESULT")" "decision"
+chk "  names both conflicting items" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -Ec '#128.*#143|#143.*#128')" "1"
+chk "  never starts the model" "$(claude_called)" "no"
+chk "  and never reaches git" "$(git_called)" "no"
+
+scene; prlist "$conflict_pr"
+rc=$(run_review 143)
+chk "review asks on the same conflicting PR" "$rc" "20"
+chk "  as a human decision" "$(jq -r .kind "$CONVEYOR_RESULT")" "decision"
+chk "  names the conflicting PR" "$(jq -r .reason "$CONVEYOR_RESULT" | grep -c '#172')" "1"
 chk "  never starts the model" "$(claude_called)" "no"
 chk "  and never reaches git" "$(git_called)" "no"
 
