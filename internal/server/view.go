@@ -120,6 +120,9 @@ type State struct {
 	// neither reads Why nor acts on Until; it is here so a card can draw a
 	// live countdown instead of looking stopped.
 	Waiting map[string]model.Waiting `json:"waiting,omitempty"`
+	// Resting names every item deferred until discovery, including untyped
+	// waits. It lets read-only scheduling simulations apply the same gate.
+	Resting []string `json:"resting,omitempty"`
 	// Plans is each item's current plan summary, keyed by item id — what a
 	// card needs to draw progress and a current step, and what survives
 	// refresh and a restart. Present only for an item whose current stage
@@ -138,7 +141,9 @@ type State struct {
 	Mode string `json:"mode"`
 	// Storage is what the run store currently holds and how far back
 	// retention still reaches.
-	Storage StorageView `json:"storage"`
+	Storage  StorageView  `json:"storage"`
+	Watchdog WatchdogView `json:"watchdog"`
+	Metrics  Metrics      `json:"metrics"`
 	// PersistFault is a run whose own record could not be trusted — a full
 	// disk during its meta.json write — kept until a later run persists
 	// cleanly. Unlike Warnings, refresh never rebuilds this: a disk-full
@@ -585,7 +590,11 @@ type Server struct {
 	// recovery is every deterministic wait and per-source retry deadline. It
 	// is persisted because a restart must not turn backoff into an immediate
 	// retry or forget what unchanged condition a probe is comparing.
-	recovery *store.Recovery
+	recovery      *store.Recovery
+	audit         *store.Audit
+	watchdogStore *store.Watchdog
+	watchdogState store.WatchdogState
+	watchdogMu    sync.Mutex
 	// cancels is the audit record of a run an operator cancelled, kept until
 	// that item's next transition starts and overwrites it. Memory-only: a
 	// restart has no run left in flight to cancel, so there is nothing here
@@ -735,6 +744,8 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 		manualPauses:    store.OpenPauses(filepath.Join(cfg.DataDir(), "pauses.json")),
 		budgets:         store.OpenBudgets(filepath.Join(cfg.DataDir(), "budgets.json")),
 		recovery:        store.OpenRecovery(filepath.Join(cfg.DataDir(), "recovery.json")),
+		audit:           store.OpenAudit(filepath.Join(cfg.DataDir(), "audit.jsonl")),
+		watchdogStore:   store.OpenWatchdog(filepath.Join(cfg.DataDir(), "watchdog.json")),
 		tick:            make(chan struct{}, 1),
 		wake:            make(chan struct{}, 1),
 		ctx:             context.Background(),
@@ -780,6 +791,7 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 	s.verify = newAuthVerifier(s.cfg.Auth.Check)
 	s.listedAt = map[string]time.Time{}
 	s.listErr = map[string]string{}
+	s.watchdogState = s.watchdogStore.Get()
 	rel := release.Current()
 	if len(releaseInfo) > 0 {
 		rel = releaseInfo[0]

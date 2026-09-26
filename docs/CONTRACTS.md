@@ -909,8 +909,8 @@ storage:
   criticalWatermark: 95
   sweepAt: 04:00
   retention:
-    model: 30d
-    failure: 90d
+    model: 7d
+    failure: 7d
     polling: 2d
     status: 7d
 ```
@@ -972,6 +972,35 @@ still refused. `/api/state.storage` reports bytes
 by class, temporary and total bytes, total 24-hour projected growth across the
 run, payload, persistent-store and scratch roots, watermarks, level and last
 cleanup.
+
+Operational reporting uses one fixed seven-day window regardless of shorter
+run-retention classes. Every settled stage transition appends its structured
+outcome, model classification and confirmed next stage to `data/audit.jsonl`;
+operator controls append a human-intervention event, and removing a provider
+mark appends its blocked-to-recovered duration. The file is pruned to seven days
+and atomically replaced. It never contains or parses logs, plans or control
+records. `/api/state.metrics` defines its aggregates as follows:
+
+- `successRate`: confirmed successful stage runs / all stage runs settled in the
+  window.
+- `completionsPerDay`: confirmed arrivals in a terminal stage / 7.
+- `retriesPerCompletion`: non-successful settled stage runs / terminal arrivals.
+- `blockedToRecoveredNs`: mean duration from the current mark's recorded time to
+  its confirmed removal.
+- `wastedModelRuns`: agent-backed runs without a confirmed successful move.
+- `humanInterventions`: accepted tick, start, reorder, steering, mark/action,
+  pause/resume, cancel and budget-control requests.
+
+The server watchdog owns source freshness and evaluates it every minute even
+under storage pressure. It reports stale/failed sources, unfinished and runnable
+counts versus active transitions, seven-day completion health, repeated
+blockers, storage headroom and immutable revision/config coherence in
+`/api/state.watchdog`. Its only incident alert is a runnable unfinished line
+with no active transition and no confirmed stage movement for
+`watchdog.stallWindow` (default `30m`). The incident key, last useful progress
+and alert time are atomically persisted in `data/watchdog.json`, so restart and
+repeated polling cannot send the same alert twice. Listings, plan updates and
+control traffic are not useful progress and are not scheduler inputs.
 
 The former `logs:` block is a load error with migration guidance: one retention
 duration cannot silently stand for four materially different classes.

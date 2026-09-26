@@ -178,7 +178,18 @@ loopback-peer check cannot tell that traffic apart from the whole internet.
 The socket proves "local" the way a peer address cannot — the filesystem
 already stops every other user from reaching it.
 
-### Post-deploy check: `conveyor probe`
+### Post-deploy gate: `conveyor gate`
+
+`conveyor gate -c conveyor.yaml -expected-revision <revision>` is the local,
+read-only release gate used by `deploy/install-release`. Over the server's Unix
+socket it requires a fresh successful listing from every configured source,
+checks the immutable release/config identity, probes the API and embedded UI,
+and runs a pure `pipeline.Target/Pick` scheduling simulation. It does not claim
+capacity, reserve a budget, run a script or write provider state. A failed
+candidate gate rolls back; a failed rollback gate removes `current` and stops
+the service. See `docs/SOAK.md` for the seven-day unattended report.
+
+### External-route check: `conveyor probe`
 
 A deploy that builds, tests and installs cleanly can still leave the running
 board unreachable — an allowlist with no entry for the live config is green

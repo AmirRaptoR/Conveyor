@@ -130,6 +130,7 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 	// waits for it to actually exit, not just for ctx to be cancelled.
 	s.spawn(func() { s.poll(runCtx) })
 	s.spawn(func() { s.button(runCtx, mode) })
+	s.spawn(func() { s.watchdog(runCtx.Done()) })
 	if mode.Runs() {
 		s.spawn(func() { s.schedule(runCtx) })
 		s.spawn(func() { s.recover(runCtx) })

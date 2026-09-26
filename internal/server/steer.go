@@ -146,6 +146,7 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 	delete(s.steeringMisses, id)
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "steering", RunID: body.RunID, ItemID: id, Steering: &view})
+	s.auditHuman("steer-"+body.Kind, id, requestedBy(r))
 	w.WriteHeader(http.StatusAccepted)
 }
 

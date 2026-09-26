@@ -7,10 +7,9 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 prefix=${CONVEYOR_PREFIX:-/opt/conveyor}
 config=${CONVEYOR_CONFIG:-/var/lib/conveyor/conveyor.yaml}
 service=${CONVEYOR_SERVICE:-conveyor}
-addr=${CONVEYOR_ADDR:-127.0.0.1:8090}
 systemctl_bin=${CONVEYOR_SYSTEMCTL:-systemctl}
-healthcheck=${CONVEYOR_HEALTHCHECK:-}
-health_attempts=${CONVEYOR_HEALTH_ATTEMPTS:-30}
+gate_hook=${CONVEYOR_GATE:-}
+gate_timeout=${CONVEYOR_GATE_TIMEOUT:-60s}
 
 if [[ ! -f "$config" ]]; then
   echo "install-release: config does not exist: $config" >&2
@@ -43,22 +42,16 @@ for required in flock jq; do
     exit 1
   fi
 done
-if [[ -z "$healthcheck" ]] && ! command -v curl >/dev/null 2>&1; then
-  echo "install-release: curl is required for the built-in health check" >&2
-  exit 1
-fi
 exec 9>"$prefix/deploy.lock"
 if ! flock -n 9; then
   echo "install-release: another deployment already holds $prefix/deploy.lock" >&2
   exit 1
 fi
 manifest_tmp=$(mktemp "${TMPDIR:-/tmp}/conveyor-manifest.XXXXXX")
-probe_err=$(mktemp "${TMPDIR:-/tmp}/conveyor-probe.XXXXXX")
 link_tmp=""
 
 cleanup() {
   rm -f "$manifest_tmp"
-  rm -f "$probe_err"
   if [[ -n "$link_tmp" ]]; then rm -f "$link_tmp"; fi
   if [[ -d "$stage" ]]; then
     chmod -R u+w "$stage" 2>/dev/null || true
@@ -76,37 +69,15 @@ atomic_link() {
   link_tmp=""
 }
 
-state_once() {
-  local expected=$1
-  if [[ -n "$healthcheck" ]]; then
-    "$healthcheck" "http://$addr/api/state" "$expected"
+gate_release() {
+  local release_dir=$1 expected=$2
+  if [[ -n "$gate_hook" ]]; then
+    "$gate_hook" "$expected"
     return
   fi
-  curl --silent --show-error --fail --max-time 5 \
-    --unix-socket "$api_socket" http://localhost/api/state
-}
-
-health() {
-	local expected=$1 attempt body last="no response"
-	for ((attempt=1; attempt<=health_attempts; attempt++)); do
-		: >"$probe_err"
-		if body=$(state_once "$expected" 2>"$probe_err"); then
-      if jq -e --arg revision "$expected" \
-        '.release.managed == true and .release.revision == $revision' \
-        <<<"$body" >/dev/null 2>&1; then
-        return 0
-      fi
-      last="response did not identify managed release $expected"
-		else
-			last="state endpoint unavailable"
-			while IFS= read -r detail; do
-				[[ -n "$detail" ]] && last="state endpoint unavailable: $detail"
-			done <"$probe_err"
-    fi
-    if (( attempt < health_attempts )); then sleep 2; fi
-  done
-  echo "install-release: health probe failed: $last" >&2
-  return 1
+  CONVEYOR_RELEASE_DIR="$release_dir" "$release_dir/conveyor" gate \
+    -c "$config" -socket "$api_socket" -timeout "$gate_timeout" \
+    -expected-revision "$expected" >/dev/null
 }
 
 if [[ ! -e "$target" ]]; then
@@ -153,7 +124,7 @@ if [[ -n "$rollback" && "$rollback" == "$target" ]]; then
 fi
 
 atomic_link "$target" "$current"
-if ! "$systemctl_bin" restart "$service" 9>&- || ! health "$revision"; then
+if ! "$systemctl_bin" restart "$service" 9>&- || ! gate_release "$target" "$revision"; then
   echo "install-release: activation of $revision failed; rolling back" >&2
   restored=false
 	if [[ -n "$rollback" && -x "$rollback/conveyor" ]]; then
@@ -161,9 +132,10 @@ if ! "$systemctl_bin" restart "$service" 9>&- || ! health "$revision"; then
 		if CONVEYOR_RELEASE_DIR="$rollback" "$rollback/conveyor" version >/dev/null 2>&1; then
 			old_revision=$(jq -er '.revision' "$rollback/release.json" 2>/dev/null || true)
 			if [[ -n "$old_revision" ]] && atomic_link "$rollback" "$current"; then
-				restored=true
-				if ! "$systemctl_bin" restart "$service" 9>&- || ! health "$old_revision"; then
-          echo "install-release: previous release was restored but did not become healthy" >&2
+				if "$systemctl_bin" restart "$service" 9>&- && gate_release "$rollback" "$old_revision"; then
+					restored=true
+				else
+          echo "install-release: previous release was restored but failed its gate" >&2
         fi
       fi
 		else
@@ -173,7 +145,7 @@ if ! "$systemctl_bin" restart "$service" 9>&- || ! health "$revision"; then
   if [[ "$restored" != true ]]; then
     rm -f "$current"
 		"$systemctl_bin" stop "$service" 9>&- || true
-    echo "install-release: no usable previous release; failed activation removed and service stopped" >&2
+    echo "install-release: no verified release remains; current removed and service stopped" >&2
   fi
   exit 1
 fi

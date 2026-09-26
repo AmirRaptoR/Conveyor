@@ -31,7 +31,7 @@ cat >"$tmp/health" <<'SH'
 mode=$(cat "$HEALTH_STATE")
 case "$mode" in
   pass)
-    printf '{"release":{"managed":true,"revision":"%s"}}\n' "$2"
+    exit 0
     ;;
   flaky)
     n=0
@@ -39,7 +39,13 @@ case "$mode" in
     n=$((n + 1))
     printf '%s\n' "$n" >"$HEALTH_CALLS"
     if (( n == 1 )); then exit 1; fi
-    printf '{"release":{"managed":true,"revision":"%s"}}\n' "$2"
+    exit 0
+    ;;
+  candidate-fail)
+    [[ "$1" != "selfcheck-three" ]]
+    ;;
+  same-revision-fail)
+    [[ "$1" != "selfcheck-two" ]]
     ;;
   *) exit 1 ;;
 esac
@@ -51,39 +57,48 @@ deploy() {
   CONVEYOR_PREFIX="$prefix" \
   CONVEYOR_CONFIG="$repo/conveyor.example.yaml" \
   CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
-  CONVEYOR_HEALTHCHECK="$tmp/health" \
-  CONVEYOR_HEALTH_ATTEMPTS=2 \
+  CONVEYOR_GATE="$tmp/health" \
   CONVEYOR_REVISION="$revision" \
   CONVEYOR_ALLOW_DIRTY=1 \
   CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" \
     "$repo/deploy/install-release"
 }
 
-# Successful swaps retain the old release, and a transient health failure gets
-# the same retry grace whether it comes from the built-in check or a hook.
+# Successful swaps retain the old release.
 prefix="$tmp/prefix"
 echo pass >"$health_state"
 deploy "$prefix" selfcheck-one >/dev/null
 [[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-one" ]]
 CONVEYOR_RELEASE_DIR="$prefix/current" "$prefix/current/conveyor" version | grep -q 'selfcheck-one'
 
-echo flaky >"$health_state"
-rm -f "$health_calls"
+echo pass >"$health_state"
 deploy "$prefix" selfcheck-two >/dev/null
-[[ $(cat "$health_calls") == 2 ]]
 [[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-two" ]]
 [[ $(readlink -f "$prefix/previous") == "$prefix/releases/selfcheck-one" ]]
 
 # A failed activation restores the last verified release.
-echo fail >"$health_state"
+echo candidate-fail >"$health_state"
 if deploy "$prefix" selfcheck-three >/dev/null 2>&1; then
   echo "install-release-selfcheck: an unhealthy release was accepted" >&2
   exit 1
 fi
 [[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-two" ]]
 
+# If rollback restart/gate fails, fail closed: no current release and a stopped
+# service, never an unverified old process left active.
+echo fail >"$health_state"
+if deploy "$prefix" selfcheck-rollback-fails >/dev/null 2>&1; then
+  echo "install-release-selfcheck: failed rollback was accepted" >&2
+  exit 1
+fi
+[[ ! -e "$prefix/current" ]]
+grep -q '^stop conveyor$' "$calls"
+echo pass >"$health_state"
+deploy "$prefix" selfcheck-two >/dev/null
+
 # Re-activating the current revision must use `previous` as its rollback target,
 # not call the same unhealthy release a successful restoration.
+echo same-revision-fail >"$health_state"
 if deploy "$prefix" selfcheck-two >/dev/null 2>&1; then
   echo "install-release-selfcheck: unhealthy same-revision deploy was accepted" >&2
   exit 1
@@ -160,7 +175,7 @@ chmod +x "$tmp/systemctl-real"
 CONVEYOR_PREFIX="$real_prefix" \
 CONVEYOR_CONFIG="$real_dir/conveyor.yaml" \
 CONVEYOR_SYSTEMCTL="$tmp/systemctl-real" \
-CONVEYOR_HEALTH_ATTEMPTS=15 \
+CONVEYOR_GATE_TIMEOUT=15s \
 CONVEYOR_REVISION=real-health \
 CONVEYOR_ALLOW_DIRTY=1 \
 REAL_PREFIX="$real_prefix" REAL_CONFIG="$real_dir/conveyor.yaml" \
@@ -173,7 +188,7 @@ curl --silent --fail --unix-socket "$real_dir/data/api.sock" http://localhost/ap
 CONVEYOR_PREFIX="$real_prefix" \
 CONVEYOR_CONFIG="$real_dir/conveyor.yaml" \
 CONVEYOR_SYSTEMCTL="$tmp/systemctl-real" \
-CONVEYOR_HEALTH_ATTEMPTS=15 \
+CONVEYOR_GATE_TIMEOUT=15s \
 CONVEYOR_REVISION=real-health \
 CONVEYOR_ALLOW_DIRTY=1 \
 REAL_PREFIX="$real_prefix" REAL_CONFIG="$real_dir/conveyor.yaml" \

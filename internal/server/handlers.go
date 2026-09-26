@@ -62,6 +62,10 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 			st.Waiting[id] = wt
 		}
 	}
+	for id := range s.resting {
+		st.Resting = append(st.Resting, id)
+	}
+	sort.Strings(st.Resting)
 	st.Times = make(map[string]ItemTime, len(s.times))
 	for id, t := range s.times {
 		st.Times[id] = t
@@ -119,6 +123,9 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.mu.RUnlock()
+	// Metrics are a read model over bounded structured evidence. Recompute on
+	// demand so a report taken between watchdog ticks includes the latest run.
+	st.Metrics = s.metrics(time.Now())
 	st.ManualPauses = s.manualPauseList()
 	if budgets := s.budgetViews(st.Items); len(budgets) > 0 {
 		st.Budgets = budgets
@@ -162,6 +169,7 @@ func (s *Server) handleTick(w http.ResponseWriter, r *http.Request) {
 	}
 	select {
 	case s.tick <- struct{}{}:
+		s.auditHuman("tick", "", requestedBy(r))
 		w.WriteHeader(http.StatusAccepted)
 	default:
 		http.Error(w, "a tick is already in flight", http.StatusConflict)
@@ -350,6 +358,7 @@ func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.auditHuman("unblock", item.ID, requestedBy(r))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -430,6 +439,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
 	s.wakeUp()
+	s.auditHuman("action", item.ID, requestedBy(r))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -905,6 +915,9 @@ func (s *Server) unblockKind(ctx context.Context, item model.Item, expectedKind 
 	delete(s.waiting, item.ID)
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
+	if !block.At.IsZero() {
+		s.auditRecovery(item.ID, time.Since(block.At))
+	}
 	s.wakeUp()
 	return nil
 }

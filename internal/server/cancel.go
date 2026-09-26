@@ -67,5 +67,6 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	s.hub.publish(event{Kind: "state"})
 
 	v.(context.CancelFunc)()
+	s.auditHuman("cancel", id, requestedBy(r))
 	w.WriteHeader(http.StatusAccepted)
 }

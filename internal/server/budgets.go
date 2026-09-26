@@ -252,6 +252,7 @@ func (s *Server) handleBudgetOverride(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.auditHuman("budget-override", id, requestedBy(r))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -279,5 +280,6 @@ func (s *Server) handleBudgetRestore(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.auditHuman("budget-restore", id, requestedBy(r))
 	w.WriteHeader(http.StatusNoContent)
 }

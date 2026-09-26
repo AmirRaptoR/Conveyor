@@ -40,6 +40,9 @@ timeout: 90m          # default per-script timeout; a source may override per
                       # too tight or no guard at all
 discovery: 2m         # a listing is a handful of API calls, not agent work,
                       # and must not be able to delay any other source's
+                      # listing.
+watchdog:
+  stallWindow: 30m
 
 storage:
   maxBytes: 20GiB
@@ -48,8 +51,8 @@ storage:
   criticalWatermark: 95
   sweepAt: "04:00"
   retention:
-    model: 30d
-    failure: 90d
+    model: 7d
+    failure: 7d
     polling: 2d
     status: 7d
 

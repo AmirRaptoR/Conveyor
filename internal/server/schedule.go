@@ -578,6 +578,10 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 		delete(s.waiting, tr.Item.ID)
 	}
 	s.mu.Unlock()
+	if tr.Item.Stage != tr.From {
+		s.noteUsefulProgress(now)
+	}
+	s.auditRun(tr)
 
 	// The two moments a person wants to hear about without watching: a
 	// question only they can answer, and an item reaching the end of the line.

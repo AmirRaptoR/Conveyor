@@ -262,31 +262,30 @@ The installer performs these operations in order:
    failing if even one configured source cannot run.
 4. Rename the complete staging directory into `releases/` and atomically swap
    `current`.
-5. Restart the service, poll its passwordless local Unix socket and require
-   `/api/state` to identify the expected managed revision. An old process, a
-   development-mode process and the wrong release all fail this check.
-6. If restart or health checking fails, atomically restore the old `current`,
-   restart it, and return failure. On success the old target is retained as
-   `previous`.
+5. Restart the service and run `conveyor gate` through its passwordless local
+   Unix socket. The gate validates the config through normal loading, requires
+   every configured source to have a fresh successful listing, verifies the
+   expected immutable revision/config identity, probes `/api/state` and the
+   embedded UI, and calls `pipeline.Target/Pick` for a pure scheduling
+   simulation. It claims no slot, writes no provider state and reserves no
+   budget or storage.
+6. If restart or the candidate gate fails, atomically restore the old `current`,
+   restart it and run the old release's gate. If either rollback restart or gate
+   fails, remove `current` and stop the service. On success the old target is
+   retained as `previous`.
 
-The defaults match `deploy/conveyor.service.example`. The built-in health check
-uses `curl` and `jq` over `<config directory>/data/api.sock`, which bypasses
-browser authentication but remains accessible only to the service account.
-Automated deployment systems may set `CONVEYOR_HEALTHCHECK` to an executable
-that receives the public state URL and expected revision as arguments and
-prints that endpoint's `/api/state` JSON on stdout. The installer applies the
-same retry window and revision check to that JSON; diagnostic text belongs on
-stderr. Set `CONVEYOR_ADDR` when the URL passed to such a hook differs from
-`127.0.0.1:8090`, and `CONVEYOR_HEALTH_ATTEMPTS` to change the default 30
-attempts. `CONVEYOR_SYSTEMCTL` selects the service-control executable, primarily
-for non-systemd test environments.
+The defaults match `deploy/conveyor.service.example`. The gate reads `<config
+directory>/data/api.sock`, which bypasses browser authentication but remains
+accessible only to the service account. `CONVEYOR_GATE_TIMEOUT` changes its
+default `60s` wait. Test or non-systemd environments may set `CONVEYOR_GATE` to
+an executable receiving the expected revision; success means the complete gate
+passed. `CONVEYOR_SYSTEMCTL` selects the service-control executable.
 
 Run the installer as root (as above), or as the unit's `User=` when that account
-is authorized to restart the unit. The built-in probe must be able to read the
-service-owned `data/api.sock`; inability to verify health is deliberately a
+is authorized to restart the unit. The built-in gate must be able to read the
+service-owned `data/api.sock`; inability to verify the gate is deliberately a
 failed deployment, never permission to leave an unverified release active. The
-installer checks for `flock`, `jq` and (when using the built-in probe) `curl`
-before it changes `current`.
+installer checks for `flock` and `jq` before it changes `current`.
 
 `CONVEYOR_ALLOW_DIRTY=1` is an emergency/testing escape hatch for packaging a
 modified checkout. Such a manifest records `modified: true`, and `/api/state`
@@ -310,7 +309,7 @@ storage:
   highWatermark: 80
   criticalWatermark: 95
   sweepAt: "04:00"
-  retention: {model: 30d, failure: 90d, polling: 2d, status: 7d}
+  retention: {model: 7d, failure: 7d, polling: 2d, status: 7d}
 ```
 
 Size suffixes are binary (`KiB`, `MiB`, `GiB`, `TiB`). Check

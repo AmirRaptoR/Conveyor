@@ -154,6 +154,7 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.auditHuman("pause", body.Scope, requestedBy(r))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -171,5 +172,6 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.auditHuman("resume", body.Scope, requestedBy(r))
 	w.WriteHeader(http.StatusNoContent)
 }
