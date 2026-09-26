@@ -70,12 +70,15 @@ atomic_link() {
 }
 
 gate_release() {
-  local release_dir=$1 expected=$2
+  local expected=$1
   if [[ -n "$gate_hook" ]]; then
     "$gate_hook" "$expected"
     return
   fi
-  CONVEYOR_RELEASE_DIR="$release_dir" "$release_dir/conveyor" gate \
+  # The candidate is the deployment tool we just verified. A rollback release
+  # may predate `conveyor gate`; use the new tool to inspect whichever server
+  # is active while binding the check to that server's expected revision.
+  CONVEYOR_RELEASE_DIR="$target" "$target/conveyor" gate \
     -c "$config" -socket "$api_socket" -timeout "$gate_timeout" \
     -expected-revision "$expected" >/dev/null
 }
@@ -124,7 +127,7 @@ if [[ -n "$rollback" && "$rollback" == "$target" ]]; then
 fi
 
 atomic_link "$target" "$current"
-if ! "$systemctl_bin" restart "$service" 9>&- || ! gate_release "$target" "$revision"; then
+if ! "$systemctl_bin" restart "$service" 9>&- || ! gate_release "$revision"; then
   echo "install-release: activation of $revision failed; rolling back" >&2
   restored=false
 	if [[ -n "$rollback" && -x "$rollback/conveyor" ]]; then
@@ -132,7 +135,7 @@ if ! "$systemctl_bin" restart "$service" 9>&- || ! gate_release "$target" "$revi
 		if CONVEYOR_RELEASE_DIR="$rollback" "$rollback/conveyor" version >/dev/null 2>&1; then
 			old_revision=$(jq -er '.revision' "$rollback/release.json" 2>/dev/null || true)
 			if [[ -n "$old_revision" ]] && atomic_link "$rollback" "$current"; then
-				if "$systemctl_bin" restart "$service" 9>&- && gate_release "$rollback" "$old_revision"; then
+				if "$systemctl_bin" restart "$service" 9>&- && gate_release "$old_revision"; then
 					restored=true
 				else
           echo "install-release: previous release was restored but failed its gate" >&2

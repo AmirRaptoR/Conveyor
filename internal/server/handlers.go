@@ -201,11 +201,16 @@ func (s *Server) handleTick(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "conveyor is shutting down", http.StatusServiceUnavailable)
 		return
 	}
+	intent, ok := s.beginHumanAuditHTTP(w, r, "tick", "")
+	if !ok {
+		return
+	}
 	select {
 	case s.tick <- struct{}{}:
-		s.auditHuman("tick", "", requestedBy(r))
+		s.resolveHumanAudit(intent, true)
 		w.WriteHeader(http.StatusAccepted)
 	default:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, "a tick is already in flight", http.StatusConflict)
 	}
 }
@@ -228,7 +233,12 @@ func (s *Server) handleOrder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "expected a JSON array of item ids", http.StatusBadRequest)
 		return
 	}
+	intent, ok := s.beginHumanAuditHTTP(w, r, "reorder", "")
+	if !ok {
+		return
+	}
 	if err := s.order.Set(ids); err != nil {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -236,7 +246,7 @@ func (s *Server) handleOrder(w http.ResponseWriter, r *http.Request) {
 	s.state.Order = s.order.IDs()
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
-	s.auditHuman("reorder", "", requestedBy(r))
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -317,6 +327,10 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "conveyor is shutting down", http.StatusServiceUnavailable)
 		return
 	}
+	intent, audited := s.beginHumanAuditHTTP(w, r, "start", item.ID)
+	if !audited {
+		return
+	}
 	// A manual start goes through the same atomic claim as every other
 	// dispatch path (claim), and overrides exactly one guard:
 	//   - overrides: resting — a deferral means "wait for the next listing",
@@ -330,25 +344,31 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	//     item, or no next stage).
 	switch s.claimAndLaunch(s.ctx, item, target, false) {
 	case claimItemBusy:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, fmt.Sprintf("%s is already running in %s", id, target), http.StatusConflict)
 		return
 	case claimSlotBusy:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, s.whyBusy(item.Source, target), http.StatusConflict)
 		return
 	case claimAgentPaused:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, s.whyPaused(s.cfg.AgentFor(item.Source, target)), http.StatusConflict)
 		return
 	case claimManuallyPaused:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, s.whyManuallyPaused(item.Source), http.StatusConflict)
 		return
 	case claimBudgetExhausted:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, s.whyBudgetExhausted(item.ID, target), http.StatusConflict)
 		return
 	case claimStorageHigh:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, "storage cannot safely accept model work; usage is above its high watermark or run persistence is faulted", http.StatusInsufficientStorage)
 		return
 	}
-	s.auditHuman("start", item.ID, requestedBy(r))
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -390,11 +410,16 @@ func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent) // already where the caller wants it
 		return
 	}
+	intent, ok := s.beginHumanAuditHTTP(w, r, "unblock", item.ID)
+	if !ok {
+		return
+	}
 	if err := s.answerThenUnblock(s.ctx, item, said.Answer); err != nil {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.auditHuman("unblock", item.ID, requestedBy(r))
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -441,6 +466,10 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 			http.StatusBadRequest)
 		return
 	}
+	intent, ok := s.beginHumanAuditHTTP(w, r, "action", item.ID)
+	if !ok {
+		return
+	}
 	// Layered onto whatever is already armed rather than replacing it: an
 	// answer someone typed and an action they then pressed are two things a
 	// person said about the same stop, and the next run should get both.
@@ -453,6 +482,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	armed.Stage = item.Stage
 	armed.Script = binding
 	if err := s.answers.Set(item.ID, armed); err != nil {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -466,6 +496,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	// not recreate that wait.
 	if err := s.recovery.Delete("item", item.ID); err != nil {
 		s.mu.Unlock()
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -475,7 +506,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
 	s.wakeUp()
-	s.auditHuman("action", item.ID, requestedBy(r))
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 

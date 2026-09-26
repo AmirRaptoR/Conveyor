@@ -248,11 +248,16 @@ func (s *Server) handleBudgetOverride(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no item "+id+" on the board", http.StatusNotFound)
 		return
 	}
+	intent, audited := s.beginHumanAuditHTTP(w, r, "budget-override", id)
+	if !audited {
+		return
+	}
 	if err := s.overrideBudget(id, stage, reason, requestedBy(r)); err != nil {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.auditHuman("budget-override", id, requestedBy(r))
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -276,10 +281,15 @@ func (s *Server) itemStage(id string) (string, bool) {
 // as resuming a source that was never paused.
 func (s *Server) handleBudgetRestore(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	intent, ok := s.beginHumanAuditHTTP(w, r, "budget-restore", id)
+	if !ok {
+		return
+	}
 	if err := s.restoreBudget(id, requestedBy(r)); err != nil {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.auditHuman("budget-restore", id, requestedBy(r))
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusNoContent)
 }

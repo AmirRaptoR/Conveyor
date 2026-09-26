@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/model"
@@ -78,6 +79,9 @@ func calculateMetrics(now time.Time, coverage metricCoverage, runs []RunMeta, ev
 		}
 		switch event.Kind {
 		case "human":
+			if event.State != "committed" {
+				continue
+			}
 			m.HumanInterventions++
 		case "recovery":
 			m.BlockedRecoveries++
@@ -100,10 +104,14 @@ func (s *Server) metricsAt(now time.Time) Metrics {
 	s.mu.RLock()
 	revision := s.state.Release.Revision
 	s.mu.RUnlock()
-	coverage := metricCoverage{StartedAt: soak.StartedAt, Healthy: status.Healthy}
+	coverage := metricCoverage{StartedAt: soak.StartedAt, Healthy: status.Healthy && status.EvidenceComplete}
 	switch {
 	case !status.Healthy:
 		coverage.Error = status.Error
+	case !status.ReconciliationComplete:
+		coverage.Error = "run audit reconciliation is incomplete"
+	case status.PendingHuman > 0:
+		coverage.Error = fmt.Sprintf("%d human audit intent(s) are unresolved", status.PendingHuman)
 	case soak.StartedAt.IsZero():
 		coverage.Healthy, coverage.Error = false, "soak has not been started"
 	case soak.Revision != revision:

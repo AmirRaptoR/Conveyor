@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,26 +40,16 @@ func (s *Server) sendNotification(title, body, itemID string) error {
 	if s.pushSubs.Len() == 0 {
 		return errors.New("no push subscriber")
 	}
-	if len(body) > 160 {
-		body = body[:157] + "…"
-	}
-	payload, _ := json.Marshal(map[string]string{
-		"title": title, "body": body, "tag": itemID,
-		"url": "/#item=" + url.PathEscape(itemID),
-	})
 	delivered := 0
 	var last error
-	for _, sub := range s.pushSubs.All() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		err := s.pushKeys.Send(ctx, sub, payload, "https://github.com/AmirRaptoR/Conveyor")
-		cancel()
+	for _, endpoint := range s.pushEndpoints() {
+		err := s.sendNotificationEndpoint(endpoint, title, body, itemID)
 		switch {
 		case errors.Is(err, push.Gone):
-			_ = s.pushSubs.Remove(sub.Endpoint)
 			last = err
 		case err != nil:
 			last = err
-			fmt.Fprintf(os.Stderr, "conveyor: push to %s: %v\n", sub.Endpoint, err)
+			fmt.Fprintf(os.Stderr, "conveyor: push to %s: %v\n", endpoint, err)
 		default:
 			delivered++
 		}
@@ -70,6 +61,46 @@ func (s *Server) sendNotification(title, body, itemID string) error {
 		return last
 	}
 	return nil
+}
+
+func (s *Server) pushEndpoints() []string {
+	var endpoints []string
+	for _, sub := range s.pushSubs.All() {
+		endpoints = append(endpoints, sub.Endpoint)
+	}
+	sort.Strings(endpoints)
+	return endpoints
+}
+
+func (s *Server) sendNotificationEndpoint(endpoint, title, body, itemID string) error {
+	if s.pushKeys == nil {
+		return errors.New("push notifications are off")
+	}
+	var selected *push.Subscription
+	for _, sub := range s.pushSubs.All() {
+		if sub.Endpoint == endpoint {
+			copy := sub
+			selected = &copy
+			break
+		}
+	}
+	if selected == nil {
+		return push.Gone
+	}
+	if len(body) > 160 {
+		body = body[:157] + "…"
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"title": title, "body": body, "tag": itemID,
+		"url": "/#item=" + url.PathEscape(itemID),
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	err := s.pushKeys.Send(ctx, *selected, payload, "https://github.com/AmirRaptoR/Conveyor")
+	if errors.Is(err, push.Gone) {
+		_ = s.pushSubs.Remove(endpoint)
+	}
+	return err
 }
 
 func (s *Server) handlePushKey(w http.ResponseWriter, r *http.Request) {

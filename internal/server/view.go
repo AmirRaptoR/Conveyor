@@ -703,9 +703,10 @@ type Server struct {
 	// key file, and the board simply does not notify.
 	pushKeys *push.Keys
 	pushSubs *push.Store
-	// watchdogNotifier is synchronous so successful delivery can be
-	// acknowledged durably; tests replace it without a push service.
-	watchdogNotifier func(string, string, string) error
+	// Watchdog delivery is endpoint-addressed so successful devices are
+	// acknowledged durably and skipped on a partial retry.
+	watchdogEndpoints      func() []string
+	watchdogNotifyEndpoint func(string, string, string, string) error
 
 	// verify bounds the cost of Auth.Check — see authVerifier.
 	verify *authVerifier
@@ -768,7 +769,8 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 	} else {
 		s.pushKeys = keys
 	}
-	s.watchdogNotifier = s.sendNotification
+	s.watchdogEndpoints = s.pushEndpoints
+	s.watchdogNotifyEndpoint = s.sendNotificationEndpoint
 	s.blocks = map[string]Block{}
 	s.times = map[string]ItemTime{}
 	s.plans = map[string]PlanView{}
@@ -802,6 +804,11 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 	s.listErr = map[string]string{}
 	if err := s.audit.Establish(time.Now()); err != nil {
 		fmt.Fprintf(os.Stderr, "conveyor: establish audit evidence: %v\n", err)
+	}
+	if status := s.watchdogStore.Status(); !status.Established {
+		if err := s.watchdogStore.Establish(store.WatchdogState{LastProgressAt: time.Now()}); err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: establish watchdog evidence: %v\n", err)
+		}
 	}
 	rel := release.Current()
 	if len(releaseInfo) > 0 {
@@ -885,6 +892,9 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 			prevSteering(runID, itemID, u)
 		}
 		s.handleSteeringUpdate(runID, itemID, u)
+	}
+	if err := s.reconcileAuditRuns(); err != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: reconcile run audit evidence: %v\n", err)
 	}
 	return s
 }

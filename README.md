@@ -188,7 +188,9 @@ the API and embedded UI, and runs the scheduler's shared read-only admission
 evaluation before `pipeline.Pick`. It does not claim
 capacity, reserve a budget, run a script or write provider state. A failed
 candidate gate rolls back; a failed rollback gate removes `current`, requires a
-successful stop and verifies the service inactive. Use `conveyor soak-start`
+successful stop and verifies the service inactive. Rollback health is checked
+with the verified candidate tool, so the restored release need not provide its
+own `gate` command. Use `conveyor soak-start`
 explicitly after selecting a candidate for a seven-day unattended run; see
 `docs/SOAK.md` for the report.
 

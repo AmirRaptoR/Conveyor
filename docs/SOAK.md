@@ -35,7 +35,7 @@ The generated report is the required report, not a prose checklist. `pass` is
 true only when the explicitly started soak identity names the running revision,
 its validated audit evidence continuity is intact, at least 168 hours have
 elapsed since that start, the watchdog has no open stall, no source-stale,
-revision-coherence or repeated-blocker finding exists, storage is not critical,
+revision-coherence, repeated-blocker or completion-rate finding exists, storage is not critical,
 and `humanInterventions` is zero. A deployment never resets or blesses the
 observation clock: run `soak-start` after every candidate you intend to soak,
 including a same-revision redeploy. Restarting without that command preserves
@@ -43,5 +43,6 @@ the current record but cannot repair broken evidence continuity. The report
 always includes the soak identity, revision, evidence health, exact window,
 success rate, completions per day, retries per completion, mean
 blocked-to-recovered time, wasted model runs and human interventions. A failed
-final gate or fewer than 168 elapsed hours is a procedure failure even if the
-report itself says pass.
+final gate, fewer than 168 elapsed hours, or no confirmed terminal completion is
+a failure. A zero-work window is reported explicitly as inconclusive rather
+than passing by absence of evidence.

@@ -3,6 +3,9 @@ package server
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,7 +28,8 @@ func TestWatchdogDetectsDeadSchedulerAndDeduplicatesAlert(t *testing.T) {
 	if !first.Alert || !hasFinding(first.Findings, "dead-scheduler") {
 		t.Fatalf("first evaluation = %#v, want one dead-scheduler alert", first)
 	}
-	s.watchdogNotifier = func(string, string, string) error { return nil }
+	s.watchdogEndpoints = func() []string { return []string{"device"} }
+	s.watchdogNotifyEndpoint = func(string, string, string, string) error { return nil }
 	s.deliverWatchdogAlert(first)
 	second := s.evaluateWatchdog(now.Add(time.Minute))
 	if second.Alert {
@@ -36,6 +40,19 @@ func TestWatchdogDetectsDeadSchedulerAndDeduplicatesAlert(t *testing.T) {
 	restarted.listedAt["s1"] = now
 	if got := restarted.evaluateWatchdog(now.Add(2 * time.Minute)); got.Alert {
 		t.Fatal("unchanged incident alerted again after restart")
+	}
+}
+
+func TestWatchdogEvidenceLossIsVisibleAfterRestart(t *testing.T) {
+	cfg, r := boardFor(t)
+	_ = New(cfg, r)
+	if err := os.Remove(filepath.Join(cfg.DataDir(), "watchdog.json")); err != nil {
+		t.Fatal(err)
+	}
+	restarted := New(cfg, r)
+	view := restarted.evaluateWatchdog(time.Now())
+	if view.EvidenceHealthy || view.EvidenceError == "" || !hasFinding(view.Findings, "watchdog-evidence") {
+		t.Fatalf("view = %#v", view)
 	}
 }
 
@@ -99,7 +116,7 @@ func TestWatchdogAlertRemainsPendingWithoutSubscriberAndRetriesAfterRestart(t *t
 	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "backlog", Title: "waiting"}}
 	s.listedAt["s1"] = now
 	s.watchdogState.LastProgressAt = now.Add(-time.Hour)
-	s.watchdogNotifier = func(string, string, string) error { return errors.New("no subscribers") }
+	s.watchdogEndpoints = func() []string { return nil }
 	first := s.evaluateWatchdog(now)
 	if !first.Alert || first.DeliveryStatus != "pending" {
 		t.Fatalf("first = %#v", first)
@@ -113,7 +130,8 @@ func TestWatchdogAlertRemainsPendingWithoutSubscriberAndRetriesAfterRestart(t *t
 	restarted.state.Items = append([]model.Item(nil), s.state.Items...)
 	restarted.listedAt["s1"] = now
 	calls := 0
-	restarted.watchdogNotifier = func(string, string, string) error { calls++; return nil }
+	restarted.watchdogEndpoints = func() []string { return []string{"device"} }
+	restarted.watchdogNotifyEndpoint = func(string, string, string, string) error { calls++; return nil }
 	retry := restarted.evaluateWatchdog(now.Add(time.Minute))
 	if !retry.Alert {
 		t.Fatalf("restart did not retry pending delivery: %#v", retry)
@@ -123,6 +141,74 @@ func TestWatchdogAlertRemainsPendingWithoutSubscriberAndRetriesAfterRestart(t *t
 	restarted.deliverWatchdogAlert(settled)
 	if calls != 1 || settled.Alert || settled.DeliveryStatus != "delivered" || settled.DeliveredAt.IsZero() {
 		t.Fatalf("settled = %#v calls=%d", settled, calls)
+	}
+}
+
+func TestOldWatchdogDeliveryCannotAcknowledgeNewIncident(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	now := time.Now().UTC()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "backlog", Title: "waiting"}}
+	s.listedAt["s1"] = now
+	s.watchdogState.LastProgressAt = now.Add(-time.Hour)
+	old := s.evaluateWatchdog(now)
+	started, release := make(chan struct{}), make(chan struct{})
+	s.watchdogEndpoints = func() []string { return []string{"device"} }
+	s.watchdogNotifyEndpoint = func(string, string, string, string) error {
+		close(started)
+		<-release
+		return nil
+	}
+	done := make(chan struct{})
+	go func() { s.deliverWatchdogAlert(old); close(done) }()
+	<-started
+	s.watchdogMu.Lock()
+	next := s.watchdogState
+	next.IncidentKey = "new-incident"
+	next.DetectedAt = now.Add(time.Minute)
+	next.DeliveryStatus = "pending"
+	next.DeliveryAcks = nil
+	s.watchdogState = next
+	if err := s.watchdogStore.Set(next); err != nil {
+		t.Fatal(err)
+	}
+	s.watchdogMu.Unlock()
+	close(release)
+	<-done
+	if state := s.watchdogStore.Get(); state.IncidentKey != "new-incident" || state.DeliveryStatus != "pending" || state.DeliveredAt.IsZero() == false {
+		t.Fatalf("new incident was acknowledged by old delivery: %#v", state)
+	}
+}
+
+func TestWatchdogRetriesOnlyFailedEndpoints(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	now := time.Now().UTC()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "backlog", Title: "waiting"}}
+	s.listedAt["s1"] = now
+	s.watchdogState.LastProgressAt = now.Add(-time.Hour)
+	view := s.evaluateWatchdog(now)
+	s.watchdogEndpoints = func() []string { return []string{"good", "flaky"} }
+	var mu sync.Mutex
+	calls := map[string]int{}
+	s.watchdogNotifyEndpoint = func(endpoint, _, _, _ string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls[endpoint]++
+		if endpoint == "flaky" && calls[endpoint] == 1 {
+			return errors.New("temporary failure")
+		}
+		return nil
+	}
+	s.deliverWatchdogAlert(view)
+	if state := s.watchdogStore.Get(); state.DeliveryStatus != "pending" || !state.DeliveryAcks["good"] || state.DeliveryAcks["flaky"] {
+		t.Fatalf("partial state = %#v", state)
+	}
+	retry := s.evaluateWatchdog(now.Add(time.Minute))
+	s.deliverWatchdogAlert(retry)
+	state := s.watchdogStore.Get()
+	if state.DeliveryStatus != "delivered" || calls["good"] != 1 || calls["flaky"] != 2 {
+		t.Fatalf("state = %#v calls=%#v", state, calls)
 	}
 }
 

@@ -112,6 +112,66 @@ deploy "$prefix" selfcheck-two >/dev/null
 [[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-two" ]]
 [[ $(readlink -f "$prefix/previous") == "$prefix/releases/selfcheck-one" ]]
 
+# Rollback health is inspected by the verified candidate deployment tool, not
+# by the old release being restored. This fixture's old binary deliberately has
+# no gate command; the new binary fails itself and can gate the old revision.
+mkdir -p "$tmp/fake-bin"
+cat >"$tmp/fake-bin/go" <<'SH'
+#!/usr/bin/env bash
+out="" revision=""
+while (($#)); do
+  case "$1" in
+    -o) out=$2; shift 2 ;;
+    -ldflags) revision=${2##*=}; shift 2 ;;
+    *) shift ;;
+  esac
+done
+cat >"$out" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  version|validate) exit 0 ;;
+  release-manifest)
+    printf '{"revision":"$revision","schema":1,"files":[]}\n'
+    ;;
+  gate)
+    expected=""
+    while ((\$#)); do
+      if [[ "\$1" == -expected-revision ]]; then expected=\$2; break; fi
+      shift
+    done
+    printf '%s:%s\n' '$revision' "\$expected" >>"\$FIXTURE_GATE_LOG"
+    [[ '$revision' != fixture-old ]] || exit 2
+    [[ "\$expected" != fixture-new ]] || exit 1
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$out"
+SH
+chmod +x "$tmp/fake-bin/go"
+fixture_prefix="$tmp/gate-tool-prefix"
+fixture_gate_log="$tmp/gate-tool.log"
+PATH="$tmp/fake-bin:$PATH" CONVEYOR_PREFIX="$fixture_prefix" \
+  CONVEYOR_CONFIG="$repo/conveyor.example.yaml" CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
+  CONVEYOR_GATE="$tmp/health" CONVEYOR_REVISION=fixture-old CONVEYOR_ALLOW_DIRTY=1 \
+  CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" SYSTEMCTL_STATE="$systemctl_state" \
+  "$repo/deploy/install-release" >/dev/null
+if ! PATH="$tmp/fake-bin:$PATH" CONVEYOR_PREFIX="$fixture_prefix" \
+  CONVEYOR_CONFIG="$repo/conveyor.example.yaml" CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
+  CONVEYOR_REVISION=fixture-new CONVEYOR_ALLOW_DIRTY=1 FIXTURE_GATE_LOG="$fixture_gate_log" \
+  CALLS="$calls" SYSTEMCTL_STATE="$systemctl_state" \
+  "$repo/deploy/install-release" >/dev/null 2>&1; then
+  : # Candidate failure is expected even when rollback succeeds.
+fi
+[[ $(readlink -f "$fixture_prefix/current") == "$fixture_prefix/releases/fixture-old" ]]
+grep -q '^fixture-new:fixture-new$' "$fixture_gate_log"
+grep -q '^fixture-new:fixture-old$' "$fixture_gate_log"
+if grep -q '^fixture-old:' "$fixture_gate_log"; then
+  echo "install-release-selfcheck: rollback gate used the old release tool" >&2
+  exit 1
+fi
+
 # A failed activation restores the last verified release.
 echo candidate-fail >"$health_state"
 if deploy "$prefix" selfcheck-three >/dev/null 2>&1; then

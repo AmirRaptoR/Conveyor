@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
+	"github.com/AmirRaptoR/Conveyor/internal/push"
 )
 
 type WatchdogFinding struct {
@@ -19,21 +21,24 @@ type WatchdogFinding struct {
 }
 
 type WatchdogView struct {
-	EvaluatedAt         time.Time         `json:"evaluatedAt"`
-	LastProgressAt      time.Time         `json:"lastProgressAt"`
-	StallWindow         time.Duration     `json:"stallWindowNs"`
-	Unfinished          int               `json:"unfinished"`
-	Potential           int               `json:"potential"`
-	Runnable            int               `json:"runnable"`
-	Active              int               `json:"active"`
-	Incident            bool              `json:"incident"`
-	DetectedAt          time.Time         `json:"detectedAt,omitempty"`
-	DeliveryStatus      string            `json:"deliveryStatus,omitempty"`
-	DeliveryAttemptedAt time.Time         `json:"deliveryAttemptedAt,omitempty"`
-	DeliveredAt         time.Time         `json:"deliveredAt,omitempty"`
-	DeliveryError       string            `json:"deliveryError,omitempty"`
-	Findings            []WatchdogFinding `json:"findings,omitempty"`
-	Alert               bool              `json:"-"`
+	EvaluatedAt          time.Time         `json:"evaluatedAt"`
+	LastProgressAt       time.Time         `json:"lastProgressAt"`
+	StallWindow          time.Duration     `json:"stallWindowNs"`
+	Unfinished           int               `json:"unfinished"`
+	Potential            int               `json:"potential"`
+	Runnable             int               `json:"runnable"`
+	Active               int               `json:"active"`
+	Incident             bool              `json:"incident"`
+	DetectedAt           time.Time         `json:"detectedAt,omitempty"`
+	DeliveryStatus       string            `json:"deliveryStatus,omitempty"`
+	DeliveryAttemptedAt  time.Time         `json:"deliveryAttemptedAt,omitempty"`
+	DeliveredAt          time.Time         `json:"deliveredAt,omitempty"`
+	DeliveryError        string            `json:"deliveryError,omitempty"`
+	DeliveryAcknowledged int               `json:"deliveryAcknowledged"`
+	EvidenceHealthy      bool              `json:"evidenceHealthy"`
+	EvidenceError        string            `json:"evidenceError,omitempty"`
+	Findings             []WatchdogFinding `json:"findings,omitempty"`
+	Alert                bool              `json:"-"`
 }
 
 func hasFinding(findings []WatchdogFinding, kind string) bool {
@@ -72,6 +77,7 @@ func (s *Server) evaluateWatchdog(now time.Time) WatchdogView {
 	s.mu.RUnlock()
 
 	state := s.watchdogState
+	evidence := s.watchdogStore.Status()
 	if state.LastProgressAt.IsZero() {
 		state.LastProgressAt = now
 	}
@@ -152,8 +158,20 @@ func (s *Server) evaluateWatchdog(now time.Time) WatchdogView {
 	if metrics.StageRuns >= 3 && metrics.CompletionRate == 0 {
 		view.Findings = append(view.Findings, WatchdogFinding{Kind: "completion-rate", Detail: fmt.Sprintf("seven-day completion rate is %.2f per day after %d settled stage runs", metrics.CompletionRate, metrics.StageRuns)})
 	}
-	if status := s.audit.Status(); !status.Healthy {
-		view.Findings = append(view.Findings, WatchdogFinding{Kind: "audit-evidence", Detail: status.Error})
+	if status := s.audit.Status(); !status.EvidenceComplete {
+		detail := status.Error
+		if detail == "" && !status.ReconciliationComplete {
+			detail = "run audit reconciliation is incomplete"
+		}
+		if detail == "" && status.PendingHuman > 0 {
+			detail = fmt.Sprintf("%d human audit intent(s) are unresolved", status.PendingHuman)
+		}
+		view.Findings = append(view.Findings, WatchdogFinding{Kind: "audit-evidence", Detail: detail})
+		view.Incident = true
+	}
+	view.EvidenceHealthy, view.EvidenceError = evidence.Healthy, evidence.Error
+	if !evidence.Healthy {
+		view.Findings = append(view.Findings, WatchdogFinding{Kind: "watchdog-evidence", Detail: evidence.Error})
 		view.Incident = true
 	}
 	blocked := map[string]int{}
@@ -179,7 +197,7 @@ func (s *Server) evaluateWatchdog(now time.Time) WatchdogView {
 		var causes []string
 		for _, finding := range view.Findings {
 			switch finding.Kind {
-			case "dead-scheduler", "stale-source-stall", "capacity-leak", "audit-evidence":
+			case "dead-scheduler", "stale-source-stall", "capacity-leak", "audit-evidence", "watchdog-evidence":
 				causes = append(causes, finding.Kind)
 			}
 		}
@@ -188,14 +206,17 @@ func (s *Server) evaluateWatchdog(now time.Time) WatchdogView {
 		if state.IncidentKey != key {
 			state.IncidentKey, state.DetectedAt = key, now
 			state.DeliveryStatus, state.DeliveryAttemptedAt, state.DeliveredAt, state.DeliveryError = "pending", time.Time{}, time.Time{}, ""
+			state.DeliveryAcks = nil
 		}
 		view.Alert = state.DeliveryStatus != "delivered"
 	} else {
 		state.IncidentKey, state.DetectedAt = "", time.Time{}
 		state.DeliveryStatus, state.DeliveryAttemptedAt, state.DeliveredAt, state.DeliveryError = "", time.Time{}, time.Time{}, ""
+		state.DeliveryAcks = nil
 	}
 	view.DetectedAt, view.DeliveryStatus = state.DetectedAt, state.DeliveryStatus
 	view.DeliveryAttemptedAt, view.DeliveredAt, view.DeliveryError = state.DeliveryAttemptedAt, state.DeliveredAt, state.DeliveryError
+	view.DeliveryAcknowledged = len(state.DeliveryAcks)
 	s.watchdogState = state
 	if err := s.watchdogStore.Set(state); err != nil {
 		fmt.Fprintf(os.Stderr, "conveyor: persist watchdog state: %v\n", err)
@@ -260,19 +281,77 @@ func (s *Server) deliverWatchdogAlert(view WatchdogView) {
 	if len(view.Findings) > 0 {
 		body = view.Findings[0].Detail
 	}
-	err := s.watchdogNotifier("Conveyor stalled", body, "watchdog-stall")
+	incidentKey, detectedAt := state.IncidentKey, state.DetectedAt
+	endpoints := s.watchdogEndpoints()
+	if len(endpoints) == 0 {
+		s.finishWatchdogDelivery(incidentKey, detectedAt, nil, errors.New("no push subscriber"), false)
+		return
+	}
+	var lastErr error
+	for _, endpoint := range endpoints {
+		s.watchdogMu.Lock()
+		state = s.watchdogState
+		already := state.DeliveryAcks[endpoint]
+		current := state.IncidentKey == incidentKey && state.DetectedAt.Equal(detectedAt)
+		s.watchdogMu.Unlock()
+		if !current {
+			return
+		}
+		if already {
+			continue
+		}
+		err := s.watchdogNotifyEndpoint(endpoint, "Conveyor stalled", body, "watchdog-stall")
+		accepted := err == nil || errors.Is(err, push.Gone)
+		if !accepted {
+			lastErr = err
+		}
+		if !s.finishWatchdogDelivery(incidentKey, detectedAt, []string{endpoint}, err, accepted) {
+			return
+		}
+	}
+	currentEndpoints := s.watchdogEndpoints()
+	s.watchdogMu.Lock()
+	state = s.watchdogState
+	all := state.IncidentKey == incidentKey && state.DetectedAt.Equal(detectedAt)
+	for _, endpoint := range currentEndpoints {
+		all = all && state.DeliveryAcks[endpoint]
+	}
+	s.watchdogMu.Unlock()
+	if all {
+		s.finishWatchdogDelivery(incidentKey, detectedAt, nil, nil, true)
+	} else if lastErr != nil {
+		s.finishWatchdogDelivery(incidentKey, detectedAt, nil, lastErr, false)
+	} else {
+		s.finishWatchdogDelivery(incidentKey, detectedAt, nil, errors.New("not every current push subscriber acknowledged the incident"), false)
+	}
+}
+
+func (s *Server) finishWatchdogDelivery(key string, detected time.Time, endpoints []string, deliveryErr error, accepted bool) bool {
 	s.watchdogMu.Lock()
 	defer s.watchdogMu.Unlock()
-	state = s.watchdogState
-	if err != nil {
-		state.DeliveryStatus, state.DeliveryError = "pending", err.Error()
-	} else {
+	state := s.watchdogState
+	if state.IncidentKey != key || !state.DetectedAt.Equal(detected) {
+		return false
+	}
+	if accepted && len(endpoints) > 0 {
+		if state.DeliveryAcks == nil {
+			state.DeliveryAcks = map[string]bool{}
+		}
+		for _, endpoint := range endpoints {
+			state.DeliveryAcks[endpoint] = true
+		}
+	}
+	if accepted && len(endpoints) == 0 {
 		state.DeliveryStatus, state.DeliveredAt, state.DeliveryError = "delivered", time.Now(), ""
+	} else if deliveryErr != nil {
+		state.DeliveryStatus, state.DeliveryError = "pending", deliveryErr.Error()
 	}
 	s.watchdogState = state
-	if persistErr := s.watchdogStore.Set(state); persistErr != nil {
-		fmt.Fprintf(os.Stderr, "conveyor: persist watchdog delivery: %v\n", persistErr)
+	if err := s.watchdogStore.Set(state); err != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: persist watchdog delivery: %v\n", err)
+		return false
 	}
+	return true
 }
 
 func (s *Server) noteUsefulProgress(at time.Time) {
@@ -281,6 +360,7 @@ func (s *Server) noteUsefulProgress(at time.Time) {
 	state := s.watchdogState
 	state.LastProgressAt, state.IncidentKey, state.DetectedAt = at, "", time.Time{}
 	state.DeliveryStatus, state.DeliveryAttemptedAt, state.DeliveredAt, state.DeliveryError = "", time.Time{}, time.Time{}, ""
+	state.DeliveryAcks = nil
 	s.watchdogState = state
 	if err := s.watchdogStore.Set(state); err != nil {
 		fmt.Fprintf(os.Stderr, "conveyor: persist watchdog progress: %v\n", err)

@@ -60,6 +60,10 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, id+" has no run in flight to cancel", http.StatusConflict)
 		return
 	}
+	intent, audited := s.beginHumanAuditHTTP(w, r, "cancel", id)
+	if !audited {
+		return
+	}
 
 	s.mu.Lock()
 	s.cancels[id] = CancelView{By: requestedBy(r), Reason: reason, At: time.Now()}
@@ -67,6 +71,6 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	s.hub.publish(event{Kind: "state"})
 
 	v.(context.CancelFunc)()
-	s.auditHuman("cancel", id, requestedBy(r))
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusAccepted)
 }

@@ -131,9 +131,14 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 		ID: commandID, At: time.Now(), Kind: body.Kind, Text: text,
 		ItemID: id, RunID: body.RunID, Session: res.Session, By: requestedBy(r),
 	}
+	intent, audited := s.beginHumanAuditHTTP(w, r, "steer-"+body.Kind, id)
+	if !audited {
+		return
+	}
 	ctlPath := filepath.Join(entry.Dir, "control.jsonl")
 	seq, err := steering.AppendCommand(ctlPath, cmd)
 	if err != nil {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, "could not record the command: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -146,7 +151,7 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 	delete(s.steeringMisses, id)
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "steering", RunID: body.RunID, ItemID: id, Steering: &view})
-	s.auditHuman("steer-"+body.Kind, id, requestedBy(r))
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusAccepted)
 }
 

@@ -15,10 +15,10 @@ func TestAuditPersistsAndBoundsSevenDayEvents(t *testing.T) {
 	if err := a.Establish(now.Add(-8 * 24 * time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Append(AuditEvent{At: now.Add(-8 * 24 * time.Hour), Kind: "human", Action: "old"}, now); err != nil {
+	if err := a.Append(AuditEvent{At: now.Add(-8 * 24 * time.Hour), Kind: "human", Action: "old", State: "committed"}, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Append(AuditEvent{At: now, Kind: "human", Action: "pause"}, now); err != nil {
+	if err := a.Append(AuditEvent{At: now, Kind: "human", Action: "pause", State: "committed"}, now); err != nil {
 		t.Fatal(err)
 	}
 	reopened := OpenAudit(path)
@@ -119,5 +119,58 @@ func TestAuditWriteFailureAndRecordCapAreVisible(t *testing.T) {
 	b.mu.Unlock()
 	if err := b.Append(AuditEvent{At: now, Kind: "human", Action: "over-cap"}, now); err == nil {
 		t.Fatal("record cap did not fail closed")
+	}
+}
+
+func TestAuditPendingHumanIntentIsIncompleteUntilResolved(t *testing.T) {
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	a := OpenAudit(filepath.Join(t.TempDir(), "audit.jsonl"))
+	if err := a.Establish(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.BeginRunReconciliation(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.CompleteRunReconciliation(""); err != nil {
+		t.Fatal(err)
+	}
+	id, err := a.BeginHuman("start", "s1:1", "operator", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := a.Status(); status.PendingHuman != 1 || status.EvidenceComplete {
+		t.Fatalf("pending status = %#v", status)
+	}
+	if err := a.ResolveHuman(id, true, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got := a.Since(now.Add(-time.Hour))
+	if len(got) != 1 || got[0].State != "committed" || got[0].IntentID != id {
+		t.Fatalf("events = %#v", got)
+	}
+	if status := OpenAudit(a.path).Status(); status.PendingHuman != 0 || !status.EvidenceComplete {
+		t.Fatalf("resolved status = %#v", status)
+	}
+}
+
+func TestAuditRunReconciliationMustCompleteDurably(t *testing.T) {
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	a := OpenAudit(filepath.Join(t.TempDir(), "audit.jsonl"))
+	if err := a.Establish(now); err != nil {
+		t.Fatal(err)
+	}
+	watermark, err := a.BeginRunReconciliation()
+	if err != nil || watermark != "" {
+		t.Fatalf("begin = %q, %v", watermark, err)
+	}
+	if status := a.Status(); status.ReconciliationComplete || status.EvidenceComplete {
+		t.Fatalf("in-progress status = %#v", status)
+	}
+	if err := a.CompleteRunReconciliation("2026-09-26/run-2"); err != nil {
+		t.Fatal(err)
+	}
+	status := OpenAudit(a.path).Status()
+	if !status.ReconciliationComplete || status.RunWatermark != "2026-09-26/run-2" || !status.EvidenceComplete {
+		t.Fatalf("complete status = %#v", status)
 	}
 }

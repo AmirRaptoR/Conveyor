@@ -149,7 +149,7 @@ func TestManualStartAndReorderAuditOnlyAcceptedRequests(t *testing.T) {
 			human = append(human, event)
 		}
 	}
-	if len(human) != 2 || human[0].Action != "reorder" || human[1].Action != "start" || human[1].ItemID != "s1:1" {
+	if len(human) != 2 || human[0].Action != "reorder" || human[0].State != "committed" || human[1].Action != "start" || human[1].State != "committed" || human[1].ItemID != "s1:1" {
 		t.Fatalf("human events = %#v, want accepted reorder and start", human)
 	}
 	waitFor(t, "the manually started transition to finish", func() bool { return s.inFlight.Load() == 0 })

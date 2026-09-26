@@ -115,7 +115,7 @@ func cmdSoakReport(args []string) error {
 	if err != nil {
 		return err
 	}
-	pass := soakPass(state)
+	pass, reasons := soakEvaluation(state)
 	report := struct {
 		Schema      int                 `json:"schema"`
 		Pass        bool                `json:"pass"`
@@ -125,9 +125,10 @@ func cmdSoakReport(args []string) error {
 		Watchdog    server.WatchdogView `json:"watchdog"`
 		Audit       any                 `json:"audit"`
 		Soak        any                 `json:"soak"`
-	}{1, pass, time.Now().UTC(), "7d", state.Metrics, state.Watchdog, state.Audit, state.Soak}
+		Reasons     []string            `json:"reasons,omitempty"`
+	}{1, pass, time.Now().UTC(), "7d", state.Metrics, state.Watchdog, state.Audit, state.Soak, reasons}
 	if *format == "markdown" {
-		fmt.Printf("# Conveyor Seven-Day Soak Report\n\n- Result: **%s**\n- Soak ID: `%s`\n- Revision: `%s`\n- Coverage complete: `%t`\n- Evidence healthy: `%t`\n- Evidence error: `%s`\n- Observation began: `%s`\n- Window: `%s` to `%s`\n- Success rate: `%.2f`\n- Completions per day: `%.2f`\n- Retries per completion: `%.2f`\n- Wasted model runs: `%d`\n- Human interventions: `%d`\n- Blocked-to-recovered mean: `%s`\n", map[bool]string{true: "PASS", false: "FAIL"}[pass], state.Soak.ID, state.Soak.Revision, report.Metrics.CoverageComplete, report.Metrics.EvidenceHealthy, report.Metrics.EvidenceError, report.Metrics.ObservationSince.Format(time.RFC3339), report.Metrics.WindowStart.Format(time.RFC3339), report.Metrics.WindowEnd.Format(time.RFC3339), report.Metrics.SuccessRate, report.Metrics.CompletionRate, report.Metrics.RetriesPerCompletion, report.Metrics.WastedModelRuns, report.Metrics.HumanInterventions, report.Metrics.BlockedToRecovered)
+		fmt.Printf("# Conveyor Seven-Day Soak Report\n\n- Result: **%s**\n- Reasons: `%s`\n- Soak ID: `%s`\n- Revision: `%s`\n- Coverage complete: `%t`\n- Evidence healthy: `%t`\n- Evidence error: `%s`\n- Observation began: `%s`\n- Window: `%s` to `%s`\n- Success rate: `%.2f`\n- Completions per day: `%.2f`\n- Retries per completion: `%.2f`\n- Wasted model runs: `%d`\n- Human interventions: `%d`\n- Blocked-to-recovered mean: `%s`\n", map[bool]string{true: "PASS", false: "FAIL"}[pass], strings.Join(reasons, "; "), state.Soak.ID, state.Soak.Revision, report.Metrics.CoverageComplete, report.Metrics.EvidenceHealthy, report.Metrics.EvidenceError, report.Metrics.ObservationSince.Format(time.RFC3339), report.Metrics.WindowStart.Format(time.RFC3339), report.Metrics.WindowEnd.Format(time.RFC3339), report.Metrics.SuccessRate, report.Metrics.CompletionRate, report.Metrics.RetriesPerCompletion, report.Metrics.WastedModelRuns, report.Metrics.HumanInterventions, report.Metrics.BlockedToRecovered)
 		return nil
 	}
 	if *format != "json" {
@@ -167,11 +168,31 @@ func cmdSoakStart(args []string) error {
 }
 
 func soakPass(state server.State) bool {
-	pass := state.Metrics.CoverageComplete && !state.Watchdog.Incident && state.Metrics.HumanInterventions == 0 && state.Storage.Level != "critical"
+	pass, _ := soakEvaluation(state)
+	return pass
+}
+
+func soakEvaluation(state server.State) (bool, []string) {
+	var reasons []string
+	if !state.Metrics.CoverageComplete {
+		reasons = append(reasons, "seven-day evidence coverage is incomplete")
+	}
+	if state.Metrics.Completions == 0 {
+		reasons = append(reasons, "inconclusive: no terminal completions in the seven-day window")
+	}
+	if state.Watchdog.Incident {
+		reasons = append(reasons, "watchdog incident is open")
+	}
+	if state.Metrics.HumanInterventions != 0 {
+		reasons = append(reasons, "human interventions occurred")
+	}
+	if state.Storage.Level == "critical" {
+		reasons = append(reasons, "storage is critical")
+	}
 	for _, finding := range state.Watchdog.Findings {
-		if finding.Kind == "source-stale" || finding.Kind == "revision-coherence" || finding.Kind == "repeated-blocker" {
-			pass = false
+		if finding.Kind == "source-stale" || finding.Kind == "revision-coherence" || finding.Kind == "repeated-blocker" || finding.Kind == "completion-rate" {
+			reasons = append(reasons, "watchdog finding: "+finding.Kind)
 		}
 	}
-	return pass
+	return len(reasons) == 0, reasons
 }

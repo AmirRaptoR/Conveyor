@@ -270,9 +270,11 @@ The installer performs these operations in order:
    admission evaluator the scheduler uses (including global/source/stage/resource
    capacity) before `pipeline.Pick`. It claims no slot, writes no provider state
    and reserves no budget or storage.
-6. If restart or the candidate gate fails, atomically restore the old `current`,
-   restart it and run the old release's gate. If either rollback restart or gate
-   fails, remove `current`, require the service stop to succeed, and verify
+6. If restart or the candidate gate fails, atomically restore the old `current`
+   and restart it. The verified candidate deployment binary then gates the
+   active rollback server while requiring the old revision; this remains
+   compatible with releases that predate the `gate` command. If either rollback
+   restart or that gate fails, remove `current`, require the service stop to succeed, and verify
    systemd reports it inactive. A failed stop or still-active unit gets a
    distinct fatal diagnostic; the installer never claims containment in that
    state. On success the old target is retained as `previous`.

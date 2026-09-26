@@ -16,7 +16,7 @@ func TestOperationalMetricsUseStructuredSevenDayEvidence(t *testing.T) {
 		{Run: model.Run{Kind: "stage", ItemID: "s:old", To: "work", StartedAt: now.Add(-8 * 24 * time.Hour), Outcome: model.OutcomeFailure, RetentionClass: "model"}},
 	}
 	events := []store.AuditEvent{
-		{At: now.Add(-30 * time.Minute), Kind: "human", Action: "unblock"},
+		{At: now.Add(-30 * time.Minute), Kind: "human", Action: "unblock", State: "committed"},
 		{At: now.Add(-20 * time.Minute), Kind: "recovery", DurationNs: int64(10 * time.Minute)},
 	}
 	coverage := metricCoverage{StartedAt: now.Add(-metricsWindow), Healthy: true}
@@ -32,6 +32,19 @@ func TestOperationalMetricsUseStructuredSevenDayEvidence(t *testing.T) {
 	}
 	if broken := calculateMetrics(now, metricCoverage{StartedAt: now.Add(-metricsWindow), Error: "audit truncated"}, runs, events, map[string]bool{"done": true}); broken.CoverageComplete || broken.EvidenceError == "" {
 		t.Fatalf("broken evidence metrics = %#v", broken)
+	}
+}
+
+func TestMetricsIgnorePendingAndRejectedHumanIntents(t *testing.T) {
+	now := time.Now().UTC()
+	events := []store.AuditEvent{
+		{At: now, Kind: "human", Action: "start", State: "pending"},
+		{At: now, Kind: "human", Action: "reorder", State: "rejected"},
+		{At: now, Kind: "human", Action: "tick", State: "committed"},
+	}
+	m := calculateMetrics(now, metricCoverage{StartedAt: now.Add(-metricsWindow), Healthy: true}, nil, events, nil)
+	if m.HumanInterventions != 1 {
+		t.Fatalf("human interventions = %d, want only committed", m.HumanInterventions)
 	}
 }
 
