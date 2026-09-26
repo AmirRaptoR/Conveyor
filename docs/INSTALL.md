@@ -41,6 +41,25 @@ depends on all of them at once.
 | systemd | running the engine as a service (`deploy/conveyor.service.example`) | `systemctl --version` |
 | Caddy | TLS in front of the board, required for Web Push (a secure origin) | `caddy version` |
 
+### Production model mapping (2026-09-26)
+
+The five-source production configuration uses the exact IDs advertised by the
+host's Codex catalogue (`~/.codex/models_cache.json`):
+
+| Stage | Agent | Model policy |
+| --- | --- | --- |
+| `refining` | `codex` | `gpt-5.6-sol`; specification quality governs every later stage |
+| `in-progress` | `codex` | `gpt-5.6-sol`; implementation is high-consequence work |
+| `review` | `reviewer` | Claude `claude-sonnet-5` while available, then `gpt-5.6-sol` on a confirmed pre-run or in-run Claude quota limit |
+| `approving` | `codex` | `gpt-5.6-terra`; the model path is a rare, bounded review-thread repair |
+
+The same catalogue also advertises `gpt-5.6-luna`. It is deliberately not
+assigned: there is no separate low-risk model stage in this pipeline, and
+inventing one only to consume a cheaper model would change the workflow. All
+four stages reserve the shared `codex` resource conservatively, including
+review while Claude is primary and approving while its deterministic gate does
+not need a model.
+
 OpenCode is pinned exactly because `opencode run --format json` is a CLI event
 projection rather than a versioned protocol. Disable its auto-update and install
 the supported version before enabling an OpenCode script:
