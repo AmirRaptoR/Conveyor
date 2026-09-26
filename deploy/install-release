@@ -107,6 +107,7 @@ if [[ ! -e "$target" ]]; then
           exit 1
         fi
         cp -a "$source_dir" "$target_dir"
+        rm -f "$target_dir"/*.bak "$target_dir"/*~
       done
     fi
   )
