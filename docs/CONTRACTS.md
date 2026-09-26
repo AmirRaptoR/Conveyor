@@ -73,9 +73,10 @@ arrive in this shape.
 
 Rules the engine enforces:
 
-- Unknown `stage` → the item is rejected and logged, not silently dropped.
-- Missing `ref` → the item is rejected and logged, the same as a missing `id`.
-- Duplicate `id` within one poll → first wins, the collision is logged. This is
+- Unknown `stage`, missing id/ref/title, or a duplicate id rejects the entire
+  source listing and retains its last-good state. A valid subset is never
+  authoritative source state. Cross-source collisions still keep the first
+  source in configuration order and warn. This is
   enforced across every source's listing, not merely within one source's own —
   the engine keys `working`, marks, timers and the manual order by the bare id,
   and two sources cannot be trusted not to collide.
@@ -180,7 +181,7 @@ author learns it once.
 
 These channels are separate on purpose. An AI agent writes megabytes of prose
 to stdout; parsing data out of that is how this kind of system breaks. If a
-script writes nothing to the result file, it simply produced no data — and a
+stage script writes nothing to the result file, it simply produced no data — and a
 script that publishes no plan or capability produces no corresponding board
 entry, never a warning: both are adapter promises, never requirements of the
 engine or the config (CLAUDE.md's extension-seam invariant).
@@ -397,6 +398,9 @@ one, never a partial write.
 **`list`** — read items from a provider. Writes either a JSON array of items or
 the `{items, warnings}` envelope from §2 to `$CONVEYOR_RESULT`. Exit 0 with
 `[]` or `{"items":[]}` means an empty backlog, which is normal.
+Exit 0 with an empty, JSON `null`, truncated or otherwise invalid result is a failed listing,
+not an authoritative empty backlog; the server retains that source's last-good
+state.
 
 What it does not emit does not exist: an item the lister filters out is not on
 the board, not in a count, and nothing will ever be run against it. That is the
@@ -873,7 +877,7 @@ data/runs/<yyyy-mm-dd>/<run-id>/
                  started/finished, duration, the env the script was given
   stdin.json     exactly what was piped in
   log.txt        stdout and stderr interleaved in real order, each line stamped
-  result.json    whatever the script wrote to $CONVEYOR_RESULT (may be absent)
+  result.json    script output, or a content-addressed list/status reference
   plan.jsonl     the plan channel (§2a): one JSON todo revision per accepted
                  line, always present (may be empty) — pre-created the same
                  way result.json is
@@ -887,24 +891,42 @@ Self-contained is the point: a failed run can be `tar`'d and handed to someone
 else — or to another agent — with everything needed to understand it and nothing
 else needed from the machine it ran on.
 
-Logs go to disk, not into the database. An AI stage script produces megabytes;
-that is a file, not a row. The store indexes run metadata and points at the
-directory.
+Logs go to disk, not into the database. Completed logs over 1 MiB are gzip
+compressed and read transparently by the run API. Every non-empty list/status
+result, including malformed data the caller rejects, leaves a small `sha256:`
+reference to one compressed blob under `data/payloads`; unchanged polls do not
+copy the same payload, while malformed bytes remain invalid and are never
+exposed as structured `Data`. Stage results remain in their run, so current
+blocker evidence and recovery never depend on that blob store.
 
 ### Retention
 
 ```yaml
-logs:
-  retention: 30d       # runs older than this are deleted
-  sweepAt: 04:00       # daily; also runs once on startup
+storage:
+  maxBytes: 20GiB
+  tempMaxBytes: 4GiB
+  highWatermark: 80
+  criticalWatermark: 95
+  sweepAt: 04:00
+  retention:
+    model: 30d
+    failure: 90d
+    polling: 2d
+    status: 7d
 ```
 
-Comparing days, not timestamps: a run directory whose day is strictly before
-the cutoff's UTC date is deleted, one on or after it is kept, and a whole
-expired day can be skipped without reading a single `meta.json` — conservative
-by up to 24 hours in the safe direction. The sweep runs once at startup and
-then daily at `sweepAt`, in the process's own local time zone, and never under
-`-watch`: a server that only observes must not delete anything either.
+Omitted storage fields take the defaults shown above. An explicitly configured
+zero for either ceiling, either watermark or any retention class is invalid;
+zero never means "use the default".
+
+Failures, blocks, timeouts and interruptions use the `failure` class even for a
+model stage. Successful agent-backed stages use `model`, status probes use
+`status`, and successful discovery/provider/deterministic runs use `polling`.
+The startup sweep waits until every runnable source has produced an
+authoritative listing and current-item evidence has been recalled, then runs;
+later sweeps run daily at `sweepAt`, in the process's own local time zone, and
+never under `-watch`: a server that only observes must not delete anything
+either.
 
 Three exceptions, and they matter:
 
@@ -927,6 +949,41 @@ an expired run belonging to nothing on the board today is swept normally. A
 day directory left empty by the sweep is removed; one still holding a pinned
 run is not. Pinned runs are reported in the sweep log, named individually, so
 they cannot pile up unnoticed.
+
+The data ceiling covers the whole data directory; the temporary ceiling covers
+the engine-owned scratch root. Every script receives a fresh marked child of
+that root as `TMPDIR`, removed when it returns. The child is named for its exact
+run ID; its strict marker carries that same ID, the run process lease and
+deadline, and is explicitly ended when the child exits, so a leak is reclaimable
+while the long-lived server remains alive. Cleanup removes only expired children
+whose marker is readable, well-formed and bound to that exact directory. It
+retains and reports uncertain markers, never follows symlinks, and never infers
+ownership from age. At the high watermark only new agent-backed stages pause; admission
+atomically reserves a conservative projected-growth allowance until the run
+finishes, so concurrent starts cannot all pass one stale byte snapshot.
+Listings, status probes, deterministic work and HTTP state/history remain
+available. A run-store persistence fault, including failed log finalization or
+compaction, pauses the same model admission until a later run persists cleanly.
+Critical pressure runs cleanup immediately before admission and keeps model
+work paused if usage stays high. Before initial source evidence has been
+reconstructed, that cleanup may reclaim independently owned expired scratch and
+unreferenced payload blobs, but it does not sweep run history and model work is
+still refused. `/api/state.storage` reports bytes
+by class, temporary and total bytes, total 24-hour projected growth across the
+run, payload, persistent-store and scratch roots, watermarks, level and last
+cleanup.
+
+The former `logs:` block is a load error with migration guidance: one retention
+duration cannot silently stand for four materially different classes.
+
+Git worktrees remain adapter-owned and outside the data/scratch byte account:
+the engine still has no Git concept. `agents/_worktree` reclaims spent trees
+opportunistically before creating/reusing one, but only at the exact managed
+source/ref path with Conveyor's ownership marker (or the narrow legacy linked-
+worktree proof), no live PID/deadline lease, no uncommitted files and no
+unpushed commits. Dirty or unpushed trees are evidence, not temporary files;
+they are deliberately reported/retained rather than deleted to satisfy a byte
+target.
 
 ### Failure is a first-class state
 

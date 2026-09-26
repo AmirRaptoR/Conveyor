@@ -9,9 +9,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
+	"github.com/AmirRaptoR/Conveyor/internal/runner"
 )
 
 // SweepResult is what one retention pass did, reported in a single summary
@@ -117,9 +120,7 @@ func sweepRoot(root string, cutoff time.Time, pinned func(RunMeta) (bool, string
 	return res, errors.Join(errs...)
 }
 
-// dirSize sums file sizes under dir without reading any file's content —
-// exactly the cost /api/state's storage figure is allowed to pay, and the
-// cost retention itself pays only for a run it has decided to delete.
+// dirSize sums file sizes under dir without reading file content.
 func dirSize(dir string) int64 {
 	var total int64
 	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
@@ -171,17 +172,28 @@ func (s *Server) pinnedFunc() func(RunMeta) (bool, string) {
 // even when nothing was deleted, so a sweep that ran and found nothing to do
 // is as visible as one that did.
 func (s *Server) runSweep(w io.Writer) {
-	cutoff := time.Now().Add(-s.cfg.Logs.Retention.D())
-	pinned := s.pinnedFunc()
+	now := time.Now()
 	s.runStoreMu.Lock()
-	res, err := sweepRoot(s.run.Root, cutoff, pinned)
+	ready := s.retentionIsReady()
+	res := SweepResult{}
+	var err error
+	if ready {
+		res, err = sweepClasses(s.run.Root, s.cfg, now, s.pinnedFunc())
+	}
+	tempFreed, tempErr := runner.SweepTemp(s.run.TempRoot, now.Add(-24*time.Hour))
+	payloadFreed, payloadErr := s.run.SweepPayloads(now.Add(-24 * time.Hour))
+	res.BytesFreed += tempFreed + payloadFreed
+	err = errors.Join(err, tempErr, payloadErr)
 
 	s.mu.Lock()
 	if res.Deleted > 0 {
 		s.everSwept = true
 		s.runStoreGen++
 	}
-	s.sweepHorizon = res.Horizon
+	if ready {
+		s.sweepHorizon = res.Horizon
+	}
+	s.lastCleanup = now
 	if len(res.DeletedRuns) > 0 {
 		deleted := make(map[string]bool, len(res.DeletedRuns))
 		for _, id := range res.DeletedRuns {
@@ -218,6 +230,11 @@ func (s *Server) runSweep(w io.Writer) {
 	}
 	s.mu.Unlock()
 	s.runStoreMu.Unlock()
+	storage := s.storageUse()
+	s.mu.Lock()
+	s.state.Storage = storage
+	s.mu.Unlock()
+	s.hub.publish(event{Kind: "state"})
 
 	fmt.Fprintf(w, "conveyor: retention sweep: deleted %d run(s), %d bytes reclaimed, %d pinned, horizon %s\n",
 		res.Deleted, res.BytesFreed, len(res.Pinned), res.Horizon.Format("2006-01-02"))
@@ -227,19 +244,36 @@ func (s *Server) runSweep(w io.Writer) {
 	if err != nil {
 		fmt.Fprintf(w, "conveyor: retention sweep had errors: %v\n", err)
 	}
+	if !ready {
+		fmt.Fprintln(w, "conveyor: retention sweep: run deletion deferred until initial source evidence is reconstructed")
+	}
+}
+
+func (s *Server) retentionIsReady() bool {
+	select {
+	case <-s.retentionReady:
+		return true
+	default:
+		return false
+	}
 }
 
 // sweep runs the retention sweep once at startup and then daily at
-// logs.sweepAt, parsed in the process's own local time zone, until ctx ends.
+// storage.sweepAt, parsed in the process's own local time zone, until ctx ends.
 // Callers gate this on auto: a server started with -watch only observes, and
 // must not delete anything either.
 func (s *Server) sweep(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-s.retentionReady:
+	}
 	s.runSweep(os.Stderr)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(untilNextSweepAt(s.cfg.Logs.SweepAt, time.Now())):
+		case <-time.After(untilNextSweepAt(s.cfg.Storage.SweepAt, time.Now())):
 			s.runSweep(os.Stderr)
 		}
 	}
@@ -257,21 +291,30 @@ func untilNextSweepAt(hhmm string, now time.Time) time.Duration {
 	return next.Sub(now)
 }
 
-// StorageView is what the run store currently holds, computed by walking
-// directory and file sizes only — never by decoding a single meta.json,
-// which is the cost retention exists to bound.
+// StorageView is what the data and scratch stores currently hold. Run metadata
+// is decoded only to assign each directory's bytes to its persisted class.
 type StorageView struct {
-	Bytes     int64  `json:"bytes"`
-	Runs      int    `json:"runs"`
-	OldestDay string `json:"oldestDay,omitempty"`
+	Bytes             int64            `json:"bytes"`
+	TemporaryBytes    int64            `json:"temporaryBytes"`
+	Runs              int              `json:"runs"`
+	OldestDay         string           `json:"oldestDay,omitempty"`
+	ByClass           map[string]int64 `json:"byClass"`
+	ProjectedGrowth   int64            `json:"projectedGrowth"`
+	MaxBytes          int64            `json:"maxBytes"`
+	TempMaxBytes      int64            `json:"tempMaxBytes"`
+	HighWatermark     int              `json:"highWatermark"`
+	CriticalWatermark int              `json:"criticalWatermark"`
+	Level             string           `json:"level"`
+	LastCleanup       time.Time        `json:"lastCleanup,omitempty"`
 }
 
 func (s *Server) storageUse() StorageView {
-	var v StorageView
+	v := StorageView{ByClass: map[string]int64{}, MaxBytes: int64(s.cfg.Storage.MaxBytes), TempMaxBytes: int64(s.cfg.Storage.TempMaxBytes), HighWatermark: s.cfg.Storage.HighWatermark, CriticalWatermark: s.cfg.Storage.CriticalWatermark}
+	s.mu.RLock()
+	v.LastCleanup = s.lastCleanup
+	s.mu.RUnlock()
+	now := time.Now()
 	days, err := os.ReadDir(s.run.Root)
-	if err != nil {
-		return v
-	}
 	for _, day := range days {
 		if !day.IsDir() {
 			continue
@@ -287,9 +330,217 @@ func (s *Server) storageUse() StorageView {
 		for _, e := range entries {
 			if e.IsDir() {
 				v.Runs++
+				dir := filepath.Join(dayDir, e.Name())
+				sz := dirSize(dir)
+				b, _ := os.ReadFile(filepath.Join(dir, "meta.json"))
+				var m model.Run
+				if json.Unmarshal(b, &m) == nil {
+					v.ByClass[runClass(s.cfg, m)] += sz
+				}
 			}
 		}
-		v.Bytes += dirSize(dayDir)
+	}
+	_ = err
+	dataRoot := s.cfg.DataDir()
+	payloadRoot := filepath.Join(filepath.Dir(s.run.Root), "payloads")
+	v.Bytes = dirSize(dataRoot)
+	v.ProjectedGrowth = recentSize(dataRoot, now.Add(-24*time.Hour))
+	for _, root := range []string{s.run.Root, payloadRoot, s.run.TempRoot} {
+		if !pathWithin(dataRoot, root) {
+			v.Bytes += dirSize(root)
+			v.ProjectedGrowth += recentSize(root, now.Add(-24*time.Hour))
+		}
+	}
+	v.TemporaryBytes = dirSize(s.run.TempRoot)
+	var accounted int64
+	for _, n := range v.ByClass {
+		accounted += n
+	}
+	v.ByClass["payloads"] = dirSize(payloadRoot)
+	v.ByClass["scratch"] = v.TemporaryBytes
+	accounted += v.ByClass["payloads"] + v.ByClass["scratch"]
+	if storeBytes := v.Bytes - accounted; storeBytes > 0 {
+		v.ByClass["store"] = storeBytes
+	}
+	pct := 0
+	if v.MaxBytes > 0 {
+		pct = int(v.Bytes * 100 / v.MaxBytes)
+	}
+	tmpPct := 0
+	if v.TempMaxBytes > 0 {
+		tmpPct = int(v.TemporaryBytes * 100 / v.TempMaxBytes)
+	}
+	if tmpPct > pct {
+		pct = tmpPct
+	}
+	switch {
+	case pct >= v.CriticalWatermark:
+		v.Level = "critical"
+	case pct >= v.HighWatermark:
+		v.Level = "high"
+	default:
+		v.Level = "ok"
 	}
 	return v
+}
+
+func pathWithin(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+func recentSize(root string, since time.Time) int64 {
+	var total int64
+	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil && info.ModTime().After(since) {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+func runClass(cfg *config.Config, m model.Run) string {
+	if m.Outcome == model.OutcomeFailure || m.Outcome == model.OutcomeBlocked || m.Outcome == model.OutcomeTimeout || m.Outcome == model.OutcomeInterrupted {
+		return "failure"
+	}
+	if m.RetentionClass == "model" || m.RetentionClass == "status" || m.RetentionClass == "polling" {
+		return m.RetentionClass
+	}
+	if m.Kind == "stage" && cfg.AgentFor(m.Source, m.To) != "" {
+		return "model"
+	}
+	if m.Kind == "status" {
+		return "status"
+	}
+	return "polling"
+}
+
+func retentionFor(cfg *config.Config, class string) time.Duration {
+	switch class {
+	case "failure":
+		return cfg.Storage.Retention.Failure.D()
+	case "model":
+		return cfg.Storage.Retention.Model.D()
+	case "status":
+		return cfg.Storage.Retention.Status.D()
+	default:
+		return cfg.Storage.Retention.Polling.D()
+	}
+}
+
+func sweepClasses(root string, cfg *config.Config, now time.Time, pinned func(RunMeta) (bool, string)) (SweepResult, error) {
+	res := SweepResult{Horizon: now.UTC()}
+	days, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return res, nil
+	}
+	if err != nil {
+		return res, err
+	}
+	var errs []error
+	for _, day := range days {
+		if !day.IsDir() {
+			continue
+		}
+		// Today's directory may contain a run between mkdir and its first
+		// atomic metadata write. No retention class can expire today.
+		if day.Name() >= now.UTC().Format("2006-01-02") {
+			continue
+		}
+		dayDir := filepath.Join(root, day.Name())
+		entries, readErr := os.ReadDir(dayDir)
+		if readErr != nil {
+			errs = append(errs, readErr)
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			dir := filepath.Join(dayDir, entry.Name())
+			b, readErr := os.ReadFile(filepath.Join(dir, "meta.json"))
+			if readErr != nil {
+				errs = append(errs, readErr)
+				continue
+			}
+			var m RunMeta
+			if json.Unmarshal(b, &m) != nil {
+				errs = append(errs, fmt.Errorf("parse %s: invalid JSON", filepath.Join(dir, "meta.json")))
+				continue
+			}
+			m.ID, m.Dir = entry.Name(), dir
+			if m.Outcome == model.OutcomeRunning {
+				res.Pinned = append(res.Pinned, m.ID+" (still running)")
+				continue
+			}
+			if keep, why := pinned(m); keep {
+				res.Pinned = append(res.Pinned, fmt.Sprintf("%s (%s)", m.ID, why))
+				continue
+			}
+			started := m.StartedAt
+			if started.IsZero() {
+				started, _ = time.Parse("2006-01-02", day.Name())
+			}
+			if !started.Before(now.Add(-retentionFor(cfg, runClass(cfg, m.Run)))) {
+				continue
+			}
+			sz := dirSize(dir)
+			if removeErr := os.RemoveAll(dir); removeErr != nil {
+				errs = append(errs, removeErr)
+				continue
+			}
+			res.Deleted++
+			res.BytesFreed += sz
+			res.DeletedRuns = append(res.DeletedRuns, m.ID)
+		}
+		left, _ := os.ReadDir(dayDir)
+		if len(left) == 0 {
+			_ = os.Remove(dayDir)
+		}
+	}
+	return res, errors.Join(errs...)
+}
+
+const minimumModelStorageAllowance int64 = 1 << 20
+
+func (s *Server) reserveModelStorage(itemID string) bool {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	s.mu.RLock()
+	persistFault := s.state.PersistFault != nil
+	s.mu.RUnlock()
+	if persistFault {
+		return false
+	}
+	v := s.storageUse()
+	if v.Level == "critical" {
+		s.runSweep(io.Discard)
+		v = s.storageUse()
+	}
+	allowance := v.ProjectedGrowth
+	highBytes := v.MaxBytes * int64(v.HighWatermark) / 100
+	if floor := min(minimumModelStorageAllowance, highBytes/20); allowance < floor {
+		allowance = floor
+	}
+	var reserved int64
+	for _, n := range s.storageReserved {
+		reserved += n
+	}
+	tempHighBytes := v.TempMaxBytes * int64(v.HighWatermark) / 100
+	if v.Level != "ok" || v.Bytes+reserved+allowance >= highBytes ||
+		v.TemporaryBytes+reserved+allowance >= tempHighBytes {
+		return false
+	}
+	s.storageReserved[itemID] = allowance
+	return true
+}
+
+func (s *Server) releaseModelStorage(itemID string) {
+	s.storageMu.Lock()
+	delete(s.storageReserved, itemID)
+	s.storageMu.Unlock()
 }

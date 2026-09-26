@@ -1,8 +1,10 @@
 package server
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -88,7 +90,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	b, _ := os.ReadFile(filepath.Join(run.Dir, "log.txt"))
+	b, _ := readStoredLog(run.Dir)
 	all := parseLog(string(b))
 	run.TotalLines = len(all)
 	run.Lines = logWindow(all, r.URL.Query().Get("tail"), r.URL.Query().Get("offset"))
@@ -110,6 +112,24 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 	s.runStoreMu.RUnlock()
 	writeJSON(w, run)
+}
+
+func readStoredLog(dir string) ([]byte, error) {
+	plain := filepath.Join(dir, "log.txt")
+	if b, err := os.ReadFile(plain); err == nil {
+		return b, nil
+	}
+	f, err := os.Open(plain + ".gz")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	return io.ReadAll(zr)
 }
 
 // defaultTailLines is what GET /api/runs/{id} returns when the caller asks

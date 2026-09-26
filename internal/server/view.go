@@ -541,6 +541,15 @@ type Server struct {
 	// sweepHorizon is the oldest day the last sweep left standing, named in a
 	// 410 so an operator knows how far back retention still reaches.
 	sweepHorizon time.Time
+	lastCleanup  time.Time
+	// retentionReady closes after every runnable source has produced at least
+	// one authoritative listing and recallBlocks has rebuilt item evidence.
+	// Startup retention waits for it so it cannot delete the history needed to
+	// establish its own pins.
+	retentionReady     chan struct{}
+	retentionReadyOnce sync.Once
+	storageMu          sync.Mutex
+	storageReserved    map[string]int64
 	// paused is the agents the scheduler is holding work back from, by name.
 	//
 	// Not persisted, deliberately: it is a fact about the outside world right
@@ -717,20 +726,22 @@ type Server struct {
 func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Server {
 	secureDataDir(cfg.DataDir())
 	s := &Server{
-		cfg:          cfg,
-		run:          r,
-		eng:          pipeline.New(cfg, r),
-		hub:          newHub(),
-		order:        store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
-		answers:      store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
-		manualPauses: store.OpenPauses(filepath.Join(cfg.DataDir(), "pauses.json")),
-		budgets:      store.OpenBudgets(filepath.Join(cfg.DataDir(), "budgets.json")),
-		recovery:     store.OpenRecovery(filepath.Join(cfg.DataDir(), "recovery.json")),
-		tick:         make(chan struct{}, 1),
-		wake:         make(chan struct{}, 1),
-		ctx:          context.Background(),
-		drainGrace:   drainGrace,
-		liveRuns:     registry.New(),
+		cfg:             cfg,
+		run:             r,
+		eng:             pipeline.New(cfg, r),
+		hub:             newHub(),
+		order:           store.OpenOrder(filepath.Join(cfg.DataDir(), "order.json")),
+		answers:         store.OpenAnswers(filepath.Join(cfg.DataDir(), "answers.json")),
+		manualPauses:    store.OpenPauses(filepath.Join(cfg.DataDir(), "pauses.json")),
+		budgets:         store.OpenBudgets(filepath.Join(cfg.DataDir(), "budgets.json")),
+		recovery:        store.OpenRecovery(filepath.Join(cfg.DataDir(), "recovery.json")),
+		tick:            make(chan struct{}, 1),
+		wake:            make(chan struct{}, 1),
+		ctx:             context.Background(),
+		drainGrace:      drainGrace,
+		liveRuns:        registry.New(),
+		retentionReady:  make(chan struct{}),
+		storageReserved: map[string]int64{},
 	}
 	s.pushSubs = push.OpenStore(filepath.Join(cfg.DataDir(), "push.json"))
 	if keys, err := push.LoadKeys(filepath.Join(cfg.DataDir(), "vapid.json")); err != nil {
@@ -855,7 +866,8 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 }
 
 // notePersistFault sets or clears the board-visible sticky fault from one
-// run's outcome: a run whose meta.json write or log.txt append failed sets it
+// run's outcome: a run whose metadata, log write, finalization or compaction
+// failed sets it
 // (naming the run that failed to record itself honestly); any other run
 // persisting means the disk is not, or is no longer, the problem, and clears
 // it. It is intentional that this is not scoped to one item or source — a

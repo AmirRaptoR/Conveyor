@@ -39,6 +39,14 @@ export const fmtBytes = n => {
   return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
 };
 
+export const storageSummary = storage => [
+  `data ${fmtBytes(storage.bytes)} / ${fmtBytes(storage.maxBytes || 0)}`,
+  `temporary ${fmtBytes(storage.temporaryBytes || 0)} / ${fmtBytes(storage.tempMaxBytes || 0)}`,
+  storage.byClass && Object.entries(storage.byClass).map(([name, bytes]) => `${name}: ${fmtBytes(bytes)}`).join(" · "),
+  `projected +${fmtBytes(storage.projectedGrowth || 0)}/day`,
+  storage.lastCleanup ? `last cleanup ${new Date(storage.lastCleanup).toLocaleString()}` : "cleanup has not run",
+].filter(Boolean).join(" · ");
+
 // The board is served to phones over the network, where a skewed device
 // clock is an everyday thing. Every other timestamp here is absolute, so a
 // skewed clock is merely a slightly wrong wall clock — but a duration is

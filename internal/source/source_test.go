@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
@@ -21,6 +22,8 @@ func TestListResultAcceptsWarningEnvelopeAndLegacyArray(t *testing.T) {
 	}{
 		{name: "legacy array", body: `[{"id":"s1:1","ref":"1","source":"s1","stage":"ready","title":"one"}]`},
 		{name: "warning envelope", body: `{"items":[{"id":"s1:1","ref":"1","source":"s1","stage":"ready","title":"one"}],"warnings":[{"itemId":"s1:1","reason":"native parent disagrees with marker"}]}`, wantWarnings: 1},
+		{name: "explicit empty array", body: `[]`},
+		{name: "null", body: `null`, wantErr: true},
 		// `items` is required even when empty. Treating an object typo as an
 		// empty listing would erase that source's last-good board state.
 		{name: "object without items", body: `{"warnings":[]}`, wantErr: true},
@@ -51,8 +54,31 @@ func TestListResultAcceptsWarningEnvelopeAndLegacyArray(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(res.Items) != 1 || len(res.Warnings) != tc.wantWarnings {
-				t.Fatalf("result = %+v, want one item and %d warnings", res, tc.wantWarnings)
+			wantItems := 1
+			if tc.name == "explicit empty array" {
+				wantItems = 0
+			}
+			if len(res.Items) != wantItems || len(res.Warnings) != tc.wantWarnings {
+				t.Fatalf("result = %+v, want %d item(s) and %d warnings", res, wantItems, tc.wantWarnings)
+			}
+		})
+	}
+}
+
+func TestListRejectsMissingOrTruncatedResult(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "empty", body: `: >"$CONVEYOR_RESULT"`},
+		{name: "truncated", body: `printf '%s' '[{"id":"s1:1"' >"$CONVEYOR_RESULT"`},
+		{name: "null", body: `printf '%s' 'null' >"$CONVEYOR_RESULT"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, src := preflightConfig(t, nil)
+			writeExecFile(t, src.List, "#!/bin/sh\n"+tc.body+"\n")
+			if res, err := New(cfg, src, runner.New(filepath.Join(t.TempDir(), "runs"))).List(context.Background()); err == nil {
+				t.Fatalf("List succeeded with %+v, want invalid result error", res)
 			}
 		})
 	}
@@ -90,6 +116,17 @@ func TestValidateRejectsAnEmptyRef(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("warnings = %v, want one naming items[0] with no ref", warns)
+	}
+}
+
+func TestListRejectsAValidSubsetSoItCannotReplaceSourceState(t *testing.T) {
+	cfg, src := preflightConfig(t, nil)
+	writeExecFile(t, src.List, `#!/bin/sh
+printf '%s' '[{"id":"s1:1","ref":"1","stage":"backlog","title":"valid"},{"id":"s1:2","stage":"backlog","title":"partial"}]' >"$CONVEYOR_RESULT"
+`)
+	res, err := New(cfg, src, runner.New(filepath.Join(t.TempDir(), "runs"))).List(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "incomplete listing rejected") {
+		t.Fatalf("List = (%+v, %v), want whole-list rejection", res, err)
 	}
 }
 

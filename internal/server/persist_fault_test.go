@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
 )
@@ -100,5 +101,18 @@ func TestPersistenceFaultClearsOnALaterSuccessfulPersist(t *testing.T) {
 	s.notePersistFault(&runner.Result{Run: model.Run{ID: "y", Outcome: model.OutcomeSuccess}})
 	if s.state.PersistFault != nil {
 		t.Errorf("PersistFault = %+v, want cleared by a later clean persist", s.state.PersistFault)
+	}
+}
+
+func TestPersistenceFaultPausesModelStorageAdmission(t *testing.T) {
+	cfg, r := boardFor(t)
+	cfg.Sources[0].Scripts["work"] = config.ScriptSpec{Agent: "fake"}
+	s := New(cfg, r)
+	s.notePersistFault(&runner.Result{
+		Run:        model.Run{ID: "x"},
+		PersistErr: "compact log.txt: no space left on device",
+	})
+	if s.reserveModelStorage("s1:1") {
+		t.Fatal("model work admitted while run persistence is faulted")
 	}
 }

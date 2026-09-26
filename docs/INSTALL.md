@@ -299,6 +299,24 @@ config schema and canonical release directory. In production the badge must say
 
 ### Migrating an existing checkout-based service
 
+Replace the former `logs:` block before starting the new binary. It is rejected
+rather than guessed because successful polling, status, model work and failures
+now have intentionally different lifetimes:
+
+```yaml
+storage:
+  maxBytes: 20GiB
+  tempMaxBytes: 4GiB
+  highWatermark: 80
+  criticalWatermark: 95
+  sweepAt: "04:00"
+  retention: {model: 30d, failure: 90d, polling: 2d, status: 7d}
+```
+
+Size suffixes are binary (`KiB`, `MiB`, `GiB`, `TiB`). Check
+`/api/state.storage` after restart; `high` or `critical` pauses new model stages
+but deliberately leaves discovery and the board available.
+
 Before starting autonomous mode after upgrading from the all-transition budget
 ledger, add positive `budgets.maxRunsPerItem` and `budgets.maxRunsPerDay` values.
 If `data/budgets.json` predates the model-only ledger, startup names the reset

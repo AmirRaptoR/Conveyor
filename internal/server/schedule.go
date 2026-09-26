@@ -24,6 +24,7 @@ const (
 	claimAgentPaused                  // the stage's agent is over quota and overridePause is false
 	claimManuallyPaused               // an operator paused this source, or the whole board
 	claimBudgetExhausted              // this item, or the board's day, spent its execution ceiling
+	claimStorageHigh                  // model writes are paused by pressure or a persistence fault
 )
 
 // claim is the only place s.working is populated. Every dispatch path — the
@@ -74,6 +75,11 @@ func (s *Server) claim(item model.Item, target string, overridePause bool) claim
 		s.working.Delete(item.ID)
 		return claimSlotBusy
 	}
+	if s.cfg.AgentFor(item.Source, target) != "" && !s.reserveModelStorage(item.ID) {
+		s.working.Delete(item.ID)
+		s.eng.Locks().Release(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...)
+		return claimStorageHigh
+	}
 	// Spent last, once nothing else stands between this item and actually
 	// launching: a claim refused for a busy slot or a paused source has run
 	// nothing and must not count against either ceiling, so the reservation
@@ -81,6 +87,7 @@ func (s *Server) claim(item model.Item, target string, overridePause bool) claim
 	// everything already reserved — the same "changed nothing" guarantee
 	// claimSlotBusy above keeps.
 	if ok, _ := s.reserveBudget(item.ID, item.Source, target); !ok {
+		s.releaseModelStorage(item.ID)
 		s.working.Delete(item.ID)
 		s.eng.Locks().Release(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...)
 		return claimBudgetExhausted
@@ -230,7 +237,7 @@ func (s *Server) launch(ctx context.Context) int {
 				fullStage[target] = true
 			}
 			continue
-		case claimItemBusy, claimAgentPaused, claimManuallyPaused, claimBudgetExhausted:
+		case claimItemBusy, claimAgentPaused, claimManuallyPaused, claimBudgetExhausted, claimStorageHigh:
 			busy[item.ID] = true
 			continue
 		}
@@ -248,6 +255,7 @@ func (s *Server) transition(ctx context.Context, item model.Item, target string)
 	defer s.wakeUp()
 	defer s.inFlight.Add(-1)
 	defer s.working.Delete(item.ID)
+	defer s.releaseModelStorage(item.ID)
 	defer s.eng.Locks().Release(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...)
 	s.runOne(ctx, item, target)
 }
@@ -628,6 +636,7 @@ func (s *Server) advance(ctx context.Context) bool {
 	}
 	defer s.eng.Locks().Release(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...)
 	defer s.working.Delete(item.ID)
+	defer s.releaseModelStorage(item.ID)
 	// Counted the same way schedule's launches are, so a drain waiting on
 	// inFlight actually waits for this too — the only mover with -watch set,
 	// where schedule never launches anything at all.

@@ -576,6 +576,7 @@ func TestRetentionSweepEvictsCachedPlanEntry(t *testing.T) {
 	s.planMisses["s1:2"] = planCursor{RunID: runID, Stage: "working"}
 	storeGeneration := s.runStoreGen
 
+	allowRunRetention(s)
 	s.runSweep(os.Stderr)
 	s.mergeRecoveredPlans(
 		storeGeneration,
@@ -605,6 +606,7 @@ func TestRetentionWaitsForRunStoreReaders(t *testing.T) {
 	s.runStoreMu.RLock()
 	done := make(chan struct{})
 	go func() {
+		allowRunRetention(s)
 		s.runSweep(os.Stderr)
 		close(done)
 	}()

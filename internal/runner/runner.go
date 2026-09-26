@@ -12,11 +12,14 @@ package runner
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,6 +65,9 @@ type Spec struct {
 	// must not look like stage work, spend model runs, or notify on an unchanged
 	// condition; their structured result is still returned to the caller.
 	Transient bool
+	// Model records that this stage invokes an agent. It affects storage policy
+	// only; scripts and models never see or choose it.
+	Model bool
 }
 
 // Result is a finished run plus whatever the script wrote to the result file.
@@ -72,10 +78,10 @@ type Result struct {
 	Data json.RawMessage
 	// Log is a bounded tail of the run's output — at most maxLogLines lines,
 	// each at most maxLineBytes. Nothing in production reads it (only this
-	// package's own tests do); log.txt on disk is always the complete,
-	// untruncated record. See CONTRACTS §6.
+	// package's own tests do); the archived log is always complete and
+	// untruncated, though completed large logs are gzip-compressed. See §6.
 	Log []LogLine
-	// PersistErr names a failure to write meta.json or append log.txt, set
+	// PersistErr names a failure to persist or finalize a run artifact, set
 	// independently of Run.Error. Run.Error keeps only the first failure a
 	// run hit — a process that fails to start sets it before persist() ever
 	// runs — so a simultaneous persistence failure could occupy no field a
@@ -92,13 +98,23 @@ const maxLogLines = 1000
 // maxLineBytes bounds a single log line kept in memory and published over
 // SSE. A script can emit one very long line — scan() below never limits a
 // read for exactly that reason — but a browser rendering it, or this slice
-// holding it, must not be handed the whole thing. log.txt still gets it in
-// full.
+// holding it, must not be handed the whole thing. The archived log keeps it.
 const maxLineBytes = 64 * 1024
 
 // Runner writes run directories under Root.
 type Runner struct {
 	Root string
+	// TempRoot is the engine-owned scratch root handed to scripts as TMPDIR.
+	// Every invocation gets one marked child which is removed on return.
+	TempRoot  string
+	payloadMu sync.Mutex
+	// compactLog is replaceable by package tests so failures such as ENOSPC can
+	// be exercised without relying on filesystem permissions or capacity.
+	compactLog func(string) error
+	// Directory creation is replaceable by package tests so partial-creation
+	// failures can be exercised without relying on filesystem permissions.
+	mkdirAll func(string, fs.FileMode) error
+	mkdir    func(string, fs.FileMode) error
 	// OnStart, if set, is called after the run's directory and initial metadata
 	// exist, immediately before its process is started. It gives live views the
 	// run id while the run is still active rather than only after it returns.
@@ -165,7 +181,12 @@ const gracePeriod = 30 * time.Second
 // second per assertion.
 var tickInterval = time.Second
 
-func New(root string) *Runner { return &Runner{Root: root} }
+func New(root string) *Runner {
+	return &Runner{
+		Root: root, TempRoot: filepath.Join(filepath.Dir(root), "tmp"),
+		compactLog: compactLog, mkdirAll: os.MkdirAll, mkdir: os.Mkdir,
+	}
+}
 
 // idRe is the shape Run() gives a run ID: HHMMSS.mmm-<base36 suffix>. A
 // caller resolving an ID from a request path must reject anything else before
@@ -184,8 +205,46 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	started := time.Now()
 	runID := fmt.Sprintf("%s-%s", started.UTC().Format("150405.000"), randSuffix())
 	dir := filepath.Join(r.Root, started.UTC().Format("2006-01-02"), runID)
+	run := model.Run{
+		ID: runID, Source: spec.Source, Kind: spec.Kind, Script: spec.Script,
+		From: spec.From, To: spec.To, StartedAt: started, Dir: dir, Item: spec.Item,
+	}
+	switch {
+	case spec.Kind == "status":
+		run.RetentionClass = "status"
+	case spec.Kind == "stage" && spec.Model:
+		run.RetentionClass = "model"
+	default:
+		run.RetentionClass = "polling"
+	}
+	if spec.Item != nil {
+		run.ItemID = spec.Item.ID
+	}
+	setupFailure := func(cause error, paths ...string) (*Result, error) {
+		for _, path := range paths {
+			_ = os.RemoveAll(path)
+		}
+		run.Error = cause.Error()
+		run.Outcome = model.OutcomeFailure
+		run.ExitCode = -1
+		run.FinishedAt = time.Now()
+		run.Duration = run.FinishedAt.Sub(started)
+		res := &Result{Run: run, PersistErr: cause.Error()}
+		if !spec.Transient && r.OnResult != nil {
+			r.OnResult(res)
+		}
+		return res, cause
+	}
+	mkdirAll := r.mkdirAll
+	if mkdirAll == nil {
+		mkdirAll = os.MkdirAll
+	}
+	mkdir := r.mkdir
+	if mkdir == nil {
+		mkdir = os.Mkdir
+	}
 	if spec.Transient {
-		if err := os.MkdirAll(r.Root, 0o700); err != nil {
+		if err := mkdirAll(r.Root, 0o700); err != nil {
 			return nil, fmt.Errorf("create probe root: %w", err)
 		}
 		var err error
@@ -197,17 +256,23 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	}
 	// 0o700: a run directory holds prompts, a person's typed answer (stdin.json)
 	// and logs, all meant for the operator who runs conveyor and nobody else.
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create run dir: %w", err)
+	if err := mkdirAll(dir, 0o700); err != nil {
+		return setupFailure(fmt.Errorf("create run dir: %w", err), dir)
 	}
+	if err := mkdirAll(r.TempRoot, 0o700); err != nil {
+		return setupFailure(fmt.Errorf("create temporary root: %w", err), dir)
+	}
+	tmpDir := filepath.Join(r.TempRoot, runID)
+	if err := mkdir(tmpDir, 0o700); err != nil {
+		return setupFailure(fmt.Errorf("create run temporary directory: %w", err), tmpDir, dir)
+	}
+	leasePath := filepath.Join(tmpDir, ".conveyor-owned")
+	if err := writeTempLease(leasePath, tempLease{RunID: runID}); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return nil, fmt.Errorf("mark run temporary directory: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
 
-	run := model.Run{
-		ID: runID, Source: spec.Source, Kind: spec.Kind, Script: spec.Script,
-		From: spec.From, To: spec.To, StartedAt: started, Dir: dir, Item: spec.Item,
-	}
-	if spec.Item != nil {
-		run.ItemID = spec.Item.ID
-	}
 	failSetup := func(cause error) (*Result, error) {
 		run.Error = cause.Error()
 		run.Outcome = model.OutcomeFailure
@@ -368,7 +433,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	if err := os.WriteFile(controlAckPath, nil, 0o600); err != nil {
 		return failSetup(fmt.Errorf("create control acknowledgement channel: %w", err))
 	}
-	env, envMap := buildEnv(spec, resultPath, planPath, controlPath, controlAckPath, deadline)
+	env, envMap := buildEnv(spec, resultPath, planPath, controlPath, controlAckPath, tmpDir, deadline)
 	run.Env = envMap
 	cmd := exec.Command(script)
 	cmd.Dir = spec.Workdir
@@ -396,6 +461,11 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 			r.OnResult(res)
 		}
 		return res, fmt.Errorf("start %s: %w", script, err)
+	}
+	if err := writeTempLease(leasePath, tempLease{RunID: runID, PID: cmd.Process.Pid, Deadline: deadline}); err != nil {
+		killGroup(cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Wait()
+		return failSetup(fmt.Errorf("lease run temporary directory: %w", err))
 	}
 	if !spec.Transient && r.OnStart != nil {
 		r.OnStart(run)
@@ -549,6 +619,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 
 	wg.Wait()
 	waitErr := cmd.Wait()
+	if err := writeTempLease(leasePath, tempLease{RunID: runID, Ended: true}); err != nil {
+		emit("engine", "end temporary lease: "+err.Error())
+	}
 	if !spec.Transient && r.OnProcessExit != nil {
 		r.OnProcessExit(run)
 	}
@@ -607,13 +680,60 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (*Result, error) {
 	r.finish(&run, started, persist)
 
 	res := &Result{Run: run, Log: lines, PersistErr: persistErr}
+	var rawResult []byte
 	if b, err := os.ReadFile(resultPath); err == nil && len(b) > 0 {
+		rawResult = b
 		if json.Valid(b) {
 			res.Data = json.RawMessage(b)
 		} else {
 			// Malformed result is worth surfacing: the script thought it was
 			// producing data. It does not change the outcome.
 			emit("engine", "result.json is not valid JSON; ignoring")
+		}
+	}
+	if !spec.Transient {
+		if (spec.Kind == "list" || spec.Kind == "status") && len(rawResult) > 0 {
+			if err := r.referencePayload(resultPath, rawResult); err != nil {
+				msg := "persist result reference: " + err.Error()
+				if res.Run.Error == "" {
+					res.Run.Error = msg
+				}
+				if res.PersistErr == "" {
+					res.PersistErr = msg
+				} else {
+					res.PersistErr += "; " + msg
+				}
+				emit("engine", msg)
+			}
+		}
+		if err := errors.Join(logFile.Sync(), logFile.Close()); err != nil {
+			msg := "finalize log.txt: " + err.Error()
+			if res.Run.Error == "" {
+				res.Run.Error = msg
+			}
+			if res.PersistErr == "" {
+				res.PersistErr = msg
+			} else {
+				res.PersistErr += "; " + msg
+			}
+			fmt.Fprintln(os.Stderr, "conveyor: "+msg)
+		} else {
+			compact := r.compactLog
+			if compact == nil {
+				compact = compactLog
+			}
+			if err := compact(logPath); err != nil {
+				msg := "compact log.txt: " + err.Error()
+				if res.Run.Error == "" {
+					res.Run.Error = msg
+				}
+				if res.PersistErr == "" {
+					res.PersistErr = msg
+				} else {
+					res.PersistErr += "; " + msg
+				}
+				fmt.Fprintln(os.Stderr, "conveyor: "+msg)
+			}
 		}
 	}
 	if !spec.Transient && r.OnResult != nil {
@@ -737,7 +857,7 @@ func trimNewline(s string) string {
 	return s
 }
 
-func buildEnv(spec Spec, resultPath, planPath, controlPath, controlAckPath string, deadline time.Time) ([]string, map[string]string) {
+func buildEnv(spec Spec, resultPath, planPath, controlPath, controlAckPath, tmpDir string, deadline time.Time) ([]string, map[string]string) {
 	own := map[string]string{
 		"CONVEYOR_RESULT":  resultPath,
 		"CONVEYOR_WORKDIR": spec.Workdir,
@@ -772,11 +892,297 @@ func buildEnv(spec Spec, resultPath, planPath, controlPath, controlAckPath strin
 	own["CONVEYOR_PLAN"] = planPath
 	own["CONVEYOR_CONTROL"] = controlPath
 	own["CONVEYOR_CONTROL_ACK"] = controlAckPath
+	// Applied last for the same reason as the control paths: temporary files
+	// must stay inside the engine-owned, quota-visible scratch root.
+	own["TMPDIR"] = tmpDir
 	env := os.Environ()
 	for k, v := range own {
 		env = append(env, k+"="+v)
 	}
 	return env, own
+}
+
+const compressThreshold = 1 << 20
+
+func compactLog(path string) error {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() < compressThreshold {
+		return err
+	}
+	in, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".gz.tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return errors.Join(err, in.Close())
+	}
+	zw := gzip.NewWriter(out)
+	_, copyErr := io.Copy(zw, in)
+	closeErr := zw.Close()
+	fileCloseErr := out.Close()
+	inputCloseErr := in.Close()
+	if copyErr != nil || closeErr != nil || fileCloseErr != nil || inputCloseErr != nil {
+		_ = os.Remove(tmp)
+		return errors.Join(copyErr, closeErr, fileCloseErr, inputCloseErr)
+	}
+	if err := os.Rename(tmp, path+".gz"); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Remove(path)
+}
+
+func (r *Runner) referencePayload(path string, data []byte) error {
+	r.payloadMu.Lock()
+	defer r.payloadMu.Unlock()
+	sum := fmt.Sprintf("%x", sha256.Sum256(data))
+	root := filepath.Join(filepath.Dir(r.Root), "payloads")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return err
+	}
+	blob := filepath.Join(root, sum+".json.gz")
+	if _, err := os.Stat(blob); os.IsNotExist(err) {
+		tmp, err := os.CreateTemp(root, ".payload-*.tmp")
+		if err != nil {
+			return err
+		}
+		_ = tmp.Chmod(0o600)
+		zw := gzip.NewWriter(tmp)
+		_, werr := zw.Write(data)
+		zerr := zw.Close()
+		cerr := tmp.Close()
+		if werr != nil || zerr != nil || cerr != nil {
+			_ = os.Remove(tmp.Name())
+			return errors.Join(werr, zerr, cerr)
+		}
+		if err := os.Rename(tmp.Name(), blob); err != nil && !os.IsExist(err) {
+			_ = os.Remove(tmp.Name())
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	ref, _ := json.Marshal(map[string]string{"payload": "sha256:" + sum})
+	return atomicReplace(path, ref, 0o600)
+}
+
+func atomicReplace(path string, data []byte, mode fs.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	_, writeErr := tmp.Write(data)
+	closeErr := tmp.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	return nil
+}
+
+type tempLease struct {
+	Version  int       `json:"v"`
+	RunID    string    `json:"runId"`
+	PID      int       `json:"pid,omitempty"`
+	Deadline time.Time `json:"deadline,omitempty"`
+	Ended    bool      `json:"ended,omitempty"`
+}
+
+func writeTempLease(path string, lease tempLease) error {
+	lease.Version = 1
+	b, err := json.Marshal(lease)
+	if err != nil {
+		return err
+	}
+	return atomicReplace(path, b, 0o600)
+}
+
+// SweepTemp removes only expired children whose marker is a valid Conveyor
+// lease bound to that exact scratch directory. Unknown entries and symlinks
+// are never touched; uncertain markers are retained and reported.
+func SweepTemp(root string, before time.Time) (int64, error) {
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var freed int64
+	var errs []error
+	for _, e := range entries {
+		if !e.IsDir() || e.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		dir := filepath.Join(root, e.Name())
+		marker := filepath.Join(dir, ".conveyor-owned")
+		mi, err := os.Lstat(marker)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				errs = append(errs, fmt.Errorf("inspect temporary lease %s: %w", marker, err))
+			}
+			continue
+		}
+		if !mi.Mode().IsRegular() {
+			errs = append(errs, fmt.Errorf("invalid temporary lease %s: marker is not a regular file", marker))
+			continue
+		}
+		if !mi.ModTime().Before(before) {
+			continue
+		}
+		b, err := os.ReadFile(marker)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("read temporary lease %s: %w", marker, err))
+			continue
+		}
+		lease, err := parseTempLease(b, e.Name())
+		if err != nil {
+			errs = append(errs, fmt.Errorf("invalid temporary lease %s: %w", marker, err))
+			continue
+		}
+		if !lease.Ended && lease.PID > 0 && syscall.Kill(lease.PID, 0) == nil &&
+			(lease.Deadline.IsZero() || time.Now().Before(lease.Deadline)) {
+			continue
+		}
+		sz := directorySize(dir)
+		if err := os.RemoveAll(dir); err != nil {
+			errs = append(errs, err)
+		} else {
+			freed += sz
+		}
+	}
+	return freed, errors.Join(errs...)
+}
+
+func parseTempLease(b []byte, dirName string) (tempLease, error) {
+	var lease tempLease
+	dec := json.NewDecoder(strings.NewReader(string(b)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&lease); err != nil {
+		return tempLease{}, err
+	}
+	if dec.Decode(&struct{}{}) != io.EOF {
+		return tempLease{}, errors.New("marker must contain exactly one JSON object")
+	}
+	if lease.Version != 1 {
+		return tempLease{}, errors.New("unsupported or missing lease version")
+	}
+	if !ValidID(lease.RunID) || lease.RunID != dirName {
+		return tempLease{}, errors.New("runId does not identify this scratch directory")
+	}
+	if lease.PID < 0 || (lease.Ended && (lease.PID != 0 || !lease.Deadline.IsZero())) {
+		return tempLease{}, errors.New("invalid lease state")
+	}
+	return lease, nil
+}
+
+// SweepPayloads removes unreferenced, expired payload blobs while holding the
+// same lock publication uses. Any unreadable run tree or result reference
+// aborts deletion: uncertainty about a reference must retain blobs, not lose
+// data a completed run still names.
+func (r *Runner) SweepPayloads(before time.Time) (int64, error) {
+	r.payloadMu.Lock()
+	defer r.payloadMu.Unlock()
+	root := filepath.Join(filepath.Dir(r.Root), "payloads")
+	used := map[string]bool{}
+	err := filepath.WalkDir(r.Root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() || d.Name() != "result.json" {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read payload reference %s: %w", path, err)
+		}
+		if len(strings.TrimSpace(string(b))) == 0 {
+			return nil
+		}
+		if !json.Valid(b) {
+			return fmt.Errorf("read payload reference %s: invalid JSON", path)
+		}
+		var object map[string]json.RawMessage
+		if json.Unmarshal(b, &object) != nil || object == nil {
+			return nil
+		}
+		raw, hasPayload := object["payload"]
+		if !hasPayload {
+			return nil
+		}
+		var payload string
+		if json.Unmarshal(raw, &payload) != nil || !strings.HasPrefix(payload, "sha256:") {
+			return fmt.Errorf("read payload reference %s: invalid payload reference", path)
+		}
+		hex := strings.TrimPrefix(payload, "sha256:")
+		if len(hex) != 64 || strings.Trim(hex, "0123456789abcdef") != "" {
+			return fmt.Errorf("read payload reference %s: invalid payload digest", path)
+		}
+		used[hex+".json.gz"] = true
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		return 0, err
+	}
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var freed int64
+	var errs []error
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || used[name] || len(name) != 64+len(".json.gz") || !strings.HasSuffix(name, ".json.gz") {
+			continue
+		}
+		hex := strings.TrimSuffix(name, ".json.gz")
+		if strings.Trim(hex, "0123456789abcdef") != "" {
+			continue
+		}
+		path := filepath.Join(root, name)
+		info, statErr := os.Lstat(path)
+		if statErr != nil {
+			errs = append(errs, statErr)
+			continue
+		}
+		if !info.Mode().IsRegular() || !info.ModTime().Before(before) {
+			continue
+		}
+		if removeErr := os.Remove(path); removeErr != nil {
+			errs = append(errs, removeErr)
+		} else {
+			freed += info.Size()
+		}
+	}
+	return freed, errors.Join(errs...)
+}
+
+func directorySize(root string) int64 {
+	var n int64
+	_ = filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			if i, e := d.Info(); e == nil {
+				n += i.Size()
+			}
+		}
+		return nil
+	})
+	return n
 }
 
 func exitCode(err error) int {

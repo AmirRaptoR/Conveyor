@@ -461,6 +461,28 @@ func (s *Server) refresh(ctx context.Context) {
 	// keep unsafe work stopped.
 	s.releaseDependencyMarks(ctx)
 	s.reconcileTracking(ctx)
+	s.markRetentionReady()
+}
+
+func (s *Server) markRetentionReady() {
+	s.mu.RLock()
+	ready := true
+	for _, src := range s.cfg.Sources {
+		if !src.OK() {
+			continue
+		}
+		if _, ok := s.eng.Client(src.Name); !ok {
+			continue
+		}
+		if s.listedAt[src.Name].IsZero() {
+			ready = false
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if ready {
+		s.retentionReadyOnce.Do(func() { close(s.retentionReady) })
+	}
 }
 
 // mergeSourceListing reconciles one source's listing (fresh may be nil, for a

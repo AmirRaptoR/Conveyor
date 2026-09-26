@@ -24,9 +24,9 @@ func statDir(p string) (bool, error) {
 	return fi.IsDir(), nil
 }
 
-// Warning is a non-fatal problem with one item. A bad item is skipped and
-// reported, never silently dropped: an item that vanishes without explanation
-// is the hardest kind of bug to find in a pipeline.
+// Warning is a provider-reported non-fatal problem. Engine validation errors
+// fail the whole listing: publishing the valid subset would turn a partial
+// response into authoritative source state and make omitted work disappear.
 type Warning struct {
 	ItemID string `json:"itemId,omitempty"`
 	Reason string `json:"reason"`
@@ -90,27 +90,34 @@ func (c *Client) List(ctx context.Context) (*ListResult, error) {
 		return out, fmt.Errorf("source %q: list exited %d (%s); log: %s/log.txt",
 			c.src.Name, res.Run.ExitCode, res.Run.Outcome, res.Run.Dir)
 	}
+	if len(res.Data) == 0 {
+		return out, fmt.Errorf("source %q: list wrote no valid JSON to $CONVEYOR_RESULT", c.src.Name)
+	}
 
 	var raw []model.Item
-	if len(res.Data) > 0 {
-		// The original list contract was a bare item array. Keep accepting it
-		// forever, while allowing providers that discover non-fatal metadata
-		// problems to return an envelope with actionable warnings.
-		if err := json.Unmarshal(res.Data, &raw); err != nil {
-			var envelope struct {
-				Items    []model.Item `json:"items"`
-				Warnings []Warning    `json:"warnings,omitempty"`
-			}
-			if envelopeErr := json.Unmarshal(res.Data, &envelope); envelopeErr != nil || envelope.Items == nil {
-				return out, fmt.Errorf("source %q: result is neither a JSON array of items nor an {items,warnings} object: %w", c.src.Name, err)
-			}
-			raw = envelope.Items
-			out.Warnings = append(out.Warnings, envelope.Warnings...)
+	// The original list contract was a bare item array. Keep accepting it
+	// forever, while allowing providers that discover non-fatal metadata
+	// problems to return an envelope with actionable warnings.
+	if err := json.Unmarshal(res.Data, &raw); err != nil {
+		var envelope struct {
+			Items    []model.Item `json:"items"`
+			Warnings []Warning    `json:"warnings,omitempty"`
 		}
+		if envelopeErr := json.Unmarshal(res.Data, &envelope); envelopeErr != nil || envelope.Items == nil {
+			return out, fmt.Errorf("source %q: result is neither a JSON array of items nor an {items,warnings} object: %w", c.src.Name, err)
+		}
+		raw = envelope.Items
+		out.Warnings = append(out.Warnings, envelope.Warnings...)
+	}
+	if raw == nil {
+		return out, fmt.Errorf("source %q: result must be a JSON array of items or an {items,warnings} object; null is not a listing", c.src.Name)
 	}
 	var validationWarnings []Warning
 	out.Items, validationWarnings = c.validate(raw)
 	out.Warnings = append(out.Warnings, validationWarnings...)
+	if len(validationWarnings) > 0 {
+		return out, fmt.Errorf("source %q: incomplete listing rejected (%s)", c.src.Name, validationWarnings[0].String())
+	}
 	return out, nil
 }
 
@@ -131,7 +138,7 @@ func (c *Client) validate(in []model.Item) ([]model.Item, []Warning) {
 			warns = append(warns, Warning{Reason: fmt.Sprintf("items[%d] has no ref; skipped", i)})
 			continue
 		case seen[it.ID]:
-			warns = append(warns, Warning{ItemID: it.ID, Reason: "duplicate id in one listing; first wins"})
+			warns = append(warns, Warning{ItemID: it.ID, Reason: "duplicate id in one listing; listing rejected"})
 			continue
 		case it.Title == "":
 			warns = append(warns, Warning{ItemID: it.ID, Reason: "no title; skipped"})

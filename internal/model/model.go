@@ -154,6 +154,9 @@ type Run struct {
 	ExitCode   int           `json:"exitCode"`
 	TimedOut   bool          `json:"timedOut"`
 	Outcome    Outcome       `json:"outcome"`
+	// RetentionClass records whether a stage was agent-backed at dispatch time,
+	// so a later config change cannot reclassify its historical bytes.
+	RetentionClass string `json:"retentionClass,omitempty"`
 	// Error is set when the script could not be run at all (missing file, not
 	// executable) as opposed to running and failing.
 	Error string `json:"error,omitempty"`

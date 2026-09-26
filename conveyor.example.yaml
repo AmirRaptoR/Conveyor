@@ -85,18 +85,17 @@ discovery: 2m         # how long one source's list script may run before that
                       # API calls, not agent work, and a hung source must not
                       # be able to delay any other source's listing.
 
-logs:
-  # Read and validated now, but not yet enforced: no sweep runs against these
-  # keys today, so run directories accumulate under data/runs/ regardless of
-  # what is set here. The values are reserved for the sweep that will read
-  # them, whenever it lands, so the schema does not change out from under a
-  # working config.
-  retention: 30d      # once implemented: runs older than this are swept
-  sweepAt: "04:00"    # once implemented: daily, and once on startup
-                      # A run will be PINNED and never swept while it is the
-                      # most recent failed/blocked run of an item still in
-                      # that state: retention must not delete the evidence
-                      # for the thing currently asking for attention.
+storage:
+  maxBytes: 20GiB       # total data-directory ceiling
+  tempMaxBytes: 4GiB    # engine-owned TMPDIR ceiling
+  highWatermark: 80     # pause new model work at this percentage
+  criticalWatermark: 95 # clean immediately before another model admission
+  sweepAt: "04:00"      # daily, and once on startup
+  retention:
+    model: 30d
+    failure: 90d        # current blocker evidence remains pinned
+    polling: 2d         # successful discovery and deterministic runs
+    status: 7d
 
 # ---------------------------------------------------------------------------
 # Stages. Minimum two. Order defines the board's columns, left to right, and the
