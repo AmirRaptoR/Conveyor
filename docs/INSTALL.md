@@ -374,16 +374,24 @@ pr=172
 item=143
 old_branch=issue-128
 new_branch=issue-143
+base=$(gh pr view "$pr" --repo "$repo" --json baseRefName --jq .baseRefName)
+title=$(gh pr view "$pr" --repo "$repo" --json title --jq .title)
 
-gh api -X POST "repos/$repo/branches/$old_branch/rename" -f new_name="$new_branch"
+git fetch origin "$old_branch"
+git push origin "refs/remotes/origin/$old_branch:refs/heads/$new_branch"
 body=$(mktemp)
 gh pr view "$pr" --repo "$repo" --json body --jq .body >"$body"
+# Edit $body so its closing reference names only #143 and remove any old
+# conveyor:item marker, then add the replacement marker.
 printf '\n<!-- conveyor:item %s -->\n' "$item" >>"$body"
-gh pr edit "$pr" --repo "$repo" --body-file "$body"
+replacement=$(gh pr create --repo "$repo" --head "$new_branch" --base "$base" \
+  --title "$title" --body-file "$body")
+gh pr close "$pr" --repo "$repo" --comment "Replaced by $replacement for item #$item."
 rm -f "$body"
 ```
 
-Verify the PR body closes the same item and then hand that item back. If a
+Do not rename the open PR's head branch: GitHub closes that PR rather than
+retargeting it. Verify the replacement body closes the same item and then hand that item back. If a
 managed worktree for the old item still exists, let Conveyor's ordinary
 positive-ownership cleanup remove it; do not delete an unmarked path by hand.
 
