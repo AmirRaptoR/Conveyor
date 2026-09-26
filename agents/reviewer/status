@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Availability of Claude-first review with Codex fallback. The reviewer is
+# limited only when both backends are confirmed limited. Inconclusive evidence
+# remains unknown rather than being presented as a quota fact.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/_probe"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+probe_status "$here/../claude/status" "$tmp/claude.json"
+probe_status "$here/../codex/status" "$tmp/codex.json"
+claude_state=$(jq -r .state "$tmp/claude.json")
+codex_state=$(jq -r .state "$tmp/codex.json")
+
+if [[ "$claude_state" == "ok" ]]; then
+	state=ok
+	selected=Claude
+elif [[ "$claude_state" == "limited" && "$codex_state" == "ok" ]]; then
+	state=ok
+	selected="Codex fallback"
+elif [[ "$claude_state" == "limited" && "$codex_state" == "limited" ]]; then
+	state=limited
+	selected=none
+else
+	state=unknown
+	selected=unknown
+fi
+
+jq -n \
+	--arg state "$state" \
+	--arg selected "$selected" \
+	--arg claude "$claude_state" \
+	--arg codex "$codex_state" \
+	--slurpfile c "$tmp/claude.json" \
+	--slurpfile x "$tmp/codex.json" '
+	{
+		state: $state,
+		summary: ("review backend: " + $selected + " (Claude " + $claude + ", Codex " + $codex + ")"),
+		detail: [
+			{label:"Claude", value:($c[0].summary // $claude)},
+			{label:"Codex fallback", value:($x[0].summary // $codex)}
+		]
+	}
+	| if $state == "limited" then
+		([$c[0].resetsAt, $x[0].resetsAt] | map(select(type == "string" and length > 0)) | sort | .[0]) as $reset
+		| if $reset then .resetsAt = $reset else . end
+	  else . end
+	' >"${CONVEYOR_RESULT:?}"
+
+jq -r .summary "$CONVEYOR_RESULT" >&2
