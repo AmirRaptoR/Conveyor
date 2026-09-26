@@ -33,11 +33,11 @@ the end of its own run never had one.
 
 ## Workflow
 
-### 1. Find the PR
+### 1. Use the selected PR
 
 ```bash
 gh issue view <N> --json title,body,state
-gh pr list --search "<N>" --state open --json number,headRefName,url
+gh pr view <PR number supplied by the adapter> --json number,headRefName,url
 ```
 
 No open PR is not a review failure — it means the work has not been delivered
@@ -160,10 +160,10 @@ open, and stop. Do not merge.
 Requires all of: full local suite green, `gh pr checks` green, review clean,
 every criterion ticked. Then **stop, with the PR open**. Do not merge.
 
-The one thing to check before you finish: the PR body must say `Closes #N`.
-That is the link that ties the work to the item, and the `approving` stage finds
-the pull request by exactly that reference — a PR without it is a PR the gate
-cannot see. Add it if it is missing; never close the issue by hand.
+Before finishing, the PR body must contain matching `Closes #N` and
+`<!-- conveyor:item N -->` lines. The marker is Conveyor's ownership identity;
+the closing reference is GitHub's completion link. Add either if it is missing;
+never close the issue by hand.
 
 What happens next, so you can leave it confidently: `approving` re-checks the
 PR on every poll and merges it once it is not a draft, has no conflict, has
@@ -183,7 +183,7 @@ clock.
 ## Quick reference
 
 ```bash
-gh pr list --search "<N>" --state open      # find it
+gh pr view <PR> --json number,headRefName,url # inspect the adapter-selected PR
 gh pr checks --watch                        # CI must be green
 codex exec review --base main "..."         # round 1: the whole diff
 codex exec review --base "$reviewed" "..."  # rounds 2-3: only what changed since

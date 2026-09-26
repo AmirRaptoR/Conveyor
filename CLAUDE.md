@@ -293,9 +293,15 @@ peer, and the socket is the only door with no password on it (#94).
   that can pass on retry (grey: `limit`, `turns`, `unfinished`, `dependency`,
   `worktree`, `invalid-result`), or a fault (red) — and lists every question in a strip under
   the masthead. The tone is presentation: the engine still reads only `asked`.
-- **An item's pull request is found by closing reference, never by search.**
-  `agents/_pr` is the one lookup — "Closes #N" in the body, or the
-  `issue-N` branch `_worktree` names — used by implement, review and approve.
+- **An item's pull request has one explicit identity, never a search result.**
+  New PRs carry `<!-- conveyor:item N -->` as their primary identity. An
+  unambiguous closing reference is the legacy fallback and `issue-N` the final
+  compatibility fallback; every signal present must agree. A malformed marker
+  or marker/body/branch disagreement stops every named item before model
+  dispatch and names every conflict, so one PR cannot be selected for two
+  items. The repair command is documented in `docs/INSTALL.md`.
+  The closing reference remains GitHub's native completion link.
+  `agents/_pr` is the one classifier used by implement, review and approve.
   `gh pr list --search "$ref"` matched the number anywhere in any PR and handed
   issue 188 the PR whose body said "depends on #188". `agents/_pr` also asks
   GitHub whether an item has *landed* — `item_landed`, straight off

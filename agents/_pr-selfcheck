@@ -34,6 +34,13 @@ if [[ "\$1 \$2" == "api graphql" ]]; then
 	if [[ -f "$tmp/graphql" ]]; then cat "$tmp/graphql"; else echo "stub gh: no fixture for graphql" >&2; exit 98; fi
 	exit 0
 fi
+if [[ "\$1 \$2" == "pr edit" ]]; then
+	while [[ \$# -gt 0 ]]; do
+		if [[ "\$1" == "--body-file" ]]; then cp "\$2" "$tmp/edited-body"; fi
+		shift
+	done
+	exit 0
+fi
 echo "stub gh: unhandled: \$*" >&2
 exit 97
 STUB
@@ -66,6 +73,49 @@ chk "a renamed branch still matches by body" "$PR_STATUS" "one"
 scene; list '[{"number":9,"body":"no keyword here","state":"OPEN","headRefName":"issue-7","url":"u"}]'
 pr_lookup 7
 chk "the item's own branch matches with no keyword" "$PR_STATUS" "one"
+
+# --- an explicit item marker is primary, but every identity must agree ------
+scene; list '[{"number":9,"body":"<!-- conveyor:item 7 -->","state":"OPEN","headRefName":"feature","url":"u"}]'
+pr_lookup 7
+chk "an item marker identifies the PR" "$PR_STATUS" "one"
+
+scene; list '[{"number":9,"body":"<!-- conveyor:item 7 -->\nCloses #7","state":"OPEN","headRefName":"issue-7","url":"u"}]'
+pr_lookup 7
+chk "matching marker, body and branch identify one item" "$PR_STATUS" "one"
+
+scene; rm -f "$tmp/edited-body"
+list '[{"number":9,"body":"Closes #7","state":"OPEN","headRefName":"issue-7","url":"u"}]'
+pr_lookup 7
+pr_ensure_marker 7
+chk "a fresh unmarked PR can be stamped deterministically" "$(grep -c '<!-- conveyor:item 7 -->' "$tmp/edited-body")" "1"
+
+# The live #172 shape: one PR must not be handed to #128 by its branch and
+# #143 by its body. Both lookups see the same conflict and name every signal.
+scene; list '[{"number":172,"body":"Part of #128 (tracking). Closes #143.","state":"OPEN","headRefName":"issue-128","url":"u"}]'
+pr_lookup 128
+chk "a body/branch conflict stops the branch item" "$PR_STATUS" "conflict"
+chk "  the conflict names the PR" "$PR_CONFLICT_REASON" "PR #172 has conflicting item identities: body closes #143; branch issue-128 identifies #128."
+pr_lookup 143
+chk "the same conflict stops the body item" "$PR_STATUS" "conflict"
+chk "  with the same complete reason" "$PR_CONFLICT_REASON" "PR #172 has conflicting item identities: body closes #143; branch issue-128 identifies #128."
+
+scene; list '[{"number":172,"body":"Closes #143","state":"CLOSED","headRefName":"issue-128","url":"u"},{"number":173,"body":"Closes #143","state":"OPEN","headRefName":"feature","url":"u"}]'
+pr_lookup 143 all
+chk "an abandoned conflicting PR is history, not an active conflict" "$PR_STATUS" "several"
+chk "  no active conflict reason is set" "$PR_CONFLICT_REASON" ""
+
+scene; list '[{"number":9,"body":"<!-- conveyor:item 7 -->\nCloses #8","state":"OPEN","headRefName":"feature","url":"u"}]'
+pr_lookup 7
+chk "a marker/body conflict stops" "$PR_STATUS" "conflict"
+
+scene; list '[{"number":9,"body":"<!-- conveyor:item nope -->\nCloses #7","state":"OPEN","headRefName":"feature","url":"u"}]'
+pr_lookup 7
+chk "a malformed Conveyor marker stops" "$PR_STATUS" "conflict"
+
+scene; list '[{"number":9,"body":"<!-- conveyor:item 7 extra -->","state":"OPEN","headRefName":"feature","url":"u"}]'
+pr_lookup 7
+chk "a malformed numeric marker still stops its named item" "$PR_STATUS" "conflict"
+chk "  rather than disappearing and allowing a duplicate" "$(grep -c '#7' <<<"$PR_CONFLICT_REASON")" "1"
 
 # --- #N in a different repository's issue is never seen, because the list is
 # already scoped to $REPO by `gh pr list --repo` --------------------------
