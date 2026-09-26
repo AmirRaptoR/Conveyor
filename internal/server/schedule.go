@@ -137,6 +137,8 @@ func (s *Server) launch(ctx context.Context) int {
 	}
 	s.mu.RLock()
 	items := append([]model.Item(nil), s.state.Items...)
+	storageLevel := s.state.Storage.Level
+	persistFault := s.state.PersistFault != nil
 	resting := make(map[string]bool, len(s.resting))
 	for id := range s.resting {
 		resting[id] = true
@@ -173,44 +175,19 @@ func (s *Server) launch(ctx context.Context) int {
 		free := items[:0:0]
 		for _, it := range items {
 			target, ok := pipeline.Target(s.cfg, &it, deps)
-			if !ok || fullSrc[it.Source] || fullStage[target] || busy[it.ID] ||
-				s.eng.Locks().Busy(it.Source, target, s.cfg.ResourcesFor(it.Source, target)...) {
+			agent := s.cfg.AgentFor(it.Source, target)
+			_, running := s.working.Load(it.ID)
+			slotBlocked := fullSrc[it.Source] || fullStage[target] ||
+				s.eng.Locks().Busy(it.Source, target, s.cfg.ResourcesFor(it.Source, target)...) ||
+				spends(s.cfg.ResourcesFor(it.Source, target), fullResource)
+			reason := admissionReason(admissionFacts{targetOK: ok, itemBusy: busy[it.ID] || running,
+				resting: resting[it.ID], stale: dispatchUsesStaleState(it, deps, staleSrc, staleItems),
+				manualPaused: s.manuallyPaused(it.Source), agentPaused: s.agentPaused(agent),
+				budgetBlocked:  !s.budgetAvailable(it.ID, it.Source, target),
+				storageBlocked: agent != "" && storageLevel != "" && storageLevel != "ok",
+				slotBlocked:    slotBlocked, persistFault: agent != "" && persistFault})
+			if reason != "" {
 				continue
-			}
-			if dispatchUsesStaleState(it, deps, staleSrc, staleItems) {
-				continue // it or a dependency is last-good, not confirmed this poll
-			}
-			if spends(s.cfg.ResourcesFor(it.Source, target), fullResource) {
-				continue // something it needs is already all in use
-			}
-			// Whose quota this would spend, and whether they have any. Checked
-			// here and not in Pick, because it is a fact about the world right
-			// now rather than about the ordering: the item is still next, the
-			// line simply cannot afford it yet.
-			if s.agentPaused(s.cfg.AgentFor(it.Source, target)) {
-				continue
-			}
-			// An operator's own pause, global or on this item's source —
-			// filtered here, before Pick, for the same reason a paused
-			// agent is: it is a fact about the world right now, not about
-			// the ordering, so a held item is simply not a candidate this
-			// pass rather than one Pick ranks and claim then refuses.
-			if s.manuallyPaused(it.Source) {
-				continue
-			}
-			// This item's own execution budget, or the board's daily one —
-			// a fact about the world right now, filtered here for the same
-			// reason a paused agent and a manual pause are: claim spends the
-			// reservation atomically and is the authority, this only saves
-			// Pick from ranking a candidate that cannot actually launch.
-			if !s.budgetAvailable(it.ID, it.Source, target) {
-				continue
-			}
-			if _, running := s.working.Load(it.ID); running {
-				continue // already being worked; the locks do not know that
-			}
-			if resting[it.ID] {
-				continue // it exited 10 here and asked for the next poll, not this one
 			}
 			free = append(free, it)
 		}
@@ -230,6 +207,8 @@ func (s *Server) launch(ctx context.Context) int {
 			// be a different set entirely — an agent's quota is shared across
 			// every repository and stage that names it.
 			switch held := s.eng.Locks().Holding(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...); {
+			case held == "global":
+				return n
 			case strings.HasPrefix(held, "resource "):
 				fullResource[strings.TrimPrefix(held, "resource ")] = true
 			default:
@@ -578,6 +557,10 @@ func (s *Server) applyTransition(tr *pipeline.Transition) {
 		delete(s.waiting, tr.Item.ID)
 	}
 	s.mu.Unlock()
+	if tr.Item.Stage != tr.From {
+		s.noteUsefulProgress(now)
+	}
+	s.auditRun(tr)
 
 	// The two moments a person wants to hear about without watching: a
 	// question only they can answer, and an item reaching the end of the line.

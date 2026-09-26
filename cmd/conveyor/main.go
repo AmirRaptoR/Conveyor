@@ -48,6 +48,12 @@ func main() {
 		err = cmdTick(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "gate":
+		err = cmdGate(os.Args[2:])
+	case "soak-report":
+		err = cmdSoakReport(os.Args[2:])
+	case "soak-start":
+		err = cmdSoakStart(os.Args[2:])
 	case "budget-reset":
 		err = cmdBudgetReset(os.Args[2:])
 	case "probe":
@@ -93,6 +99,12 @@ func usage() {
                                         manual (tick button only) or observe
                                         (nothing ever advances). -watch is an
                                         alias for -mode=observe
+  gate      [-timeout 1m]               read-only post-deploy validation over
+            [-expected-revision REV]    the server Unix socket
+	  soak-report [-format json|markdown]   emit the fixed seven-day operations
+	                                        report from the same server metrics
+	  soak-start                            explicitly start a new soak for the
+	                                        revision currently serving
   budget-reset -reason TEXT             archive an incompatible/old execution
                                         ledger and start a versioned model-run
                                         ledger. Requires exclusive ownership.
@@ -359,8 +371,8 @@ func cmdValidate(args []string) error {
 		}
 		fmt.Printf("    resources: %s\n", strings.Join(limits, ", "))
 	}
-	fmt.Printf("    poll %s, default timeout %s, storage %d bytes (model %s, failure %s, polling %s, status %s)\n",
-		cfg.Poll.D(), cfg.Timeout.D(), cfg.Storage.MaxBytes, cfg.Storage.Retention.Model.D(),
+	fmt.Printf("    poll %s, watchdog stall %s, default timeout %s, storage %d bytes (model %s, failure %s, polling %s, status %s)\n",
+		cfg.Poll.D(), cfg.Watchdog.StallWindow.D(), cfg.Timeout.D(), cfg.Storage.MaxBytes, cfg.Storage.Retention.Model.D(),
 		cfg.Storage.Retention.Failure.D(), cfg.Storage.Retention.Polling.D(), cfg.Storage.Retention.Status.D())
 	fmt.Println("    (* runs a script on enter, . terminal)")
 

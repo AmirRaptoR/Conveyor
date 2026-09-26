@@ -402,6 +402,14 @@ func TestBulkClearingLeavesQuestionsStanding(t *testing.T) {
 		defer s.mu.RUnlock()
 		return len(s.blocks) == 1
 	})
+	waitFor(t, "bulk unblock audit to resolve", func() bool {
+		for _, event := range s.audit.Since(time.Time{}) {
+			if event.Kind == "human" && event.Action == "unblock-all" && event.State == "committed" {
+				return true
+			}
+		}
+		return false
+	})
 	s.mu.RLock()
 	_, question := s.blocks["s1:3"]
 	s.mu.RUnlock()

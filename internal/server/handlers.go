@@ -16,6 +16,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/source"
+	"github.com/AmirRaptoR/Conveyor/internal/store"
 )
 
 // handleState hands out the board. Items go out in the order the scheduler
@@ -62,6 +63,10 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 			st.Waiting[id] = wt
 		}
 	}
+	for id := range s.resting {
+		st.Resting = append(st.Resting, id)
+	}
+	sort.Strings(st.Resting)
 	st.Times = make(map[string]ItemTime, len(s.times))
 	for id, t := range s.times {
 		st.Times[id] = t
@@ -119,6 +124,11 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.mu.RUnlock()
+	// Metrics are a read model over bounded structured evidence. Recompute on
+	// demand so a report taken between watchdog ticks includes the latest run.
+	st.Metrics = s.metrics(time.Now())
+	st.Audit = s.audit.Status()
+	st.Soak = s.soakStore.Get()
 	st.ManualPauses = s.manualPauseList()
 	if budgets := s.budgetViews(st.Items); len(budgets) > 0 {
 		st.Budgets = budgets
@@ -149,6 +159,37 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
+func (s *Server) startSoak(now time.Time) (store.SoakRecord, error) {
+	status := s.audit.Status()
+	if !status.Healthy {
+		return store.SoakRecord{}, fmt.Errorf("audit evidence is not healthy: %s", status.Error)
+	}
+	s.mu.RLock()
+	revision := s.state.Release.Revision
+	s.mu.RUnlock()
+	record, err := store.NewSoakRecord(revision, status.ContinuityID, now)
+	if err != nil {
+		return store.SoakRecord{}, err
+	}
+	if err := s.soakStore.Set(record); err != nil {
+		return store.SoakRecord{}, err
+	}
+	s.mu.Lock()
+	s.state.Soak = record
+	s.mu.Unlock()
+	s.hub.publish(event{Kind: "state"})
+	return record, nil
+}
+
+func (s *Server) handleSoakStart(w http.ResponseWriter, _ *http.Request) {
+	record, err := s.startSoak(time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, record)
+}
+
 // handleTick advances one item. Non-blocking: a second press while one is
 // running is dropped rather than queued, because two agents in one worktree is
 // exactly what perSource exists to prevent.
@@ -160,10 +201,16 @@ func (s *Server) handleTick(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "conveyor is shutting down", http.StatusServiceUnavailable)
 		return
 	}
+	intent, ok := s.beginHumanAuditHTTP(w, r, "tick", "")
+	if !ok {
+		return
+	}
 	select {
 	case s.tick <- struct{}{}:
+		s.resolveHumanAudit(intent, true)
 		w.WriteHeader(http.StatusAccepted)
 	default:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, "a tick is already in flight", http.StatusConflict)
 	}
 }
@@ -186,7 +233,12 @@ func (s *Server) handleOrder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "expected a JSON array of item ids", http.StatusBadRequest)
 		return
 	}
+	intent, ok := s.beginHumanAuditHTTP(w, r, "reorder", "")
+	if !ok {
+		return
+	}
 	if err := s.order.Set(ids); err != nil {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -194,6 +246,7 @@ func (s *Server) handleOrder(w http.ResponseWriter, r *http.Request) {
 	s.state.Order = s.order.IDs()
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -274,6 +327,10 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "conveyor is shutting down", http.StatusServiceUnavailable)
 		return
 	}
+	intent, audited := s.beginHumanAuditHTTP(w, r, "start", item.ID)
+	if !audited {
+		return
+	}
 	// A manual start goes through the same atomic claim as every other
 	// dispatch path (claim), and overrides exactly one guard:
 	//   - overrides: resting — a deferral means "wait for the next listing",
@@ -287,24 +344,31 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	//     item, or no next stage).
 	switch s.claimAndLaunch(s.ctx, item, target, false) {
 	case claimItemBusy:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, fmt.Sprintf("%s is already running in %s", id, target), http.StatusConflict)
 		return
 	case claimSlotBusy:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, s.whyBusy(item.Source, target), http.StatusConflict)
 		return
 	case claimAgentPaused:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, s.whyPaused(s.cfg.AgentFor(item.Source, target)), http.StatusConflict)
 		return
 	case claimManuallyPaused:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, s.whyManuallyPaused(item.Source), http.StatusConflict)
 		return
 	case claimBudgetExhausted:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, s.whyBudgetExhausted(item.ID, target), http.StatusConflict)
 		return
 	case claimStorageHigh:
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, "storage cannot safely accept model work; usage is above its high watermark or run persistence is faulted", http.StatusInsufficientStorage)
 		return
 	}
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -346,10 +410,16 @@ func (s *Server) handleUnblock(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent) // already where the caller wants it
 		return
 	}
+	intent, ok := s.beginHumanAuditHTTP(w, r, "unblock", item.ID)
+	if !ok {
+		return
+	}
 	if err := s.answerThenUnblock(s.ctx, item, said.Answer); err != nil {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -396,6 +466,10 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 			http.StatusBadRequest)
 		return
 	}
+	intent, ok := s.beginHumanAuditHTTP(w, r, "action", item.ID)
+	if !ok {
+		return
+	}
 	// Layered onto whatever is already armed rather than replacing it: an
 	// answer someone typed and an action they then pressed are two things a
 	// person said about the same stop, and the next run should get both.
@@ -408,6 +482,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	armed.Stage = item.Stage
 	armed.Script = binding
 	if err := s.answers.Set(item.ID, armed); err != nil {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -421,6 +496,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	// not recreate that wait.
 	if err := s.recovery.Delete("item", item.ID); err != nil {
 		s.mu.Unlock()
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -430,6 +506,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
 	s.wakeUp()
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -526,7 +603,14 @@ func (s *Server) handleUnblockAll(w http.ResponseWriter, r *http.Request) {
 		toUnblock = append(toUnblock, it)
 	}
 	s.mu.RUnlock()
-	s.spawn(func() { s.unblockAll(s.ctx, toUnblock) })
+	intent, ok := s.beginHumanAuditHTTP(w, r, "unblock-all", "")
+	if !ok {
+		return
+	}
+	s.spawn(func() {
+		unblocked := s.unblockAll(s.ctx, toUnblock)
+		s.resolveHumanAudit(intent, unblocked > 0 || len(toUnblock) == 0)
+	})
 	writeJSON(w, map[string]int{
 		"unblocking":         len(toUnblock),
 		"waitingOnYou":       waitingOnYou,
@@ -905,6 +989,9 @@ func (s *Server) unblockKind(ctx context.Context, item model.Item, expectedKind 
 	delete(s.waiting, item.ID)
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
+	if !block.At.IsZero() {
+		s.auditRecovery(item.ID, time.Since(block.At))
+	}
 	s.wakeUp()
 	return nil
 }
@@ -997,6 +1084,10 @@ func heldOf(cfg *config.Config, items []model.Item, deps pipeline.Deps) map[stri
 // guessing from the active list alone names the wrong thing.
 func (s *Server) whyBusy(src, stage string) string {
 	held := s.eng.Locks().Holding(src, stage, s.cfg.ResourcesFor(src, stage)...)
+	if held == "global" {
+		_, _, used, limit, _, _ := s.eng.Locks().Snapshot()
+		return fmt.Sprintf("global transition capacity is full (%d/%d); %s waits for a slot", used, limit, stage)
+	}
 	if name, ok := strings.CutPrefix(held, "resource "); ok {
 		r := s.eng.Locks().Resources()[name]
 		return fmt.Sprintf("all %d of %s is in use; %s waits for one to come free", r[1], name, stage)

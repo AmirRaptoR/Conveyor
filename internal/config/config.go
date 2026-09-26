@@ -59,6 +59,9 @@ type Config struct {
 	// shorter than Timeout, so an existing config needs no change to get the
 	// guard.
 	Discovery Duration `yaml:"discovery"`
+	// Watchdog detects an unfinished line that has made no authoritative stage
+	// progress for this long. It observes scheduler state; it never dispatches.
+	Watchdog Watchdog `yaml:"watchdog"`
 	// Kept only so old files receive an actionable migration error instead of
 	// a generic unknown-field message. Automatic recovery is blocker-specific;
 	// it never clears every mark because a timer elapsed.
@@ -117,6 +120,10 @@ type Budgets struct {
 	// QuarantineAfter is how many failures with the same structured signature
 	// establish that the failure is deterministic. Unset defaults to 2.
 	QuarantineAfter int `yaml:"quarantineAfter"`
+}
+
+type Watchdog struct {
+	StallWindow Duration `yaml:"stallWindow"`
 }
 
 type Storage struct {
@@ -455,6 +462,9 @@ func (c *Config) applyDefaults() {
 	if c.Discovery == 0 {
 		c.Discovery = Duration(2 * time.Minute)
 	}
+	if c.Watchdog.StallWindow == 0 {
+		c.Watchdog.StallWindow = Duration(30 * time.Minute)
+	}
 	if !c.storageSet.maxBytes {
 		c.Storage.MaxBytes = ByteSize(20 << 30)
 	}
@@ -471,10 +481,10 @@ func (c *Config) applyDefaults() {
 		c.Storage.SweepAt = "04:00"
 	}
 	if !c.storageSet.model {
-		c.Storage.Retention.Model = Duration(30 * 24 * time.Hour)
+		c.Storage.Retention.Model = Duration(7 * 24 * time.Hour)
 	}
 	if !c.storageSet.failure {
-		c.Storage.Retention.Failure = Duration(90 * 24 * time.Hour)
+		c.Storage.Retention.Failure = Duration(7 * 24 * time.Hour)
 	}
 	if !c.storageSet.polling {
 		c.Storage.Retention.Polling = Duration(2 * 24 * time.Hour)
@@ -1049,6 +1059,9 @@ func (c *Config) Validate() []string {
 	}
 	if c.Budgets.QuarantineAfter < 2 {
 		add("budgets.quarantineAfter must be at least 2, got %d", c.Budgets.QuarantineAfter)
+	}
+	if c.Watchdog.StallWindow <= 0 {
+		add("watchdog.stallWindow must be greater than zero")
 	}
 	if c.Storage.MaxBytes <= 0 {
 		add("storage.maxBytes must be greater than zero")

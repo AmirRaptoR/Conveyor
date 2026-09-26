@@ -150,10 +150,16 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	intent, ok := s.beginHumanAuditHTTP(w, r, "pause", body.Scope)
+	if !ok {
+		return
+	}
 	if err := s.pauseManual(body.Scope, reason, requestedBy(r)); err != nil {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -167,9 +173,15 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		_ = json.NewDecoder(io.LimitReader(r.Body, pauseBodyLimit)).Decode(&body)
 	}
+	intent, ok := s.beginHumanAuditHTTP(w, r, "resume", body.Scope)
+	if !ok {
+		return
+	}
 	if err := s.resumeManual(body.Scope); err != nil {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusNoContent)
 }

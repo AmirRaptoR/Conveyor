@@ -180,6 +180,14 @@ func (s *Server) refresh(ctx context.Context) {
 	failedNow := map[string]string{}
 
 	s.mu.Lock()
+	// A fresh provider listing is authoritative too: work completed outside
+	// this process (a PR merged by hand, for example) is useful progress when
+	// it moves an already-known item forward. First discovery and backward
+	// reconciliation are not progress.
+	oldStage := make(map[string]string, len(s.state.Items))
+	for _, item := range s.state.Items {
+		oldStage[item.ID] = item.Stage
+	}
 	s.state.Polling = true
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "polling"})
@@ -329,6 +337,17 @@ func (s *Server) refresh(ctx context.Context) {
 		}
 	}
 
+	position := make(map[string]int, len(s.cfg.Stages))
+	for i, stage := range s.cfg.Stages {
+		position[stage.Name] = i
+	}
+	listingProgress := false
+	for _, item := range items {
+		if old, known := oldStage[item.ID]; known && position[item.Stage] > position[old] {
+			listingProgress = true
+			break
+		}
+	}
 	s.mu.Lock()
 	// Both fields describe the latest attempt, not a high-water mark: a
 	// success clears the previous failure, and a later failure sets it again
@@ -377,6 +396,7 @@ func (s *Server) refresh(ctx context.Context) {
 	// note with it. The provider is the authority on whether, always.
 	marked := map[string]bool{}
 	onBoard := make(map[string]bool, len(items))
+	recovered := map[string]time.Duration{}
 	for _, it := range items {
 		onBoard[it.ID] = true
 		if it.Blocked {
@@ -385,6 +405,9 @@ func (s *Server) refresh(ctx context.Context) {
 	}
 	for id := range s.blocks {
 		if !marked[id] {
+			if onBoard[id] && !s.blocks[id].At.IsZero() {
+				recovered[id] = time.Since(s.blocks[id].At)
+			}
 			delete(s.blocks, id)
 		}
 	}
@@ -440,6 +463,12 @@ func (s *Server) refresh(ctx context.Context) {
 		}
 	}
 	s.mu.Unlock()
+	if listingProgress {
+		s.noteUsefulProgress(time.Now())
+	}
+	for id, duration := range recovered {
+		s.auditRecovery(id, duration)
+	}
 	for _, entry := range staleRecoveries {
 		if _, err := s.recovery.DeleteIf(entry); err != nil {
 			fmt.Fprintf(os.Stderr, "conveyor: %s: clear stale recovery: %v\n", entry.ID, err)

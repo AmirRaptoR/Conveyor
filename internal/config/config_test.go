@@ -96,6 +96,29 @@ func TestResolvesProviderAndScripts(t *testing.T) {
 	}
 }
 
+func TestWatchdogDefaultsAndValidatesStallWindow(t *testing.T) {
+	_, path := onboarded(t)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Watchdog.StallWindow.D(), 30*time.Minute; got != want {
+		t.Fatalf("watchdog stall window = %s, want %s", got, want)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = []byte(strings.Replace(string(raw), "version: 1\n", "version: 1\nwatchdog:\n  stallWindow: -1m\n", 1))
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "watchdog.stallWindow must be greater than zero") {
+		t.Fatalf("Load error = %v, want stall window validation", err)
+	}
+}
+
 func TestLoadFromRootsOverridesMutableAssetPaths(t *testing.T) {
 	dir := t.TempDir()
 	providerRoot := filepath.Join(t.TempDir(), "providers")
@@ -642,7 +665,7 @@ func TestStorageDefaultsAndClasses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Storage.Retention.Model.D() != 30*24*time.Hour || cfg.Storage.Retention.Failure.D() != 90*24*time.Hour || cfg.Storage.Retention.Polling.D() != 2*24*time.Hour || cfg.Storage.Retention.Status.D() != 7*24*time.Hour {
+	if cfg.Storage.Retention.Model.D() != 7*24*time.Hour || cfg.Storage.Retention.Failure.D() != 7*24*time.Hour || cfg.Storage.Retention.Polling.D() != 2*24*time.Hour || cfg.Storage.Retention.Status.D() != 7*24*time.Hour {
 		t.Errorf("retention defaults = %+v", cfg.Storage.Retention)
 	}
 	if cfg.Storage.MaxBytes <= 0 || cfg.Storage.TempMaxBytes <= 0 || cfg.Storage.HighWatermark >= cfg.Storage.CriticalWatermark {

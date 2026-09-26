@@ -282,16 +282,23 @@ func (s *Server) handleItemResume(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, id+" has no operator cancellation to resume", http.StatusConflict)
 		return
 	}
+	intent, auditOK := s.beginHumanAuditHTTP(w, r, "resume-item", id)
+	if !auditOK {
+		return
+	}
 	resolved, err := s.recovery.ResolveOperator(entry, requestedBy(r), reason, time.Now())
 	if err != nil {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if !resolved {
+		s.resolveHumanAudit(intent, false)
 		http.Error(w, id+" recovery changed before it could be resumed", http.StatusConflict)
 		return
 	}
 	s.finishRecoveryState(id)
+	s.resolveHumanAudit(intent, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 

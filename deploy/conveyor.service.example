@@ -9,7 +9,7 @@
 #   sudo systemctl enable conveyor
 #   deploy/install-release   # creates current, then starts and verifies it
 #
-# See README.md's "Post-deploy check: conveyor probe" for what `Restart=`
+# See README.md's "External-route check: conveyor probe" for what `Restart=`
 # does and does not cover, and docs/INSTALL.md for the migration order.
 [Unit]
 Description=Conveyor — pipeline engine and board

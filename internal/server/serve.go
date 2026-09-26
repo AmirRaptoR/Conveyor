@@ -130,6 +130,7 @@ func (s *Server) Run(ctx context.Context, addr string, mode Mode) error {
 	// waits for it to actually exit, not just for ctx to be cancelled.
 	s.spawn(func() { s.poll(runCtx) })
 	s.spawn(func() { s.button(runCtx, mode) })
+	s.spawn(func() { s.watchdog(runCtx.Done()) })
 	if mode.Runs() {
 		s.spawn(func() { s.schedule(runCtx) })
 		s.spawn(func() { s.recover(runCtx) })
@@ -224,6 +225,7 @@ func (s *Server) handler() (tcp, socket http.Handler, err error) {
 	mux.HandleFunc("GET /api/runs/{id}", s.handleRun)
 	mux.HandleFunc("GET /api/items/{id}/report", s.handleReport)
 	mux.HandleFunc("POST /api/refresh", s.handleRefresh)
+	mux.HandleFunc("POST /api/soak/start", s.handleSoakStart)
 	mux.HandleFunc("POST /api/tick", s.mutationGuard(s.handleTick))
 	mux.HandleFunc("PUT /api/order", s.handleOrder)
 	mux.HandleFunc("POST /api/items/{id}/start", s.mutationGuard(s.handleStart))

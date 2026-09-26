@@ -84,6 +84,8 @@ discovery: 2m         # how long one source's list script may run before that
                       # much shorter than timeout: a listing is a handful of
                       # API calls, not agent work, and a hung source must not
                       # be able to delay any other source's listing.
+watchdog:
+  stallWindow: 30m    # alert once after this long without confirmed movement
 
 storage:
   maxBytes: 20GiB       # total data-directory ceiling
@@ -92,8 +94,8 @@ storage:
   criticalWatermark: 95 # clean immediately before another model admission
   sweepAt: "04:00"      # daily, and once on startup
   retention:
-    model: 30d
-    failure: 90d        # current blocker evidence remains pinned
+    model: 7d           # operational metrics use this fixed seven-day window
+    failure: 7d         # current blocker evidence remains pinned beyond expiry
     polling: 2d         # successful discovery and deterministic runs
     status: 7d
 

@@ -909,8 +909,8 @@ storage:
   criticalWatermark: 95
   sweepAt: 04:00
   retention:
-    model: 30d
-    failure: 90d
+    model: 7d
+    failure: 7d
     polling: 2d
     status: 7d
 ```
@@ -972,6 +972,73 @@ still refused. `/api/state.storage` reports bytes
 by class, temporary and total bytes, total 24-hour projected growth across the
 run, payload, persistent-store and scratch roots, watermarks, level and last
 cleanup.
+
+Operational reporting uses one fixed seven-day window regardless of shorter
+run-retention classes. Every settled stage transition appends its structured
+outcome, model classification and confirmed next stage to the bounded atomic
+snapshot `data/audit.jsonl`; retries of one RunID replace that run's canonical
+record rather than multiplying it. At startup, before metrics can be complete,
+one authoritative walk reconciles durable stage-run metadata newer than the
+persisted reconciliation cursor; the cursor and completion bit live in the same
+snapshot. Startup first persists the incomplete boundary, canonicalizes the
+entire scan by RunID in memory, then persists the events, advanced cursor and
+complete bit in one atomic replacement rather than rewriting once per run. No
+request or minute watchdog tick scans history. Operator controls
+persist a pending human-intervention intent after validation but before their
+mutation, then replace it atomically with committed or rejected state. A pending
+intent after restart makes coverage incomplete, and only committed intents are
+counted. Bulk unblock carries that intent into its asynchronous worker, so a
+process loss cannot erase an accepted request; item recovery resume follows the
+same protocol. Removing a provider mark appends its blocked-to-recovered duration. The file is pruned to seven days
+and atomically replaced. A separate continuity marker binds its identity and
+SHA-256 digest. Missing, unreadable, malformed, truncated or externally
+rewritten evidence and every append failure are board-visible faults and make
+coverage incomplete. The validated seven-day projection is loaded once and
+updated in memory on append; reads do not parse the file. A 100,000-record / 64
+MiB ceiling fails closed instead of allowing request latency to grow without a
+bound. It never contains or parses logs, plans or control records.
+
+`conveyor soak-start` is the only operation that starts a soak. It persists a
+new identity, current immutable revision, start instant and current evidence
+continuity identity. Startup and deployment never infer one, and a fresh start
+on the same revision cannot inherit elapsed time from an older record.
+`soak-report` requires that identity, seven elapsed days and at least one
+confirmed terminal completion. A zero-work window is explicitly inconclusive,
+not a successful soak; a completion-rate watchdog finding also fails it.
+`/api/state.metrics` defines its aggregates as follows:
+
+- `successRate`: confirmed successful stage runs / all stage runs settled in the
+  window.
+- `completionsPerDay`: confirmed arrivals in a terminal stage / 7.
+- `retriesPerCompletion`: non-successful settled stage runs / terminal arrivals.
+- `blockedToRecoveredNs`: mean duration from the current mark's recorded time to
+  its confirmed removal.
+- `wastedModelRuns`: agent-backed runs without a confirmed successful move.
+- `humanInterventions`: accepted tick, start, reorder, steering, mark/action,
+  pause/resume, cancel and budget-control requests.
+
+The server watchdog owns source freshness and evaluates it every minute even
+under storage pressure. It reports stale/failed sources, unfinished, potential
+and runnable counts versus active transitions, seven-day completion health, repeated
+blockers, storage headroom and immutable revision/config coherence in
+`/api/state.watchdog`. An incident is potential unfinished work with no active
+transition and no confirmed stage movement for `watchdog.stallWindow` (default
+`30m`), classified as a dead scheduler, stale provider evidence or capacity
+held without an active run. Audit or watchdog-state continuity failure is an immediate incident.
+The incident key, last useful progress, detection, attempted delivery and
+confirmed delivery are stored in a schema-versioned `data/watchdog.json` bound
+to a persistent identity and SHA-256 continuity marker. Missing, truncated or
+corrupt established state is a visible fault and is never initialized as new.
+Delivery acknowledgements are persisted per push endpoint; a partial retry
+skips accepted endpoints, and an old send checks the incident key again before
+it can acknowledge anything. Endpoint sends run concurrently beneath one
+server-derived context and operation deadline shorter than shutdown's drain
+grace; the tracked parent waits for every sender before it returns, while
+durable acknowledgements are serialized. No subscriber or a send failure remains visibly
+pending and retries after restart; only acceptance by every current non-gone
+endpoint is called delivered and suppresses repeats. Listings,
+plan updates and control traffic are not useful progress and are not scheduler
+inputs.
 
 The former `logs:` block is a load error with migration guidance: one retention
 duration cannot silently stand for four materially different classes.

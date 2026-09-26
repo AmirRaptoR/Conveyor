@@ -21,17 +21,25 @@ trap cleanup EXIT
 calls="$tmp/systemctl.log"
 health_state="$tmp/health-state"
 health_calls="$tmp/health-calls"
+systemctl_state="$tmp/systemctl-state"
 
 cat >"$tmp/systemctl" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$CALLS"
+mode=pass
+[[ -f "$SYSTEMCTL_STATE" ]] && mode=$(cat "$SYSTEMCTL_STATE")
+if [[ "$1" == stop && "$mode" == stop-fail ]]; then exit 1; fi
+if [[ "$1" == is-active ]]; then
+  [[ "$mode" == still-active ]]
+  exit
+fi
 SH
 cat >"$tmp/health" <<'SH'
 #!/usr/bin/env bash
 mode=$(cat "$HEALTH_STATE")
 case "$mode" in
   pass)
-    printf '{"release":{"managed":true,"revision":"%s"}}\n' "$2"
+    exit 0
     ;;
   flaky)
     n=0
@@ -39,7 +47,13 @@ case "$mode" in
     n=$((n + 1))
     printf '%s\n' "$n" >"$HEALTH_CALLS"
     if (( n == 1 )); then exit 1; fi
-    printf '{"release":{"managed":true,"revision":"%s"}}\n' "$2"
+    exit 0
+    ;;
+  candidate-fail)
+    [[ "$1" != "selfcheck-three" ]]
+    ;;
+  same-revision-fail)
+    [[ "$1" != "selfcheck-two" ]]
     ;;
   *) exit 1 ;;
 esac
@@ -51,39 +65,177 @@ deploy() {
   CONVEYOR_PREFIX="$prefix" \
   CONVEYOR_CONFIG="$repo/conveyor.example.yaml" \
   CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
-  CONVEYOR_HEALTHCHECK="$tmp/health" \
-  CONVEYOR_HEALTH_ATTEMPTS=2 \
+  CONVEYOR_GATE="$tmp/health" \
   CONVEYOR_REVISION="$revision" \
   CONVEYOR_ALLOW_DIRTY=1 \
-  CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" \
+  CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" SYSTEMCTL_STATE="$systemctl_state" \
     "$repo/deploy/install-release"
 }
 
-# Successful swaps retain the old release, and a transient health failure gets
-# the same retry grace whether it comes from the built-in check or a hook.
+echo pass >"$systemctl_state"
+
+# Successful swaps retain the old release.
 prefix="$tmp/prefix"
 echo pass >"$health_state"
 deploy "$prefix" selfcheck-one >/dev/null
 [[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-one" ]]
 CONVEYOR_RELEASE_DIR="$prefix/current" "$prefix/current/conveyor" version | grep -q 'selfcheck-one'
 
-echo flaky >"$health_state"
-rm -f "$health_calls"
+echo pass >"$health_state"
 deploy "$prefix" selfcheck-two >/dev/null
-[[ $(cat "$health_calls") == 2 ]]
+
+# Failed containment must never claim the service stopped when systemd refused
+# the stop or still reports the candidate active.
+echo fail >"$health_state"
+echo stop-fail >"$systemctl_state"
+if output=$(deploy "$prefix" selfcheck-stop-fails 2>&1); then
+  echo "install-release-selfcheck: stop failure was accepted" >&2
+  exit 1
+fi
+[[ ! -e "$prefix/current" ]]
+grep -q 'FATAL: failed to stop unverified service' <<<"$output"
+echo pass >"$systemctl_state"
+echo pass >"$health_state"
+deploy "$prefix" selfcheck-two >/dev/null
+
+echo fail >"$health_state"
+echo still-active >"$systemctl_state"
+if output=$(deploy "$prefix" selfcheck-still-active 2>&1); then
+  echo "install-release-selfcheck: active unverified service was accepted" >&2
+  exit 1
+fi
+[[ ! -e "$prefix/current" ]]
+grep -q 'FATAL: unverified service remains active after stop' <<<"$output"
+echo pass >"$systemctl_state"
+echo pass >"$health_state"
+deploy "$prefix" selfcheck-two >/dev/null
 [[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-two" ]]
 [[ $(readlink -f "$prefix/previous") == "$prefix/releases/selfcheck-one" ]]
 
+# Rollback health is inspected by the verified candidate deployment tool, not
+# by the old release being restored. This fixture's old binary deliberately has
+# no gate command; the new binary fails itself and can gate the old revision.
+mkdir -p "$tmp/fake-bin"
+cat >"$tmp/fake-bin/go" <<'SH'
+#!/usr/bin/env bash
+out="" revision=""
+while (($#)); do
+  case "$1" in
+    -o) out=$2; shift 2 ;;
+    -ldflags) revision=${2##*=}; shift 2 ;;
+    *) shift ;;
+  esac
+done
+cat >"$out" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  version) exit 0 ;;
+  validate)
+    strict=false config=""
+    shift
+    while ((\$#)); do
+      case "\$1" in
+        -strict-sources) strict=true; shift ;;
+        -c) config=\$2; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [[ "\$strict" == true ]] || exit 4
+    [[ "\${CONVEYOR_RELEASE_DIR:-}" == *'/$revision' || "\${CONVEYOR_RELEASE_DIR:-}" == *'/.$revision.tmp.'* ]] || exit 4
+    if [[ '$revision' == compat-old ]] && grep -q candidate-only "\$config"; then exit 3; fi
+    exit 0
+    ;;
+  release-manifest)
+    printf '{"revision":"$revision","schema":1,"files":[]}\n'
+    ;;
+  gate)
+    expected=""
+    while ((\$#)); do
+      if [[ "\$1" == -expected-revision ]]; then expected=\$2; break; fi
+      shift
+    done
+    printf '%s:%s\n' '$revision' "\$expected" >>"\$FIXTURE_GATE_LOG"
+    [[ '$revision' != fixture-old ]] || exit 2
+    [[ "\$expected" != fixture-new ]] || exit 1
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$out"
+SH
+chmod +x "$tmp/fake-bin/go"
+
+# The active release must prove it can load the candidate's current config
+# before current moves or systemd is touched. The old fixture accepts the
+# original config but rejects its candidate-only revision.
+compat_prefix="$tmp/config-compat-prefix"
+compat_config="$tmp/compat.yaml"
+printf 'version: old\n' >"$compat_config"
+PATH="$tmp/fake-bin:$PATH" CONVEYOR_PREFIX="$compat_prefix" \
+  CONVEYOR_CONFIG="$compat_config" CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
+  CONVEYOR_GATE="$tmp/health" CONVEYOR_REVISION=compat-old CONVEYOR_ALLOW_DIRTY=1 \
+  CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" SYSTEMCTL_STATE="$systemctl_state" \
+  "$repo/deploy/install-release" >/dev/null
+compat_current=$(readlink -f "$compat_prefix/current")
+compat_calls=$(wc -l <"$calls")
+printf 'version: candidate-only\n' >"$compat_config"
+if PATH="$tmp/fake-bin:$PATH" CONVEYOR_PREFIX="$compat_prefix" \
+  CONVEYOR_CONFIG="$compat_config" CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
+  CONVEYOR_GATE="$tmp/health" CONVEYOR_REVISION=compat-new CONVEYOR_ALLOW_DIRTY=1 \
+  CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" SYSTEMCTL_STATE="$systemctl_state" \
+  "$repo/deploy/install-release" >/dev/null 2>&1; then
+  echo "install-release-selfcheck: rollback-incompatible config was accepted" >&2
+  exit 1
+fi
+[[ $(readlink -f "$compat_prefix/current") == "$compat_current" ]]
+[[ $(wc -l <"$calls") == "$compat_calls" ]]
+
+fixture_prefix="$tmp/gate-tool-prefix"
+fixture_gate_log="$tmp/gate-tool.log"
+PATH="$tmp/fake-bin:$PATH" CONVEYOR_PREFIX="$fixture_prefix" \
+  CONVEYOR_CONFIG="$repo/conveyor.example.yaml" CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
+  CONVEYOR_GATE="$tmp/health" CONVEYOR_REVISION=fixture-old CONVEYOR_ALLOW_DIRTY=1 \
+  CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" SYSTEMCTL_STATE="$systemctl_state" \
+  "$repo/deploy/install-release" >/dev/null
+if ! PATH="$tmp/fake-bin:$PATH" CONVEYOR_PREFIX="$fixture_prefix" \
+  CONVEYOR_CONFIG="$repo/conveyor.example.yaml" CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
+  CONVEYOR_REVISION=fixture-new CONVEYOR_ALLOW_DIRTY=1 FIXTURE_GATE_LOG="$fixture_gate_log" \
+  CALLS="$calls" SYSTEMCTL_STATE="$systemctl_state" \
+  "$repo/deploy/install-release" >/dev/null 2>&1; then
+  : # Candidate failure is expected even when rollback succeeds.
+fi
+[[ $(readlink -f "$fixture_prefix/current") == "$fixture_prefix/releases/fixture-old" ]]
+grep -q '^fixture-new:fixture-new$' "$fixture_gate_log"
+grep -q '^fixture-new:fixture-old$' "$fixture_gate_log"
+if grep -q '^fixture-old:' "$fixture_gate_log"; then
+  echo "install-release-selfcheck: rollback gate used the old release tool" >&2
+  exit 1
+fi
+
 # A failed activation restores the last verified release.
-echo fail >"$health_state"
+echo candidate-fail >"$health_state"
 if deploy "$prefix" selfcheck-three >/dev/null 2>&1; then
   echo "install-release-selfcheck: an unhealthy release was accepted" >&2
   exit 1
 fi
 [[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-two" ]]
 
+# If rollback restart/gate fails, fail closed: no current release and a stopped
+# service, never an unverified old process left active.
+echo fail >"$health_state"
+if deploy "$prefix" selfcheck-rollback-fails >/dev/null 2>&1; then
+  echo "install-release-selfcheck: failed rollback was accepted" >&2
+  exit 1
+fi
+[[ ! -e "$prefix/current" ]]
+grep -q '^stop conveyor$' "$calls"
+echo pass >"$health_state"
+deploy "$prefix" selfcheck-two >/dev/null
+
 # Re-activating the current revision must use `previous` as its rollback target,
 # not call the same unhealthy release a successful restoration.
+echo same-revision-fail >"$health_state"
 if deploy "$prefix" selfcheck-two >/dev/null 2>&1; then
   echo "install-release-selfcheck: unhealthy same-revision deploy was accepted" >&2
   exit 1
@@ -101,17 +253,18 @@ if CONVEYOR_RELEASE_DIR="$prefix/releases/selfcheck-one" \
   exit 1
 fi
 
-# If the previous target itself no longer verifies, a failed activation leaves
-# no crash-looping current link and stops the service explicitly.
+# If the rollback target itself no longer verifies, refuse before activation:
+# current and the running service are untouched.
 chmod u+w "$prefix/releases/selfcheck-two/agents/mock/refine"
 printf '\n# tampered\n' >>"$prefix/releases/selfcheck-two/agents/mock/refine"
 echo fail >"$health_state"
+calls_before_incompatible=$(wc -l <"$calls")
 if deploy "$prefix" selfcheck-four >/dev/null 2>&1; then
   echo "install-release-selfcheck: deploy unexpectedly passed with failed health" >&2
   exit 1
 fi
-[[ ! -e "$prefix/current" ]]
-grep -q '^stop conveyor$' "$calls"
+[[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-two" ]]
+[[ $(wc -l <"$calls") == "$calls_before_incompatible" ]]
 
 # A first deployment with no rollback target also removes current and stops.
 first="$tmp/first"
@@ -154,13 +307,17 @@ case "$1" in
   stop)
     stop_running
     ;;
+  is-active)
+    [[ -f "$REAL_PID" ]] || exit 3
+    kill -0 "$(cat "$REAL_PID")" 2>/dev/null
+    ;;
 esac
 SH
 chmod +x "$tmp/systemctl-real"
 CONVEYOR_PREFIX="$real_prefix" \
 CONVEYOR_CONFIG="$real_dir/conveyor.yaml" \
 CONVEYOR_SYSTEMCTL="$tmp/systemctl-real" \
-CONVEYOR_HEALTH_ATTEMPTS=15 \
+CONVEYOR_GATE_TIMEOUT=15s \
 CONVEYOR_REVISION=real-health \
 CONVEYOR_ALLOW_DIRTY=1 \
 REAL_PREFIX="$real_prefix" REAL_CONFIG="$real_dir/conveyor.yaml" \
@@ -173,7 +330,7 @@ curl --silent --fail --unix-socket "$real_dir/data/api.sock" http://localhost/ap
 CONVEYOR_PREFIX="$real_prefix" \
 CONVEYOR_CONFIG="$real_dir/conveyor.yaml" \
 CONVEYOR_SYSTEMCTL="$tmp/systemctl-real" \
-CONVEYOR_HEALTH_ATTEMPTS=15 \
+CONVEYOR_GATE_TIMEOUT=15s \
 CONVEYOR_REVISION=real-health \
 CONVEYOR_ALLOW_DIRTY=1 \
 REAL_PREFIX="$real_prefix" REAL_CONFIG="$real_dir/conveyor.yaml" \
