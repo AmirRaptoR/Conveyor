@@ -21,10 +21,18 @@ trap cleanup EXIT
 calls="$tmp/systemctl.log"
 health_state="$tmp/health-state"
 health_calls="$tmp/health-calls"
+systemctl_state="$tmp/systemctl-state"
 
 cat >"$tmp/systemctl" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$CALLS"
+mode=pass
+[[ -f "$SYSTEMCTL_STATE" ]] && mode=$(cat "$SYSTEMCTL_STATE")
+if [[ "$1" == stop && "$mode" == stop-fail ]]; then exit 1; fi
+if [[ "$1" == is-active ]]; then
+  [[ "$mode" == still-active ]]
+  exit
+fi
 SH
 cat >"$tmp/health" <<'SH'
 #!/usr/bin/env bash
@@ -60,9 +68,11 @@ deploy() {
   CONVEYOR_GATE="$tmp/health" \
   CONVEYOR_REVISION="$revision" \
   CONVEYOR_ALLOW_DIRTY=1 \
-  CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" \
+  CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" SYSTEMCTL_STATE="$systemctl_state" \
     "$repo/deploy/install-release"
 }
+
+echo pass >"$systemctl_state"
 
 # Successful swaps retain the old release.
 prefix="$tmp/prefix"
@@ -71,6 +81,32 @@ deploy "$prefix" selfcheck-one >/dev/null
 [[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-one" ]]
 CONVEYOR_RELEASE_DIR="$prefix/current" "$prefix/current/conveyor" version | grep -q 'selfcheck-one'
 
+echo pass >"$health_state"
+deploy "$prefix" selfcheck-two >/dev/null
+
+# Failed containment must never claim the service stopped when systemd refused
+# the stop or still reports the candidate active.
+echo fail >"$health_state"
+echo stop-fail >"$systemctl_state"
+if output=$(deploy "$prefix" selfcheck-stop-fails 2>&1); then
+  echo "install-release-selfcheck: stop failure was accepted" >&2
+  exit 1
+fi
+[[ ! -e "$prefix/current" ]]
+grep -q 'FATAL: failed to stop unverified service' <<<"$output"
+echo pass >"$systemctl_state"
+echo pass >"$health_state"
+deploy "$prefix" selfcheck-two >/dev/null
+
+echo fail >"$health_state"
+echo still-active >"$systemctl_state"
+if output=$(deploy "$prefix" selfcheck-still-active 2>&1); then
+  echo "install-release-selfcheck: active unverified service was accepted" >&2
+  exit 1
+fi
+[[ ! -e "$prefix/current" ]]
+grep -q 'FATAL: unverified service remains active after stop' <<<"$output"
+echo pass >"$systemctl_state"
 echo pass >"$health_state"
 deploy "$prefix" selfcheck-two >/dev/null
 [[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-two" ]]
@@ -168,6 +204,10 @@ case "$1" in
     ;;
   stop)
     stop_running
+    ;;
+  is-active)
+    [[ -f "$REAL_PID" ]] || exit 3
+    kill -0 "$(cat "$REAL_PID")" 2>/dev/null
     ;;
 esac
 SH

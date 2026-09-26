@@ -144,8 +144,15 @@ if ! "$systemctl_bin" restart "$service" 9>&- || ! gate_release "$target" "$revi
   fi
   if [[ "$restored" != true ]]; then
     rm -f "$current"
-		"$systemctl_bin" stop "$service" 9>&- || true
-    echo "install-release: no verified release remains; current removed and service stopped" >&2
+		if ! "$systemctl_bin" stop "$service" 9>&-; then
+			echo "install-release: FATAL: failed to stop unverified service $service; current removed but the failed candidate may still be running" >&2
+			exit 1
+		fi
+		if "$systemctl_bin" is-active --quiet "$service" 9>&-; then
+			echo "install-release: FATAL: unverified service remains active after stop; current removed" >&2
+			exit 1
+		fi
+    echo "install-release: no verified release remains; current removed and service verified inactive" >&2
   fi
   exit 1
 fi

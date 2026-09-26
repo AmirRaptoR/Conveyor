@@ -16,6 +16,7 @@ import (
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/pipeline"
 	"github.com/AmirRaptoR/Conveyor/internal/source"
+	"github.com/AmirRaptoR/Conveyor/internal/store"
 )
 
 // handleState hands out the board. Items go out in the order the scheduler
@@ -126,6 +127,8 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	// Metrics are a read model over bounded structured evidence. Recompute on
 	// demand so a report taken between watchdog ticks includes the latest run.
 	st.Metrics = s.metrics(time.Now())
+	st.Audit = s.audit.Status()
+	st.Soak = s.soakStore.Get()
 	st.ManualPauses = s.manualPauseList()
 	if budgets := s.budgetViews(st.Items); len(budgets) > 0 {
 		st.Budgets = budgets
@@ -154,6 +157,37 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	s.spawn(func() { s.refresh(s.ctx) })
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func (s *Server) startSoak(now time.Time) (store.SoakRecord, error) {
+	status := s.audit.Status()
+	if !status.Healthy {
+		return store.SoakRecord{}, fmt.Errorf("audit evidence is not healthy: %s", status.Error)
+	}
+	s.mu.RLock()
+	revision := s.state.Release.Revision
+	s.mu.RUnlock()
+	record, err := store.NewSoakRecord(revision, status.ContinuityID, now)
+	if err != nil {
+		return store.SoakRecord{}, err
+	}
+	if err := s.soakStore.Set(record); err != nil {
+		return store.SoakRecord{}, err
+	}
+	s.mu.Lock()
+	s.state.Soak = record
+	s.mu.Unlock()
+	s.hub.publish(event{Kind: "state"})
+	return record, nil
+}
+
+func (s *Server) handleSoakStart(w http.ResponseWriter, _ *http.Request) {
+	record, err := s.startSoak(time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, record)
 }
 
 // handleTick advances one item. Non-blocking: a second press while one is
@@ -202,6 +236,7 @@ func (s *Server) handleOrder(w http.ResponseWriter, r *http.Request) {
 	s.state.Order = s.order.IDs()
 	s.mu.Unlock()
 	s.hub.publish(event{Kind: "state"})
+	s.auditHuman("reorder", "", requestedBy(r))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -313,6 +348,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "storage cannot safely accept model work; usage is above its high watermark or run persistence is faulted", http.StatusInsufficientStorage)
 		return
 	}
+	s.auditHuman("start", item.ID, requestedBy(r))
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -1010,6 +1046,10 @@ func heldOf(cfg *config.Config, items []model.Item, deps pipeline.Deps) map[stri
 // guessing from the active list alone names the wrong thing.
 func (s *Server) whyBusy(src, stage string) string {
 	held := s.eng.Locks().Holding(src, stage, s.cfg.ResourcesFor(src, stage)...)
+	if held == "global" {
+		_, _, used, limit, _, _ := s.eng.Locks().Snapshot()
+		return fmt.Sprintf("global transition capacity is full (%d/%d); %s waits for a slot", used, limit, stage)
+	}
 	if name, ok := strings.CutPrefix(held, "resource "); ok {
 		r := s.eng.Locks().Resources()[name]
 		return fmt.Sprintf("all %d of %s is in use; %s waits for one to come free", r[1], name, stage)

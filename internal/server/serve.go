@@ -225,6 +225,7 @@ func (s *Server) handler() (tcp, socket http.Handler, err error) {
 	mux.HandleFunc("GET /api/runs/{id}", s.handleRun)
 	mux.HandleFunc("GET /api/items/{id}/report", s.handleReport)
 	mux.HandleFunc("POST /api/refresh", s.handleRefresh)
+	mux.HandleFunc("POST /api/soak/start", s.handleSoakStart)
 	mux.HandleFunc("POST /api/tick", s.mutationGuard(s.handleTick))
 	mux.HandleFunc("PUT /api/order", s.handleOrder)
 	mux.HandleFunc("POST /api/items/{id}/start", s.mutationGuard(s.handleStart))

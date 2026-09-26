@@ -265,14 +265,17 @@ The installer performs these operations in order:
 5. Restart the service and run `conveyor gate` through its passwordless local
    Unix socket. The gate validates the config through normal loading, requires
    every configured source to have a fresh successful listing, verifies the
-   expected immutable revision/config identity, probes `/api/state` and the
-   embedded UI, and calls `pipeline.Target/Pick` for a pure scheduling
-   simulation. It claims no slot, writes no provider state and reserves no
-   budget or storage.
+   expected immutable revision/config identity, rejects a sticky run-persistence
+   fault, probes `/api/state` and the embedded UI, and runs the same pure
+   admission evaluator the scheduler uses (including global/source/stage/resource
+   capacity) before `pipeline.Pick`. It claims no slot, writes no provider state
+   and reserves no budget or storage.
 6. If restart or the candidate gate fails, atomically restore the old `current`,
    restart it and run the old release's gate. If either rollback restart or gate
-   fails, remove `current` and stop the service. On success the old target is
-   retained as `previous`.
+   fails, remove `current`, require the service stop to succeed, and verify
+   systemd reports it inactive. A failed stop or still-active unit gets a
+   distinct fatal diagnostic; the installer never claims containment in that
+   state. On success the old target is retained as `previous`.
 
 The defaults match `deploy/conveyor.service.example`. The gate reads `<config
 directory>/data/api.sock`, which bypasses browser authentication but remains

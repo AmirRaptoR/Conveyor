@@ -19,16 +19,21 @@ type WatchdogFinding struct {
 }
 
 type WatchdogView struct {
-	EvaluatedAt    time.Time         `json:"evaluatedAt"`
-	LastProgressAt time.Time         `json:"lastProgressAt"`
-	StallWindow    time.Duration     `json:"stallWindowNs"`
-	Unfinished     int               `json:"unfinished"`
-	Runnable       int               `json:"runnable"`
-	Active         int               `json:"active"`
-	Incident       bool              `json:"incident"`
-	AlertedAt      time.Time         `json:"alertedAt,omitempty"`
-	Findings       []WatchdogFinding `json:"findings,omitempty"`
-	Alert          bool              `json:"-"`
+	EvaluatedAt         time.Time         `json:"evaluatedAt"`
+	LastProgressAt      time.Time         `json:"lastProgressAt"`
+	StallWindow         time.Duration     `json:"stallWindowNs"`
+	Unfinished          int               `json:"unfinished"`
+	Potential           int               `json:"potential"`
+	Runnable            int               `json:"runnable"`
+	Active              int               `json:"active"`
+	Incident            bool              `json:"incident"`
+	DetectedAt          time.Time         `json:"detectedAt,omitempty"`
+	DeliveryStatus      string            `json:"deliveryStatus,omitempty"`
+	DeliveryAttemptedAt time.Time         `json:"deliveryAttemptedAt,omitempty"`
+	DeliveredAt         time.Time         `json:"deliveredAt,omitempty"`
+	DeliveryError       string            `json:"deliveryError,omitempty"`
+	Findings            []WatchdogFinding `json:"findings,omitempty"`
+	Alert               bool              `json:"-"`
 }
 
 func hasFinding(findings []WatchdogFinding, kind string) bool {
@@ -55,6 +60,7 @@ func (s *Server) evaluateWatchdog(now time.Time) WatchdogView {
 	}
 	storage := s.state.Storage
 	rel := s.state.Release
+	persistFault := s.state.PersistFault != nil
 	resting := make(map[string]bool, len(s.resting))
 	for id := range s.resting {
 		resting[id] = true
@@ -79,9 +85,13 @@ func (s *Server) evaluateWatchdog(now time.Time) WatchdogView {
 
 	deps := pipeline.NewDeps(s.cfg, items)
 	staleSrc := map[string]bool{}
+	freshFor := 2 * s.cfg.Poll.D()
+	if freshFor < time.Minute {
+		freshFor = time.Minute
+	}
 	for _, source := range s.cfg.Sources {
 		at, listedOK := listed[source.Name]
-		if !listedOK || now.Sub(at) > s.cfg.Watchdog.StallWindow.D() || listErr[source.Name] != "" {
+		if !listedOK || now.Sub(at) > freshFor || listErr[source.Name] != "" {
 			staleSrc[source.Name] = true
 			detail := "never listed successfully"
 			if listedOK {
@@ -94,52 +104,64 @@ func (s *Server) evaluateWatchdog(now time.Time) WatchdogView {
 		}
 	}
 	staleItems := staleItemIDs(items, staleSrc)
+	stalePotential := 0
 	for _, item := range items {
 		target, ok := pipeline.Target(s.cfg, &item, deps)
+		if ok {
+			view.Potential++
+		}
 		agent := s.cfg.AgentFor(item.Source, target)
-		if !ok || dispatchUsesStaleState(item, deps, staleSrc, staleItems) || resting[item.ID] || s.manuallyPaused(item.Source) ||
-			paused[agent] || !s.budgetAvailable(item.ID, item.Source, target) ||
-			(agent != "" && storage.Level != "" && storage.Level != "ok") ||
-			s.eng.Locks().Busy(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...) {
+		stale := dispatchUsesStaleState(item, deps, staleSrc, staleItems)
+		if ok && stale {
+			stalePotential++
+		}
+		_, itemBusy := s.working.Load(item.ID)
+		reason := admissionReason(admissionFacts{targetOK: ok, itemBusy: itemBusy, resting: resting[item.ID], stale: stale,
+			manualPaused: s.manuallyPaused(item.Source), agentPaused: paused[agent],
+			budgetBlocked:  !s.budgetAvailable(item.ID, item.Source, target),
+			storageBlocked: agent != "" && storage.Level != "" && storage.Level != "ok",
+			slotBlocked:    s.eng.Locks().Busy(item.Source, target, s.cfg.ResourcesFor(item.Source, target)...),
+			persistFault:   agent != "" && persistFault})
+		if reason != "" {
 			continue
 		}
-		if _, busy := s.working.Load(item.ID); !busy {
-			view.Runnable++
-		}
+		view.Runnable++
 	}
-	if view.Unfinished > 0 && view.Runnable > 0 && view.Active == 0 && now.Sub(state.LastProgressAt) >= view.StallWindow {
-		view.Findings = append(view.Findings, WatchdogFinding{Kind: "dead-scheduler", Detail: fmt.Sprintf("%d item(s) runnable with no active transition or useful progress for %s", view.Runnable, view.StallWindow)})
-		view.Incident = true
+	_, _, held, _, _, _ := s.eng.Locks().Snapshot()
+	if view.Potential > 0 && view.Active == 0 && now.Sub(state.LastProgressAt) >= view.StallWindow {
+		if held > 0 {
+			view.Findings = append(view.Findings, WatchdogFinding{Kind: "capacity-leak", Detail: fmt.Sprintf("%d global slot(s) held with no active transition for %s", held, view.StallWindow)})
+			view.Incident = true
+		}
+		if stalePotential > 0 {
+			view.Findings = append(view.Findings, WatchdogFinding{Kind: "stale-source-stall", Detail: fmt.Sprintf("%d potential item(s) unavailable because provider evidence is stale for %s", stalePotential, view.StallWindow)})
+			view.Incident = true
+		}
+		if view.Runnable > 0 {
+			view.Findings = append(view.Findings, WatchdogFinding{Kind: "dead-scheduler", Detail: fmt.Sprintf("%d item(s) runnable with no active transition or useful progress for %s", view.Runnable, view.StallWindow)})
+			view.Incident = true
+		}
 	}
 	if storage.Level == "high" || storage.Level == "critical" {
 		view.Findings = append(view.Findings, WatchdogFinding{Kind: "storage-headroom", Detail: "storage level is " + storage.Level})
 	}
-	if rel.Managed && (filepath.Base(rel.Dir) != rel.Revision || rel.ConfigSchema != s.cfg.Version) {
+	if !rel.Managed || filepath.Base(rel.Dir) != rel.Revision || rel.ConfigSchema != s.cfg.Version {
 		view.Findings = append(view.Findings, WatchdogFinding{Kind: "revision-coherence", Detail: fmt.Sprintf("release revision %q does not match directory/config identity", rel.Revision)})
 	}
-	metrics := s.metrics(now)
-	if metrics.StageRuns >= 3 && metrics.SuccessRate < .25 {
-		view.Findings = append(view.Findings, WatchdogFinding{Kind: "completion-rate", Detail: fmt.Sprintf("seven-day stage success rate is %.1f%%", metrics.SuccessRate*100)})
+	metrics := s.metricsAt(now)
+	if metrics.StageRuns >= 3 && metrics.CompletionRate == 0 {
+		view.Findings = append(view.Findings, WatchdogFinding{Kind: "completion-rate", Detail: fmt.Sprintf("seven-day completion rate is %.2f per day after %d settled stage runs", metrics.CompletionRate, metrics.StageRuns)})
+	}
+	if status := s.audit.Status(); !status.Healthy {
+		view.Findings = append(view.Findings, WatchdogFinding{Kind: "audit-evidence", Detail: status.Error})
+		view.Incident = true
 	}
 	blocked := map[string]int{}
-	auditedRuns := map[string]bool{}
 	for _, event := range s.audit.Since(now.Add(-metricsWindow)) {
 		if event.Kind == "run" && event.Outcome == string(model.OutcomeBlocked) {
 			blocked[event.ItemID+"\x00"+event.BlockKind]++
 		}
-		if event.Kind == "run" {
-			auditedRuns[event.RunID] = true
-		}
 	}
-	s.walkRuns(func(run RunMeta) bool {
-		if run.StartedAt.Before(now.Add(-metricsWindow)) {
-			return false
-		}
-		if run.Kind == "stage" && run.Outcome == model.OutcomeBlocked && !auditedRuns[run.ID] {
-			blocked[run.ItemID+"\x00"+run.MarkKind]++
-		}
-		return true
-	})
 	for key, count := range blocked {
 		if count >= 3 {
 			item, _, _ := strings.Cut(key, "\x00")
@@ -154,19 +176,31 @@ func (s *Server) evaluateWatchdog(now time.Time) WatchdogView {
 	})
 	key := ""
 	if view.Incident {
-		h := sha256.Sum256([]byte(fmt.Sprint(view.Unfinished, ":", view.Runnable, ":", state.LastProgressAt.Unix())))
+		var causes []string
+		for _, finding := range view.Findings {
+			switch finding.Kind {
+			case "dead-scheduler", "stale-source-stall", "capacity-leak", "audit-evidence":
+				causes = append(causes, finding.Kind)
+			}
+		}
+		h := sha256.Sum256([]byte(fmt.Sprint(state.LastProgressAt.Unix(), ":", strings.Join(causes, ","))))
 		key = fmt.Sprintf("%x", h[:8])
 		if state.IncidentKey != key {
-			view.Alert = true
-			state.IncidentKey, state.AlertedAt = key, now
+			state.IncidentKey, state.DetectedAt = key, now
+			state.DeliveryStatus, state.DeliveryAttemptedAt, state.DeliveredAt, state.DeliveryError = "pending", time.Time{}, time.Time{}, ""
 		}
+		view.Alert = state.DeliveryStatus != "delivered"
 	} else {
-		state.IncidentKey, state.AlertedAt = "", time.Time{}
+		state.IncidentKey, state.DetectedAt = "", time.Time{}
+		state.DeliveryStatus, state.DeliveryAttemptedAt, state.DeliveredAt, state.DeliveryError = "", time.Time{}, time.Time{}, ""
 	}
-	view.AlertedAt = state.AlertedAt
+	view.DetectedAt, view.DeliveryStatus = state.DetectedAt, state.DeliveryStatus
+	view.DeliveryAttemptedAt, view.DeliveredAt, view.DeliveryError = state.DeliveryAttemptedAt, state.DeliveredAt, state.DeliveryError
 	s.watchdogState = state
 	if err := s.watchdogStore.Set(state); err != nil {
 		fmt.Fprintf(os.Stderr, "conveyor: persist watchdog state: %v\n", err)
+		view.Alert = false
+		view.DeliveryError = "watchdog incident is not durable: " + err.Error()
 	}
 	return view
 }
@@ -181,14 +215,7 @@ func (s *Server) watchdog(ctxDone <-chan struct{}) {
 		s.mu.Unlock()
 		s.hub.publish(event{Kind: "state"})
 		if view.Alert {
-			body := "unfinished runnable work made no useful progress"
-			for _, finding := range view.Findings {
-				if finding.Kind == "dead-scheduler" {
-					body = finding.Detail
-					break
-				}
-			}
-			s.notify("Conveyor stalled", body, "watchdog-stall")
+			s.spawn(func() { s.deliverWatchdogAlert(view) })
 		}
 	}
 	run()
@@ -204,11 +231,56 @@ func (s *Server) watchdog(ctxDone <-chan struct{}) {
 	}
 }
 
+func (s *Server) deliverWatchdogAlert(view WatchdogView) {
+	if !s.watchdogAlerting.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.watchdogAlerting.Store(false)
+	s.watchdogMu.Lock()
+	state := s.watchdogState
+	if state.IncidentKey == "" || !state.DetectedAt.Equal(view.DetectedAt) || state.DeliveryStatus == "delivered" {
+		s.watchdogMu.Unlock()
+		return
+	}
+	state.DeliveryStatus = "attempted"
+	state.DeliveryAttemptedAt = time.Now()
+	state.DeliveryError = ""
+	s.watchdogState = state
+	if err := s.watchdogStore.Set(state); err != nil {
+		state.DeliveryStatus = "pending"
+		state.DeliveryError = "persist delivery attempt: " + err.Error()
+		s.watchdogState = state
+		fmt.Fprintf(os.Stderr, "conveyor: persist watchdog delivery attempt: %v\n", err)
+		s.watchdogMu.Unlock()
+		return
+	}
+	s.watchdogMu.Unlock()
+
+	body := "Conveyor detected an operational stall"
+	if len(view.Findings) > 0 {
+		body = view.Findings[0].Detail
+	}
+	err := s.watchdogNotifier("Conveyor stalled", body, "watchdog-stall")
+	s.watchdogMu.Lock()
+	defer s.watchdogMu.Unlock()
+	state = s.watchdogState
+	if err != nil {
+		state.DeliveryStatus, state.DeliveryError = "pending", err.Error()
+	} else {
+		state.DeliveryStatus, state.DeliveredAt, state.DeliveryError = "delivered", time.Now(), ""
+	}
+	s.watchdogState = state
+	if persistErr := s.watchdogStore.Set(state); persistErr != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: persist watchdog delivery: %v\n", persistErr)
+	}
+}
+
 func (s *Server) noteUsefulProgress(at time.Time) {
 	s.watchdogMu.Lock()
 	defer s.watchdogMu.Unlock()
 	state := s.watchdogState
-	state.LastProgressAt, state.IncidentKey, state.AlertedAt = at, "", time.Time{}
+	state.LastProgressAt, state.IncidentKey, state.DetectedAt = at, "", time.Time{}
+	state.DeliveryStatus, state.DeliveryAttemptedAt, state.DeliveredAt, state.DeliveryError = "", time.Time{}, time.Time{}, ""
 	s.watchdogState = state
 	if err := s.watchdogStore.Set(state); err != nil {
 		fmt.Fprintf(os.Stderr, "conveyor: persist watchdog progress: %v\n", err)

@@ -32,6 +32,26 @@ func TestEvaluateRequiresFreshEverySourceAndExpectedRevision(t *testing.T) {
 	}
 }
 
+func TestEvaluateFailsOnPersistenceFaultAndHonorsGlobalCapacity(t *testing.T) {
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	cfg := &config.Config{Version: 1, Poll: config.Duration(time.Minute), Stages: []config.Stage{{Name: "ready", OnSuccess: "done"}, {Name: "done", Terminal: true}}, Sources: []config.Source{{Name: "one"}}}
+	state := server.State{
+		Release: release.Info{Managed: true, Revision: "new", Dir: "/opt/conveyor/releases/new", ConfigSchema: 1},
+		Sources: []server.SourceView{{Name: "one", LastListedAt: now.Format(time.RFC3339)}},
+		Items:   []model.Item{{ID: "one:1", Source: "one", Stage: "ready", Title: "work"}},
+		Slots:   server.SlotsView{Global: 1, GlobalMax: 1, BySource: map[string]int{}, ByStage: map[string]int{}},
+	}
+	result := Evaluate(cfg, state, "new", true, now)
+	if !result.Pass || result.Simulation.Candidate != "" || result.Simulation.Detail != "no item is currently runnable after global-capacity" {
+		t.Fatalf("capacity result = %#v", result)
+	}
+	state.PersistFault = &server.PersistFault{RunID: "run-1", Message: "disk full", At: now}
+	result = Evaluate(cfg, state, "new", true, now)
+	if result.Pass || checkStatus(result.Checks, "persistence") != "fail" {
+		t.Fatalf("persistence result = %#v", result)
+	}
+}
+
 func checkStatus(checks []Check, name string) string {
 	for _, check := range checks {
 		if check.Name == name {

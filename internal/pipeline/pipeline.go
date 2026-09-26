@@ -103,6 +103,9 @@ func (l *Locks) full(src, stage string, resources []string) string {
 			return "resource " + r
 		}
 	}
+	if len(l.global) >= cap(l.global) {
+		return "global"
+	}
 	return ""
 }
 
@@ -119,16 +122,9 @@ func (l *Locks) TryAcquire(src, stage string, resources ...string) bool {
 	for _, r := range resources {
 		l.byResource[r]++
 	}
+	l.global <- struct{}{}
 	l.mu.Unlock()
-
-	select {
-	case l.global <- struct{}{}:
-		return true
-	default:
-		// The global cap is full; give back what was taken rather than hold it.
-		l.give(src, stage, resources)
-		return false
-	}
+	return true
 }
 
 // Busy reports whether a transition would be refused right now. Advisory: the

@@ -15,6 +15,10 @@ const metricsWindow = 7 * 24 * time.Hour
 type Metrics struct {
 	WindowStart          time.Time     `json:"windowStart"`
 	WindowEnd            time.Time     `json:"windowEnd"`
+	ObservationSince     time.Time     `json:"observationSince"`
+	CoverageComplete     bool          `json:"coverageComplete"`
+	EvidenceHealthy      bool          `json:"evidenceHealthy"`
+	EvidenceError        string        `json:"evidenceError,omitempty"`
 	StageRuns            int           `json:"stageRuns"`
 	SuccessfulRuns       int           `json:"successfulRuns"`
 	SuccessRate          float64       `json:"successRate"`
@@ -28,8 +32,16 @@ type Metrics struct {
 	HumanInterventions   int           `json:"humanInterventions"`
 }
 
-func calculateMetrics(now time.Time, runs []RunMeta, events []store.AuditEvent, terminal map[string]bool) Metrics {
-	m := Metrics{WindowStart: now.Add(-metricsWindow), WindowEnd: now}
+type metricCoverage struct {
+	StartedAt time.Time
+	Healthy   bool
+	Error     string
+}
+
+func calculateMetrics(now time.Time, coverage metricCoverage, runs []RunMeta, events []store.AuditEvent, terminal map[string]bool) Metrics {
+	m := Metrics{WindowStart: now.Add(-metricsWindow), WindowEnd: now, ObservationSince: coverage.StartedAt,
+		EvidenceHealthy: coverage.Healthy, EvidenceError: coverage.Error,
+		CoverageComplete: coverage.Healthy && !coverage.StartedAt.IsZero() && !coverage.StartedAt.After(now.Add(-metricsWindow))}
 	for _, run := range runs {
 		at := run.FinishedAt
 		if at.IsZero() {
@@ -79,14 +91,38 @@ func calculateMetrics(now time.Time, runs []RunMeta, events []store.AuditEvent, 
 }
 
 func (s *Server) metrics(now time.Time) Metrics {
-	events := s.audit.Since(now.Add(-metricsWindow))
-	audited := map[string]bool{}
+	return s.metricsAt(now)
+}
+
+func (s *Server) metricsAt(now time.Time) Metrics {
+	status := s.audit.Status()
+	soak := s.soakStore.Get()
+	s.mu.RLock()
+	revision := s.state.Release.Revision
+	s.mu.RUnlock()
+	coverage := metricCoverage{StartedAt: soak.StartedAt, Healthy: status.Healthy}
+	switch {
+	case !status.Healthy:
+		coverage.Error = status.Error
+	case soak.StartedAt.IsZero():
+		coverage.Healthy, coverage.Error = false, "soak has not been started"
+	case soak.Revision != revision:
+		coverage.Healthy, coverage.Error = false, "soak revision does not match the running release"
+	case soak.EvidenceID == "" || soak.EvidenceID != status.ContinuityID:
+		coverage.Healthy, coverage.Error = false, "soak audit evidence identity does not match"
+	case status.ContinuitySince.After(soak.StartedAt):
+		coverage.Healthy, coverage.Error = false, "audit evidence continuity began after the soak"
+	}
+	cutoff := now.Add(-metricsWindow)
+	if !soak.StartedAt.IsZero() && soak.StartedAt.After(cutoff) {
+		cutoff = soak.StartedAt
+	}
+	events := s.audit.Since(cutoff)
 	var runs []RunMeta
 	for _, event := range events {
 		if event.Kind != "run" {
 			continue
 		}
-		audited[event.RunID] = true
 		class := ""
 		if event.ModelRun {
 			class = "model"
@@ -95,18 +131,9 @@ func (s *Server) metrics(now time.Time) Metrics {
 			To: event.Stage, StartedAt: event.At, FinishedAt: event.At, Outcome: model.Outcome(event.Outcome), NextStage: event.NextStage,
 			MoveConfirmed: event.Confirmed, RetentionClass: class}})
 	}
-	s.walkRuns(func(run RunMeta) bool {
-		if !run.StartedAt.IsZero() && run.StartedAt.Before(now.Add(-metricsWindow)) {
-			return false
-		}
-		if !audited[run.ID] {
-			runs = append(runs, run)
-		}
-		return true
-	})
 	terminal := map[string]bool{}
 	for _, stage := range s.cfg.Stages {
 		terminal[stage.Name] = stage.Terminal
 	}
-	return calculateMetrics(now, runs, events, terminal)
+	return calculateMetrics(now, coverage, runs, events, terminal)
 }

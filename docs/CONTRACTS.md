@@ -975,11 +975,25 @@ cleanup.
 
 Operational reporting uses one fixed seven-day window regardless of shorter
 run-retention classes. Every settled stage transition appends its structured
-outcome, model classification and confirmed next stage to `data/audit.jsonl`;
+outcome, model classification and confirmed next stage to the bounded atomic
+snapshot `data/audit.jsonl`; retries of one RunID replace that run's canonical
+record rather than multiplying it;
 operator controls append a human-intervention event, and removing a provider
 mark appends its blocked-to-recovered duration. The file is pruned to seven days
-and atomically replaced. It never contains or parses logs, plans or control
-records. `/api/state.metrics` defines its aggregates as follows:
+and atomically replaced. A separate continuity marker binds its identity and
+SHA-256 digest. Missing, unreadable, malformed, truncated or externally
+rewritten evidence and every append failure are board-visible faults and make
+coverage incomplete. The validated seven-day projection is loaded once and
+updated in memory on append; reads do not parse the file. A 100,000-record / 64
+MiB ceiling fails closed instead of allowing request latency to grow without a
+bound. It never contains or parses logs, plans or control records.
+
+`conveyor soak-start` is the only operation that starts a soak. It persists a
+new identity, current immutable revision, start instant and current evidence
+continuity identity. Startup and deployment never infer one, and a fresh start
+on the same revision cannot inherit elapsed time from an older record.
+`soak-report` requires that identity and seven elapsed days.
+`/api/state.metrics` defines its aggregates as follows:
 
 - `successRate`: confirmed successful stage runs / all stage runs settled in the
   window.
@@ -992,15 +1006,19 @@ records. `/api/state.metrics` defines its aggregates as follows:
   pause/resume, cancel and budget-control requests.
 
 The server watchdog owns source freshness and evaluates it every minute even
-under storage pressure. It reports stale/failed sources, unfinished and runnable
-counts versus active transitions, seven-day completion health, repeated
+under storage pressure. It reports stale/failed sources, unfinished, potential
+and runnable counts versus active transitions, seven-day completion health, repeated
 blockers, storage headroom and immutable revision/config coherence in
-`/api/state.watchdog`. Its only incident alert is a runnable unfinished line
-with no active transition and no confirmed stage movement for
-`watchdog.stallWindow` (default `30m`). The incident key, last useful progress
-and alert time are atomically persisted in `data/watchdog.json`, so restart and
-repeated polling cannot send the same alert twice. Listings, plan updates and
-control traffic are not useful progress and are not scheduler inputs.
+`/api/state.watchdog`. An incident is potential unfinished work with no active
+transition and no confirmed stage movement for `watchdog.stallWindow` (default
+`30m`), classified as a dead scheduler, stale provider evidence or capacity
+held without an active run. Audit continuity failure is an immediate incident.
+The incident key, last useful progress, detection, attempted delivery and
+confirmed delivery are atomically persisted in `data/watchdog.json`. No
+subscriber or a send failure remains visibly pending and retries after restart;
+only a successful send is called delivered and suppresses repeats. Listings,
+plan updates and control traffic are not useful progress and are not scheduler
+inputs.
 
 The former `logs:` block is a load error with migration guidance: one retention
 duration cannot silently stand for four materially different classes.

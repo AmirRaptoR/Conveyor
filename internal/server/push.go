@@ -25,6 +25,20 @@ func (s *Server) notify(title, body, itemID string) {
 	if s.pushKeys == nil || s.pushSubs.Len() == 0 {
 		return
 	}
+	s.spawn(func() {
+		if err := s.sendNotification(title, body, itemID); err != nil {
+			fmt.Fprintf(os.Stderr, "conveyor: push notification: %v\n", err)
+		}
+	})
+}
+
+func (s *Server) sendNotification(title, body, itemID string) error {
+	if s.pushKeys == nil {
+		return errors.New("push notifications are off")
+	}
+	if s.pushSubs.Len() == 0 {
+		return errors.New("no push subscriber")
+	}
 	if len(body) > 160 {
 		body = body[:157] + "…"
 	}
@@ -32,20 +46,30 @@ func (s *Server) notify(title, body, itemID string) {
 		"title": title, "body": body, "tag": itemID,
 		"url": "/#item=" + url.PathEscape(itemID),
 	})
+	delivered := 0
+	var last error
 	for _, sub := range s.pushSubs.All() {
-		sub := sub
-		s.spawn(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			err := s.pushKeys.Send(ctx, sub, payload, "https://github.com/AmirRaptoR/Conveyor")
-			switch {
-			case errors.Is(err, push.Gone):
-				_ = s.pushSubs.Remove(sub.Endpoint)
-			case err != nil:
-				fmt.Fprintf(os.Stderr, "conveyor: push to %s: %v\n", sub.Endpoint, err)
-			}
-		})
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := s.pushKeys.Send(ctx, sub, payload, "https://github.com/AmirRaptoR/Conveyor")
+		cancel()
+		switch {
+		case errors.Is(err, push.Gone):
+			_ = s.pushSubs.Remove(sub.Endpoint)
+			last = err
+		case err != nil:
+			last = err
+			fmt.Fprintf(os.Stderr, "conveyor: push to %s: %v\n", sub.Endpoint, err)
+		default:
+			delivered++
+		}
 	}
+	if delivered == 0 {
+		if last == nil {
+			last = errors.New("no push subscriber accepted the alert")
+		}
+		return last
+	}
+	return nil
 }
 
 func (s *Server) handlePushKey(w http.ResponseWriter, r *http.Request) {

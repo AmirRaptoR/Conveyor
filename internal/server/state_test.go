@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
 	"github.com/AmirRaptoR/Conveyor/internal/runner"
+	"github.com/AmirRaptoR/Conveyor/internal/store"
 )
 
 func boardFor(t *testing.T) (*config.Config, *runner.Runner) {
@@ -114,6 +116,43 @@ func TestStartRunsTheNextTransitionNow(t *testing.T) {
 	if got != "done" {
 		t.Errorf("stage = %q, want done — backlog is a queue, so working ran and routed on", got)
 	}
+}
+
+func TestManualStartAndReorderAuditOnlyAcceptedRequests(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	s.ctx = t.Context()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "backlog", Title: "waiting"}}
+
+	badStart := httptest.NewRecorder()
+	badStartReq := httptest.NewRequest("POST", "/api/items/s1:1/start", strings.NewReader(`{"stage":"done"}`))
+	badStartReq.SetPathValue("id", "s1:1")
+	s.handleStart(badStart, badStartReq)
+	badOrder := httptest.NewRecorder()
+	s.handleOrder(badOrder, httptest.NewRequest("PUT", "/api/order", strings.NewReader(`not-json`)))
+	if got := s.audit.Since(time.Time{}); len(got) != 0 {
+		t.Fatalf("rejected requests were audited: %#v", got)
+	}
+
+	order := httptest.NewRecorder()
+	s.handleOrder(order, httptest.NewRequest("PUT", "/api/order", strings.NewReader(`["s1:1"]`)))
+	start := httptest.NewRecorder()
+	startReq := httptest.NewRequest("POST", "/api/items/s1:1/start", nil)
+	startReq.SetPathValue("id", "s1:1")
+	s.handleStart(start, startReq)
+	if order.Code != http.StatusNoContent || start.Code != http.StatusAccepted {
+		t.Fatalf("order/start status = %d/%d", order.Code, start.Code)
+	}
+	var human []store.AuditEvent
+	for _, event := range s.audit.Since(time.Time{}) {
+		if event.Kind == "human" {
+			human = append(human, event)
+		}
+	}
+	if len(human) != 2 || human[0].Action != "reorder" || human[1].Action != "start" || human[1].ItemID != "s1:1" {
+		t.Fatalf("human events = %#v, want accepted reorder and start", human)
+	}
+	waitFor(t, "the manually started transition to finish", func() bool { return s.inFlight.Load() == 0 })
 }
 
 // A drop is a decision about when, not about which stage: hand-skipping to a

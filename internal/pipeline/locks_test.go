@@ -83,8 +83,12 @@ func TestRefusedAcquireTakesNothing(t *testing.T) {
 	if !l.TryAcquire("b", "two") {
 		t.Error("a refused acquire left slots held")
 	}
+	if !l.Busy("c", "three") {
+		t.Error("the full global capacity was not reported busy")
+	}
+	l.Release("b", "two")
 	if l.Busy("c", "three") {
-		t.Error("an unrelated transition reported busy")
+		t.Error("global capacity stayed busy after release")
 	}
 }
 

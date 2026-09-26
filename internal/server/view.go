@@ -141,9 +141,11 @@ type State struct {
 	Mode string `json:"mode"`
 	// Storage is what the run store currently holds and how far back
 	// retention still reaches.
-	Storage  StorageView  `json:"storage"`
-	Watchdog WatchdogView `json:"watchdog"`
-	Metrics  Metrics      `json:"metrics"`
+	Storage  StorageView       `json:"storage"`
+	Watchdog WatchdogView      `json:"watchdog"`
+	Metrics  Metrics           `json:"metrics"`
+	Audit    store.AuditStatus `json:"audit"`
+	Soak     store.SoakRecord  `json:"soak"`
 	// PersistFault is a run whose own record could not be trusted — a full
 	// disk during its meta.json write — kept until a later run persists
 	// cleanly. Unlike Warnings, refresh never rebuilds this: a disk-full
@@ -590,11 +592,13 @@ type Server struct {
 	// recovery is every deterministic wait and per-source retry deadline. It
 	// is persisted because a restart must not turn backoff into an immediate
 	// retry or forget what unchanged condition a probe is comparing.
-	recovery      *store.Recovery
-	audit         *store.Audit
-	watchdogStore *store.Watchdog
-	watchdogState store.WatchdogState
-	watchdogMu    sync.Mutex
+	recovery         *store.Recovery
+	audit            *store.Audit
+	soakStore        *store.Soak
+	watchdogStore    *store.Watchdog
+	watchdogState    store.WatchdogState
+	watchdogMu       sync.Mutex
+	watchdogAlerting atomic.Bool
 	// cancels is the audit record of a run an operator cancelled, kept until
 	// that item's next transition starts and overwrites it. Memory-only: a
 	// restart has no run left in flight to cancel, so there is nothing here
@@ -699,6 +703,9 @@ type Server struct {
 	// key file, and the board simply does not notify.
 	pushKeys *push.Keys
 	pushSubs *push.Store
+	// watchdogNotifier is synchronous so successful delivery can be
+	// acknowledged durably; tests replace it without a push service.
+	watchdogNotifier func(string, string, string) error
 
 	// verify bounds the cost of Auth.Check — see authVerifier.
 	verify *authVerifier
@@ -745,6 +752,7 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 		budgets:         store.OpenBudgets(filepath.Join(cfg.DataDir(), "budgets.json")),
 		recovery:        store.OpenRecovery(filepath.Join(cfg.DataDir(), "recovery.json")),
 		audit:           store.OpenAudit(filepath.Join(cfg.DataDir(), "audit.jsonl")),
+		soakStore:       store.OpenSoak(filepath.Join(cfg.DataDir(), "soak.json")),
 		watchdogStore:   store.OpenWatchdog(filepath.Join(cfg.DataDir(), "watchdog.json")),
 		tick:            make(chan struct{}, 1),
 		wake:            make(chan struct{}, 1),
@@ -760,6 +768,7 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 	} else {
 		s.pushKeys = keys
 	}
+	s.watchdogNotifier = s.sendNotification
 	s.blocks = map[string]Block{}
 	s.times = map[string]ItemTime{}
 	s.plans = map[string]PlanView{}
@@ -791,11 +800,14 @@ func New(cfg *config.Config, r *runner.Runner, releaseInfo ...release.Info) *Ser
 	s.verify = newAuthVerifier(s.cfg.Auth.Check)
 	s.listedAt = map[string]time.Time{}
 	s.listErr = map[string]string{}
-	s.watchdogState = s.watchdogStore.Get()
+	if err := s.audit.Establish(time.Now()); err != nil {
+		fmt.Fprintf(os.Stderr, "conveyor: establish audit evidence: %v\n", err)
+	}
 	rel := release.Current()
 	if len(releaseInfo) > 0 {
 		rel = releaseInfo[0]
 	}
+	s.watchdogState = s.watchdogStore.Get()
 	s.state = State{
 		Release: rel,
 		Stages:  stageViews(cfg),

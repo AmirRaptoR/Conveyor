@@ -183,11 +183,14 @@ already stops every other user from reaching it.
 `conveyor gate -c conveyor.yaml -expected-revision <revision>` is the local,
 read-only release gate used by `deploy/install-release`. Over the server's Unix
 socket it requires a fresh successful listing from every configured source,
-checks the immutable release/config identity, probes the API and embedded UI,
-and runs a pure `pipeline.Target/Pick` scheduling simulation. It does not claim
+checks the immutable release/config identity and run-persistence health, probes
+the API and embedded UI, and runs the scheduler's shared read-only admission
+evaluation before `pipeline.Pick`. It does not claim
 capacity, reserve a budget, run a script or write provider state. A failed
-candidate gate rolls back; a failed rollback gate removes `current` and stops
-the service. See `docs/SOAK.md` for the seven-day unattended report.
+candidate gate rolls back; a failed rollback gate removes `current`, requires a
+successful stop and verifies the service inactive. Use `conveyor soak-start`
+explicitly after selecting a candidate for a seven-day unattended run; see
+`docs/SOAK.md` for the report.
 
 ### External-route check: `conveyor probe`
 

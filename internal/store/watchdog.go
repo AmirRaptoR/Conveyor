@@ -8,9 +8,13 @@ import (
 )
 
 type WatchdogState struct {
-	LastProgressAt time.Time `json:"lastProgressAt"`
-	IncidentKey    string    `json:"incidentKey,omitempty"`
-	AlertedAt      time.Time `json:"alertedAt,omitempty"`
+	LastProgressAt      time.Time `json:"lastProgressAt"`
+	IncidentKey         string    `json:"incidentKey,omitempty"`
+	DetectedAt          time.Time `json:"detectedAt,omitempty"`
+	DeliveryStatus      string    `json:"deliveryStatus,omitempty"`
+	DeliveryAttemptedAt time.Time `json:"deliveryAttemptedAt,omitempty"`
+	DeliveredAt         time.Time `json:"deliveredAt,omitempty"`
+	DeliveryError       string    `json:"deliveryError,omitempty"`
 }
 
 type Watchdog struct {
