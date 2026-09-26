@@ -12,91 +12,45 @@ check() {
 	if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi
 }
 
-# Status fixtures read their result from a sibling data file, keeping every
-# adapter invocation deterministic and offline.
-make_status_fixture() { # agent
-	local agent=$1
-	cat >"$tmp/agents/$agent/status" <<'SCRIPT'
-#!/usr/bin/env bash
-cp "$(dirname "$0")/status-result.json" "$CONVEYOR_RESULT"
-SCRIPT
-	chmod +x "$tmp/agents/$agent/status"
-}
-make_status_fixture claude
-make_status_fixture codex
-
-set_state() { # agent state summary [reset]
-	local agent=$1 state=$2 summary=$3 reset=${4:-}
-	jq -n --arg state "$state" --arg summary "$summary" --arg reset "$reset" \
-		'{state:$state,summary:$summary} | if $reset != "" then .resetsAt=$reset else . end' \
-		>"$tmp/agents/$agent/status-result.json"
-}
-
-run_status() {
-	CONVEYOR_RESULT="$tmp/combined.json" "$tmp/agents/reviewer/status" >/dev/null 2>&1
-}
-
-set_state claude ok "Claude available"
-set_state codex limited "Codex limited"
-run_status
-check "Claude availability selects Claude" "$(jq -r .state "$tmp/combined.json")/$(jq -r .summary "$tmp/combined.json")" \
-	"ok/review backend: Claude (Claude ok, Codex limited)"
-
-set_state claude limited "Claude limited" "2026-09-27T03:00:00Z"
-set_state codex ok "Codex available"
-run_status
-check "Codex availability keeps the reviewer ready" "$(jq -r .state "$tmp/combined.json")/$(jq -r .summary "$tmp/combined.json")" \
-	"ok/review backend: Codex fallback (Claude limited, Codex ok)"
-
-set_state claude limited "Claude limited" "2026-09-27T03:00:00Z"
-set_state codex limited "Codex limited" "2026-09-27T02:00:00Z"
-run_status
-check "both confirmed limits pause review" "$(jq -r .state "$tmp/combined.json")/$(jq -r .resetsAt "$tmp/combined.json")" \
-	"limited/2026-09-27T02:00:00Z"
-
-printf '{bad json' >"$tmp/agents/codex/status-result.json"
-run_status
-check "an inconclusive fallback is not called limited" "$(jq -r .state "$tmp/combined.json")" "unknown"
-
-# One fake runner stands in for the shared review policy and records which
-# backend and model the wrapper selected. It can also emulate Claude reaching
-# quota after a pre-run ok status, proving the in-run handoff.
+# Any Claude invocation is a test failure. The fixture exists specifically to
+# prove an installed, available Claude backend cannot be selected.
 cat >"$tmp/agents/claude/review" <<'SCRIPT'
+#!/usr/bin/env bash
+printf 'claude-called\n' >>"$CALLS"
+exit 99
+SCRIPT
+cat >"$tmp/agents/claude/status" <<'SCRIPT'
+#!/usr/bin/env bash
+printf 'claude-status-called\n' >>"$CALLS"
+exit 99
+SCRIPT
+
+cat >"$tmp/agents/codex/review" <<'SCRIPT'
 #!/usr/bin/env bash
 payload=$(cat)
 printf '%s\t%s\t%s\n' "$CONVEYOR_AGENT_BACKEND" "${MODEL:-}" "$payload" >>"$CALLS"
-if [[ "$CONVEYOR_AGENT_BACKEND" == "claude" && "${FAKE_CLAUDE_LIMIT_DURING_RUN:-}" == "1" ]]; then
-	printf '%s\n' '{"v":1,"outcome":"blocked","blocked":true,"kind":"limit","reason":"quota"}' >"$CONVEYOR_RESULT"
-	exit 20
-fi
 printf '%s\n' '{"v":1,"outcome":"success"}' >"$CONVEYOR_RESULT"
 SCRIPT
-chmod +x "$tmp/agents/claude/review"
+cat >"$tmp/agents/codex/status" <<'SCRIPT'
+#!/usr/bin/env bash
+printf 'codex-status-called\n' >>"$CALLS"
+printf '%s\n' '{"state":"ok","summary":"Codex available"}' >"$CONVEYOR_RESULT"
+SCRIPT
+chmod +x "$tmp/agents/claude/"{review,status} "$tmp/agents/codex/"{review,status}
 
-run_review() {
-	: >"$tmp/calls"
-	CONVEYOR_RESULT="$tmp/stage-result.json" CALLS="$tmp/calls" \
-	CLAUDE_MODEL=claude-test CODEX_MODEL=codex-sol-test \
-	FAKE_CLAUDE_LIMIT_DURING_RUN=${1:-0} \
-		"$tmp/agents/reviewer/review" <<<'{"item":{"ref":"67"}}' >/dev/null 2>&1
-}
+: >"$tmp/calls"
+CONVEYOR_RESULT="$tmp/stage-result.json" CALLS="$tmp/calls" \
+	CLAUDE_MODEL=claude-must-not-run CODEX_MODEL=gpt-5.6-sol \
+	"$tmp/agents/reviewer/review" <<<'{"item":{"ref":"67"}}' >/dev/null 2>&1
+check "review dispatches Codex Sol" "$(head -1 "$tmp/calls")" $'codex\tgpt-5.6-sol\t{"item":{"ref":"67"}}'
+check "review never invokes Claude" "$(grep -c 'claude-called' "$tmp/calls" || true)" "0"
+check "Codex result is preserved" "$(jq -r .outcome "$tmp/stage-result.json")" "success"
 
-set_state claude ok "Claude available"
-set_state codex ok "Codex available"
-run_review
-check "review dispatches Claude while available" "$(cut -f1-2 "$tmp/calls")" $'claude\tclaude-test'
-
-set_state claude limited "Claude limited"
-set_state codex ok "Codex available"
-run_review
-check "review dispatches Codex after a confirmed Claude limit" "$(cut -f1-2 "$tmp/calls")" $'codex\tcodex-sol-test'
-
-set_state claude ok "Claude available"
-set_state codex ok "Codex available"
-run_review 1
-check "an exact in-run Claude quota result falls through to Codex" \
-	"$(cut -f1-2 "$tmp/calls" | paste -sd, -)" $'claude\tclaude-test,codex\tcodex-sol-test'
-check "the fallback replaces the quota result" "$(jq -r .outcome "$tmp/stage-result.json")" "success"
-check "the original stage input reaches both attempts" "$(cut -f3 "$tmp/calls" | uniq | wc -l | tr -d ' ')" "1"
+: >"$tmp/calls"
+CONVEYOR_RESULT="$tmp/status-result.json" CALLS="$tmp/calls" \
+	"$tmp/agents/reviewer/status" >/dev/null 2>&1
+check "status delegates to Codex" "$(cat "$tmp/calls")" "codex-status-called"
+check "status never probes Claude" "$(grep -c 'claude-status-called' "$tmp/calls" || true)" "0"
+check "Codex status is preserved" "$(jq -r .summary "$tmp/status-result.json")" "Codex available"
 
 exit "$fail"

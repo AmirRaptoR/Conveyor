@@ -84,9 +84,11 @@ func (s *Server) evaluateWatchdog(now time.Time) WatchdogView {
 	}
 	view := WatchdogView{EvaluatedAt: now, LastProgressAt: state.LastProgressAt,
 		StallWindow: s.cfg.Watchdog.StallWindow.D(), Active: len(s.activeList())}
+	unfinishedIDs := make(map[string]bool, len(items))
 	for _, item := range items {
 		if stage, ok := s.cfg.Stage(item.Stage); ok && !stage.Terminal {
 			view.Unfinished++
+			unfinishedIDs[item.ID] = true
 		}
 	}
 
@@ -177,7 +179,7 @@ func (s *Server) evaluateWatchdog(now time.Time) WatchdogView {
 	}
 	blocked := map[string]int{}
 	for _, event := range s.audit.Since(now.Add(-metricsWindow)) {
-		if event.Kind == "run" && event.Outcome == string(model.OutcomeBlocked) {
+		if event.Kind == "run" && event.Outcome == string(model.OutcomeBlocked) && unfinishedIDs[event.ItemID] {
 			blocked[event.ItemID+"\x00"+event.BlockKind]++
 		}
 	}

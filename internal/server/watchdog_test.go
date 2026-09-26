@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -271,5 +272,41 @@ func TestWatchdogCompletionFindingUsesTerminalCompletions(t *testing.T) {
 	view := s.evaluateWatchdog(now)
 	if !hasFinding(view.Findings, "completion-rate") {
 		t.Fatalf("findings = %#v, successful nonterminal churn hid zero completions", view.Findings)
+	}
+}
+
+func TestWatchdogRepeatedBlockersOnlyIncludeCurrentUnfinishedItems(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	s.state.Items = []model.Item{
+		{ID: "s1:live", Source: "s1", Stage: "working", Title: "still actionable"},
+		{ID: "s1:done", Source: "s1", Stage: "done", Title: "already resolved"},
+	}
+	for _, itemID := range []string{"s1:live", "s1:done", "s1:removed"} {
+		for i := 0; i < 3; i++ {
+			event := store.AuditEvent{
+				At:        now.Add(-time.Duration(i) * time.Hour),
+				Kind:      "run",
+				RunID:     fmt.Sprintf("%s-%d", itemID, i),
+				ItemID:    itemID,
+				Outcome:   string(model.OutcomeBlocked),
+				BlockKind: "dependency",
+			}
+			if err := s.audit.Append(event, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	view := s.evaluateWatchdog(now)
+	var repeated []string
+	for _, finding := range view.Findings {
+		if finding.Kind == "repeated-blocker" {
+			repeated = append(repeated, finding.Detail)
+		}
+	}
+	if got, want := repeated, []string{"s1:live blocked 3 times in seven days"}; !slices.Equal(got, want) {
+		t.Fatalf("repeated blockers = %q, want %q", got, want)
 	}
 }
