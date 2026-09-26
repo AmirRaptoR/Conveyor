@@ -251,8 +251,17 @@ sudo env \
   CONVEYOR_PREFIX=/opt/conveyor \
   CONVEYOR_CONFIG=/var/lib/conveyor/conveyor.yaml \
   CONVEYOR_SERVICE=conveyor \
+  CONVEYOR_LOCAL_SCRIPTS=/var/lib/conveyor/scripts \
   "$(pwd)/deploy/install-release"
 ```
+
+`CONVEYOR_LOCAL_SCRIPTS` is optional machine state for source-specific adapters
+that must not live in the Conveyor repository. The installer snapshots its
+`_sync` helper as `agents/_sync` and each `<source>/` directory as
+`agents/local-<source>/`, before the release manifest is generated. Configure
+those entries with `agent: local-<source>` rather than an external `script:`
+path; the running release then executes the hashed snapshot, never the mutable
+source directory.
 
 The installer performs these operations in order:
 
