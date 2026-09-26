@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Claude-first review with a Codex Sol fallback. Backend choice is adapter
+# policy: the engine sees one ordinary agent and one ordinary review script.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/_probe"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+probe_status "$here/../claude/status" "$tmp/claude.json"
+probe_status "$here/../codex/status" "$tmp/codex.json"
+claude_state=$(jq -r .state "$tmp/claude.json")
+codex_state=$(jq -r .state "$tmp/codex.json")
+payload=$(cat)
+
+run_review() { # backend
+	local backend=$1 selected_model=""
+	case "$backend" in
+	claude)
+		selected_model=${CLAUDE_MODEL:-${MODEL:-}}
+		;;
+	codex)
+		selected_model=${CODEX_MODEL:-${MODEL:-}}
+		;;
+	esac
+	(
+		export CONVEYOR_AGENT_BACKEND=$backend
+		if [[ -n "$selected_model" ]]; then export MODEL=$selected_model; else unset MODEL; fi
+		printf '%s' "$payload" | "$here/../claude/review"
+	)
+}
+
+backend=claude
+if [[ "$claude_state" == "limited" ]]; then
+	backend=codex
+	printf 'Claude review quota is limited; selecting Codex fallback (Codex status: %s).\n' "$codex_state" >&2
+else
+	printf 'Selecting Claude review (Claude status: %s).\n' "$claude_state" >&2
+fi
+
+set +e
+run_review "$backend"
+rc=$?
+set -e
+
+# A status event can race the call. If Claude itself reports an exact quota
+# stop, consume that adapter-authored result and continue with Codex inside the
+# same stage run. No other blocked result is eligible for fallback.
+if [[ "$backend" == "claude" && $rc -eq 20 ]] \
+	&& jq -e '.blocked == true and .kind == "limit"' "${CONVEYOR_RESULT:?}" >/dev/null 2>&1; then
+	echo "Claude became quota-limited during review; continuing with Codex fallback." >&2
+	: >"$CONVEYOR_RESULT"
+	set +e
+	run_review codex
+	rc=$?
+	set -e
+fi
+
+exit "$rc"

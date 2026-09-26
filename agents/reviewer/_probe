@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Shared status normalization for the Claude-first review adapter. A probe is
+# evidence about quota, never a model call. Malformed output and probe failures
+# stay unknown; they must not be promoted to a confirmed limit.
+
+probe_status() { # script normalized-result
+	local script=$1 dest=$2 raw="${2}.raw" rc=0
+	CONVEYOR_RESULT="$raw" "$script" >/dev/null 2>&1 || rc=$?
+	if [[ $rc -eq 0 ]] && jq -e 'type == "object"' "$raw" >/dev/null 2>&1; then
+		jq '
+			.state = (if .state == "ok" or .state == "limited" then .state else "unknown" end)
+			| .summary = ((.summary // "status probe returned no summary") | tostring)
+		' "$raw" >"$dest"
+	else
+		jq -n --arg summary "status probe failed or returned malformed output" \
+			'{state:"unknown", summary:$summary}' >"$dest"
+	fi
+}
