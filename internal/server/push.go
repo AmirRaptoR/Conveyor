@@ -12,6 +12,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/push"
@@ -40,10 +41,15 @@ func (s *Server) sendNotification(title, body, itemID string) error {
 	if s.pushSubs.Len() == 0 {
 		return errors.New("no push subscriber")
 	}
+	ctx, cancel := s.pushContext()
+	defer cancel()
 	delivered := 0
 	var last error
-	for _, endpoint := range s.pushEndpoints() {
-		err := s.sendNotificationEndpoint(endpoint, title, body, itemID)
+	endpoints := s.pushEndpoints()
+	for result := range sendPushEndpoints(ctx, endpoints, func(ctx context.Context, endpoint string) error {
+		return s.sendNotificationEndpoint(ctx, endpoint, title, body, itemID)
+	}) {
+		err, endpoint := result.err, result.endpoint
 		switch {
 		case errors.Is(err, push.Gone):
 			last = err
@@ -63,6 +69,41 @@ func (s *Server) sendNotification(title, body, itemID string) error {
 	return nil
 }
 
+type pushEndpointResult struct {
+	endpoint string
+	err      error
+}
+
+func sendPushEndpoints(ctx context.Context, endpoints []string, send func(context.Context, string) error) <-chan pushEndpointResult {
+	results := make(chan pushEndpointResult, len(endpoints))
+	var wg sync.WaitGroup
+	for _, endpoint := range endpoints {
+		endpoint := endpoint
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- pushEndpointResult{endpoint: endpoint, err: send(ctx, endpoint)}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	return results
+}
+
+func (s *Server) pushContext() (context.Context, context.CancelFunc) {
+	base := s.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	timeout := 30 * time.Second
+	if s.drainGrace > 0 && s.drainGrace/2 < timeout {
+		timeout = s.drainGrace / 2
+	}
+	return context.WithTimeout(base, timeout)
+}
+
 func (s *Server) pushEndpoints() []string {
 	var endpoints []string
 	for _, sub := range s.pushSubs.All() {
@@ -72,7 +113,7 @@ func (s *Server) pushEndpoints() []string {
 	return endpoints
 }
 
-func (s *Server) sendNotificationEndpoint(endpoint, title, body, itemID string) error {
+func (s *Server) sendNotificationEndpoint(ctx context.Context, endpoint, title, body, itemID string) error {
 	if s.pushKeys == nil {
 		return errors.New("push notifications are off")
 	}
@@ -94,8 +135,6 @@ func (s *Server) sendNotificationEndpoint(endpoint, title, body, itemID string) 
 		"title": title, "body": body, "tag": itemID,
 		"url": "/#item=" + url.PathEscape(itemID),
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
 	err := s.pushKeys.Send(ctx, *selected, payload, "https://github.com/AmirRaptoR/Conveyor")
 	if errors.Is(err, push.Gone) {
 		_ = s.pushSubs.Remove(endpoint)

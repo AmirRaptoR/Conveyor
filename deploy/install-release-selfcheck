@@ -129,7 +129,22 @@ done
 cat >"$out" <<EOF
 #!/usr/bin/env bash
 case "\$1" in
-  version|validate) exit 0 ;;
+  version) exit 0 ;;
+  validate)
+    strict=false config=""
+    shift
+    while ((\$#)); do
+      case "\$1" in
+        -strict-sources) strict=true; shift ;;
+        -c) config=\$2; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [[ "\$strict" == true ]] || exit 4
+    [[ "\${CONVEYOR_RELEASE_DIR:-}" == *'/$revision' || "\${CONVEYOR_RELEASE_DIR:-}" == *'/.$revision.tmp.'* ]] || exit 4
+    if [[ '$revision' == compat-old ]] && grep -q candidate-only "\$config"; then exit 3; fi
+    exit 0
+    ;;
   release-manifest)
     printf '{"revision":"$revision","schema":1,"files":[]}\n'
     ;;
@@ -150,6 +165,32 @@ EOF
 chmod +x "$out"
 SH
 chmod +x "$tmp/fake-bin/go"
+
+# The active release must prove it can load the candidate's current config
+# before current moves or systemd is touched. The old fixture accepts the
+# original config but rejects its candidate-only revision.
+compat_prefix="$tmp/config-compat-prefix"
+compat_config="$tmp/compat.yaml"
+printf 'version: old\n' >"$compat_config"
+PATH="$tmp/fake-bin:$PATH" CONVEYOR_PREFIX="$compat_prefix" \
+  CONVEYOR_CONFIG="$compat_config" CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
+  CONVEYOR_GATE="$tmp/health" CONVEYOR_REVISION=compat-old CONVEYOR_ALLOW_DIRTY=1 \
+  CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" SYSTEMCTL_STATE="$systemctl_state" \
+  "$repo/deploy/install-release" >/dev/null
+compat_current=$(readlink -f "$compat_prefix/current")
+compat_calls=$(wc -l <"$calls")
+printf 'version: candidate-only\n' >"$compat_config"
+if PATH="$tmp/fake-bin:$PATH" CONVEYOR_PREFIX="$compat_prefix" \
+  CONVEYOR_CONFIG="$compat_config" CONVEYOR_SYSTEMCTL="$tmp/systemctl" \
+  CONVEYOR_GATE="$tmp/health" CONVEYOR_REVISION=compat-new CONVEYOR_ALLOW_DIRTY=1 \
+  CALLS="$calls" HEALTH_STATE="$health_state" HEALTH_CALLS="$health_calls" SYSTEMCTL_STATE="$systemctl_state" \
+  "$repo/deploy/install-release" >/dev/null 2>&1; then
+  echo "install-release-selfcheck: rollback-incompatible config was accepted" >&2
+  exit 1
+fi
+[[ $(readlink -f "$compat_prefix/current") == "$compat_current" ]]
+[[ $(wc -l <"$calls") == "$compat_calls" ]]
+
 fixture_prefix="$tmp/gate-tool-prefix"
 fixture_gate_log="$tmp/gate-tool.log"
 PATH="$tmp/fake-bin:$PATH" CONVEYOR_PREFIX="$fixture_prefix" \
@@ -212,17 +253,18 @@ if CONVEYOR_RELEASE_DIR="$prefix/releases/selfcheck-one" \
   exit 1
 fi
 
-# If the previous target itself no longer verifies, a failed activation leaves
-# no crash-looping current link and stops the service explicitly.
+# If the rollback target itself no longer verifies, refuse before activation:
+# current and the running service are untouched.
 chmod u+w "$prefix/releases/selfcheck-two/agents/mock/refine"
 printf '\n# tampered\n' >>"$prefix/releases/selfcheck-two/agents/mock/refine"
 echo fail >"$health_state"
+calls_before_incompatible=$(wc -l <"$calls")
 if deploy "$prefix" selfcheck-four >/dev/null 2>&1; then
   echo "install-release-selfcheck: deploy unexpectedly passed with failed health" >&2
   exit 1
 fi
-[[ ! -e "$prefix/current" ]]
-grep -q '^stop conveyor$' "$calls"
+[[ $(readlink -f "$prefix/current") == "$prefix/releases/selfcheck-two" ]]
+[[ $(wc -l <"$calls") == "$calls_before_incompatible" ]]
 
 # A first deployment with no rollback target also removes current and stops.
 first="$tmp/first"

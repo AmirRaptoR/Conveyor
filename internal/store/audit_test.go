@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -172,5 +173,45 @@ func TestAuditRunReconciliationMustCompleteDurably(t *testing.T) {
 	status := OpenAudit(a.path).Status()
 	if !status.ReconciliationComplete || status.RunWatermark != "2026-09-26/run-2" || !status.EvidenceComplete {
 		t.Fatalf("complete status = %#v", status)
+	}
+}
+
+func TestAuditBulkRunReconciliationCanonicalizesAndPersistsOnce(t *testing.T) {
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	a := OpenAudit(filepath.Join(t.TempDir(), "audit.jsonl"))
+	if err := a.Establish(now); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Append(AuditEvent{At: now.Add(-time.Hour), Kind: "run", RunID: "same", Outcome: "failure"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.BeginRunReconciliation(); err != nil {
+		t.Fatal(err)
+	}
+	continuity := a.Status().ContinuityID
+	before := a.sequence
+	events := make([]AuditEvent, 0, 501)
+	events = append(events, AuditEvent{At: now, Kind: "run", RunID: "same", Outcome: "success", Confirmed: true})
+	for i := 0; i < 500; i++ {
+		events = append(events, AuditEvent{At: now, Kind: "run", RunID: fmt.Sprintf("run-%03d", i), Outcome: "success"})
+	}
+	if err := a.ReconcileRuns(events, "2026-09-26/run-499", now); err != nil {
+		t.Fatal(err)
+	}
+	if a.sequence != before+1 {
+		t.Fatalf("sequence advanced by %d, want one bulk persistence", a.sequence-before)
+	}
+	status := a.Status()
+	if !status.Healthy || !status.ReconciliationComplete || status.RunWatermark != "2026-09-26/run-499" || status.ContinuityID != continuity {
+		t.Fatalf("status = %#v", status)
+	}
+	got := a.Since(time.Time{})
+	if len(got) != 501 {
+		t.Fatalf("events = %d, want 501 canonical runs", len(got))
+	}
+	for _, event := range got {
+		if event.RunID == "same" && (event.Outcome != "success" || !event.Confirmed || !event.At.Equal(now.Add(-time.Hour))) {
+			t.Fatalf("canonical run = %#v", event)
+		}
 	}
 }

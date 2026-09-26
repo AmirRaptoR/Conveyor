@@ -980,11 +980,16 @@ snapshot `data/audit.jsonl`; retries of one RunID replace that run's canonical
 record rather than multiplying it. At startup, before metrics can be complete,
 one authoritative walk reconciles durable stage-run metadata newer than the
 persisted reconciliation cursor; the cursor and completion bit live in the same
-snapshot. No request or minute watchdog tick scans history. Operator controls
+snapshot. Startup first persists the incomplete boundary, canonicalizes the
+entire scan by RunID in memory, then persists the events, advanced cursor and
+complete bit in one atomic replacement rather than rewriting once per run. No
+request or minute watchdog tick scans history. Operator controls
 persist a pending human-intervention intent after validation but before their
 mutation, then replace it atomically with committed or rejected state. A pending
 intent after restart makes coverage incomplete, and only committed intents are
-counted. Removing a provider mark appends its blocked-to-recovered duration. The file is pruned to seven days
+counted. Bulk unblock carries that intent into its asynchronous worker, so a
+process loss cannot erase an accepted request; item recovery resume follows the
+same protocol. Removing a provider mark appends its blocked-to-recovered duration. The file is pruned to seven days
 and atomically replaced. A separate continuity marker binds its identity and
 SHA-256 digest. Missing, unreadable, malformed, truncated or externally
 rewritten evidence and every append failure are board-visible faults and make
@@ -1026,7 +1031,10 @@ to a persistent identity and SHA-256 continuity marker. Missing, truncated or
 corrupt established state is a visible fault and is never initialized as new.
 Delivery acknowledgements are persisted per push endpoint; a partial retry
 skips accepted endpoints, and an old send checks the incident key again before
-it can acknowledge anything. No subscriber or a send failure remains visibly
+it can acknowledge anything. Endpoint sends run concurrently beneath one
+server-derived context and operation deadline shorter than shutdown's drain
+grace; the tracked parent waits for every sender before it returns, while
+durable acknowledgements are serialized. No subscriber or a send failure remains visibly
 pending and retries after restart; only acceptance by every current non-gone
 endpoint is called delivered and suppresses repeats. Listings,
 plan updates and control traffic are not useful progress and are not scheduler

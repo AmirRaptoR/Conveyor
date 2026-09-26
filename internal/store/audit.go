@@ -234,6 +234,71 @@ func (a *Audit) CompleteRunReconciliation(watermark string) error {
 	return a.persistLocked(snapshot)
 }
 
+// ReconcileRuns canonicalizes a startup history scan in memory and commits the
+// complete projection once. BeginRunReconciliation is the preceding durable
+// crash boundary: until this write succeeds, evidence remains incomplete.
+func (a *Audit) ReconcileRuns(events []AuditEvent, watermark string, now time.Time) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.validateFilesLocked()
+	if !a.status.Healthy {
+		return errors.New(a.status.Error)
+	}
+	cutoff := now.Add(-auditWindow)
+	incoming := make(map[string]AuditEvent, len(events))
+	order := make([]string, 0, len(events))
+	for _, event := range events {
+		if event.Kind != "run" || event.RunID == "" || event.At.IsZero() {
+			return fmt.Errorf("invalid reconciled run event %q", event.RunID)
+		}
+		if prior, ok := incoming[event.RunID]; ok {
+			if prior.At.Before(event.At) {
+				event.At = prior.At
+			}
+		} else {
+			order = append(order, event.RunID)
+		}
+		incoming[event.RunID] = event
+	}
+	next := make([]AuditEvent, 0, len(a.events)+len(incoming))
+	used := make(map[string]bool, len(incoming))
+	for _, existing := range a.events {
+		if existing.At.Before(cutoff) && !(existing.Kind == "human" && existing.State == "pending") {
+			continue
+		}
+		if existing.Kind == "run" {
+			if event, ok := incoming[existing.RunID]; ok {
+				if existing.At.Before(event.At) {
+					event.At = existing.At
+				}
+				incoming[existing.RunID] = event
+				if !used[existing.RunID] {
+					next = append(next, event)
+					used[existing.RunID] = true
+				}
+				continue
+			}
+		}
+		next = append(next, existing)
+	}
+	for _, id := range order {
+		if !used[id] && !incoming[id].At.Before(cutoff) {
+			next = append(next, incoming[id])
+		}
+	}
+	if len(next) > maxAuditRecords {
+		return a.failLocked(fmt.Errorf("audit evidence exceeds %d records", maxAuditRecords))
+	}
+	snapshot := a.snapshotLocked(next)
+	snapshot.ReconciliationComplete = true
+	snapshot.RunWatermark = watermark
+	if err := a.persistLocked(snapshot); err != nil {
+		return err
+	}
+	a.events = next
+	return nil
+}
+
 // Since reads only the validated bounded in-memory projection loaded at open.
 func (a *Audit) Since(cutoff time.Time) []AuditEvent {
 	a.mu.Lock()

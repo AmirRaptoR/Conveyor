@@ -603,7 +603,14 @@ func (s *Server) handleUnblockAll(w http.ResponseWriter, r *http.Request) {
 		toUnblock = append(toUnblock, it)
 	}
 	s.mu.RUnlock()
-	s.spawn(func() { s.unblockAll(s.ctx, toUnblock) })
+	intent, ok := s.beginHumanAuditHTTP(w, r, "unblock-all", "")
+	if !ok {
+		return
+	}
+	s.spawn(func() {
+		unblocked := s.unblockAll(s.ctx, toUnblock)
+		s.resolveHumanAudit(intent, unblocked > 0 || len(toUnblock) == 0)
+	})
 	writeJSON(w, map[string]int{
 		"unblocking":         len(toUnblock),
 		"waitingOnYou":       waitingOnYou,

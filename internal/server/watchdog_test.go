@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -29,7 +30,7 @@ func TestWatchdogDetectsDeadSchedulerAndDeduplicatesAlert(t *testing.T) {
 		t.Fatalf("first evaluation = %#v, want one dead-scheduler alert", first)
 	}
 	s.watchdogEndpoints = func() []string { return []string{"device"} }
-	s.watchdogNotifyEndpoint = func(string, string, string, string) error { return nil }
+	s.watchdogNotifyEndpoint = func(context.Context, string, string, string, string) error { return nil }
 	s.deliverWatchdogAlert(first)
 	second := s.evaluateWatchdog(now.Add(time.Minute))
 	if second.Alert {
@@ -131,7 +132,7 @@ func TestWatchdogAlertRemainsPendingWithoutSubscriberAndRetriesAfterRestart(t *t
 	restarted.listedAt["s1"] = now
 	calls := 0
 	restarted.watchdogEndpoints = func() []string { return []string{"device"} }
-	restarted.watchdogNotifyEndpoint = func(string, string, string, string) error { calls++; return nil }
+	restarted.watchdogNotifyEndpoint = func(context.Context, string, string, string, string) error { calls++; return nil }
 	retry := restarted.evaluateWatchdog(now.Add(time.Minute))
 	if !retry.Alert {
 		t.Fatalf("restart did not retry pending delivery: %#v", retry)
@@ -154,7 +155,7 @@ func TestOldWatchdogDeliveryCannotAcknowledgeNewIncident(t *testing.T) {
 	old := s.evaluateWatchdog(now)
 	started, release := make(chan struct{}), make(chan struct{})
 	s.watchdogEndpoints = func() []string { return []string{"device"} }
-	s.watchdogNotifyEndpoint = func(string, string, string, string) error {
+	s.watchdogNotifyEndpoint = func(context.Context, string, string, string, string) error {
 		close(started)
 		<-release
 		return nil
@@ -191,7 +192,7 @@ func TestWatchdogRetriesOnlyFailedEndpoints(t *testing.T) {
 	s.watchdogEndpoints = func() []string { return []string{"good", "flaky"} }
 	var mu sync.Mutex
 	calls := map[string]int{}
-	s.watchdogNotifyEndpoint = func(endpoint, _, _, _ string) error {
+	s.watchdogNotifyEndpoint = func(_ context.Context, endpoint, _, _, _ string) error {
 		mu.Lock()
 		defer mu.Unlock()
 		calls[endpoint]++
@@ -209,6 +210,48 @@ func TestWatchdogRetriesOnlyFailedEndpoints(t *testing.T) {
 	state := s.watchdogStore.Get()
 	if state.DeliveryStatus != "delivered" || calls["good"] != 1 || calls["flaky"] != 2 {
 		t.Fatalf("state = %#v calls=%#v", state, calls)
+	}
+}
+
+func TestWatchdogSendsEndpointsConcurrentlyAndCancelsWithServer(t *testing.T) {
+	cfg, r := boardFor(t)
+	s := New(cfg, r)
+	serverCtx, cancel := context.WithCancel(context.Background())
+	s.ctx = serverCtx
+	s.drainGrace = time.Second
+	now := time.Now().UTC()
+	s.state.Items = []model.Item{{ID: "s1:1", Source: "s1", Stage: "backlog", Title: "waiting"}}
+	s.listedAt["s1"] = now
+	s.watchdogState.LastProgressAt = now.Add(-time.Hour)
+	view := s.evaluateWatchdog(now)
+	s.watchdogEndpoints = func() []string { return []string{"one", "two", "three"} }
+	started := make(chan string, 3)
+	s.watchdogNotifyEndpoint = func(ctx context.Context, endpoint, _, _, _ string) error {
+		started <- endpoint
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	done := make(chan struct{})
+	s.spawn(func() { s.deliverWatchdogAlert(view); close(done) })
+	for i := 0; i < 3; i++ {
+		select {
+		case <-started:
+		case <-time.After(300 * time.Millisecond):
+			t.Fatal("endpoint sends were sequential")
+		}
+	}
+	cancel()
+	s.drain()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("watchdog delivery outlived server cancellation")
+	}
+	if s.shutdownWork.Load() != 0 {
+		t.Fatalf("shutdown retained %d push worker(s)", s.shutdownWork.Load())
+	}
+	if state := s.watchdogStore.Get(); state.DeliveryStatus != "pending" || len(state.DeliveryAcks) != 0 {
+		t.Fatalf("cancelled delivery = %#v", state)
 	}
 }
 

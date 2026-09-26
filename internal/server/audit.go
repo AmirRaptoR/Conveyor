@@ -100,6 +100,7 @@ func (s *Server) reconcileAuditRuns() error {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].cursor < entries[j].cursor })
 	nextWatermark := watermark
+	events := make([]store.AuditEvent, 0, len(entries))
 	for _, entry := range entries {
 		if entry.run.Outcome == model.OutcomeRunning {
 			return fmt.Errorf("reconcile run %s: run is not authoritatively settled", entry.cursor)
@@ -109,13 +110,11 @@ func (s *Server) reconcileAuditRuns() error {
 			if event.At.IsZero() {
 				return fmt.Errorf("reconcile run %s: settled stage run has no timestamp", entry.cursor)
 			}
-			if err := s.audit.Append(event, time.Now()); err != nil {
-				return err
-			}
+			events = append(events, event)
 		}
 		nextWatermark = entry.cursor
 	}
-	return s.audit.CompleteRunReconciliation(nextWatermark)
+	return s.audit.ReconcileRuns(events, nextWatermark, time.Now())
 }
 
 func (s *Server) auditRun(tr *pipeline.Transition) {

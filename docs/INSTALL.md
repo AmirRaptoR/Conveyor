@@ -260,9 +260,11 @@ The installer performs these operations in order:
 2. Copy and hash all shipped agents and providers, then make the tree read-only.
 3. Run the staged binary's own manifest check and validate the real config,
    failing if even one configured source cannot run.
-4. Rename the complete staging directory into `releases/` and atomically swap
-   `current`.
-5. Restart the service and run `conveyor gate` through its passwordless local
+4. Rename the complete staging directory into `releases/`, then run the selected
+   rollback binary's own manifest verification and `validate -strict-sources`
+   against the current config in that release's environment. An incompatible
+   rollback refuses the deployment before `current` moves or systemd restarts.
+5. Atomically swap `current`, restart the service and run `conveyor gate` through its passwordless local
    Unix socket. The gate validates the config through normal loading, requires
    every configured source to have a fresh successful listing, verifies the
    expected immutable revision/config identity, rejects a sticky run-persistence

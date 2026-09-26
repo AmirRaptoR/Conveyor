@@ -190,7 +190,9 @@ capacity, reserve a budget, run a script or write provider state. A failed
 candidate gate rolls back; a failed rollback gate removes `current`, requires a
 successful stop and verifies the service inactive. Rollback health is checked
 with the verified candidate tool, so the restored release need not provide its
-own `gate` command. Use `conveyor soak-start`
+own `gate` command. Before activation, the rollback binary itself must verify
+its release and load the current config with strict source validation; failure
+leaves `current` and the running service untouched. Use `conveyor soak-start`
 explicitly after selecting a candidate for a seven-day unattended run; see
 `docs/SOAK.md` for the report.
 

@@ -196,6 +196,15 @@ func TestCancelReapsOnlyTheSelectedRunsChildren(t *testing.T) {
 	if !ok || resumeAudit.ResumedBy != "reviewer" || resumeAudit.ResumeReason != "worktree inspected" || resumeAudit.ResumedAt.IsZero() {
 		t.Fatalf("resume audit = %+v ok=%v", resumeAudit, ok)
 	}
+	var humanResume bool
+	for _, event := range restarted.audit.Since(time.Time{}) {
+		if event.Kind == "human" && event.Action == "resume-item" && event.ItemID == "s1:1" && event.By == "reviewer" && event.State == "committed" {
+			humanResume = true
+		}
+	}
+	if !humanResume {
+		t.Fatal("item resume was not committed to human audit")
+	}
 
 	// s2 was never asked to stop and is still running, children and all.
 	if !alive(pid2) {

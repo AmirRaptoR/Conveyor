@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -287,7 +288,9 @@ func (s *Server) deliverWatchdogAlert(view WatchdogView) {
 		s.finishWatchdogDelivery(incidentKey, detectedAt, nil, errors.New("no push subscriber"), false)
 		return
 	}
-	var lastErr error
+	ctx, cancel := s.pushContext()
+	defer cancel()
+	pending := make([]string, 0, len(endpoints))
 	for _, endpoint := range endpoints {
 		s.watchdogMu.Lock()
 		state = s.watchdogState
@@ -300,7 +303,13 @@ func (s *Server) deliverWatchdogAlert(view WatchdogView) {
 		if already {
 			continue
 		}
-		err := s.watchdogNotifyEndpoint(endpoint, "Conveyor stalled", body, "watchdog-stall")
+		pending = append(pending, endpoint)
+	}
+	var lastErr error
+	for result := range sendPushEndpoints(ctx, pending, func(ctx context.Context, endpoint string) error {
+		return s.watchdogNotifyEndpoint(ctx, endpoint, "Conveyor stalled", body, "watchdog-stall")
+	}) {
+		err, endpoint := result.err, result.endpoint
 		accepted := err == nil || errors.Is(err, push.Gone)
 		if !accepted {
 			lastErr = err

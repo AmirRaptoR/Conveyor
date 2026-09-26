@@ -120,7 +120,7 @@ func SimulateAdmission(cfg *config.Config, state State, now time.Time) (Admissio
 			stale: dispatchUsesStaleState(item, deps, stale, staleItems), manualPaused: manualGlobal || manualSource[item.Source],
 			agentPaused: pausedAgent[agent], budgetBlocked: budgetBlocked,
 			storageBlocked: agent != "" && state.Storage.Level != "" && state.Storage.Level != "ok",
-			slotBlocked:    slotBlocked, persistFault: state.PersistFault != nil})
+			slotBlocked:    slotBlocked, persistFault: agent != "" && state.PersistFault != nil})
 		if reason != "" {
 			rejected[reason]++
 			continue

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/AmirRaptoR/Conveyor/internal/config"
 	"github.com/AmirRaptoR/Conveyor/internal/model"
@@ -114,5 +115,29 @@ func TestPersistenceFaultPausesModelStorageAdmission(t *testing.T) {
 	})
 	if s.reserveModelStorage("s1:1") {
 		t.Fatal("model work admitted while run persistence is faulted")
+	}
+}
+
+func TestPersistenceFaultAdmissionMatchesSchedulerAgentScope(t *testing.T) {
+	cfg, _ := boardFor(t)
+	state := State{
+		Items:        []model.Item{{ID: "s1:1", Ref: "1", Source: "s1", Stage: "backlog", Title: "deterministic"}},
+		PersistFault: &PersistFault{RunID: "failed-run"},
+	}
+	got, err := SimulateAdmission(cfg, state, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Candidate != "s1:1" {
+		t.Fatalf("deterministic admission = %#v, want candidate despite persistence fault", got)
+	}
+
+	cfg.Sources[0].Scripts["work"] = config.ScriptSpec{Agent: "fake"}
+	got, err = SimulateAdmission(cfg, state, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Candidate != "" || got.Reason != "persistence-fault" {
+		t.Fatalf("agent admission = %#v, want persistence-fault refusal", got)
 	}
 }

@@ -706,7 +706,7 @@ type Server struct {
 	// Watchdog delivery is endpoint-addressed so successful devices are
 	// acknowledged durably and skipped on a partial retry.
 	watchdogEndpoints      func() []string
-	watchdogNotifyEndpoint func(string, string, string, string) error
+	watchdogNotifyEndpoint func(context.Context, string, string, string, string) error
 
 	// verify bounds the cost of Auth.Check — see authVerifier.
 	verify *authVerifier
