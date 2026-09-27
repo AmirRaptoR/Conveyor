@@ -1301,12 +1301,51 @@ func PendingMove(root, itemID, stage string) (model.Run, bool) {
 	return model.Run{}, false
 }
 
+// StageRunKey identifies the history lane whose newest persisted stage run is
+// authoritative. It is exported so callers reconciling a whole board can
+// build one archive index instead of walking the same archive once per lane.
+type StageRunKey struct {
+	ItemID string
+	Stage  string
+}
+
+// LatestStageRuns returns the newest persisted stage run for every item/stage
+// lane in one archive walk. Run directories are ordered newest first exactly
+// as LatestStageRun orders them, and the first valid run in each lane wins.
+func LatestStageRuns(root string) map[StageRunKey]model.Run {
+	out := map[StageRunKey]model.Run{}
+	walkStageRunsNewest(root, func(run model.Run) bool {
+		key := StageRunKey{ItemID: run.ItemID, Stage: run.To}
+		if _, found := out[key]; !found {
+			out[key] = run
+		}
+		return true
+	})
+	return out
+}
+
 // LatestStageRun returns the newest persisted stage run for one item at one
 // stage. Callers use the same ordering as pending-move recovery.
 func LatestStageRun(root, itemID, stage string) (model.Run, bool) {
+	var found model.Run
+	ok := false
+	walkStageRunsNewest(root, func(run model.Run) bool {
+		if run.ItemID != itemID || run.To != stage {
+			return true
+		}
+		found = run
+		ok = true
+		return false
+	})
+	return found, ok
+}
+
+// walkStageRunsNewest visits valid stage runs in the same newest-first order
+// used by pending-move recovery. Returning false stops the walk.
+func walkStageRunsNewest(root string, visit func(model.Run) bool) {
 	days, err := os.ReadDir(root)
 	if err != nil {
-		return model.Run{}, false
+		return
 	}
 	dayNames := make([]string, 0, len(days))
 	for _, d := range days {
@@ -1337,12 +1376,13 @@ func LatestStageRun(root, itemID, stage string) (model.Run, bool) {
 			if json.Unmarshal(b, &run) != nil {
 				continue
 			}
-			if run.Kind != "stage" || run.ItemID != itemID || run.To != stage {
+			if run.Kind != "stage" {
 				continue
 			}
 			run.Dir = dir
-			return run, true
+			if !visit(run) {
+				return
+			}
 		}
 	}
-	return model.Run{}, false
 }

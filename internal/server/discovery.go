@@ -349,6 +349,14 @@ func (s *Server) refresh(ctx context.Context) {
 		}
 	}
 	s.mu.Lock()
+	// Listing reconciliation above can do substantial archive and status work
+	// after the provider reads have returned. A transition may finish in that
+	// interval, after mergeSourceListing took its cache snapshot but before
+	// this publication lock. Rebase once more while holding the same lock that
+	// publishes Items so a stale pre-transition listing cannot erase the newer
+	// stage or mark. This closes the second half of F03: not only "transition
+	// during List", but also "transition after List, before publish".
+	items = s.rebaseLateTransitionsLocked(items)
 	// Both fields describe the latest attempt, not a high-water mark: a
 	// success clears the previous failure, and a later failure sets it again
 	// without disturbing the lastListedAt a prior success already wrote.
@@ -491,6 +499,38 @@ func (s *Server) refresh(ctx context.Context) {
 	s.releaseDependencyMarks(ctx)
 	s.reconcileTracking(ctx)
 	s.markRetentionReady()
+}
+
+// rebaseLateTransitionsLocked overlays transition outcomes that became
+// authoritative after a source's current listing began. s.mu must be held by
+// the caller, so no transition can update state or confirmedAt between this
+// final comparison and publication.
+func (s *Server) rebaseLateTransitionsLocked(items []model.Item) []model.Item {
+	out := append([]model.Item(nil), items...)
+	positions := make(map[string]int, len(out))
+	for i := range out {
+		positions[out[i].ID] = i
+	}
+	for _, current := range s.state.Items {
+		genStart, listed := s.sourceGen[current.Source]
+		confirmedAt, confirmed := s.confirmedAt[current.ID]
+		newer := listed && confirmed && confirmedAt.After(genStart)
+		position, present := positions[current.ID]
+		if present {
+			// Cross-source duplicate resolution already selected this slot's
+			// owner. Never let an identically named item from another source
+			// replace that winner during the late rebase.
+			if newer && out[position].Source == current.Source {
+				out[position] = current
+			}
+			continue
+		}
+		if _, working := s.working.Load(current.ID); working || newer {
+			positions[current.ID] = len(out)
+			out = append(out, current)
+		}
+	}
+	return out
 }
 
 func (s *Server) markRetentionReady() {
