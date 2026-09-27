@@ -161,6 +161,7 @@ func (s *Server) failureViews(items []model.Item) map[string]FailureView {
 // in the item's current stage is authoritative.
 func (s *Server) reconcileModelFailures(items []model.Item, failedSources map[string]string) []string {
 	var warnings []string
+	latest := runner.LatestStageRuns(s.run.Root)
 	for _, it := range items {
 		if failedSources[it.Source] != "" {
 			continue
@@ -169,7 +170,7 @@ func (s *Server) reconcileModelFailures(items []model.Item, failedSources map[st
 			if stage.Name == it.Stage || s.cfg.AgentFor(it.Source, stage.Name) == "" {
 				continue
 			}
-			if run, ok := runner.LatestStageRun(s.run.Root, it.ID, stage.Name); ok &&
+			if run, ok := latest[runner.StageRunKey{ItemID: it.ID, Stage: stage.Name}]; ok &&
 				(run.Outcome == model.OutcomeFailure || run.Outcome == model.OutcomeTimeout) {
 				if err := s.budgets.ProcessFailureRun(it.ID, run.ID); err != nil {
 					warnings = append(warnings, it.Source+": retire stale model failure: "+err.Error())
@@ -183,7 +184,7 @@ func (s *Server) reconcileModelFailures(items []model.Item, failedSources map[st
 		if s.cfg.AgentFor(it.Source, it.Stage) == "" {
 			continue
 		}
-		run, ok := runner.LatestStageRun(s.run.Root, it.ID, it.Stage)
+		run, ok := latest[runner.StageRunKey{ItemID: it.ID, Stage: it.Stage}]
 		if !ok || run.Outcome == model.OutcomeRunning || run.Outcome == model.OutcomeInterrupted {
 			continue
 		}
