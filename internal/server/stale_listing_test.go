@@ -367,6 +367,7 @@ func TestRestingSurvivesAListingItsSourceBeganBeforeTheDeferral(t *testing.T) {
 	s.mu.Lock()
 	s.resting["s1:x"] = true
 	s.restingAt["s1:x"] = time.Now()
+	s.waiting["s1:x"] = model.Waiting{Why: "the provider must refresh"}
 	s.mu.Unlock()
 
 	if err := os.Remove(block); err != nil {
@@ -376,9 +377,13 @@ func TestRestingSurvivesAListingItsSourceBeganBeforeTheDeferral(t *testing.T) {
 
 	s.mu.RLock()
 	stillResting := s.resting["s1:x"]
+	_, stillWaiting := s.waiting["s1:x"]
 	s.mu.RUnlock()
 	if !stillResting {
 		t.Error("a deferral set after the listing began did not survive that listing's clearing of resting")
+	}
+	if !stillWaiting {
+		t.Error("the explanation for a surviving deferral did not survive with it")
 	}
 	_ = dir
 }
@@ -392,14 +397,19 @@ func TestRestingIsClearedByAListingThatBeganAfterTheDeferral(t *testing.T) {
 	s.mu.Lock()
 	s.resting["s1:x"] = true
 	s.restingAt["s1:x"] = time.Now()
+	s.waiting["s1:x"] = model.Waiting{Why: "the provider must refresh"}
 	s.mu.Unlock()
 
 	s.refresh(s.ctx) // begins after the deferral was set
 
 	s.mu.RLock()
 	stillResting := s.resting["s1:x"]
+	_, stillWaiting := s.waiting["s1:x"]
 	s.mu.RUnlock()
 	if stillResting {
 		t.Error("a deferral set before the listing began was not cleared by it")
+	}
+	if stillWaiting {
+		t.Error("a cleared deferral left its stale waiting explanation behind")
 	}
 }

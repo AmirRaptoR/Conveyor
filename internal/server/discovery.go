@@ -399,6 +399,7 @@ func (s *Server) refresh(ctx context.Context) {
 		}
 		delete(s.resting, id)
 		delete(s.restingAt, id)
+		delete(s.waiting, id)
 	}
 	// A mark cleared on the provider — a label removed by hand — takes its
 	// note with it. The provider is the authority on whether, always.
