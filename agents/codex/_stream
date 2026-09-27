@@ -9,6 +9,7 @@ CLAUDE_RAW="$_CODEX_TMP/raw"
 CLAUDE_FINAL="$_CODEX_TMP/final"
 _CODEX_STDERR="$_CODEX_TMP/stderr"
 _CODEX_RESUME="$_CODEX_TMP/resume"
+_CODEX_STREAM_ERROR="$_CODEX_TMP/stream-error"
 trap 'rm -rf "$_CODEX_TMP"' EXIT
 trap '_codex_stop_child; exit 143' TERM
 
@@ -121,10 +122,12 @@ render_stream() {
 	local line type item_type thread="" event_thread="" final="" phase=0 failed=0 detail rendered
 	: >"$CLAUDE_RAW"
 	: >"$CLAUDE_FINAL"
+	: >"$_CODEX_STREAM_ERROR"
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		[[ -z "$line" ]] && continue
 		printf '%s\n' "$line" >>"$CLAUDE_RAW" || true
 		if ! jq -e 'type == "object" and (.type | type == "string" and length > 0)' >/dev/null 2>&1 <<<"$line"; then
+			printf '%s' malformed-json >"$_CODEX_STREAM_ERROR"
 			echo "codex emitted a malformed JSON event" >&2
 			return 2
 		fi
@@ -212,6 +215,12 @@ render_stream() {
 		echo "codex stream ended without exactly one turn.completed event" >&2; return 2; }
 	[[ -n "$final" ]] || {
 		echo "codex completed without a final agent message" >&2; return 2; }
+}
+
+transport_retry_brief() {
+	printf '%s' "The previous Codex JSON event stream was interrupted after this thread started. Continue the same task from the current session state. Do not repeat completed work unnecessarily, and finish by returning exactly one valid version-1 result.
+
+$(result_brief)"
 }
 
 _codex_child_done() {
@@ -314,6 +323,18 @@ run_claude() {
 
 $(result_brief)"
 	if _codex_invoke "$prompt"; then rc=0; else rc=$?; fi
+	# A valid thread followed by one non-JSON stdout line is a transport
+	# interruption, not a model verdict. Resume that exact thread once. The
+	# second invocation is not recursive, every valid event still has strict
+	# ordering checks, and a stream without a thread remains fail-closed.
+	if [[ $rc -eq 2 && "$(<"$_CODEX_STREAM_ERROR")" == malformed-json ]] && ! hit_limit; then
+		session=$(claude_session)
+		if [[ -n "$session" ]] && ! contains_sensitive_value "$session"; then
+			RESUME_SESSION=$session
+			echo "retrying one interrupted Codex event stream in the same thread" >&2
+			if _codex_invoke "$(transport_retry_brief)"; then rc=0; else rc=$?; fi
+		fi
+	fi
 	[[ $rc -eq 0 ]] || return "$rc"
 	session=$(claude_session)
 	final=$(<"$CLAUDE_FINAL")

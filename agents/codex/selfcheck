@@ -90,6 +90,22 @@ malformed-hang)
 	printf '%s\n' 'not json'
 	sleep 300
 	;;
+malformed-after-thread-once)
+	if [[ $run_no -eq 1 ]]; then
+		trap 'touch "$CODEX_ABORTED"; exit 143' TERM
+		printf '%s\n' \
+			'{"type":"thread.started","thread_id":"thread-transport"}' \
+			'{"type":"turn.started"}' \
+			'not json'
+		sleep 300
+	else
+		printf '%s\n' \
+			'{"type":"thread.started","thread_id":"thread-transport"}' \
+			'{"type":"turn.started"}' \
+			'{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"{\"v\":1,\"outcome\":\"success\",\"summary\":\"resumed after transport interruption\"}"}}' \
+			'{"type":"turn.completed"}'
+	fi
+	;;
 limit)
 	printf '%s\n' \
 		'{"type":"thread.started","thread_id":"thread-limit"}' \
@@ -198,6 +214,15 @@ set +e; run_claude bad >/dev/null 2>&1; rc=$?; set -e
 chk "a malformed stream keeps its parser failure" "$rc" "2"
 chk "a malformed stream stops its producer" "$([[ -e "$CODEX_ABORTED" ]] && echo stopped || echo alive)" "stopped"
 chk "a malformed stream does not wait for producer exit" "$((SECONDS - started < 3 && 1 || 0))" "1"
+unset CODEX_STOP_GRACE CODEX_ABORTED
+
+reset_run
+export CODEX_SCENE=malformed-after-thread-once CODEX_ABORTED="$tmp/transport-aborted" CODEX_STOP_GRACE=1
+set +e; run_claude retry >/dev/null 2>&1; rc=$?; set -e
+chk "a malformed event after thread start gets one same-thread retry" "$rc:$(<"$CODEX_CALLS")" "0:2"
+chk "the interrupted producer is stopped before retry" "$([[ -e "$CODEX_ABORTED" ]] && echo stopped || echo alive)" "stopped"
+chk "the transport retry resumes the same thread" "$(grep -A1 -Fx resume "$CODEX_ARGS.2" | tail -1)" "thread-transport"
+chk "the resumed result is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "resumed after transport interruption"
 unset CODEX_STOP_GRACE CODEX_ABORTED
 
 reset_run
