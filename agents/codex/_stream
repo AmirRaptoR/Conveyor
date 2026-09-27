@@ -9,6 +9,7 @@ CLAUDE_RAW="$_CODEX_TMP/raw"
 CLAUDE_FINAL="$_CODEX_TMP/final"
 _CODEX_STDERR="$_CODEX_TMP/stderr"
 _CODEX_RESUME="$_CODEX_TMP/resume"
+_CODEX_SCHEMA="$_CODEX_TMP/result-schema.json"
 trap 'rm -rf "$_CODEX_TMP"' EXIT
 trap '_codex_stop_child; exit 143' TERM
 
@@ -261,12 +262,17 @@ _codex_invoke() {
 	local prompt=$1 correction=${2:-0} bin sandbox render_status child_status forced_stop=0 fifo stderr_fifo stderr_pid
 	local -a flags
 	bin=$(codex_bin)
+	if ! result_json_schema >"$_CODEX_SCHEMA"; then
+		echo "could not build the Codex output schema" >&2
+		return 2
+	fi
+	chmod 600 "$_CODEX_SCHEMA" || return 2
 	if [[ -z "${RESUME_SESSION:-}" && -s "$_CODEX_RESUME" ]]; then
 		RESUME_SESSION=$(<"$_CODEX_RESUME")
 	fi
 	sandbox=${CODEX_SANDBOX:-danger-full-access}
 	[[ "$correction" == 1 ]] && sandbox=read-only
-	flags=(exec --json --color never --sandbox "$sandbox")
+	flags=(exec --json --color never --sandbox "$sandbox" --output-schema "$_CODEX_SCHEMA")
 	[[ -n "${MODEL:-}" ]] && flags+=(--model "$MODEL")
 	# A stage may pin effort independently of the operator's global Codex
 	# default. The key is fixed here; only its TOML value comes from params.
