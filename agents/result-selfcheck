@@ -14,6 +14,17 @@ plain='{"v":1,"outcome":"success","summary":"done"}'
 result_accept "$plain" sess-1
 chk "plain JSON is persisted" "$(jq -c '[.v,.outcome,.summary,.session]' "$CONVEYOR_RESULT")" '[1,"success","done","sess-1"]'
 chk "the result stays private" "$(stat -c %a "$CONVEYOR_RESULT")" "600"
+if result_accept '{"v":1,"outcome":"success","after":"https://example.invalid/pr/1","priority":"normal","dispositions":["done"]}'; then got=accepted; else got=rejected; fi
+chk "unrequested success metadata is rejected" "$got" "rejected"
+chk "validation names disallowed fields without their values" \
+	"$_RESULT_LAST_VALIDATION_ERROR" \
+	"after must be a positive integer; dispositions must map non-empty ids to non-empty strings; fields not allowed in this stage: after, dispositions, priority; priority must be an integer from 0 through 3"
+RESULT_SUCCESS_FIELDS='priority after part of' result_accept '{"v":1,"outcome":"success","priority":2,"after":12,"part":2,"of":3}'
+chk "a stage-specific success profile accepts its fields" \
+	"$(jq -c '[.priority,.after,.part,.of]' "$CONVEYOR_RESULT")" '[2,12,2,3]'
+chk "the default generated schema exposes only summary" \
+	"$(result_json_schema | jq -c '.properties | keys')" \
+	'["kind","outcome","questions","reason","summary","v","waiting"]'
 
 result_accept $'```json\n{"v":1,"outcome":"noop","reason":"already done"}\n```'
 chk "one fenced object is accepted" "$(jq -c '[.outcome,.noop,.reason]' "$CONVEYOR_RESULT")" '["noop",true,"already done"]'
@@ -60,7 +71,7 @@ export SHORT_KEY='abc'
 result_accept '{"v":1,"outcome":"success","summary":"saw abc"}'
 chk "short non-empty secrets are redacted" "$(jq -r .summary "$CONVEYOR_RESULT")" "saw [REDACTED]"
 chk "JSON-escaped log text is redacted" "$(redact_text "$escaped" | grep -c 'quoted\\\"secret\\\\value' || true)" "0"
-result_accept '{"v":1,"outcome":"success","dispositions":{"abc":"one","[REDACTED]":"two"}}'
+RESULT_SUCCESS_FIELDS=dispositions result_accept '{"v":1,"outcome":"success","dispositions":{"abc":"one","[REDACTED]":"two"}}'
 chk "secret-bearing object keys are redacted without collision loss" "$(jq -c '.dispositions | to_entries' "$CONVEYOR_RESULT")" '[{"key":"[REDACTED]","value":"one"},{"key":"[REDACTED]-2","value":"two"}]'
 export API_KEY='waiting'
 result_accept '{"v":1,"outcome":"waiting","waiting":{"why":"waiting for checks"}}'

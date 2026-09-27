@@ -386,7 +386,7 @@ $(result_brief)"
 		return 20
 	fi
 	RESUME_SESSION=$session
-	if _claude_invoke "$(result_correction_brief)" 1; then rc=0; else rc=$?; fi
+	if _claude_invoke "$(result_correction_brief "${_RESULT_LAST_VALIDATION_ERROR:-}")" 1; then rc=0; else rc=$?; fi
 	if [[ $rc -eq 0 ]]; then
 		final=$(_claude_final)
 		if [[ -n "$final" ]] && result_accept "$final" "$session"; then

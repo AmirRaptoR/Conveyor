@@ -90,6 +90,7 @@ the result back."
 plan_start "prioritise"
 MAX_TURNS="${MAX_TURNS:-30}" \
 	ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Glob,Grep}" \
+	RESULT_SUCCESS_FIELDS="priority after part of" \
 	run_claude "$full"
 rc=$?
 

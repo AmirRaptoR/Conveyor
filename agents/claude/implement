@@ -38,6 +38,47 @@ noop_brief() {
 	BRIEF
 }
 
+# A completed implementation occasionally commits and pushes, then stops one
+# command before opening its pull request. Give that exact postcondition one
+# bounded repair in the same backend session. GitHub is checked again after the
+# call; the model's claim never substitutes for the provider result.
+repair_missing_pr() {
+	local session repair_rc=0
+	session=$(jq -r '.session // empty' "${CONVEYOR_RESULT:-/dev/null}" 2>/dev/null || true)
+	[[ -n "$session" ]] || session=$(claude_session)
+	case "$session" in
+	codex:* | opencode:*) session=${session#*:} ;;
+	esac
+	[[ -n "$session" ]] || return 1
+	contains_sensitive_value "$session" && return 1
+	RESUME_SESSION=$session
+	echo "no pull request exists after delivery; giving the same session one PR-only repair" >&2
+	set +e
+	MAX_TURNS=20 \
+		ALLOWED_TOOLS="Bash,Read,Glob,Grep" \
+		RESULT_SUCCESS_FIELDS="summary" \
+		run_claude "Delivery repair only: the implementation is already committed and pushed on the current branch, but GitHub has no open pull request for issue #${ref}. Do not change code or rerun the implementation. Open exactly one ready pull request from the current branch to the repository's default branch, with a useful title and body and an explicit 'Closes #${ref}' line. Then return a version-1 success result."
+	repair_rc=$?
+	set -e
+	record_model
+	return "$repair_rc"
+}
+
+# An invalid optional result envelope is not stronger evidence than an open PR.
+# This is intentionally implement-only: its externally observable delivery is
+# the PR, while stages such as prioritise and approve consume result fields.
+accept_provider_delivery_over_invalid_result() {
+	local session json
+	[[ -s "${CONVEYOR_RESULT:-}" ]] || return 1
+	[[ "$(jq -r '.kind // empty' "$CONVEYOR_RESULT" 2>/dev/null)" == invalid-result ]] || return 1
+	session=$(jq -r '.session // empty' "$CONVEYOR_RESULT" 2>/dev/null || true)
+	json=$(jq -nc --arg session "$session" --arg summary "GitHub confirms open pull request #${PR_NUMBER}; ignored malformed optional success metadata." '
+		{v:1,outcome:"success",summary:$summary} + (if $session == "" then {} else {session:$session} end)')
+	result_write_json "$json" || return 1
+	echo "PR #$PR_NUMBER proves delivery; ignoring malformed optional success metadata" >&2
+	return 0
+}
+
 : "${PROMPT:?PROMPT is required (set it in this script params: block)}"
 
 payload=$(cat)
@@ -235,9 +276,13 @@ fi
 
 if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
 	[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == "true" ]]; then
-	agent_asked
-	echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
-	exit 20 # the agent wrote its own reason; leave it exactly as written
+	if [[ "$(jq -r '.kind // empty' "$CONVEYOR_RESULT" 2>/dev/null)" == invalid-result ]]; then
+		echo "the result envelope was invalid; checking the provider delivery before marking the item" >&2
+	else
+		agent_asked
+		echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
+		exit 20 # the agent wrote its own reason; leave it exactly as written
+	fi
 fi
 
 if [[ $rc -eq 10 ]] && result_is_waiting; then
@@ -281,7 +326,9 @@ fi
 # reference, the same shared rule as everywhere else — never `gh pr list
 # --search`, which matches a number anywhere in any PR's text.
 if [[ -n "${REPO:-}" ]]; then
-	pr_lookup "$ref" open
+	repair_attempted=false
+	while true; do
+		pr_lookup "$ref" open
 	case "$PR_STATUS" in
 	unavailable)
 		recovers network pr-postcondition "could not confirm whether the work landed a pull request for issue #$ref; waiting before checking GitHub again"
@@ -293,6 +340,13 @@ if [[ -n "${REPO:-}" ]]; then
 		blocked decision "more than one open pull request now closes issue #$ref; resolve which one is correct before this can proceed."
 		;;
 	none)
+		if [[ "$repair_attempted" == false && $rc -eq 0 ]]; then
+			repair_attempted=true
+			repair_missing_pr || true
+			# The repair result is advisory. Re-enter the same provider decision
+			# once, and only its new answer decides whether delivery exists.
+			continue
+		fi
 		# No *open* PR is not the same as nothing landed: it may already have
 		# merged. The provider's own record of what closed the issue settles
 		# it, the same lookup the preflight above already asked.
@@ -315,7 +369,11 @@ reopen it, or answer here with what to do next."
 nothing landed. Read this run's log for what it did — a run cut short by a usage \
 limit looks exactly like this."
 		;;
+	one)
+		break
+		;;
 	esac
+	done
 	if [[ -z "$rework" ]] && ! pr_ensure_marker "$ref"; then
 		blocked input "pull request #$PR_NUMBER was created for issue #$ref, but its <!-- conveyor:item $ref --> ownership marker could not be recorded. Add the marker before this can proceed."
 	fi
@@ -328,6 +386,16 @@ limit looks exactly like this."
 	if [[ "$PR_DRAFT" == "true" ]]; then
 		recovers poll "draft:$PR_NUMBER" "pull request #$PR_NUMBER, which closes issue #$ref, is \
 still a draft; waiting for it to be marked ready"
+	fi
+	if [[ -s "${CONVEYOR_RESULT:-}" ]] &&
+		[[ "$(jq -r '.blocked // false' "$CONVEYOR_RESULT" 2>/dev/null)" == true ]]; then
+		if accept_provider_delivery_over_invalid_result; then
+			rc=0
+		else
+			agent_asked
+			echo "blocked: $(jq -r '.reason // "no reason given"' "$CONVEYOR_RESULT")" >&2
+			exit 20
+		fi
 	fi
 	pr=$PR_NUMBER
 	echo "opened PR #$pr"

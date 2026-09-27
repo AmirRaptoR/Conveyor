@@ -399,6 +399,7 @@ ${thread_text}"
 	set +e
 	MAX_TURNS="${MAX_TURNS:-40}" \
 		ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep}" \
+		RESULT_SUCCESS_FIELDS="dispositions" \
 		run_claude "$full"
 	rc=$?
 	set -e
@@ -714,6 +715,7 @@ $(decision_brief)"
 		set +e
 		MAX_TURNS="${MAX_TURNS:-40}" \
 			ALLOWED_TOOLS="${ALLOWED_TOOLS:-Bash,Read,Edit,Write,Glob,Grep}" \
+			RESULT_SUCCESS_FIELDS="dispositions" \
 			run_claude "$full"
 		rc=$?
 		set -e

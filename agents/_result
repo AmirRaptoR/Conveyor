@@ -3,6 +3,46 @@
 # object in their final response; only this adapter code may write the
 # engine-owned result file.
 
+_RESULT_ALL_SUCCESS_FIELDS=(dispositions priority after part of verdict summary)
+
+# Most stages need only a human-readable summary. Structured consumers opt into
+# their exact success fields at the run_claude call site, keeping unrelated
+# vocabulary out of both the prompt and the generated schema.
+result_success_fields_json() {
+	local raw=${RESULT_SUCCESS_FIELDS-summary} field allowed known json='[]'
+	for field in $raw; do
+		known=false
+		for allowed in "${_RESULT_ALL_SUCCESS_FIELDS[@]}"; do
+			[[ "$field" == "$allowed" ]] && known=true
+		done
+		if [[ "$known" != true ]]; then
+			echo "unknown RESULT_SUCCESS_FIELDS entry: $field" >&2
+			return 1
+		fi
+		json=$(jq -c --arg field "$field" 'if index($field) then . else . + [$field] end' <<<"$json") || return 1
+	done
+	printf '%s' "$json"
+}
+
+result_success_fields_brief() {
+	local fields field line="" type
+	fields=$(result_success_fields_json) || return 1
+	while IFS= read -r field; do
+		case "$field" in
+		dispositions) type='object mapping non-empty ids to non-empty strings' ;;
+		priority) type='integer from 0 through 3' ;;
+		after | part | of) type='positive integer' ;;
+		verdict | summary) type='string' ;;
+		esac
+		line+="${line:+; }${field} (${type})"
+	done < <(jq -r '.[]' <<<"$fields")
+	if [[ -n "$line" ]]; then
+		printf 'For success, this stage permits only these optional fields: %s.\n' "$line"
+	else
+		printf 'For success, this stage permits no optional fields.\n'
+	fi
+}
+
 result_brief() {
 	cat <<'BRIEF'
 End your final response with exactly one JSON object and no prose outside it.
@@ -15,26 +55,32 @@ Use this versioned result contract:
   AskUserQuestion shape.
 - noop requires `reason`.
 - waiting requires `waiting` with `why` and optional UTC `until`.
-- success may include task-specific `dispositions`, `priority`, `after`,
-  `part`, `of`, `verdict`, or `summary` fields when requested above.
+BRIEF
+	result_success_fields_brief
+	cat <<'BRIEF'
 Do not include file paths, `session`, `asked`, `blocked`, or `noop`; the adapter
 adds trusted transport fields. One optional ```json code fence is accepted.
 BRIEF
 }
 
 result_correction_brief() {
+	local error=${1:-the response did not match the version-1 result contract}
 	cat <<'BRIEF'
 Your previous final response could not be accepted as structured output. Do not
 continue the task and do not use tools. Return only one JSON object matching the
 version-1 result contract from the prior request. Do not wrap it in explanation.
-
+BRIEF
+	printf '\nValidation error: %s.\n\n' "$error"
+	cat <<'BRIEF'
 Use only the fields permitted for the chosen outcome:
-- success: `v`, `outcome`, and only requested `dispositions`, `priority`,
-  integer `after`, integer `part`, integer `of`, `verdict`, or `summary` fields;
+- success: `v`, `outcome`, and only the stage-specific optional fields below;
 - blocked: `v`, `outcome`, `kind`, `reason`, and optional `questions`;
 - noop: `v`, `outcome`, `reason`;
 - waiting: `v`, `outcome`, and `waiting`.
 
+BRIEF
+	result_success_fields_brief
+	cat <<'BRIEF'
 Do not copy a field from another outcome. In particular, blocked, noop, and
 waiting results must not contain `after`, `verdict`, or `summary`.
 BRIEF
@@ -52,10 +98,12 @@ is_condition_kind() {
 	return 1
 }
 
-# Broad enough for each shipped stage's task-specific payload while still
-# forcing the transport discriminator and rejecting model-owned trusted fields.
+# Exact for this model invocation: common outcome fields plus only the success
+# fields its stage explicitly requested.
 result_json_schema() {
-	jq -nc '{
+	local fields
+	fields=$(result_success_fields_json) || return 1
+	jq -nc --argjson fields "$fields" '{
 		type:"object", additionalProperties:false,
 		properties:{
 			v:{type:"integer",const:1}, outcome:{type:"string",enum:["success","blocked","noop","waiting"]},
@@ -64,7 +112,9 @@ result_json_schema() {
 			waiting:{type:"object"}, dispositions:{type:"object"},
 			priority:{type:"integer"}, after:{type:"integer"}, part:{type:"integer"}, of:{type:"integer"},
 			verdict:{type:"string"}, summary:{type:"string"}
-		}, required:["v","outcome"]
+		} | with_entries(select(.key as $key |
+			(["v","outcome","kind","reason","questions","waiting"] + $fields) | index($key))),
+		required:["v","outcome"]
 	}'
 }
 
@@ -150,14 +200,65 @@ result_parse() {
 		select(type == "object")' 2>/dev/null
 }
 
+# result_validation_error <json> prints a value-free explanation suitable for
+# the formatting-only correction prompt. Never echo the model's values here:
+# they may contain credentials even when their field names are harmless.
+result_validation_error() {
+	local json=$1 fields
+	fields=$(result_success_fields_json) || return 1
+	jq -r --argjson success "$fields" '
+		def named($xs): $xs | sort | join(", ");
+		def present($name): has($name);
+		. as $root |
+		(["v","outcome","kind","reason","questions","waiting"] + $success) as $allowed |
+		[
+			if type != "object" then "result must be an object" else empty end,
+			if type == "object" and ((keys - $allowed) | length) > 0
+				then "fields not allowed in this stage: " + named(keys - $allowed) else empty end,
+			if .v != 1 then "v must be integer 1" else empty end,
+			if (.outcome != "success" and .outcome != "blocked" and .outcome != "noop" and .outcome != "waiting")
+				then "outcome must be success, blocked, noop, or waiting" else empty end,
+			if present("summary") and (.summary | type) != "string" then "summary must be a string" else empty end,
+			if present("verdict") and (.verdict | type) != "string" then "verdict must be a string" else empty end,
+			if present("priority") then
+				if (.priority | type) != "number" then "priority must be an integer from 0 through 3"
+				elif (.priority | floor) != .priority or .priority < 0 or .priority > 3 then "priority must be an integer from 0 through 3"
+				else empty end
+			else empty end,
+			(. as $root | ["after","part","of"][] as $name |
+				if ($root | has($name)) then
+					if ($root[$name] | type) != "number" then $name + " must be a positive integer"
+					elif ($root[$name] | floor) != $root[$name] or $root[$name] <= 0 then $name + " must be a positive integer"
+					else empty end
+				else empty end),
+			if present("dispositions") then
+				if (.dispositions | type) != "object" then "dispositions must map non-empty ids to non-empty strings"
+				elif ([.dispositions | to_entries[] | select((.key | length) == 0 or (.value | type) != "string" or (.value | length) == 0)] | length) > 0
+					then "dispositions must map non-empty ids to non-empty strings"
+				else empty end
+			else empty end,
+			if .outcome == "blocked" and ((.kind | type) != "string" or (.reason | type) != "string")
+				then "blocked requires string kind and reason" else empty end,
+			if .outcome == "noop" and (.reason | type) != "string" then "noop requires string reason" else empty end,
+			if .outcome == "waiting" and ((.waiting | type) != "object" or (.waiting.why | type) != "string")
+				then "waiting requires waiting.why as a string" else empty end,
+			if .outcome == "success" and (["kind","reason","questions","waiting"] | map(select(. as $name | $root | has($name))) | length) > 0
+				then "success contains fields from another outcome" else empty end,
+			if (.outcome == "blocked" or .outcome == "noop" or .outcome == "waiting") and
+				([$success[] | select(. as $name | $root | has($name))] | length) > 0
+				then .outcome + " contains success-only fields" else empty end
+		] | unique | join("; ")
+	' <<<"$json" 2>/dev/null
+}
+
 # result_validate_model <json> validates the untrusted model-owned portion.
 # Trusted compatibility fields are added only after this succeeds.
 result_validate_model() {
-	local json=$1 until normalized_until
-	jq -e '
+	local json=$1 until normalized_until fields
+	fields=$(result_success_fields_json) || return 1
+	jq -e --argjson success "$fields" '
 		type == "object" and
-		((keys - ["v","outcome","kind","reason","questions","waiting",
-		          "dispositions","priority","after","part","of","verdict","summary"]) | length == 0) and
+		((keys - (["v","outcome","kind","reason","questions","waiting"] + $success)) | length == 0) and
 		.v == 1 and
 		(.outcome == "success" or .outcome == "blocked" or .outcome == "noop" or .outcome == "waiting") and
 		((has("kind") | not) or (.kind | type == "string" and test("^[a-z0-9][a-z0-9 -]{0,23}$"))) and
@@ -248,9 +349,20 @@ result_write_json() {
 
 result_accept() {
 	local text=$1 session=${2:-} parsed normalized
-	parsed=$(result_parse "$text") || return 1
-	[[ -n "$parsed" ]] || return 1
-	result_validate_model "$parsed" || return 1
+	_RESULT_LAST_VALIDATION_ERROR=""
+	parsed=$(result_parse "$text") || {
+		_RESULT_LAST_VALIDATION_ERROR="response was not exactly one JSON object"
+		return 1
+	}
+	if [[ -z "$parsed" ]]; then
+		_RESULT_LAST_VALIDATION_ERROR="response was not exactly one JSON object"
+		return 1
+	fi
+	if ! result_validate_model "$parsed"; then
+		_RESULT_LAST_VALIDATION_ERROR=$(result_validation_error "$parsed")
+		[[ -n "$_RESULT_LAST_VALIDATION_ERROR" ]] || _RESULT_LAST_VALIDATION_ERROR="response did not match the version-1 result contract"
+		return 1
+	fi
 	normalized=$(result_normalize "$parsed" "$session") || return 1
 	result_write_json "$normalized"
 }

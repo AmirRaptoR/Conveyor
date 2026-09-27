@@ -58,6 +58,9 @@ chmod +x "$tmp/bin/gh"
 cat >"$tmp/bin/claude" <<'STUB'
 #!/usr/bin/env bash
 scene="$SCENE"
+calls=1
+[[ -s "$scene/claude_calls" ]] && calls=$(($(<"$scene/claude_calls") + 1))
+printf '%s' "$calls" >"$scene/claude_calls"
 prev=""
 for a in "$@"; do
 	[[ "$prev" == "-p" ]] && printf '%s' "$a" >"$scene/claude_prompt"
@@ -69,12 +72,17 @@ session=""
 [[ -n "$session" ]] &&
 	printf '{"type":"system","subtype":"init","session_id":"%s","model":"claude-selfcheck"}\n' "$session"
 
-if [[ -f "$scene/do_commit" ]]; then
+if [[ -f "$scene/do_commit" && $calls -eq 1 ]]; then
 	echo committed >>file.txt
 	git add -A
 	git commit --quiet -m "the agent committed"
 fi
 [[ -f "$scene/do_push" ]] && git push --quiet origin HEAD 2>/dev/null
+if [[ -f "$scene/repair_ref" && $calls -gt 1 ]]; then
+	ref=$(<"$scene/repair_ref")
+	printf '[{"number":9,"body":"Closes #%s\\n\\n<!-- conveyor:item %s -->","state":"OPEN","headRefName":"issue-%s","url":"u","isDraft":false}]' \
+		"$ref" "$ref" "$ref" >"$scene/prlist"
+fi
 result='{"v":1,"outcome":"success"}'
 if [[ -f "$scene/write_result" ]]; then
 	result=$(jq -c '
@@ -164,6 +172,29 @@ chk "    and its own reason is kept verbatim" "$(reason)" "pick a design"
 scene; pr_fixture 102
 touch "$tmp/scene/do_commit" "$tmp/scene/do_push"
 chk "(c) a commit that was pushed exits 0" "$(run_implement 102)" "0"
+
+# --- (c2) pushed work missing only its PR gets one same-session repair -------
+scene
+echo '[]' >"$tmp/scene/prlist"
+printf '112' >"$tmp/scene/repair_ref"
+touch "$tmp/scene/do_commit" "$tmp/scene/do_push"
+rc=$(run_implement 112)
+chk "(c2) a pushed implementation repairs its missing PR" "$rc" "0"
+chk "     the same session is invoked exactly once more" "$(<"$tmp/scene/claude_calls")" "2"
+chk "     the repair prompt is PR-only" \
+	"$(grep -c 'Delivery repair only' "$tmp/scene/claude_prompt")" "1"
+chk "     provider state contains the repaired PR" "$(jq -r '.[0].number' "$tmp/scene/prlist")" "9"
+
+# --- (c3) an open PR outranks malformed, irrelevant success metadata --------
+scene; pr_fixture 113
+printf '{"after":"https://example.invalid/pr/9","dispositions":["checked"],"priority":"normal","summary":"done"}' \
+	>"$tmp/scene/write_result"
+rc=$(run_implement 113)
+chk "(c3) an existing PR prevents an invalid-result false negative" "$rc" "0"
+chk "     the provider-backed recovery is recorded as success" \
+	"$(jq -r '.outcome + " " + .summary' "$CONVEYOR_RESULT")" \
+	"success GitHub confirms open pull request #9; ignored malformed optional success metadata."
+chk "     the formatter still gets only its one bounded correction" "$(<"$tmp/scene/claude_calls")" "2"
 
 # --- (d) commit without push, empty result: exits 0 as today -----------------
 # The local tip alone moving is enough — pushing later is normal (the model

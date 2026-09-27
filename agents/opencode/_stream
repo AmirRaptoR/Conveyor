@@ -548,7 +548,7 @@ $(result_brief)"
 		[[ -n "${VARIANT:-}" ]] && flags+=(--variant "$VARIANT")
 		[[ -n "$session" ]] && flags+=(--session "$session")
 		if OPENCODE_CONFIG_CONTENT='{"agent":{"conveyor-result":{"mode":"primary","permission":{"*":"deny"}}}}' \
-			_opencode_invoke_child "$(result_correction_brief)" "$bin" "${flags[@]}"; then correction_result=0; else correction_result=$?; fi
+			_opencode_invoke_child "$(result_correction_brief "${_RESULT_LAST_VALIDATION_ERROR:-}")" "$bin" "${flags[@]}"; then correction_result=0; else correction_result=$?; fi
 		if [[ $correction_result -eq 0 ]]; then
 			final=$(<"$CLAUDE_FINAL")
 			if result_accept "$final" "${session:+opencode:$session}"; then

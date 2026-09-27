@@ -80,9 +80,13 @@ peer, and the socket is the only door with no password on it (#94).
   acknowledgement channel; commands go in through their own control channel.
   An AI stage script emits megabytes of prose. A shipped model child never sees
   `$CONVEYOR_RESULT`: it returns one v1 object in its backend's final event, and
-  `agents/_result` validates, redacts and atomically persists it. One malformed
-  completed response gets one formatting-only correction; a second becomes an
-  `invalid-result` condition. Partial event streams fail without correction.
+  `agents/_result` validates, redacts and atomically persists it against the
+  calling stage's exact success fields. One malformed completed response gets
+  one formatting-only correction naming value-free validation errors; a second
+  becomes an `invalid-result` condition. Implementation alone may recover that
+  condition when GitHub already proves the expected PR exists, because the PR
+  is that stage's provider-owned delivery record. Partial event streams fail
+  without correction.
 - **A plan is a third channel, not a parsed log line.** `$CONVEYOR_PLAN`
   (`plan.jsonl` in the run directory, pre-created 0600, engine-owned so a
   source's `env:` cannot redirect it) is where a run appends one JSON todo

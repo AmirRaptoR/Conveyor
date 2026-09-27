@@ -364,10 +364,13 @@ closed recovery `class` and a stable `key` described in §5. The adapter returns
 a stage that permits waiting takes the ordinary deferral path before its
 postconditions. `prioritise` is deliberately best-effort and treats that exit
 like any other missing decision: it writes its default and advances. A block may carry
-`questions` in the AskUserQuestion shape. A successful task may carry the
-task-specific fields the adapter requested: `dispositions`, `priority`,
-`after`, `part`, `of`, `verdict` or `summary`. Unknown fields, unknown
-versions, wrong types and contradictory outcome fields are invalid.
+`questions` in the AskUserQuestion shape. A successful task may carry only the
+task-specific fields that invocation's stage requested. The default profile
+permits `summary` alone; `prioritise` requests `priority`, `after`, `part` and
+`of`, while the approving repair path requests `dispositions`. The generated
+schema, prompt and validator all use that same profile, so vocabulary belonging
+to another stage is never merely ignored. Unknown fields, unknown versions,
+wrong types and contradictory outcome fields are invalid.
 
 The model supplies none of `blocked`, `noop`, `asked` or `session`. The adapter
 derives the compatibility booleans, classifies a real question from its kind
@@ -381,9 +384,21 @@ observed tools are terminal. Partial streams are backend failures even when a
 partial text fragment happens to contain JSON. Multiple terminal candidates
 are ambiguous rather than "last one wins". For a completed response that is
 missing, malformed, ambiguous or schema-invalid, the adapter makes exactly one
-formatting-only correction in the same session. A valid correction is handled
-normally; a second failure exits 20 with kind `invalid-result`, `asked:false`,
-the precise failure class and the resumable session. It never corrects twice.
+formatting-only correction in the same session. The correction names the
+value-free validation errors and repeats the stage's exact permitted field
+types; it never reflects rejected values back into the prompt. A valid
+correction is handled normally; a second failure exits 20 with kind
+`invalid-result`, `asked:false`, the precise failure class and the resumable
+session. It never corrects twice.
+
+The implementation adapter has two bounded delivery recoveries around that
+generic rule. If a completed run pushed its branch but GitHub still has no pull
+request, the same backend session gets one PR-only turn and GitHub is queried
+again. If result formatting still fails but GitHub proves that one open pull
+request owns the item, implementation records provider-backed success and
+hands the PR to review; optional model metadata cannot outweigh the delivery
+record. No other stage gets that exception: prioritisation and approval consume
+their result fields, so malformed data there remains a real failed result.
 
 Before logs or envelopes leave the adapter, exact non-empty values from
 environment names containing `token`, `secret`, `password`, `key` or

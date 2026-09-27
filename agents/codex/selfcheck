@@ -52,6 +52,16 @@ invalid-once|invalid-always)
 	jq -nc --arg text "$text" '{type:"item.completed",item:{id:"m",type:"agent_message",text:$text}}'
 	jq -nc '{type:"turn.completed"}'
 	;;
+semantic-extras)
+	text='{"v":1,"outcome":"success","summary":"done","after":"https://example.invalid/pr/1","dispositions":["checked"],"priority":"normal"}'
+	if [[ $run_no -gt 1 ]]; then
+		text='{"v":1,"outcome":"success","summary":"corrected"}'
+	fi
+	jq -nc '{type:"thread.started",thread_id:"thread-semantic"}'
+	jq -nc '{type:"turn.started"}'
+	jq -nc --arg text "$text" '{type:"item.completed",item:{id:"m",type:"agent_message",text:$text}}'
+	jq -nc '{type:"turn.completed"}'
+	;;
 duplicate)
 	printf '%s\n' \
 		'{"type":"thread.started","thread_id":"thread-duplicate"}' \
@@ -187,6 +197,16 @@ chk "the correction is read-only" "$(grep -A1 -Fx -- --sandbox "$CODEX_ARGS.2" |
 chk "the correction prompt forbids tools" "$(grep -c 'do not use tools' "$CODEX_PROMPT.2")" "1"
 chk "the correction prompt separates blocked fields" "$(grep -c 'blocked:.*kind.*reason.*questions' "$CODEX_PROMPT.2")" "1"
 chk "the correction prompt rejects cross-outcome after" "$(grep -c 'must not contain.*after.*verdict.*summary' "$CODEX_PROMPT.2")" "1"
+
+reset_run
+export CODEX_SCENE=semantic-extras
+set +e; run_claude correct >/dev/null 2>&1; rc=$?; set -e
+chk "semantic but stage-invalid metadata gets one correction" "$rc:$(<"$CODEX_CALLS")" "0:2"
+chk "the correction prompt names the disallowed fields" \
+	"$(grep -c 'fields not allowed in this stage: after, dispositions, priority' "$CODEX_PROMPT.2")" "1"
+chk "the correction prompt gives exact field types" \
+	"$(grep -c 'after must be a positive integer.*dispositions must map.*priority must be an integer' "$CODEX_PROMPT.2")" "1"
+chk "the corrected semantic result is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "corrected"
 
 reset_run
 export CODEX_SCENE=invalid-always
