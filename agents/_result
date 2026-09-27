@@ -27,6 +27,16 @@ result_correction_brief() {
 Your previous final response could not be accepted as structured output. Do not
 continue the task and do not use tools. Return only one JSON object matching the
 version-1 result contract from the prior request. Do not wrap it in explanation.
+
+Use only the fields permitted for the chosen outcome:
+- success: `v`, `outcome`, and only requested `dispositions`, `priority`,
+  integer `after`, integer `part`, integer `of`, `verdict`, or `summary` fields;
+- blocked: `v`, `outcome`, `kind`, `reason`, and optional `questions`;
+- noop: `v`, `outcome`, `reason`;
+- waiting: `v`, `outcome`, and `waiting`.
+
+Do not copy a field from another outcome. In particular, blocked, noop, and
+waiting results must not contain `after`, `verdict`, or `summary`.
 BRIEF
 }
 

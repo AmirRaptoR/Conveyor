@@ -494,7 +494,9 @@ Codex CLI `0.150.1` is the supported event contract. The adapter consumes
 `turn.completed`, and accepts only the last completed agent message from that
 turn as the final response. The adapter still parses and validates that final
 message itself; backend schema enforcement narrows generation but never
-replaces the fail-closed boundary. Command output and reasoning are never
+replaces the fail-closed boundary. Its one no-tool correction names the exact
+fields permitted for each outcome so a model cannot retain a task-specific
+success field on a blocked result. Command output and reasoning are never
 logged; command names and statuses are. Completed `todo_list` items publish to
 the plan channel. Stops retain the thread with a `codex:` prefix, so another
 backend treats it as foreign and falls back to the answered cold prompt. Codex

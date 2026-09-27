@@ -172,6 +172,8 @@ chk "the correction is persisted" "$(jq -r .summary "$CONVEYOR_RESULT")" "correc
 chk "the correction resumes the same thread" "$(grep -A1 -Fx resume "$CODEX_ARGS.2" | tail -1)" "thread-invalid"
 chk "the correction is read-only" "$(grep -A1 -Fx -- --sandbox "$CODEX_ARGS.2" | head -2 | tail -1)" "read-only"
 chk "the correction prompt forbids tools" "$(grep -c 'do not use tools' "$CODEX_PROMPT.2")" "1"
+chk "the correction prompt separates blocked fields" "$(grep -c 'blocked:.*kind.*reason.*questions' "$CODEX_PROMPT.2")" "1"
+chk "the correction prompt rejects cross-outcome after" "$(grep -c 'must not contain.*after.*verdict.*summary' "$CODEX_PROMPT.2")" "1"
 
 reset_run
 export CODEX_SCENE=invalid-always
