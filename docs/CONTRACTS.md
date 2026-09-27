@@ -489,15 +489,20 @@ adapter policy means the engine schema, stage routing and result contract do
 not learn what a backend is.
 
 Codex CLI `0.150.1` is the supported event contract. The adapter consumes
-`codex exec --json`, requires one stable `thread.started`, one turn and one
+`codex exec --json` with the shared version-1 result schema supplied through
+`--output-schema`, requires one stable `thread.started`, one turn and one
 `turn.completed`, and accepts only the last completed agent message from that
-turn as the final response. Command output and reasoning are never logged;
-command names and statuses are. Completed `todo_list` items publish to the plan
-channel. Stops retain the thread with a `codex:` prefix, so another backend
-treats it as foreign and falls back to the answered cold prompt. Codex exposes
-no turn-count ceiling, so the engine deadline remains its hard bound. The
-adapter does not advertise steering: the event stream has no tested boundary
-at which the adapter can stop a live turn without racing active work.
+turn as the final response. The adapter still parses and validates that final
+message itself; backend schema enforcement narrows generation but never
+replaces the fail-closed boundary. Its one no-tool correction names the exact
+fields permitted for each outcome so a model cannot retain a task-specific
+success field on a blocked result. Command output and reasoning are never
+logged; command names and statuses are. Completed `todo_list` items publish to
+the plan channel. Stops retain the thread with a `codex:` prefix, so another
+backend treats it as foreign and falls back to the answered cold prompt. Codex
+exposes no turn-count ceiling, so the engine deadline remains its hard bound.
+The adapter does not advertise steering: the event stream has no tested
+boundary at which the adapter can stop a live turn without racing active work.
 
 A source selects OpenCode with `agent: opencode` and passes `MODEL`
 (`provider/model`), optional `VARIANT`, and optional primary `AGENT` in that
